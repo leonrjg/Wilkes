@@ -8,7 +8,7 @@
 //!
 //! ## What it replaced
 //!
-//! Until now [`crate::extract::pdf`] marked out formulas by reading the font
+//! Until now [`crate::extract::document`] marked out formulas by reading the font
 //! each glyph was drawn in and tables by finding the rules the page stroked.
 //! Both worked on the documents they were written against and neither
 //! generalized: the font rule needed a list of face names and could not see
@@ -90,7 +90,7 @@
 //! ### What of that reaches the recognizer
 //!
 //! Less again, and for a reason that is not this module's. A detection becomes
-//! a crop only if `extract::pdf::typeset::regions` finds it a place in the
+//! a crop only if `extract::document::typeset::regions` finds it a place in the
 //! page's reading, and the same fixture scored one stage further down — at the
 //! crop, not the proposal — reads (needs_recognizer labels, of 555):
 //!
@@ -1081,7 +1081,7 @@ const MERGE_IOU: f32 = 0.5;
 /// *not* eat the correct small detections inside it — both go forward.
 ///
 /// What then happens to them is not settled here, and this comment used to
-/// claim it was. `extract::pdf::typeset::regions` gives the page's words to
+/// claim it was. `extract::document::typeset::regions` gives the page's words to
 /// the largest box first, and a box left owning none is kept only where
 /// nothing already speaks for its area — so on such a line the container is
 /// what gets cropped and the small ones inside it do not. Measured on the
@@ -1605,7 +1605,7 @@ mod tests {
     /// expressions the tiling exists to find.
     ///
     /// Which of the three is then cropped is not decided here — see
-    /// [`ABSORB_SHARE`]. `extract::pdf::typeset::regions` gives the line's
+    /// [`ABSORB_SHARE`]. `extract::document::typeset::regions` gives the line's
     /// words to the largest box, and the smaller ones inside it are dropped
     /// there for sitting inside an area already spoken for. A merge rule that
     /// dropped the container instead was measured against exactly this case

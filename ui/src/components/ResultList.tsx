@@ -70,7 +70,7 @@ import {
   pathIsWithinRoot,
   pathsEqual,
 } from "../lib/configuredRoots";
-import FileTree, { type FileTreeDragProps } from "./FileTree";
+import FileTree, { type FileTreeDragProps, type FileTreeHandle } from "./FileTree";
 import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
 
 function originLabel(origin: SourceOrigin): string {
@@ -396,6 +396,10 @@ interface Props {
   /** Extra content rendered under each document row. Used by the related
    *  documents pane for on-demand relation explanations. */
   documentAccessory?: (entry: FileEntry) => React.ReactNode;
+  /** Reaches the folder tree so a drag the desktop shell owns — files coming
+   *  in from outside the application — can be tracked and dropped by the same
+   *  hit test as a drag within the tree. Absent where no tree is drawn. */
+  fileTreeRef?: React.Ref<FileTreeHandle>;
 }
 
 export default function ResultList({
@@ -407,6 +411,7 @@ export default function ResultList({
   preserveDocumentOrder = false,
   documentDetails,
   documentAccessory,
+  fileTreeRef,
 }: Props) {
   const results = useSearchStore((s) => s.results);
   const stats = useSearchStore((s) => s.stats);
@@ -563,6 +568,16 @@ export default function ResultList({
       addToast(error instanceof Error ? error.message : "Failed to move file", { type: "error" });
     }
   };
+  const createTreeFolder = async (directory: string, name: string) => {
+    try {
+      const created = await (source as DesktopSourceApi).createDirectory(directory, name);
+      await refreshFileList();
+      addToast(`Created ${fileName(created)} in ${fileName(directory)}`, { type: "success" });
+    } catch (error) {
+      console.error("Failed to create folder:", error);
+      addToast(error instanceof Error ? error.message : "Failed to create folder", { type: "error" });
+    }
+  };
   const summaryInput = React.useMemo(
     () => buildSearchResultsSummaryInput(resultContext?.subject ?? "", results),
     [resultContext?.subject, results],
@@ -698,12 +713,14 @@ export default function ResultList({
         <div className="flex-1 overflow-y-auto">
           {fileTreeEnabled && !documents && directory ? (
             <FileTree
+              ref={fileTreeRef}
               root={directory}
               files={filteredVisibleFiles}
               directories={filterText.trim() ? [] : directoryList}
               movable={isTauri && !readOnly}
               expandAll={filterText.trim().length > 0}
               onMove={moveTreeFile}
+              onCreateFolder={isTauri && !readOnly ? createTreeFolder : undefined}
               renderFile={(entry, drag) => (
                 <FileEntryRowAdapter
                   entry={entry}

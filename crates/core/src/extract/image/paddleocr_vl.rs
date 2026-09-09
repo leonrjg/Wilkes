@@ -1483,7 +1483,7 @@ mod tests {
 
         let path = std::env::var("WILKES_SAMPLE_PDF").ok()?;
         let capture = std::sync::Arc::new(super::super::corpus::ImageCapture::default());
-        crate::extract::pdf::PdfExtractor::with_image_analyzer(std::sync::Arc::new(
+        crate::extract::document::DocumentExtractor::with_image_analyzer(std::sync::Arc::new(
             super::super::NativeImageAnalyzer::new(
                 Some(Box::new(capture.clone())),
                 None,

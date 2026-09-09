@@ -318,10 +318,21 @@ pub struct CitationReference {
     pub citation_line: Option<String>,
 }
 
+/// How Wilkes reads a file — not what format it is. `extension` and
+/// [`crate::extract::document::format::PagedFormat`] answer that.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileType {
+    /// The file's bytes are its text, addressed by line and column.
     PlainText,
-    Pdf,
+    /// A document read as laid-out pages, addressed by page and box. PDFs,
+    /// and every format the MuPDF backend paginates: EPUB, MOBI, FB2.
+    ///
+    /// Serialized as `"Pdf"` because that is what it has always been on the
+    /// wire, and it is a value users have written saved filters against. The
+    /// name was accurate when PDFs were the only paginated format; the
+    /// meaning has widened and the name had not.
+    #[serde(rename = "Pdf")]
+    Paged,
 }
 
 impl FileType {
@@ -336,11 +347,17 @@ impl FileType {
                 .iter()
                 .any(|s| s.to_ascii_lowercase() == *ext)
             {
-                if ext == "pdf" {
-                    return Some(FileType::Pdf);
-                } else {
-                    return Some(FileType::PlainText);
-                }
+                // Which reading a file gets, asked of the one list that
+                // decides it. `Pdf` has meant "a document read as laid-out
+                // pages" since the MuPDF backend started reading EPUB, MOBI
+                // and FB2 as well; the wire name is kept because it is a
+                // queryable field users have written filters against.
+                return Some(
+                    match crate::extract::document::format::PagedFormat::for_path(path) {
+                        Some(_) => FileType::Paged,
+                        None => FileType::PlainText,
+                    },
+                );
             }
         }
 
@@ -1602,6 +1619,24 @@ pub enum PreviewData {
         highlight_line: u32,
         highlight_range: ByteRange,
     },
+    /// A book: paginated by Wilkes, not by the file.
+    ///
+    /// Carries everything the reader needs *except* the pages themselves,
+    /// which are fetched separately because they are megabytes and this is not
+    /// the channel for them. The outline and the links travel here because a
+    /// surrogate rendering cannot hold either — see
+    /// [`crate::extract::document::surrogate`] — and because they are already known
+    /// by the time the preview is answered.
+    Book {
+        page: u32,
+        highlight_bbox: Option<BoundingBox>,
+        /// The book's own table of contents, empty when it declares none.
+        #[serde(default)]
+        outline: Vec<SurrogateOutline>,
+        /// Only pages that have links appear.
+        #[serde(default)]
+        links: Vec<SurrogatePageLinks>,
+    },
     Pdf {
         page: u32,
         highlight_bbox: Option<BoundingBox>,
@@ -1612,6 +1647,57 @@ pub enum PreviewData {
         #[serde(default)]
         superseded: Vec<SupersededArea>,
     },
+}
+
+/// One entry of a book's table of contents, anchored to a page of the
+/// surrogate rendering.
+///
+/// Deliberately not a [`PdfDestination`-shaped thing](crate::types): a pdf.js
+/// destination names its page by an internal reference that only pdf.js can
+/// resolve, and this destination was resolved here, by MuPDF, against a
+/// document the reader never sees. Saying "page 34" is the honest form of what
+/// is known.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SurrogateOutline {
+    pub title: String,
+    /// 1-based page of the surrogate, absent for an entry that resolves to no
+    /// page at all.
+    pub page: Option<u32>,
+    /// Where on that page, in unscaled page units from the top, when the
+    /// destination pins a position. Absent for a plain "fit the page"
+    /// destination, which pins none.
+    #[serde(default)]
+    pub offset_y: Option<f32>,
+    /// An external target, for the entries that are links out rather than
+    /// places in the book.
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub items: Vec<SurrogateOutline>,
+}
+
+/// The links on one page of a surrogate rendering.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SurrogatePageLinks {
+    /// 1-based.
+    pub page: u32,
+    pub links: Vec<SurrogateLink>,
+}
+
+/// One link: where it is on the page, and where it goes. Exactly one of `page`
+/// and `url` is set — MuPDF resolves an internal destination itself and leaves
+/// none for an external one, so which kind a link is comes from the document.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SurrogateLink {
+    /// In unscaled page units, top-left origin, as every other box here is.
+    pub bbox: BoundingBox,
+    /// 1-based target page inside the book.
+    #[serde(default)]
+    pub page: Option<u32>,
+    #[serde(default)]
+    pub offset_y: Option<f32>,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 // ── Embedder model ────────────────────────────────────────────────────────────
@@ -1857,7 +1943,7 @@ pub struct GenerationSettings {
 /// So the two are separable, and the cheap half is the default. Which areas
 /// are typeset is decided by the page's own evidence — the font a run is set
 /// in, the rules a table is drawn with — in the typeset survey under
-/// [`crate::extract::pdf`], and not by a model. A layout detector, when there
+/// [`crate::extract::document`], and not by a model. A layout detector, when there
 /// is one, joins that survey rather than replacing this choice: it would
 /// widen what counts as a formula or a table, which is a different question
 /// from whether the embedded rasters are read.
@@ -2640,6 +2726,11 @@ fn default_pdf_auto_zoom_target_px() -> f64 {
 fn default_supported_extensions() -> Vec<String> {
     vec![
         "txt", "md", "json", "xml", "html", "htm", "log", "csv", "jsonl", "pdf",
+        // Read as laid-out pages by the MuPDF backend. `azw3` is admitted so
+        // that a Kindle KF8 book is refused with a reason a user can see,
+        // rather than omitted as an unsupported extension and never mentioned
+        // — see `extract::document::format::guard_container`.
+        "epub", "mobi", "prc", "pdb", "fb2", "azw", "azw3", "cbz", "cbt",
     ]
     .into_iter()
     .map(String::from)
@@ -3313,7 +3404,7 @@ mod tests {
         );
         assert_eq!(
             FileType::detect(Path::new("test.pdf"), &extensions),
-            Some(FileType::Pdf)
+            Some(FileType::Paged)
         );
         assert_eq!(
             FileType::detect(Path::new("Makefile"), &extensions),
@@ -3646,6 +3737,52 @@ mod tests {
             "sentence-transformers/all-MiniLM-L12-v2"
         );
         assert_eq!(settings.selected.dimension, 384);
+    }
+
+    /// `FileType` is serialized into saved settings, into search results and
+    /// into the interface, which compares it against the literal `"Pdf"`.
+    /// Renaming the variant must not rename the value.
+    #[test]
+    fn the_paged_file_type_is_still_pdf_on_the_wire() {
+        assert_eq!(serde_json::to_string(&FileType::Paged).unwrap(), "\"Pdf\"");
+        assert_eq!(
+            serde_json::from_str::<FileType>("\"Pdf\"").unwrap(),
+            FileType::Paged
+        );
+        assert_eq!(
+            serde_json::to_string(&FileType::PlainText).unwrap(),
+            "\"PlainText\""
+        );
+    }
+
+    /// A book is detected as a paged document, not as plain text whose bytes
+    /// happen to be a zip. Before the MuPDF backend read these formats, an
+    /// `.epub` admitted to the extension list became `PlainText` and failed on
+    /// `read_to_string`.
+    #[test]
+    fn books_are_detected_as_paged_documents() {
+        let supported = default_supported_extensions();
+        for name in [
+            "book.epub",
+            "book.mobi",
+            "book.prc",
+            "book.pdb",
+            "book.fb2",
+            "book.azw3",
+        ] {
+            assert_eq!(
+                FileType::detect(std::path::Path::new(name), &supported),
+                Some(FileType::Paged),
+                "{name}"
+            );
+        }
+        for name in ["notes.txt", "readme.md", "page.html", "data.xml", "run.log"] {
+            assert_eq!(
+                FileType::detect(std::path::Path::new(name), &supported),
+                Some(FileType::PlainText),
+                "{name}"
+            );
+        }
     }
 
     #[test]

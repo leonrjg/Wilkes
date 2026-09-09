@@ -348,7 +348,7 @@ pub struct DiscoveredImage {
     /// The page rectangle the crop's pixels actually *show*, which is not
     /// always the rectangle they cover.
     ///
-    /// [`crate::extract::pdf::typeset::render`] pads a lopsided region out to
+    /// [`crate::extract::document::typeset::render`] pads a lopsided region out to
     /// an aspect bound and clips the page to the region, so the pad is white
     /// paper rather than more of the page: a table 450 points wide and 40 tall
     /// is drawn on a canvas 112 points tall, and the 36 points above and below

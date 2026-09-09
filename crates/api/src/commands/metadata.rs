@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use wilkes_core::metadata::pdf::PdfMetadataExtractor;
+use wilkes_core::metadata::document::DocumentMetadataExtractor;
 use wilkes_core::metadata::text::TextMetadataExtractor;
 use wilkes_core::metadata::MetadataExtractorRegistry;
 use wilkes_core::types::DocumentMetadata;
@@ -22,7 +22,7 @@ pub async fn get_file_metadata(
 
 pub(crate) fn build_registry(supported_extensions: Vec<String>) -> MetadataExtractorRegistry {
     let mut registry = MetadataExtractorRegistry::new();
-    registry.register(Box::new(PdfMetadataExtractor));
+    registry.register(Box::new(DocumentMetadataExtractor));
     registry.register(Box::new(TextMetadataExtractor::new(supported_extensions)));
     registry
 }

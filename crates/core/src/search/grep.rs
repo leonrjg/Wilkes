@@ -69,7 +69,7 @@ impl SearchProvider for GrepSearchProvider {
         let matcher = Self::build_matcher(query)?;
         let has_pdf = documents
             .iter()
-            .any(|document| document.file_type == FileType::Pdf);
+            .any(|document| document.file_type == FileType::Paged);
         let pdf_literal_matcher = (!query.is_regex && has_pdf)
             .then(|| pdf_projection::literal_matcher(&query.pattern, query.case_sensitive))
             .transpose()?;
@@ -236,7 +236,7 @@ fn search_document_content(
         // line/column origins that the chunk-granular index cannot reproduce, so
         // it never uses the index regardless of the setting.
         FileType::PlainText => search_text_file(path, matcher, query.context_lines as u64),
-        FileType::Pdf => {
+        FileType::Paged => {
             // Prefer text the index already holds. A genuine index fault is
             // logged and demoted to live extraction rather than failing the
             // file; "not indexed / stale / pre-v4" simply returns None.
@@ -1105,7 +1105,7 @@ mod tests {
         // extraction instead of using the index, the search would error and
         // return no matches.
         let mut extractors = ExtractorRegistry::new();
-        extractors.register(Box::new(FailingPdfExtractor));
+        extractors.register(Box::new(FailingExtractor));
 
         let provider = GrepSearchProvider::new().with_index(Some(handle));
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
@@ -1136,9 +1136,9 @@ mod tests {
         assert_eq!(outcome.index_unavailable_fallbacks, 0);
     }
 
-    struct FailingPdfExtractor;
+    struct FailingExtractor;
 
-    impl ContentExtractor for FailingPdfExtractor {
+    impl ContentExtractor for FailingExtractor {
         fn can_handle(&self, path: &Path, _mime: Option<&str>) -> bool {
             path.extension().and_then(|e| e.to_str()) == Some("pdf")
         }
@@ -1176,7 +1176,7 @@ mod tests {
 
         let provider = GrepSearchProvider::new();
         let mut extractors = ExtractorRegistry::new();
-        extractors.register(Box::new(FailingPdfExtractor));
+        extractors.register(Box::new(FailingExtractor));
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let query_clone = query.clone();
 
@@ -1385,8 +1385,8 @@ mod tests {
         use crate::types::FileMetadata;
         use crate::types::SourceMap;
 
-        struct MockPdfExtractor;
-        impl ContentExtractor for MockPdfExtractor {
+        struct MockPagedExtractor;
+        impl ContentExtractor for MockPagedExtractor {
             fn can_handle(&self, _: &Path, _: Option<&str>) -> bool {
                 true
             }
@@ -1410,7 +1410,7 @@ mod tests {
         }
 
         let mut registry = ExtractorRegistry::new();
-        registry.register(Box::new(MockPdfExtractor));
+        registry.register(Box::new(MockPagedExtractor));
 
         let provider = GrepSearchProvider::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
@@ -1425,7 +1425,7 @@ mod tests {
         }
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].file_type, FileType::Pdf);
+        assert_eq!(results[0].file_type, FileType::Paged);
     }
 
     #[test]

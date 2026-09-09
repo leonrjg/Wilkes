@@ -1,6 +1,7 @@
 import { render, screen, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import DirectoryPicker, { describeCoverage } from "./DirectoryPicker";
+import { useFileDragStore } from "../stores/useFileDragStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import { ToastProvider } from "./Toast";
 
@@ -30,6 +31,10 @@ vi.mock("../services", () => ({
 vi.mock("../lib/utils/dialog", () => ({
   confirmDialog: vi.fn().mockResolvedValue(true),
 }));
+
+beforeEach(() => {
+  useFileDragStore.setState({ path: null, target: null });
+});
 
 describe("DirectoryPicker", () => {
   const defaultProps = {
@@ -86,6 +91,29 @@ describe("DirectoryPicker", () => {
     fireEvent.scroll(roots);
     expect(screen.getByRole("button", { name: "Scroll roots left" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Scroll roots right" })).not.toBeInTheDocument();
+  });
+
+  /** The arrows cover the very edges a drag has to rest on to scroll the strip,
+   *  and a drag holds the pointer, so they cannot be pressed anyway. */
+  it("takes the carousel arrows out of the hit test while a file is being dragged", () => {
+    const { rerender } = renderWithToasts();
+    const roots = screen.getByRole("region", { name: "Workspace roots" });
+    Object.defineProperties(roots, {
+      clientWidth: { configurable: true, value: 300 },
+      scrollWidth: { configurable: true, value: 900 },
+      scrollLeft: { configurable: true, value: 600, writable: true },
+    });
+    fireEvent.scroll(roots);
+    const arrow = () => screen.getByRole("button", { name: "Scroll roots left" });
+    expect(arrow().className).not.toContain("pointer-events-none");
+
+    useFileDragStore.setState({ path: "/home/user/project/paper.pdf" });
+    rerender(
+      <ToastProvider>
+        <DirectoryPicker {...defaultProps} />
+      </ToastProvider>,
+    );
+    expect(arrow().className).toContain("pointer-events-none");
   });
 
   it("prevents directory tab text from being selected", () => {
@@ -231,6 +259,42 @@ describe("DirectoryPicker", () => {
 
     expect(mockOpenPath).toHaveBeenCalledWith("/home/user/project");
   });
+  /** The sidebar's tree owns the drag and says where it points; every root the
+   *  strip lists offers itself as a destination and shows when it is the one. */
+  it("offers every root it lists to a file being dragged out of the sidebar", () => {
+    renderWithToasts();
+    const roots = Array.from(document.querySelectorAll("[data-file-drop-root-path]"));
+    expect(roots.map((root) => root.getAttribute("data-file-drop-root-path"))).toEqual([
+      "/home/user/other",
+      "/home/user/recent",
+      "/home/user/project",
+    ]);
+    expect(document.querySelectorAll("[data-file-drop-target]")).toHaveLength(0);
+  });
+
+  it("marks the root a drag is over, and says when the file is already in it", () => {
+    const { rerender } = renderWithToasts();
+    const chip = () => document.querySelector('[data-file-drop-root-path="/home/user/other"]')!;
+
+    useFileDragStore.setState({ path: "/home/user/project/paper.pdf", target: "/home/user/other" });
+    rerender(
+      <ToastProvider>
+        <DirectoryPicker {...defaultProps} />
+      </ToastProvider>,
+    );
+    expect(chip().getAttribute("data-file-drop-target")).toBe("true");
+    expect(chip().className).toContain("ring-[var(--accent-blue)]");
+
+    useFileDragStore.setState({ path: "/home/user/other/paper.pdf" });
+    rerender(
+      <ToastProvider>
+        <DirectoryPicker {...defaultProps} />
+      </ToastProvider>,
+    );
+    expect(chip().getAttribute("data-file-drop-target")).toBe("true");
+    expect(chip().className).not.toContain("ring-[var(--accent-blue)]");
+  });
+
 });
 
 describe("DirectoryPicker index coverage", () => {

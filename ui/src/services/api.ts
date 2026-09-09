@@ -175,6 +175,13 @@ export interface SearchApi {
   customIntegrationStatus(id: string): Promise<IntegrationStatus>;
   /** A URL this application will serve a local file at, whatever the file is:
    *  the PDF a reader loads, and the pictures an HTML document sits beside. */
+  /** The pages of a book, as a PDF the reader can draw.
+   *
+   *  A book has no pages in its own bytes -- Wilkes lays them out -- so there
+   *  is nothing for `resolveAssetUrl` to point at, and the rendering comes
+   *  across as bytes instead. */
+  surrogateBytes(path: string): Promise<ArrayBuffer>;
+
   resolveAssetUrl(path: string): string;
   getLogs(): Promise<string[]>;
   clearLogs(): Promise<void>;
@@ -351,10 +358,12 @@ export interface SourceApi {
 export interface DesktopSourceApi extends SourceApi {
   type: "desktop";
   pickDirectory(): Promise<string | null>;
-  /** Imports into `root`, or into `folder` beneath it when given — created if
-   *  absent. The folder is for things that are not one file: a course is forty
-   *  PDFs that belong together, and loose in the root they are neither
-   *  attributable nor importable alongside a second course. */
+  /** Imports into `root`, or into `folder` beneath it when given — a
+   *  `/`-separated path, created if absent. The folder is for things that are
+   *  not one file: a course is forty PDFs that belong together, and loose in
+   *  the root they are neither attributable nor importable alongside a second
+   *  course. It is also where a drop lands when the user dropped it onto a
+   *  folder of the sidebar tree rather than onto the root. */
   importFiles(
     paths: string[],
     root: string,

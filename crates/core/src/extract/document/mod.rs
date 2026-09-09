@@ -1,9 +1,15 @@
 mod backend;
+/// Which files this backend is allowed to read, and on what terms.
+pub mod format;
+/// Kindle KF8 books, rebuilt into HTML MuPDF can read.
+pub mod kindle;
 /// The MuPDF reading of a document. `pub(crate)` for the two functions that
 /// find a picture again in the file it was extracted from — see
 /// [`crate::figure`], which is the only caller outside this module.
 pub(crate) mod mupdf;
 mod sanitize;
+/// A book, rendered to pages the reader can draw.
+pub mod surrogate;
 /// Formulas and ruled tables the page draws rather than embeds.
 ///
 /// `pub` for the three steps a probe must run rather than reimplement —
@@ -19,7 +25,7 @@ pub mod typeset;
 use std::path::Path;
 use std::sync::Arc;
 
-use backend::PdfBackend;
+use backend::LayoutBackend;
 use mupdf::MuPdfBackend;
 
 use crate::extract::image::ImageAnalyzer;
@@ -27,8 +33,8 @@ use crate::types::{DeclaredOutline, ExtractedContent};
 
 use super::ContentExtractor;
 
-pub struct PdfExtractor {
-    backend: Box<dyn PdfBackend>,
+pub struct DocumentExtractor {
+    backend: Box<dyn LayoutBackend>,
     /// The analyzer this extractor was built with, named in the extraction
     /// recipe. Empty when there is none, which is itself a recipe: a reading
     /// produced without a recognizer is a different reading, and mixing the
@@ -41,7 +47,7 @@ pub struct PdfExtractor {
     analyzer: Option<Arc<dyn ImageAnalyzer>>,
 }
 
-impl PdfExtractor {
+impl DocumentExtractor {
     /// A PDF extractor that reads native text only. Native images are still
     /// found, digested and counted — what is absent is the enrichment, and
     /// the diagnostics say so.
@@ -68,13 +74,13 @@ impl PdfExtractor {
     }
 }
 
-impl Default for PdfExtractor {
+impl Default for DocumentExtractor {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ContentExtractor for PdfExtractor {
+impl ContentExtractor for DocumentExtractor {
     fn image_analyzer_identity(&self) -> &str {
         &self.analyzer_identity
     }
@@ -85,11 +91,23 @@ impl ContentExtractor for PdfExtractor {
         }
     }
 
+    /// The closed list in [`format`], never `fz_recognize_document`.
+    ///
+    /// MuPDF recognizes far more than this — including `.txt`, `.html`,
+    /// `.xml`, `.zip` and `.log`, every one of which Wilkes already reads as
+    /// plain text with exact line and column origins. See that module for what
+    /// admitting them would cost.
     fn can_handle(&self, path: &Path, _mime: Option<&str>) -> bool {
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("pdf"))
-            .unwrap_or(false)
+        format::PagedFormat::for_path(path).is_some()
+    }
+
+    /// This reading's contribution to the extraction recipe.
+    ///
+    /// Per format, not per backend: a change to how EPUBs are laid out must
+    /// re-extract EPUBs and leave PDFs alone, and one identity covering both
+    /// could do neither.
+    fn recipe_identity(&self, path: &Path) -> Option<String> {
+        format::PagedFormat::for_path(path).map(|format| format.recipe_identity())
     }
 
     fn extract(&self, path: &Path) -> anyhow::Result<ExtractedContent> {
@@ -107,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_pdf_extractor_can_handle() {
-        let extractor = PdfExtractor::default();
+        let extractor = DocumentExtractor::default();
 
         assert!(extractor.can_handle(Path::new("test.pdf"), None));
         assert!(extractor.can_handle(Path::new("TEST.PDF"), None));

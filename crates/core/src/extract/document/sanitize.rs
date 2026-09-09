@@ -25,8 +25,8 @@ use crate::types::{
     TextProvenance,
 };
 
+use crate::extract::document::typeset::Anchor;
 use crate::extract::image::serialize;
-use crate::extract::pdf::typeset::Anchor;
 
 /// The flow a line belongs to. Body text is one flow for the whole document —
 /// it continues across block and page boundaries, which is what lets a word

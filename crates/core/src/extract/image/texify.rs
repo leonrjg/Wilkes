@@ -325,7 +325,7 @@ pub fn install(
 /// first run of this against inline crops returned `\sqrt{n}` for everything
 /// until the upscale was put back. The aspect is kept and the remainder is
 /// paper, because a squashed expression is not the same expression.
-/// `pub` for the same reason [`crate::extract::pdf::typeset::render`] is: a
+/// `pub` for the same reason [`crate::extract::document::typeset::render`] is: a
 /// probe that measured the encoder against its own resize would be measuring a
 /// model nobody runs. Pure, and holds no state.
 pub fn preprocess(crop: &RgbImage) -> Vec<f32> {

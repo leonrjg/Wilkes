@@ -312,17 +312,22 @@ impl ExtractionRecipe {
         chunk_overlap: usize,
     ) -> Self {
         let mut recipe = Self::new(chunk_size, chunk_overlap);
-        recipe.selected_extractor = match path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "pdf" => "pdf-mupdf-v1",
-            _ => "plain-text-v1",
-        }
-        .to_string();
+        // Asked of the registry that will do the extracting, rather than
+        // matched here against a list of extensions. There were two such lists
+        // — this one and `ContentExtractor::can_handle` — and a format added
+        // to one and not the other is a document extracted by one recipe and
+        // recorded under another.
+        recipe.selected_extractor = match extractors.find(path, None) {
+            Some(extractor) => extractor.recipe_identity(path).unwrap_or_else(|| {
+                tracing::error!(
+                    "{} was claimed by a registered extractor that names no recipe identity for \
+                     it; recording it as plain text, which is very likely wrong",
+                    path.display()
+                );
+                "plain-text-v1".to_string()
+            }),
+            None => "plain-text-v1".to_string(),
+        };
         recipe.image_analyzer_recipe = extractors.image_analyzer_identity().to_string();
         recipe
     }

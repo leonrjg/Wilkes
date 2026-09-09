@@ -1,6 +1,6 @@
+pub mod document;
 pub mod image;
 pub mod outline;
-pub mod pdf;
 
 use crate::types::{DeclaredOutline, ExtractedContent};
 use std::path::Path;
@@ -11,6 +11,22 @@ pub trait ContentExtractor: Send + Sync {
 
     /// Extract searchable text and a source map from the file.
     fn extract(&self, path: &Path) -> anyhow::Result<ExtractedContent>;
+
+    /// How this extractor's reading of *this file* is named in
+    /// [`crate::embed::ExtractionRecipe`], or `None` when it does not handle
+    /// the file at all.
+    ///
+    /// Per path rather than per extractor, because one extractor can read
+    /// several formats and they do not version together: laying EPUBs out on a
+    /// different page must re-extract EPUBs and leave PDFs untouched.
+    ///
+    /// Defaulted to `None` so a test double need not invent a recipe; a
+    /// registered extractor that returns `None` for a file it claims in
+    /// `can_handle` is reported by `ExtractionRecipe::for_path`, which then
+    /// falls back to the plain-text identity rather than silently minting one.
+    fn recipe_identity(&self, _path: &Path) -> Option<String> {
+        None
+    }
 
     /// The image analyzer this extractor enriches native images with, or an
     /// empty string when it does not enrich them at all.
@@ -67,8 +83,8 @@ pub trait ContentExtractor: Send + Sync {
 pub fn production_registry() -> ExtractorRegistry {
     let mut registry = ExtractorRegistry::new();
     registry.register(match image::configured() {
-        Some(analyzer) => Box::new(pdf::PdfExtractor::with_image_analyzer(analyzer)),
-        None => Box::new(pdf::PdfExtractor::new()),
+        Some(analyzer) => Box::new(document::DocumentExtractor::with_image_analyzer(analyzer)),
+        None => Box::new(document::DocumentExtractor::new()),
     });
     registry
 }
@@ -110,12 +126,12 @@ pub fn production_registry() -> ExtractorRegistry {
 ///
 /// **What it costs.** A PDF read this way is read for the text it typesets,
 /// not for text that exists only inside its pictures. That is the reading
-/// [`pdf::PdfExtractor::new`] documents, the count of files a search took it
+/// [`document::DocumentExtractor::new`] documents, the count of files a search took it
 /// for is `live_pdf_fallbacks` in the search outcome, and the way to search a
 /// picture's text is to index the file — which is what the index is for.
 pub fn native_text_registry() -> ExtractorRegistry {
     let mut registry = ExtractorRegistry::new();
-    registry.register(Box::new(pdf::PdfExtractor::new()));
+    registry.register(Box::new(document::DocumentExtractor::new()));
     registry
 }
 
@@ -127,7 +143,7 @@ pub fn native_text_registry() -> ExtractorRegistry {
 /// The registry decides *which* extractor reads the file, not whether that
 /// read runs inference: a PDF outline is anchored in the page's own glyphs
 /// whichever registry is passed, enforced in the backend rather than here —
-/// see `pdf::mupdf::MuPdfBackend::outline`. Callers therefore need not pick,
+/// see `document::mupdf::MuPdfBackend::outline`. Callers therefore need not pick,
 /// and a caller that passes the production registry does not thereby start a
 /// recognition worker.
 pub fn document_outline(
@@ -213,6 +229,7 @@ impl Default for ExtractorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embed::ExtractionRecipe;
 
     struct MockExtractor;
     impl ContentExtractor for MockExtractor {
@@ -314,7 +331,7 @@ mod tests {
         }
 
         let mut enriched = ExtractorRegistry::new();
-        enriched.register(Box::new(pdf::PdfExtractor::with_image_analyzer(
+        enriched.register(Box::new(document::DocumentExtractor::with_image_analyzer(
             std::sync::Arc::new(Named),
         )));
         // The analyzer, and the routing that decides which areas of a page
@@ -427,10 +444,10 @@ mod tests {
         let registry = |analyzer: Option<&'static str>| {
             let mut registry = ExtractorRegistry::new();
             registry.register(match analyzer {
-                Some(name) => Box::new(pdf::PdfExtractor::with_image_analyzer(std::sync::Arc::new(
-                    Named(name),
-                ))) as Box<dyn ContentExtractor>,
-                None => Box::new(pdf::PdfExtractor::new()),
+                Some(name) => Box::new(document::DocumentExtractor::with_image_analyzer(
+                    std::sync::Arc::new(Named(name)),
+                )) as Box<dyn ContentExtractor>,
+                None => Box::new(document::DocumentExtractor::new()),
             });
             registry
         };
@@ -445,6 +462,63 @@ mod tests {
             plain.selected_extractor = "pdf-mupdf-v1".to_string();
             plain.id()
         });
+    }
+
+    /// The recipe now comes from the extractor that will do the extracting,
+    /// so a format added to `can_handle` and forgotten here would be a
+    /// document extracted under one recipe and recorded under another.
+    ///
+    /// The PDF line is the load-bearing one: every already-indexed PDF was
+    /// extracted under `pdf-mupdf-v1`, and a change to it re-extracts and
+    /// re-embeds every library that exists.
+    #[test]
+    fn each_admitted_format_names_its_own_recipe() {
+        let _serialized = image::CONFIGURED_ANALYZER_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let registry = native_text_registry();
+        let recipe = |name: &str| {
+            ExtractionRecipe::for_path(Path::new(name), &registry, 600, 128).selected_extractor
+        };
+
+        assert_eq!(recipe("paper.pdf"), "pdf-mupdf-v1");
+        assert_eq!(recipe("book.epub"), "epub-mupdf-v1+layout-450x600x11");
+        assert_eq!(recipe("book.mobi"), "mobi-mupdf-v1+layout-450x600x11");
+        // Kindle's two formats are different pipelines and version apart:
+        // MOBI 6 is read by MuPDF, KF8 by rebuilding it first.
+        assert_eq!(recipe("book.azw3"), "kf8-rebuilt-v1+layout-450x600x11");
+        assert_eq!(recipe("book.azw"), "kf8-rebuilt-v1+layout-450x600x11");
+        assert_eq!(recipe("comic.cbz"), "cbz-mupdf-v1");
+        assert_eq!(recipe("book.fb2"), "fb2-mupdf-v1+layout-450x600x11");
+
+        // Everything the registry does not claim keeps the identity every
+        // text file in every index already has.
+        for name in ["notes.txt", "readme.md", "page.html", "data.xml", "run.log"] {
+            assert_eq!(recipe(name), "plain-text-v1", "{name}");
+        }
+    }
+
+    /// The registry's admission and the recipe's must be the same list. They
+    /// were two lists before, matched against extensions in two places.
+    #[test]
+    fn the_registry_admits_exactly_the_paged_formats() {
+        let registry = native_text_registry();
+        for name in [
+            "a.pdf", "b.epub", "c.mobi", "d.prc", "e.pdb", "f.azw3", "g.fb2",
+        ] {
+            assert!(
+                registry.find(Path::new(name), None).is_some(),
+                "{name} should be read by the backend"
+            );
+        }
+        for name in [
+            "a.txt", "b.md", "c.html", "d.xml", "e.log", "f.zip", "g.docx",
+        ] {
+            assert!(
+                registry.find(Path::new(name), None).is_none(),
+                "{name} must stay plain text"
+            );
+        }
     }
 
     #[test]

@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use wilkes_core::extract::document::DocumentExtractor;
 use wilkes_core::extract::image::{AnalysisContext, DiscoveredImage, ImageAnalyzer, NativeImage};
-use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ContentExtractor;
 use wilkes_core::types::{ExtractedImage, ExtractionDiagnostics, RegionOrigin};
 
@@ -153,7 +153,7 @@ fn main() -> anyhow::Result<()> {
             tally: Mutex::new(Tally::default()),
             areas: Mutex::new((Vec::new(), Vec::new())),
         });
-        let extractor = PdfExtractor::with_image_analyzer(counter.clone());
+        let extractor = DocumentExtractor::with_image_analyzer(counter.clone());
         let started = std::time::Instant::now();
         // `outline` reads the document exactly as `extract` does and hands back
         // the diagnostics, which is where the typeset budget reports itself.

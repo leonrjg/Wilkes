@@ -3138,6 +3138,15 @@ impl AppContext {
         crate::commands::preview::preview(match_ref, Some(index)).await
     }
 
+    /// The pages of a book, as a PDF the reader can draw.
+    ///
+    /// A separate call from `preview` because these are megabytes: the preview
+    /// carries the outline, the links and where to open, and the interface
+    /// asks for the pages once it knows it needs them.
+    pub async fn surrogate_bytes(&self, path: std::path::PathBuf) -> anyhow::Result<Vec<u8>> {
+        crate::commands::preview::surrogate_bytes(path).await
+    }
+
     /// The retained snapshots this managed corpus has admitted, each with the
     /// rendition it was admitted as — what a projection must hold to be level
     /// with it.

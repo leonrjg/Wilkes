@@ -23,13 +23,13 @@
 
 use std::sync::Arc;
 
+use wilkes_core::extract::document::DocumentExtractor;
 use wilkes_core::extract::image::dispatch::{self, RecognitionEngine, RecognizerRole};
 use wilkes_core::extract::image::ocr::{ImageRecognition, OcrEngine};
 use wilkes_core::extract::image::serialize::{reading_regions, superseded_areas};
 use wilkes_core::extract::image::{
     doclayout, granite_docling, table_structure, texify, NativeImageAnalyzer,
 };
-use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ContentExtractor;
 use wilkes_core::types::{ImageScope, OcrAdmission};
 
@@ -152,7 +152,7 @@ fn main() -> anyhow::Result<()> {
     eprintln!("table reader for this run: {table_reader}");
 
     let started = std::time::Instant::now();
-    let content = PdfExtractor::with_image_analyzer(Arc::new(analyzer))
+    let content = DocumentExtractor::with_image_analyzer(Arc::new(analyzer))
         .extract(std::path::Path::new(&pdf))?;
     println!(
         "\nread in {:?}, {} bytes",
