@@ -51,6 +51,8 @@ pub enum PagedFormat {
     Fb2,
     /// A comic archive: a zip of page images, with no text of its own.
     Cbz,
+    /// A Kindle KF8 book, read by rebuilding it — see [`super::kindle`].
+    Kf8,
 }
 
 impl PagedFormat {
@@ -75,7 +77,12 @@ impl PagedFormat {
             // of one empty page; a file left out of this list would instead be
             // omitted as an unsupported extension and say nothing at all. See
             // `guard_container`, which is what stops the empty reading.
-            "mobi" | "prc" | "pdb" | "azw3" | "azw" => Self::Mobi,
+            // Kindle's two formats share a container and are told apart by
+            // the header, not the name — see `guard_container`. The extension
+            // decides only which is expected, because a recipe has to be
+            // derivable without opening the file.
+            "mobi" | "prc" | "pdb" => Self::Mobi,
+            "azw3" | "azw" => Self::Kf8,
             "fb2" => Self::Fb2,
             // `cbz` and `cbt` only. MuPDF's comic handler also claims `.zip`
             // and `.tar`, and a corpus's archives are not documents.
@@ -94,7 +101,7 @@ impl PagedFormat {
     pub fn is_reflowable(self) -> bool {
         match self {
             Self::Pdf => false,
-            Self::Epub | Self::Mobi | Self::Fb2 => true,
+            Self::Epub | Self::Mobi | Self::Fb2 | Self::Kf8 => true,
             // Each page is an image with its own size; there is nothing to
             // reflow and MuPDF reports it as such.
             Self::Cbz => false,
@@ -114,6 +121,9 @@ impl PagedFormat {
             Self::Mobi => format!("mobi-mupdf-v1+{}", reflowable_recipe_suffix()),
             Self::Fb2 => format!("fb2-mupdf-v1+{}", reflowable_recipe_suffix()),
             Self::Cbz => "cbz-mupdf-v1".to_string(),
+            // Its own identity because it is its own pipeline: rebuilt by
+            // `kindle`, then laid out by MuPDF as HTML.
+            Self::Kf8 => format!("kf8-rebuilt-v1+{}", reflowable_recipe_suffix()),
         }
     }
 
@@ -130,6 +140,7 @@ impl PagedFormat {
             Self::Mobi => "mobi",
             Self::Fb2 => "fb2",
             Self::Cbz => "cbz",
+            Self::Kf8 => "azw3",
         }
     }
 
@@ -140,6 +151,7 @@ impl PagedFormat {
             Self::Mobi => "application/x-mobipocket-ebook",
             Self::Fb2 => "application/x-fictionbook",
             Self::Cbz => "application/vnd.comicbook+zip",
+            Self::Kf8 => "application/vnd.amazon.ebook",
         }
     }
 }
@@ -170,27 +182,57 @@ pub fn reflowable_recipe_suffix() -> String {
 /// and the failing KF8 file declare PalmDOC. The MOBI header's file-version
 /// field does: 6 for what MuPDF reads, 8 for what it cannot.
 pub fn guard_container(path: &Path, format: PagedFormat) -> anyhow::Result<()> {
-    if format != PagedFormat::Mobi {
+    if !matches!(format, PagedFormat::Mobi | PagedFormat::Kf8) {
         return Ok(());
     }
-    let mut file = std::fs::File::open(path)?;
-
-    // PalmDB: 78-byte header, then 8 bytes per record entry. Record 0 holds
-    // the PalmDOC header and, for a MOBI, the MOBI header behind it.
-    let mut header = [0u8; 86];
-    file.read_exact(&mut header).map_err(|error| {
-        anyhow::anyhow!(
-            "{} is too short to be a PalmDB container: {error}",
+    let header = palmdb_header(path)?;
+    let Some(header) = header else {
+        // Not a Mobipocket container at all. MuPDF would refuse it too, but it
+        // would refuse it after opening, which for these formats is where the
+        // silent readings come from.
+        anyhow::bail!(
+            "{} is named as a Kindle book but is not a Mobipocket container",
             path.display()
-        )
-    })?;
-    let kind = &header[60..68];
+        );
+    };
+    // MuPDF decodes only these two and sends everything else through the
+    // PalmDOC decompressor regardless, which returns plausible bytes rather
+    // than an error. The `mobi` crate is no better placed to guess.
     anyhow::ensure!(
-        kind == b"BOOKMOBI" || kind == b"TEXtREAd",
-        "{} is not a Mobipocket container (type {:?})",
+        header.compression == 1 || header.compression == 2,
+        "{} uses compression {}, which no reader here can decode \
+         (only uncompressed and PalmDOC are supported; 17480 is HUFF/CDIC)",
         path.display(),
-        String::from_utf8_lossy(kind)
+        header.compression
     );
+    Ok(())
+}
+
+/// The MOBI header's file-version field, or `None` for a container that has no
+/// MOBI header (a plain PalmDOC book) or is not one at all.
+///
+/// This is what tells KF8 from MOBI 6, and it is the only thing that does: both
+/// declare PalmDOC compression, so the field one would reach for first is the
+/// wrong one.
+pub fn mobi_file_version(path: &Path) -> anyhow::Result<Option<u32>> {
+    Ok(palmdb_header(path)?.and_then(|header| header.version))
+}
+
+struct PalmDbHeader {
+    compression: u16,
+    version: Option<u32>,
+}
+
+fn palmdb_header(path: &Path) -> anyhow::Result<Option<PalmDbHeader>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut header = [0u8; 86];
+    if file.read_exact(&mut header).is_err() {
+        return Ok(None);
+    }
+    let kind = &header[60..68];
+    if kind != b"BOOKMOBI" && kind != b"TEXtREAd" {
+        return Ok(None);
+    }
     let record0 = u32::from_be_bytes([header[78], header[79], header[80], header[81]]) as u64;
 
     let mut record = [0u8; 40];
@@ -198,32 +240,12 @@ pub fn guard_container(path: &Path, format: PagedFormat) -> anyhow::Result<()> {
     file.read_exact(&mut record)
         .map_err(|error| anyhow::anyhow!("{} has no readable record 0: {error}", path.display()))?;
 
-    // PalmDOC header, first field. MuPDF decodes only these two and sends
-    // everything else through the PalmDOC decompressor regardless, which
-    // returns plausible bytes rather than an error.
-    let compression = u16::from_be_bytes([record[0], record[1]]);
-    anyhow::ensure!(
-        compression == 1 || compression == 2,
-        "{} uses compression {compression}, which this reader cannot decode \
-         (only uncompressed and PalmDOC are supported; 17480 is HUFF/CDIC)",
-        path.display()
-    );
-
-    // The MOBI header follows the 16-byte PalmDOC header. A container without
-    // one is a plain PalmDOC book, which MuPDF reads.
-    if &record[16..20] != b"MOBI" {
-        return Ok(());
-    }
-    let version = u32::from_be_bytes([record[36], record[37], record[38], record[39]]);
-    anyhow::ensure!(
-        version < 8,
-        "{} is a Kindle KF8 book (MOBI file version {version}). MuPDF reads \
-         MOBI 6 records and this file has none, so it would be indexed as \
-         empty rather than failing; refused instead. Convert it to EPUB to \
-         read it here.",
-        path.display()
-    );
-    Ok(())
+    Ok(Some(PalmDbHeader {
+        compression: u16::from_be_bytes([record[0], record[1]]),
+        // The MOBI header follows the 16-byte PalmDOC header.
+        version: (&record[16..20] == b"MOBI")
+            .then(|| u32::from_be_bytes([record[36], record[37], record[38], record[39]])),
+    }))
 }
 
 #[cfg(test)]
@@ -270,8 +292,8 @@ mod tests {
             ("c.mobi", PagedFormat::Mobi),
             ("d.prc", PagedFormat::Mobi),
             ("e.pdb", PagedFormat::Mobi),
-            ("f.azw3", PagedFormat::Mobi),
-            ("f.azw", PagedFormat::Mobi),
+            ("f.azw3", PagedFormat::Kf8),
+            ("f.azw", PagedFormat::Kf8),
             ("g.fb2", PagedFormat::Fb2),
             ("h.cbz", PagedFormat::Cbz),
             ("i.cbt", PagedFormat::Cbz),
@@ -295,7 +317,12 @@ mod tests {
     /// is what produced its page numbers.
     #[test]
     fn reflowable_recipes_carry_the_layout() {
-        for format in [PagedFormat::Epub, PagedFormat::Mobi, PagedFormat::Fb2] {
+        for format in [
+            PagedFormat::Epub,
+            PagedFormat::Mobi,
+            PagedFormat::Fb2,
+            PagedFormat::Kf8,
+        ] {
             assert!(format.is_reflowable(), "{format:?}");
             let identity = format.recipe_identity();
             assert!(identity.contains("layout-450x600x11"), "{identity}");
@@ -315,6 +342,7 @@ mod tests {
         assert_eq!(PagedFormat::Mobi.query_name(), "mobi");
         assert_eq!(PagedFormat::Fb2.query_name(), "fb2");
         assert_eq!(PagedFormat::Cbz.query_name(), "cbz");
+        assert_eq!(PagedFormat::Kf8.query_name(), "azw3");
     }
 
     #[test]
@@ -325,40 +353,57 @@ mod tests {
         assert!(guard_container(&path, PagedFormat::Epub).is_ok());
     }
 
-    /// The measured failure, reconstructed: a PalmDB container declaring
-    /// PalmDOC compression (which is what the real KF8 files declare) and MOBI
-    /// file version 8.
+    /// KF8 is told from MOBI 6 by the file-version field and by nothing else:
+    /// both declare PalmDOC compression, so the field one would reach for
+    /// first cannot distinguish them. Getting this wrong once meant two
+    /// measured books indexing as empty without any error.
     #[test]
-    fn a_kf8_container_is_refused_by_version_not_compression() {
+    fn the_file_version_is_what_tells_kf8_from_mobi_six() {
         let dir = tempfile::tempdir().unwrap();
-        let mobi6 = palmdb_fixture(2, Some(6));
-        let kf8 = palmdb_fixture(2, Some(8));
-        let huff = palmdb_fixture(17480, Some(6));
-
         let write = |name: &str, bytes: &[u8]| {
             let path = dir.path().join(name);
             std::fs::write(&path, bytes).unwrap();
             path
         };
 
-        let good = write("good.mobi", &mobi6);
-        assert!(guard_container(&good, PagedFormat::Mobi).is_ok());
+        let six = write("six.mobi", &palmdb_fixture(2, Some(6)));
+        let eight = write("eight.azw3", &palmdb_fixture(2, Some(8)));
+        assert_eq!(mobi_file_version(&six).unwrap(), Some(6));
+        assert_eq!(mobi_file_version(&eight).unwrap(), Some(8));
+        // Both are readable now — one by MuPDF, one by rebuilding it — so
+        // neither is refused.
+        assert!(guard_container(&six, PagedFormat::Mobi).is_ok());
+        assert!(guard_container(&eight, PagedFormat::Kf8).is_ok());
+    }
 
-        let bad = write("bad.azw3", &kf8);
-        let error = guard_container(&bad, PagedFormat::Mobi)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("KF8"), "{error}");
-        assert!(error.contains("file version 8"), "{error}");
-
-        let compressed = write("huff.mobi", &huff);
-        let error = guard_container(&compressed, PagedFormat::Mobi)
+    /// Compression MuPDF would decode as PalmDOC anyway, returning plausible
+    /// bytes rather than an error. Refused before anything reads it.
+    #[test]
+    fn undecodable_compression_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huff.mobi");
+        std::fs::write(&path, palmdb_fixture(17480, Some(6))).unwrap();
+        let error = guard_container(&path, PagedFormat::Mobi)
             .unwrap_err()
             .to_string();
         assert!(
             error.contains("17480") || error.contains("compression"),
             "{error}"
         );
+    }
+
+    /// A file named as a Kindle book that is not one is refused here rather
+    /// than opened and found wanting.
+    #[test]
+    fn a_container_that_is_not_mobipocket_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake.azw3");
+        std::fs::write(
+            &path,
+            b"this is not a palmdb container at all, not even close",
+        )
+        .unwrap();
+        assert!(guard_container(&path, PagedFormat::Kf8).is_err());
     }
 
     /// A PalmDB container with the given PalmDOC compression and, optionally,

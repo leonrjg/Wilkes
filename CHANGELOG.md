@@ -4,8 +4,8 @@
 
 ### Added
 
-- EPUB, MOBI, FB2 books and CBZ/CBT comic archives are searched and indexed
-  alongside PDFs. MuPDF has
+- EPUB, MOBI, AZW3, FB2 books and CBZ/CBT comic archives are searched, indexed
+  and read alongside PDFs. MuPDF has
   read all three since it was first linked here — its EPUB, HTML and MOBI
   handlers are compiled in and registered — and nothing ever routed a file to
   them: the extractor's `can_handle` matched `pdf` alone, and every other
@@ -50,6 +50,65 @@
   196-page volume against a few hundred milliseconds and 4 MB for a novel,
   which is why renderings are now held to a memory budget rather than a count:
   "two documents" is 12 MB or 96 MB depending on what was opened.
+
+  Kindle's AZW3 books are read by rebuilding them. Amazon's two formats share
+  one container and are told apart only by a version field in its header — the
+  compression word, which is the thing one reaches for first, says PalmDOC for
+  both. MuPDF reads the older MOBI 6 records; a KF8 book has none, so MuPDF
+  opened it, reported success and returned a single empty page. Two measured
+  books did exactly that, one of them reporting its title as "Table of
+  Contents". So a KF8 book now has its text and images unpacked from the
+  container, its markup reassembled into one document, and *that* laid out —
+  which yields 580 pages and 1.41 million characters for a book that read as
+  empty before, with its images and its real title and author.
+
+  Three details are load-bearing. The unpacked flow begins with several hundred
+  NUL bytes, and MuPDF's HTML parser stops at the first one: removing them is
+  the whole difference between an empty document and the book. The flow is not
+  one document but every chapter's skeleton concatenated with the fragments
+  belonging to it, so the per-document wrappers come off and what is left is
+  wrapped once. And the rebuilt copy is keyed to the book's identity and kept
+  on disk rather than in memory, because an index build can read several books
+  at once and an eviction that deleted a rebuild would delete it out from under
+  whoever was reading it.
+
+  The rebuild checks its own output. KF8's markup is not well formed — one
+  measured book carries 160 `<head` against 158 `</head>` — so a pattern that
+  strips the per-document wrappers can run past the end of its document and
+  take the next one's prose with it, which an early version of this did to
+  5,178 words without a word about it. The wrappers are now removed by a scan
+  that stops at the next document rather than a pattern that cannot, and the
+  rebuild compares the words that came out against the words that went in,
+  warning when a book loses more than a twentieth of itself and refusing
+  outright when it loses half. That check is what stands where the blanket
+  refusal of KF8 used to, and the rebuild is covered end to end by a test that
+  lays its output out with the same engine the application uses and reads the
+  book's words back.
+
+  The container is read directly rather than through an ebook crate, because
+  the crate loses a large part of the text without
+  saying so — 12.6%, 14.4% and 23.5% of the three books measured, against the
+  length each container declares for itself. It treats the header record as
+  content and strips a fixed number of trailing bytes from every text record,
+  where the format puts a variable count encoded backwards in each record's own
+  tail; the effect is that it eats compressed bytes and the text decompresses
+  short. Reading the records directly matches the declared length exactly on
+  all three books, so that length is now checked on every read and a book that
+  comes up short is refused rather than indexed as a fraction of itself. The
+  independent corroboration: this book's AZW3 and its MOBI 6 edition are
+  different files read by different pipelines, and they now agree on its text
+  to within 0.05%. Metadata comes from the container's own EXTH block for the
+  same reason, and Wilkes gained no dependency for any of it.
+
+    This is not a faithful KF8 reader: fragments are kept in the order the file
+  stores them rather than being placed inside their skeletons at the offsets
+  recorded in the format's index tables, so a book's structure is approximate
+  even though its text is complete. MOBI 6 deliberately does not come through
+  this path — measured both ways, MuPDF reads it at 2,890 characters per page
+  over 553 pages where the rebuild gives 5,265 pages of 266 characters and
+  loses a tenth of the text. Kindle metadata now comes from the container for
+  both formats, which is where the title, author and publication date actually
+  live; MuPDF reported none of them.
 
   Already-indexed PDFs are untouched: their recipe string is unchanged, so
   nothing re-extracts and nothing re-embeds.

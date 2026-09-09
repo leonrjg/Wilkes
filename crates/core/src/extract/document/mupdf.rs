@@ -16,6 +16,7 @@ use crate::types::{
 
 use super::backend::LayoutBackend;
 use super::format;
+use super::kindle;
 use super::sanitize::{self, Block, Line, Page, Reading, Word};
 use super::typeset;
 
@@ -159,8 +160,32 @@ pub(crate) fn open_document(path: &Path) -> anyhow::Result<Document> {
         .ok_or_else(|| anyhow::anyhow!("{} is not a format this backend reads", path.display()))?;
     format::guard_container(path, format)?;
 
+    // Kindle's two formats share a container and the header tells them apart,
+    // so the extension is an expectation rather than an answer. A KF8 book is
+    // rebuilt into HTML first, because MuPDF walks MOBI 6 records and a KF8
+    // book has none — it would open happily and return one empty page.
+    let rebuilt;
+    let path_str = if matches!(format, format::PagedFormat::Mobi | format::PagedFormat::Kf8)
+        && kindle::is_kf8(path)?
+    {
+        if format == format::PagedFormat::Mobi {
+            // Rare but real, and worth saying: this file is read by the KF8
+            // path while its recipe records the one its name implied.
+            info!(
+                "mupdf: {} is named as MOBI but its header says KF8; rebuilding it",
+                path.display()
+            );
+        }
+        rebuilt = kindle::materialize(path)?;
+        rebuilt
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 rebuild path"))?
+    } else {
+        path_str
+    };
+
     // Log before any mupdf FFI call so a C-level abort leaves a breadcrumb.
-    trace!("mupdf: opening {:?} as {format:?}", path);
+    trace!("mupdf: opening {path_str:?} as {format:?}");
     let mut doc = Document::open(path_str)?;
 
     // Asked of the document, not assumed from the extension: the format table

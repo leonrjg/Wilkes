@@ -1,6 +1,8 @@
 mod backend;
 /// Which files this backend is allowed to read, and on what terms.
 pub mod format;
+/// Kindle KF8 books, rebuilt into HTML MuPDF can read.
+pub mod kindle;
 /// The MuPDF reading of a document. `pub(crate)` for the two functions that
 /// find a picture again in the file it was extracted from — see
 /// [`crate::figure`], which is the only caller outside this module.

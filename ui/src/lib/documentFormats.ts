@@ -40,8 +40,10 @@ export function pagedFormatLabel(path: string): string | null {
     case "mobi":
     case "prc":
     case "pdb":
-    case "azw3":
       return "MOBI";
+    case "azw3":
+    case "azw":
+      return "AZW3";
     case "fb2":
       return "FB2";
     case "cbz":

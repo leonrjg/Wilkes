@@ -412,6 +412,15 @@ fn wilkes_path(path: &str) {
                     outline
                 );
                 println!("  images discovered: {}", content.images.len());
+                let meta = wilkes_core::metadata::document::DocumentMetadataExtractor;
+                use wilkes_core::metadata::FileMetadataExtractor;
+                match meta.extract_metadata(path) {
+                    Ok(m) => println!(
+                        "  metadata: title={:?} author={:?} date={:?}",
+                        m.title, m.author, m.created_at
+                    ),
+                    Err(e) => println!("  metadata: FAILED {e}"),
+                }
                 // The surrogate as the application builds it, cache and all.
                 // Skipped for a PDF, which the application never asks for and
                 // `surrogate` refuses: its pages are its own.

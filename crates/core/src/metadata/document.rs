@@ -21,6 +21,22 @@ impl FileMetadataExtractor for DocumentMetadataExtractor {
     }
 
     fn extract_metadata(&self, path: &Path) -> anyhow::Result<DocumentMetadata> {
+        // A Mobipocket container carries its own metadata block, and MuPDF
+        // does not read it: it returns an empty title and author for a MOBI 6
+        // book, and for a KF8 one it returns whatever the rebuilt markup's
+        // first heading happened to be ("Table of Contents", for a measured
+        // book actually called "What If?"). The container is the better source
+        // for both formats, so both are read from it.
+        if matches!(
+            crate::extract::document::format::PagedFormat::for_path(path),
+            Some(
+                crate::extract::document::format::PagedFormat::Mobi
+                    | crate::extract::document::format::PagedFormat::Kf8
+            )
+        ) {
+            return mobipocket_metadata(path);
+        }
+
         // The same guarded, pinned open the reading uses. A DOI hunt over
         // "page 1" means nothing if this laid the book out on a different page
         // than extraction did, and a KF8 container must be refused here too
@@ -36,6 +52,20 @@ impl FileMetadataExtractor for DocumentMetadataExtractor {
             ..DocumentMetadata::default()
         })
     }
+}
+
+/// Title, author and publication date as the Kindle container declares them.
+///
+/// No DOI hunt: that scans the first page of a typeset paper, and these are
+/// trade books whose first page is a cover.
+fn mobipocket_metadata(path: &Path) -> anyhow::Result<DocumentMetadata> {
+    let found = crate::extract::document::kindle::container_metadata(path)?;
+    Ok(DocumentMetadata {
+        title: found.title,
+        author: found.author,
+        created_at: found.published,
+        ..DocumentMetadata::default()
+    })
 }
 
 fn read_non_empty_metadata(doc: &Document, name: MetadataName) -> Option<String> {

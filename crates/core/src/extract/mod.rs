@@ -484,7 +484,11 @@ mod tests {
         assert_eq!(recipe("paper.pdf"), "pdf-mupdf-v1");
         assert_eq!(recipe("book.epub"), "epub-mupdf-v1+layout-450x600x11");
         assert_eq!(recipe("book.mobi"), "mobi-mupdf-v1+layout-450x600x11");
-        assert_eq!(recipe("book.azw3"), "mobi-mupdf-v1+layout-450x600x11");
+        // Kindle's two formats are different pipelines and version apart:
+        // MOBI 6 is read by MuPDF, KF8 by rebuilding it first.
+        assert_eq!(recipe("book.azw3"), "kf8-rebuilt-v1+layout-450x600x11");
+        assert_eq!(recipe("book.azw"), "kf8-rebuilt-v1+layout-450x600x11");
+        assert_eq!(recipe("comic.cbz"), "cbz-mupdf-v1");
         assert_eq!(recipe("book.fb2"), "fb2-mupdf-v1+layout-450x600x11");
 
         // Everything the registry does not claim keeps the identity every
