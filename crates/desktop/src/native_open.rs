@@ -297,8 +297,7 @@ pub(crate) fn request_from_deep_link(url: &Url) -> NativeOpenRequest {
 /// own destination.
 pub(crate) fn requests_from_urls(urls: Vec<Url>) -> Vec<NativeOpenRequest> {
     let (links, files): (Vec<Url>, Vec<Url>) = urls.into_iter().partition(is_deep_link);
-    let mut requests: Vec<NativeOpenRequest> =
-        links.iter().map(request_from_deep_link).collect();
+    let mut requests: Vec<NativeOpenRequest> = links.iter().map(request_from_deep_link).collect();
     requests.push(request_from_paths(files.into_iter().map(|url| {
         if url.scheme() != "file" {
             return Err(format!("Wilkes can only open local files, not {url}"));
@@ -396,7 +395,9 @@ pub(crate) fn deliver(app: &AppHandle, request: NativeOpenRequest) -> Result<(),
     }
     let label = request.window_label();
     ensure_window(app, label)?;
-    let ready = app.state::<NativeOpenState>().enqueue(label, request.clone());
+    let ready = app
+        .state::<NativeOpenState>()
+        .enqueue(label, request.clone());
     if ready {
         let window = app
             .get_webview_window(label)
@@ -587,8 +588,7 @@ mod tests {
         let no_path = request_from_deep_link(&Url::parse("wilkes://open").unwrap());
         assert!(no_path.errors[0].contains("must name the path"));
 
-        let wrong_action =
-            request_from_deep_link(&Url::parse("wilkes://search?q=bayes").unwrap());
+        let wrong_action = request_from_deep_link(&Url::parse("wilkes://search?q=bayes").unwrap());
         assert!(wrong_action.errors[0].contains("does not know how to \"search\""));
         assert!(wrong_action.paths.is_empty());
     }

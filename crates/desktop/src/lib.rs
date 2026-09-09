@@ -1319,6 +1319,21 @@ async fn preview(
         .map_err(|e| e.to_string())
 }
 
+/// The pages of a book, as PDF bytes.
+///
+/// Returned as bytes rather than served over the asset protocol because there
+/// is no file to serve: the pages exist only as a rendering this process made,
+/// from a layout it chose. `tauri::ipc::Response` sends them raw, so a 6 MB
+/// book does not become 8 MB of base64 on the way.
+#[tauri::command]
+async fn surrogate_bytes(app: AppHandle, path: String) -> Result<tauri::ipc::Response, String> {
+    app_context(&app)
+        .surrogate_bytes(std::path::PathBuf::from(path))
+        .await
+        .map(tauri::ipc::Response::new)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn list_files(
     root: String,
@@ -2268,6 +2283,7 @@ pub fn run() {
             related_documents,
             citation_links,
             preview,
+            surrogate_bytes,
             list_files,
             open_file,
             rename_file,

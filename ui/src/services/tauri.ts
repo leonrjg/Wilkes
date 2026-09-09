@@ -335,6 +335,13 @@ export class TauriSearchApi implements SearchApi {
     return convertFileSrc(path);
   }
 
+  async surrogateBytes(path: string): Promise<ArrayBuffer> {
+    // The command answers with `tauri::ipc::Response`, which arrives as raw
+    // bytes rather than base64 -- a 6 MB book stays 6 MB on the way over.
+    const bytes = await invoke<ArrayBuffer | number[]>("surrogate_bytes", { path });
+    return bytes instanceof ArrayBuffer ? bytes : new Uint8Array(bytes).buffer;
+  }
+
   async getLogs(): Promise<string[]> {
     return invoke<string[]>("get_logs");
   }

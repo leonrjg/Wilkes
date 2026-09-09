@@ -10,21 +10,22 @@ use super::arxiv::find_arxiv_doi;
 use super::doi::{find_doi, find_dois};
 use super::FileMetadataExtractor;
 
-pub struct PdfMetadataExtractor;
+pub struct DocumentMetadataExtractor;
 
-impl FileMetadataExtractor for PdfMetadataExtractor {
+impl FileMetadataExtractor for DocumentMetadataExtractor {
+    /// Every format the extraction backend reads, not PDF alone: the metadata
+    /// boundary and the reading must agree about which files they cover, or a
+    /// book Wilkes can read is a book whose title it refuses to look for.
     fn can_handle(&self, path: &Path, _mime: Option<&str>) -> bool {
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        crate::extract::document::format::PagedFormat::for_path(path).is_some()
     }
 
     fn extract_metadata(&self, path: &Path) -> anyhow::Result<DocumentMetadata> {
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?;
-
-        let doc = Document::open(path_str)?;
+        // The same guarded, pinned open the reading uses. A DOI hunt over
+        // "page 1" means nothing if this laid the book out on a different page
+        // than extraction did, and a KF8 container must be refused here too
+        // rather than yielding an empty document and therefore no metadata.
+        let doc = crate::extract::document::mupdf::open_document(path)?;
 
         Ok(DocumentMetadata {
             title: read_non_empty_metadata(&doc, MetadataName::Title),
@@ -191,7 +192,7 @@ mod tests {
         let pdf_base64 = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAzMDAgMTQ0XSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNiAwIFIgPj4gPj4gPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCA0NSA+PgpzdHJlYW0KQlQKL0YxIDE4IFRmCjUwIDgwIFRkCihIZWxsbyBNZXRhZGF0YSkgVGoKRVQKZW5kc3RyZWFtCmVuZG9iago1IDAgb2JqCjw8IC9UaXRsZSAoVGVzdCBUaXRsZSkgL0F1dGhvciAoVGVzdCBBdXRob3IpID4+CmVuZG9iago2IDAgb2JqCjw8IC9UeXBlIC9Gb250IC9TdWJ0eXBlIC9UeXBlMSAvQmFzZUZvbnQgL0hlbHZldGljYSA+PgplbmRvYmoKeHJlZgowIDcKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTggMDAwMDAgbiAKMDAwMDAwMDExNSAwMDAwMCBuIAowMDAwMDAwMjQxIDAwMDAwIG4gCjAwMDAwMDAzMzUgMDAwMDAgbiAKMDAwMDAwMDM5OCAwMDAwMCBuIAp0cmFpbGVyCjw8IC9TaXplIDcgL1Jvb3QgMSAwIFIgL0luZm8gNSAwIFIgPj4Kc3RhcnR4cmVmCjQ2OAolJUVPRgo=";
         fs::write(&path, STANDARD.decode(pdf_base64).unwrap()).unwrap();
 
-        let metadata = PdfMetadataExtractor.extract_metadata(&path).unwrap();
+        let metadata = DocumentMetadataExtractor.extract_metadata(&path).unwrap();
 
         assert_eq!(metadata.title.as_deref(), Some("Test Title"));
         assert_eq!(metadata.author.as_deref(), Some("Test Author"));
@@ -206,7 +207,7 @@ mod tests {
         let pdf_base64 = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAzMDAgMTQ0XSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNiAwIFIgPj4gPj4gPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCA0NSA+PgpzdHJlYW0KQlQKL0YxIDE4IFRmCjUwIDgwIFRkCihIZWxsbyBNZXRhZGF0YSkgVGoKRVQKZW5kc3RyZWFtCmVuZG9iago1IDAgb2JqCjw8IC9UaXRsZSAoVGVzdCBUaXRsZSkgL0F1dGhvciAoVGVzdCBBdXRob3IpIC9LZXl3b3JkcyAoZG9pOjEwLjEwMDAveHl6MTIzKSA+PgplbmRvYmoKNiAwIG9iago8PCAvVHlwZSAvRm9udCAvU3VidHlwZSAvVHlwZTEgL0Jhc2VGb250IC9IZWx2ZXRpY2EgPj4KZW5kb2JqCnhyZWYKMCA3CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMDU4IDAwMDAwIG4gCjAwMDAwMDAxMTUgMDAwMDAgbiAKMDAwMDAwMDI0MSAwMDAwMCBuIAowMDAwMDAwMzM1IDAwMDAwIG4gCjAwMDAwMDA0MjggMDAwMDAgbiAKdHJhaWxlcgo8PCAvU2l6ZSA3IC9Sb290IDEgMCBSIC9JbmZvIDUgMCBSID4+CnN0YXJ0eHJlZgo0OTgKJSVFT0YK";
         fs::write(&path, STANDARD.decode(pdf_base64).unwrap()).unwrap();
 
-        let metadata = PdfMetadataExtractor.extract_metadata(&path).unwrap();
+        let metadata = DocumentMetadataExtractor.extract_metadata(&path).unwrap();
         assert_eq!(metadata.doi.as_deref(), Some("10.1000/xyz123"));
         assert_eq!(metadata.created_at, None);
     }
@@ -218,7 +219,7 @@ mod tests {
         let pdf_base64 = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAzMDAgMTQ0XSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNSAwIFIgPj4gPj4gPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCA1MCA+PgpzdHJlYW0KQlQKL0YxIDEyIFRmCjUwIDgwIFRkCihET0k6IDEwLjEwMDAveHl6MTIzKSBUagpFVAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iagp4cmVmCjAgNgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1OCAwMDAwMCBuIAowMDAwMDAwMTE1IDAwMDAwIG4gCjAwMDAwMDAyNDEgMDAwMDAgbiAKMDAwMDAwMDM0MSAwMDAwMCBuIAp0cmFpbGVyCjw8IC9TaXplIDYgL1Jvb3QgMSAwIFIgPj4Kc3RhcnR4cmVmCjQxMQolJUVPRgo=";
         fs::write(&path, STANDARD.decode(pdf_base64).unwrap()).unwrap();
 
-        let metadata = PdfMetadataExtractor.extract_metadata(&path).unwrap();
+        let metadata = DocumentMetadataExtractor.extract_metadata(&path).unwrap();
         assert_eq!(metadata.doi.as_deref(), Some("10.1000/xyz123"));
         assert_eq!(metadata.created_at, None);
     }
@@ -232,7 +233,7 @@ mod tests {
             "Code DOI: 10.1000/xyz123 Article DOI: 10.1145/3544548.3581349",
         );
 
-        let metadata = PdfMetadataExtractor.extract_metadata(&path).unwrap();
+        let metadata = DocumentMetadataExtractor.extract_metadata(&path).unwrap();
         assert_eq!(metadata.doi.as_deref(), Some("10.1145/3544548.3581349"));
     }
 
@@ -245,7 +246,7 @@ mod tests {
             "First DOI: 10.1000/abc123 Second DOI: 10.2000/xyz789",
         );
 
-        let metadata = PdfMetadataExtractor.extract_metadata(&path).unwrap();
+        let metadata = DocumentMetadataExtractor.extract_metadata(&path).unwrap();
         assert_eq!(metadata.doi.as_deref(), Some("10.1000/abc123"));
     }
 
@@ -255,7 +256,7 @@ mod tests {
         let path = dir.path().join("page-arxiv.pdf");
         write_text_pdf(&path, "arXiv:2506.12014v2");
 
-        let metadata = PdfMetadataExtractor.extract_metadata(&path).unwrap();
+        let metadata = DocumentMetadataExtractor.extract_metadata(&path).unwrap();
         assert_eq!(metadata.doi.as_deref(), Some("10.48550/arXiv.2506.12014"));
     }
 
@@ -266,7 +267,7 @@ mod tests {
         let pdf_base64 = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAzMDAgMTQ0XSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNiAwIFIgPj4gPj4gPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCA0NSA+PgpzdHJlYW0KQlQKL0YxIDE4IFRmCjUwIDgwIFRkCihIZWxsbyBNZXRhZGF0YSkgVGoKRVQKZW5kc3RyZWFtCmVuZG9iago1IDAgb2JqCjw8IC9UaXRsZSAoVGVzdCBUaXRsZSkgL0NyZWF0aW9uRGF0ZSAoRDoyMDI1MDQwNzE2Mjg1Ny0wMycwMCcpID4+CmVuZG9iago2IDAgb2JqCjw8IC9UeXBlIC9Gb250IC9TdWJ0eXBlIC9UeXBlMSAvQmFzZUZvbnQgL0hlbHZldGljYSA+PgplbmRvYmoKeHJlZgowIDcKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTggMDAwMDAgbiAKMDAwMDAwMDExNSAwMDAwMCBuIAowMDAwMDAwMjQxIDAwMDAwIG4gCjAwMDAwMDAzMzUgMDAwMDAgbiAKMDAwMDAwMDQxMiAwMDAwMCBuIAp0cmFpbGVyCjw8IC9TaXplIDcgL1Jvb3QgMSAwIFIgL0luZm8gNSAwIFIgPj4Kc3RhcnR4cmVmCjQ4MgolJUVPRgo=";
         fs::write(&path, STANDARD.decode(pdf_base64).unwrap()).unwrap();
 
-        let metadata = PdfMetadataExtractor.extract_metadata(&path).unwrap();
+        let metadata = DocumentMetadataExtractor.extract_metadata(&path).unwrap();
         assert_eq!(metadata.created_at.as_deref(), Some("2025-04"));
     }
 
@@ -284,6 +285,6 @@ mod tests {
 
     #[test]
     fn test_pdf_metadata_extractor_rejects_non_pdf_extension() {
-        assert!(!PdfMetadataExtractor.can_handle(Path::new("notes.txt"), None));
+        assert!(!DocumentMetadataExtractor.can_handle(Path::new("notes.txt"), None));
     }
 }

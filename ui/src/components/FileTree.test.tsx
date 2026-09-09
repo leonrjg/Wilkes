@@ -2,7 +2,8 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { capturePointer, pointerEvent } from "../test/pointerDrag";
 import type { FileEntry } from "../lib/types";
-import FileTree, { buildFileTree } from "./FileTree";
+import { createRef } from "react";
+import FileTree, { buildFileTree, relativeFolderPath, type FileTreeHandle } from "./FileTree";
 
 const file = (path: string): FileEntry => ({
   path,
@@ -101,7 +102,8 @@ describe("FileTree", () => {
         <button {...drag} onClick={onClick}>{entry.path.split("/").pop()}</button>
       ),
     };
-    const view = render(<FileTree {...props} />);
+    const handle = createRef<FileTreeHandle>();
+    const view = render(<FileTree ref={handle} {...props} />);
     const source = screen.getByText("paper.txt");
     const parent = screen.getByRole("button", { name: "Collapse folder parent" });
     const child = screen.getByRole("button", { name: "Collapse folder child" });
@@ -113,7 +115,7 @@ describe("FileTree", () => {
       pointerEvent(window, "pointermove", { clientX: 40, clientY: 40 });
     };
     const release = () => pointerEvent(window, "pointerup", { clientX: 40, clientY: 40, buttons: 0 });
-    return { ...view, props, source, parent, child, second, hit, start, release, onMove, onClick };
+    return { ...view, props, handle, source, parent, child, second, hit, start, release, onMove, onClick };
   }
 
   it("moves once to the highlighted nested folder, using coordinates despite pointer capture", () => {
@@ -305,5 +307,196 @@ describe("FileTree", () => {
     expect(screen.getByRole("button", { name: "Collapse folder child" })).toBeInTheDocument();
     release();
     raf.mockRestore();
+  });
+
+  /** A file dragged in from the file manager is reported by position, and must
+   *  land where the highlight it drew says it will — the same folder a row
+   *  dragged to that point would land in. */
+  it("highlights and names the folder under a drag from outside the application", () => {
+    const { handle, parent, child, hit } = setup();
+    const over = (x: number, y: number) => {
+      let target: string | null = null;
+      act(() => { target = handle.current!.externalDragOver(x, y); });
+      return target;
+    };
+
+    expect(over(40, 40)).toBe("/library/parent");
+    expect(screen.getByText("Drop here").closest("button")).toBe(parent);
+    hit.mockReturnValue(child);
+    expect(over(40, 60)).toBe("/library/parent/child");
+    expect(screen.getByText("Drop here").closest("button")).toBe(child);
+
+    act(() => handle.current!.externalDragEnd());
+    expect(screen.queryByText("Drop here")).not.toBeInTheDocument();
+  });
+
+  it("offers no destination to an outside drag over a read-only tree", () => {
+    const { handle } = setup(false);
+    let target: string | null = "unset";
+    act(() => { target = handle.current!.externalDragOver(40, 40); });
+    expect(target).toBeNull();
+    expect(screen.queryByText("Drop here")).not.toBeInTheDocument();
+  });
+
+  /** The roots in the strip at the top of the window are destinations for the
+   *  same drag, so a file can leave the root it is in without a dialog. */
+  describe("the roots in the strip", () => {
+    const chip = (path: string) => {
+      const element = document.createElement("div");
+      element.dataset.fileDropRootPath = path;
+      document.body.appendChild(element);
+      return element;
+    };
+
+    afterEach(() => {
+      document.querySelectorAll("[data-file-drop-root-path]").forEach((el) => el.remove());
+    });
+
+    it("moves a file to a root outside the tree it was dragged from", () => {
+      const { hit, start, release, onMove } = setup();
+      hit.mockReturnValue(chip("/other-library"));
+      start();
+      release();
+      expect(onMove).toHaveBeenCalledExactlyOnceWith(
+        "/library/source/paper.txt",
+        "/other-library",
+      );
+    });
+
+    it("does not move a file to the root it is already in", () => {
+      const { hit, start, release, onMove } = setup();
+      hit.mockReturnValue(chip("/library/source"));
+      start();
+      release();
+      expect(onMove).not.toHaveBeenCalled();
+    });
+
+    /** The strip scrolls sideways, and a root can be off the side of the
+     *  window. Resting at an edge scrolls it into reach, as resting at the
+     *  sidebar's bottom edge scrolls a folder into reach. */
+    it("scrolls the strip when the drag rests at its edge", () => {
+      let tick: FrameRequestCallback = () => {};
+      const raf = vi.spyOn(window, "requestAnimationFrame")
+        .mockImplementation((callback) => { tick = callback; return 1; });
+      const strip = document.createElement("div");
+      strip.style.overflowX = "auto";
+      Object.defineProperties(strip, {
+        scrollWidth: { value: 900 },
+        clientWidth: { value: 300 },
+        scrollLeft: { value: 0, writable: true },
+      });
+      vi.spyOn(strip, "getBoundingClientRect").mockReturnValue({
+        left: 0, right: 300, top: 0, bottom: 24, width: 300, height: 24, x: 0, y: 0,
+        toJSON: () => ({}),
+      });
+      strip.appendChild(chip("/other-library"));
+      document.body.appendChild(strip);
+
+      const { hit, start, release } = setup();
+      hit.mockReturnValue(strip.firstElementChild!);
+      start();
+      pointerEvent(window, "pointermove", { clientX: 295, clientY: 10 });
+      act(() => tick(performance.now() + 16));
+      expect(strip.scrollLeft).toBeGreaterThan(0);
+      release();
+      strip.remove();
+      raf.mockRestore();
+    });
+
+    /** An import is admitted only into the root that is open, so a drag from
+     *  outside the application is never shown a root it cannot land in. */
+    it("are not offered to a drag from outside the application", () => {
+      const { handle, hit } = setup();
+      hit.mockReturnValue(chip("/other-library"));
+      let target: string | null = "unset";
+      act(() => { target = handle.current!.externalDragOver(40, 40); });
+      expect(target).toBeNull();
+    });
+  });
+
+  describe("the folder menu", () => {
+    function setupMenu(onCreateFolder?: (directory: string, name: string) => Promise<void>) {
+      const create = onCreateFolder ?? vi.fn().mockResolvedValue(undefined);
+      render(
+        <FileTree
+          root="/library"
+          files={[file("/library/parent/inside.txt"), file("/library/other.txt")]}
+          directories={["/library/parent/child"]}
+          movable
+          onMove={vi.fn()}
+          onCreateFolder={create}
+          renderFile={(entry, drag) => (
+            <button
+              {...drag}
+              onContextMenu={(event) => event.preventDefault()}
+            >
+              {entry.path.split("/").pop()}
+            </button>
+          )}
+        />,
+      );
+      const submit = async (name: string) => {
+        fireEvent.change(screen.getByRole("textbox"), { target: { value: name } });
+        await act(async () => {
+          fireEvent.click(screen.getByRole("button", { name: "Create" }));
+        });
+      };
+      return { create, submit };
+    }
+
+    it("creates in the root from the space around the tree's own entries", async () => {
+      const { create, submit } = setupMenu();
+      fireEvent.contextMenu(screen.getByRole("tree"));
+      expect(screen.getByRole("group", { name: "New folder in library" })).toBeInTheDocument();
+      await submit("Reading");
+      expect(create).toHaveBeenCalledWith("/library", "Reading");
+    });
+
+    it("creates within the folder whose subtree padding was clicked", async () => {
+      const { create, submit } = setupMenu();
+      fireEvent.contextMenu(screen.getByText("inside.txt").closest("li")!);
+      expect(screen.getByRole("group", { name: "New folder in parent" })).toBeInTheDocument();
+      await submit("Notes");
+      expect(create).toHaveBeenCalledWith("/library/parent", "Notes");
+    });
+
+    it("creates within a folder whose own row was clicked, and opens it", async () => {
+      const { create, submit } = setupMenu();
+      const parent = screen.getByRole("button", { name: "Collapse folder parent" });
+      fireEvent.click(parent);
+      expect(screen.queryByText("inside.txt")).toBeNull();
+
+      fireEvent.contextMenu(screen.getByRole("button", { name: "Expand folder parent" }));
+      await submit("Notes");
+      expect(create).toHaveBeenCalledWith("/library/parent", "Notes");
+      // A folder created into a closed folder would otherwise not be seen.
+      expect(screen.getByText("inside.txt")).toBeInTheDocument();
+    });
+
+    it("leaves a click a row has already answered alone", () => {
+      setupMenu();
+      fireEvent.contextMenu(screen.getByText("other.txt"));
+      expect(screen.queryByRole("menu")).toBeNull();
+    });
+
+    it("offers nothing where folders may not be created", () => {
+      render(
+        <FileTree
+          root="/library"
+          files={[file("/library/other.txt")]}
+          movable={false}
+          onMove={vi.fn()}
+          renderFile={(entry) => <span>{entry.path.split("/").pop()}</span>}
+        />,
+      );
+      fireEvent.contextMenu(screen.getByRole("tree"));
+      expect(screen.queryByRole("menu")).toBeNull();
+    });
+  });
+
+  it("names a folder relative to the root, and refuses one outside it", () => {
+    expect(relativeFolderPath("/library", "/library")).toBeNull();
+    expect(relativeFolderPath("/library", "/library/parent/child")).toBe("parent/child");
+    expect(() => relativeFolderPath("/library", "/elsewhere/parent")).toThrow(/not a folder under/);
   });
 });

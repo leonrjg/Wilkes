@@ -38,12 +38,12 @@ use image::{Rgb, RgbImage};
 use mupdf::text_page::TextBlockType;
 use mupdf::{Document, TextPageFlags};
 
+use wilkes_core::extract::document::typeset::{self, PageSurvey, WordBox};
 use wilkes_core::extract::image::dispatch::{self, RecognizerRole};
 use wilkes_core::extract::image::doclayout::{self, DocLayout, Recipe};
 use wilkes_core::extract::image::ocr::{self, markdown_table_is_rectangular, SpottedRegion};
 use wilkes_core::extract::image::table_structure::{self, TableGrid};
 use wilkes_core::extract::image::{AnalysisContext, NativeTextOnPage};
-use wilkes_core::extract::pdf::typeset::{self, PageSurvey, WordBox};
 use wilkes_core::types::{
     BoundingBox, ImageTransform, OcrAdmission, Point, RegionKind, RegionOrigin,
 };

@@ -15,8 +15,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use wilkes_core::extract::document::DocumentExtractor;
 use wilkes_core::extract::image::{AnalysisContext, DiscoveredImage, ImageAnalyzer};
-use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ContentExtractor;
 use wilkes_core::types::{
     ExtractedImage, ExtractionDiagnostics, RegionOrigin, SourceOrigin, TextProvenance,
@@ -118,7 +118,7 @@ fn main() -> anyhow::Result<()> {
     if supersede {
         println!("(every typeset region stands in for its lines)");
     }
-    let content = PdfExtractor::with_image_analyzer(recorder.clone()).extract(&path)?;
+    let content = DocumentExtractor::with_image_analyzer(recorder.clone()).extract(&path)?;
 
     let routed = recorder.routed.lock().expect("the record's lock").clone();
     println!(

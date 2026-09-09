@@ -14,7 +14,8 @@ use crate::types::{
     SourceOrigin,
 };
 
-use super::backend::PdfBackend;
+use super::backend::LayoutBackend;
+use super::format;
 use super::sanitize::{self, Block, Line, Page, Reading, Word};
 use super::typeset;
 
@@ -33,7 +34,7 @@ impl MuPdfBackend {
     }
 }
 
-impl PdfBackend for MuPdfBackend {
+impl LayoutBackend for MuPdfBackend {
     fn extract(&self, path: &Path) -> anyhow::Result<ExtractedContent> {
         let document = read_document(path, self.analyzer.as_deref())?;
         let size_bytes = std::fs::metadata(path)?.len();
@@ -46,7 +47,10 @@ impl PdfBackend for MuPdfBackend {
             metadata: FileMetadata {
                 path: path.to_path_buf(),
                 size_bytes,
-                mime: Some("application/pdf".into()),
+                // The format's own type, not PDF's: a rendition that told
+                // every consumer an EPUB was a PDF would be lying about the
+                // one field that says what was read.
+                mime: format::PagedFormat::for_path(path).map(|f| f.mime().to_string()),
                 title: document.title,
                 page_count: Some(document.page_count),
             },
@@ -131,17 +135,61 @@ pub(crate) struct PdfDocument {
 /// and there is exactly one of those. Asking for the outline therefore costs
 /// what extraction costs — the price of the offsets being real rather than a
 /// page number wearing an offset's clothes.
+/// Open a document and pin its pagination, which is the only way any part of
+/// this module is allowed to open one.
+///
+/// **Why it is shared.** A reflowable document has no pages until
+/// `layout` invents them, and the ids extraction hands out are positional —
+/// `p{page}-i{ordinal}`, and every bounding box the index stores. Two callers
+/// that laid the same book out differently would disagree about which page a
+/// picture is on while both believing they were reading the same file. So the
+/// geometry is named once, in [`format`], and every open goes through here:
+/// [`read_document`] producing the reading, and the two functions that find a
+/// picture again in the file it came from.
+///
+/// The container is guarded before the open rather than after, because the
+/// failure this guards against is not an error — MuPDF opens a Kindle KF8 book
+/// happily and returns an empty document. There is nothing to check afterwards
+/// that would distinguish it from a book that genuinely holds no text.
+pub(crate) fn open_document(path: &Path) -> anyhow::Result<Document> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?;
+    let format = format::PagedFormat::for_path(path)
+        .ok_or_else(|| anyhow::anyhow!("{} is not a format this backend reads", path.display()))?;
+    format::guard_container(path, format)?;
+
+    // Log before any mupdf FFI call so a C-level abort leaves a breadcrumb.
+    trace!("mupdf: opening {:?} as {format:?}", path);
+    let mut doc = Document::open(path_str)?;
+
+    // Asked of the document, not assumed from the extension: the format table
+    // says which formats *should* answer yes, and a disagreement between the
+    // two is a fact worth logging rather than papering over.
+    let reflowable = doc.is_reflowable()?;
+    if reflowable != format.is_reflowable() {
+        warn!(
+            "mupdf: {} opened as {format:?}, which is {}reflowable by this backend's table, \
+             but the document says {reflowable}",
+            path.display(),
+            if format.is_reflowable() { "" } else { "not " }
+        );
+    }
+    if reflowable {
+        doc.layout(
+            format::LAYOUT_WIDTH,
+            format::LAYOUT_HEIGHT,
+            format::LAYOUT_EM,
+        )?;
+    }
+    Ok(doc)
+}
+
 pub(crate) fn read_document(
     path: &Path,
     analyzer: Option<&dyn ImageAnalyzer>,
 ) -> anyhow::Result<PdfDocument> {
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?;
-
-    // Log before any mupdf FFI call so a C-level abort leaves a breadcrumb.
-    trace!("mupdf: opening {:?}", path);
-    let doc = Document::open(path_str)?;
+    let doc = open_document(path)?;
     let page_count = doc.page_count()? as u32;
 
     let title = doc
@@ -934,10 +982,7 @@ fn flush(line: &mut Line, word_chars: &mut String, bbox: &mut Option<BoundingBox
 /// the one the rendition was extracted from. The caller has a digest and can
 /// say so; this function does not guess.
 pub fn decode_embedded_image(path: &Path, area_id: &str) -> anyhow::Result<Option<NativeImage>> {
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?;
-    let doc = Document::open(path_str)?;
+    let doc = open_document(path)?;
     let page_count = doc.page_count()?;
 
     let mut ordinal = 0usize;
@@ -981,10 +1026,7 @@ pub fn decode_embedded_image(path: &Path, area_id: &str) -> anyhow::Result<Optio
 /// and the bbox recorded at extraction is the whole address. Rendering it again
 /// is what produced the pixels in the first place.
 pub fn render_page_area(path: &Path, page: u32, bbox: &BoundingBox) -> anyhow::Result<NativeImage> {
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?;
-    let doc = Document::open(path_str)?;
+    let doc = open_document(path)?;
     anyhow::ensure!(page >= 1, "pages are 1-based; got {page}");
     let loaded = doc.load_page(page as i32 - 1)?;
     let (rendered, _) = typeset::render(&loaded, bbox)?;

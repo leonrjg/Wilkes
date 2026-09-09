@@ -46,9 +46,9 @@ use ort::session::{Session, SessionInputValue, SessionOutputs};
 use ort::value::{DynValue, Tensor};
 use tokenizers::Tokenizer;
 
+use wilkes_core::extract::document::typeset::{self, PageSurvey, WordBox};
 use wilkes_core::extract::image::doclayout::{self, DocLayout, Pass, Recipe};
 use wilkes_core::extract::image::texify;
-use wilkes_core::extract::pdf::typeset::{self, PageSurvey, WordBox};
 use wilkes_core::types::{BoundingBox, RegionKind};
 
 // ---------------------------------------------------------------------------

@@ -3685,7 +3685,7 @@ mod tests {
             response: Mutex::new(Some(CollectedSearch {
                 files: vec![FileMatches {
                     path: path.clone(),
-                    file_type: FileType::Pdf,
+                    file_type: FileType::Paged,
                     title: None,
                     field_matches: vec![
                         SearchFieldMatch {
@@ -3875,7 +3875,7 @@ mod tests {
         FileEntry {
             path,
             size_bytes: 1,
-            file_type: FileType::Pdf,
+            file_type: FileType::Paged,
             extension: "pdf".into(),
             created_at_ms: None,
             modified_at_ms: None,
@@ -4062,7 +4062,7 @@ mod tests {
         *service.response.lock().unwrap() = Some(CollectedSearch {
             files: vec![FileMatches {
                 path: path.clone(),
-                file_type: FileType::Pdf,
+                file_type: FileType::Paged,
                 title: None,
                 field_matches: Vec::new(),
                 matches: vec![Match {

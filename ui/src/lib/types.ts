@@ -319,6 +319,30 @@ export interface NewBookmark {
   rects: BoundingBox[];
 }
 
+/** One entry of a book's table of contents, anchored to a page of the
+ *  rendering Wilkes made. It names a page directly because the destination was
+ *  resolved by the backend against the document it laid out. */
+export interface SurrogateOutline {
+  title: string;
+  page: number | null;
+  offset_y?: number | null;
+  url?: string | null;
+  items: SurrogateOutline[];
+}
+
+/** The links on one page of a book's rendering. */
+export interface SurrogatePageLinks {
+  page: number;
+  links: SurrogateLink[];
+}
+
+export interface SurrogateLink {
+  bbox: BoundingBox;
+  page?: number | null;
+  offset_y?: number | null;
+  url?: string | null;
+}
+
 export type PreviewData =
   | {
       Text: {
@@ -326,6 +350,18 @@ export type PreviewData =
         language: string | null;
         highlight_line: number;
         highlight_range: ByteRange;
+      };
+    }
+  | {
+      /** A book: paginated by Wilkes, not by the file. The pages are fetched
+       *  separately (`api.surrogateBytes`) because they are megabytes; what
+       *  travels here is what a rendering cannot carry -- the outline and the
+       *  links -- plus where to open. */
+      Book: {
+        page: number;
+        highlight_bbox: BoundingBox | null;
+        outline: SurrogateOutline[];
+        links: SurrogatePageLinks[];
       };
     }
   | {

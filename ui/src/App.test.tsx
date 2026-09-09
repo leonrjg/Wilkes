@@ -20,6 +20,7 @@ vi.mock("./services", () => ({
     onManagerEvent: vi.fn(() => Promise.resolve(() => {})),
     onFileMetadataUpdated: vi.fn(() => Promise.resolve(() => {})),
     onFileListChanged: vi.fn(() => Promise.resolve(() => {})),
+    onResearchStateUpdated: vi.fn(() => Promise.resolve(() => {})),
     onBookmarkClusterLabelled: vi.fn(() => Promise.resolve(() => {})),
     onChunkTopicLabelled: vi.fn(() => Promise.resolve(() => {})),
     onCatalogueDownloadProgress: vi.fn(() => Promise.resolve(() => {})),
@@ -72,7 +73,8 @@ vi.mock("./services", () => ({
   isTauri: true,
 }));
 
-const dropHandlers: ((event: { payload: { type: string; paths: string[] } }) => unknown)[] = [];
+type DropPayload = { type: string; paths?: string[]; position?: { x: number; y: number } };
+const dropHandlers: ((event: { payload: DropPayload }) => unknown)[] = [];
 
 vi.mock("@tauri-apps/api/webview", () => ({
   getCurrentWebview: vi.fn(() => ({
@@ -83,12 +85,22 @@ vi.mock("@tauri-apps/api/webview", () => ({
   })),
 }));
 
-/** Deliver a native drop to the handler App registered. */
-async function drop(paths: string[]) {
+/** Deliver a native drop to the handler App registered, at the window position
+ *  the shell reports it under — physical pixels, as Tauri sends them. */
+async function drop(paths: string[], position = { x: 0, y: 0 }) {
   const handler = dropHandlers[dropHandlers.length - 1];
   expect(handler).toBeDefined();
   await act(async () => {
-    await handler({ payload: { type: "drop", paths } });
+    await handler({ payload: { type: "drop", paths, position } });
+  });
+}
+
+/** Deliver the shell's report that a drag is over the window. */
+async function dragOver(position: { x: number; y: number }) {
+  const handler = dropHandlers[dropHandlers.length - 1];
+  expect(handler).toBeDefined();
+  await act(async () => {
+    await handler({ payload: { type: "over", position } });
   });
 }
 
@@ -405,12 +417,56 @@ describe("App", () => {
       ["/external/paper.pdf"],
       "/test/dir",
       "move",
+      undefined,
     );
     expect(addRoots).toHaveBeenCalledWith(["/external/library"]);
     expect(vi.mocked(source.importFiles).mock.invocationCallOrder[0]).toBeLessThan(
       addRoots.mock.invocationCallOrder[0],
     );
     expect(refreshFileList).toHaveBeenCalled();
+  });
+
+  /** The sidebar's folders are drop targets for a drag that started in the
+   *  file manager, exactly as they are for one that started on a row. */
+  it("imports a dropped file into the sidebar folder it was dropped on", async () => {
+    const refreshFileList = vi.fn();
+    vi.mocked(source.pathKinds).mockResolvedValueOnce(["file"]);
+    vi.mocked(source.importFiles).mockResolvedValueOnce(["/test/dir/Papers/paper.pdf"]);
+
+    await act(async () => {
+      render(
+        <ToastProvider>
+          <App />
+        </ToastProvider>
+      );
+    });
+    await act(async () => {
+      useSettingsStore.setState({
+        refreshFileList,
+        fileTreeEnabled: true,
+        directoryList: ["/test/dir/Papers"],
+      });
+    });
+
+    const folder = await screen.findByRole("button", { name: "Collapse folder Papers" });
+    Object.defineProperty(document, "elementFromPoint", {
+      configurable: true,
+      value: vi.fn(() => folder),
+    });
+
+    await dragOver({ x: 80, y: 80 });
+    expect(screen.getByText("Drop here").closest("button")).toBe(folder);
+
+    await drop(["/external/paper.pdf"], { x: 80, y: 80 });
+
+    expect(source.importFiles).toHaveBeenCalledWith(
+      ["/external/paper.pdf"],
+      "/test/dir",
+      "move",
+      "Papers",
+    );
+    expect(screen.queryByText("Drop here")).not.toBeInTheDocument();
+    Reflect.deleteProperty(document, "elementFromPoint");
   });
 
   it("refuses a drop into a read-only workspace", async () => {

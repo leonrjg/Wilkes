@@ -182,8 +182,18 @@ pub async fn open_file(
     _supported_extensions: Vec<String>,
     index: Option<crate::commands::preview::IndexHandle>,
 ) -> anyhow::Result<PreviewData> {
+    // A book the backend paginates but pdf.js cannot draw is opened as the
+    // reading Wilkes made of it, exactly as a search hit in one is — see
+    // `preview::preview_paged_reading`. Reading its bytes as UTF-8 instead is
+    // what used to happen, and produced "Cannot preview non-UTF-8 text file"
+    // for every EPUB.
+    if wilkes_core::extract::document::format::PagedFormat::for_path(&path).is_some()
+        && !crate::commands::preview::renders_as_pdf(&path)
+    {
+        return crate::commands::preview::preview_book(path, 1, None).await;
+    }
     match viewer_file_type(&path) {
-        FileType::Pdf => Ok(crate::commands::preview::pdf_preview(&path, 1, None, index)),
+        FileType::Paged => Ok(crate::commands::preview::pdf_preview(&path, 1, None, index)),
         FileType::PlainText => {
             let content =
                 tokio::fs::read_to_string(&path)
@@ -214,7 +224,7 @@ fn viewer_file_type(path: &Path) -> FileType {
         .and_then(|e| e.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("pdf"))
     {
-        Some(true) => FileType::Pdf,
+        Some(true) => FileType::Paged,
         _ => FileType::PlainText,
     }
 }
@@ -268,15 +278,17 @@ pub enum FileImportMode {
     Copy,
 }
 
-/// Imports files into `root`, or into a named folder directly beneath it.
+/// Imports files into `root`, or into a folder beneath it named by `folder`.
 ///
 /// `folder` exists because some things are not one file. A course is forty
 /// PDFs that belong together, and importing them loose puts forty
 /// `lecture5.pdf`-shaped names in the root with nothing saying what they
 /// belong to — and refuses the second course outright, since two courses
-/// collide on exactly those names. The folder is created if it is not there
-/// and validated as a single component, so a caller cannot walk out of the
-/// root with it.
+/// collide on exactly those names. It is also where a drop lands when the user
+/// dropped it onto a folder in the tree rather than onto the root, which is why
+/// it is a `/`-separated path and not one component: the tree is a tree. The
+/// folder is created if it is not there, and every component of it is
+/// validated, so a caller cannot walk out of the root with it.
 pub async fn import_files_into_root(
     paths: Vec<PathBuf>,
     root: PathBuf,
@@ -295,18 +307,25 @@ pub async fn import_files_into_root(
     if !root_meta.is_dir() {
         anyhow::bail!("Root is not a directory: {}", root.display());
     }
-    // Reuses the name rule the rename path already enforces: one component, no
-    // separators, not `.` or `..`. A second rule here would be a second answer
-    // to "what may a caller call a thing in the root".
+    // Every component is checked by the name rule the rename path already
+    // enforces: no separators, not `.` or `..`. A second rule here would be a
+    // second answer to "what may a caller call a thing in the root".
     let root = match folder {
         Some(name) => {
-            validate_new_file_name(&name)
-                .map_err(|err| anyhow::anyhow!("Import folder name is not usable: {err}"))?;
-            let target = root.join(&name);
+            let target = import_folder_path(&root, &name)?;
             tokio::fs::create_dir_all(&target).await.map_err(|err| {
                 anyhow::anyhow!("Cannot create import folder {}: {err}", target.display())
             })?;
-            tokio::fs::canonicalize(&target).await?
+            let target = tokio::fs::canonicalize(&target).await?;
+            // The component rule cannot see through a symlink; the resolved
+            // path can, and is the last word on whether we are still inside.
+            if !target.starts_with(&root) {
+                anyhow::bail!(
+                    "Import folder resolves outside the root: {}",
+                    target.display()
+                );
+            }
+            target
         }
         None => root,
     };
@@ -373,6 +392,20 @@ pub async fn move_files_into_root(
         FileImportMode::Move,
     )
     .await
+}
+
+/// The folder an import names beneath `root`: one component ("Course") or
+/// several ("Papers/2024", the folder a drop landed on in the tree). Every
+/// component is checked by the rule the rename path already enforces, rather
+/// than by a second answer here to what a caller may call a thing in the root.
+fn import_folder_path(root: &Path, folder: &str) -> anyhow::Result<PathBuf> {
+    let mut target = root.to_path_buf();
+    for component in folder.split('/') {
+        validate_new_file_name(component)
+            .map_err(|err| anyhow::anyhow!("Import folder name is not usable: {err}"))?;
+        target.push(component);
+    }
+    Ok(target)
 }
 
 fn validate_new_file_name(name: &str) -> anyhow::Result<()> {
@@ -725,8 +758,39 @@ mod tests {
         assert!(!source.exists());
     }
 
-    /// The folder is a name, not a path. Without this a caller could import
-    /// anywhere the process can write by naming its way out of the root.
+    /// A file dropped onto a folder in the tree lands in that folder, and the
+    /// tree is a tree: the folder it names can be several deep.
+    #[tokio::test]
+    async fn test_import_files_into_root_puts_them_in_a_nested_folder() {
+        let source_dir = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let source = source_dir.path().join("paper.pdf");
+        fs::write(&source, "pdf").unwrap();
+        fs::create_dir_all(root_dir.path().join("Papers").join("2024")).unwrap();
+
+        let imported = import_files_into_root(
+            vec![source.clone()],
+            root_dir.path().to_path_buf(),
+            Some("Papers/2024".to_string()),
+            vec!["pdf".to_string()],
+            FileImportMode::Move,
+        )
+        .await
+        .unwrap();
+
+        let target = root_dir
+            .path()
+            .join("Papers")
+            .join("2024")
+            .join("paper.pdf");
+        assert!(target.exists(), "the file is in the folder that was named");
+        assert_eq!(imported, vec![target.canonicalize().unwrap()]);
+        assert!(!source.exists());
+    }
+
+    /// The folder names a place under the root, and nothing else. Without this
+    /// a caller could import anywhere the process can write by naming its way
+    /// out of the root.
     #[tokio::test]
     async fn test_import_folder_cannot_escape_the_root() {
         let source_dir = tempdir().unwrap();
@@ -734,7 +798,7 @@ mod tests {
         let source = source_dir.path().join("paper.pdf");
         fs::write(&source, "pdf").unwrap();
 
-        for escape in ["../elsewhere", "a/b", "..", "/absolute"] {
+        for escape in ["../elsewhere", "a/../../b", "a//b", "..", "/absolute"] {
             let error = import_files_into_root(
                 vec![source.clone()],
                 root_dir.path().to_path_buf(),

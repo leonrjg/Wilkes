@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use crate::extract::pdf::PdfExtractor;
+use crate::extract::document::DocumentExtractor;
 use crate::extract::ContentExtractor;
 use crate::types::{
     ExtractedContent, ImageAnalysisStatus, ImageOcrRegion, OcrAdmission, Point, TextProvenance,
@@ -707,7 +707,7 @@ fn extract_scoped(
     // Two readings, each with its own double: the script is consumed in the
     // order images are met, so a reused engine would answer the second
     // reading with whatever the first left over.
-    let content = PdfExtractor::with_image_analyzer(Arc::new(NativeImageAnalyzer::new(
+    let content = DocumentExtractor::with_image_analyzer(Arc::new(NativeImageAnalyzer::new(
         Some(Box::new(ScriptedOcr::new(script.clone()))),
         describer.map(|build| build()),
         scope,
@@ -723,7 +723,7 @@ fn extract_scoped(
     // one: an outline is anchored in the page's own glyphs, precisely so that
     // asking for a table of contents does not start a recognizer. Asking it
     // here would report zero of everything these fixtures are about.
-    let diagnostics = crate::extract::pdf::mupdf::read_document(
+    let diagnostics = crate::extract::document::mupdf::read_document(
         &path,
         Some(&NativeImageAnalyzer::new(
             Some(Box::new(ScriptedOcr::new(script))),
@@ -1754,7 +1754,7 @@ fn a_second_reading_takes_its_annotation_from_the_cache() {
         )
     };
 
-    let first = PdfExtractor::with_image_analyzer(analyzer(vec![Script::Spots(vec![(
+    let first = DocumentExtractor::with_image_analyzer(analyzer(vec![Script::Spots(vec![(
         "Knowledge base",
         0.9,
         MIDDLE,
@@ -1767,7 +1767,7 @@ fn a_second_reading_takes_its_annotation_from_the_cache() {
 
     // A recognizer that would fail if it were asked. It is not asked.
     let second =
-        PdfExtractor::with_image_analyzer(analyzer(vec![Script::Fails("must not be called")]));
+        DocumentExtractor::with_image_analyzer(analyzer(vec![Script::Fails("must not be called")]));
     let content = second.extract(&path).expect("extracts");
     assert!(
         content

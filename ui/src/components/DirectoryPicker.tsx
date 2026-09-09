@@ -6,12 +6,13 @@ import { ContextMenu, useContextMenu } from "./ContextMenu";
 import { api, isTauri, source } from "../services";
 import type { DesktopSourceApi } from "../services/api";
 import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileActions";
+import { useFileDragStore } from "../stores/useFileDragStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { DirectoryTree, isStrictAncestor, parentPath } from "./DirectoryTree";
-import { configuredLibraryRoots } from "../lib/configuredRoots";
+import { configuredLibraryRoots, pathsEqual } from "../lib/configuredRoots";
 import type { RootCoverage } from "../lib/types";
 
 interface Props {
@@ -66,6 +67,11 @@ function RootCarousel({
   const scrollRef = useRef<HTMLDivElement>(null);
   const [canScrollLeft, setCanScrollLeft] = useState(false);
   const [canScrollRight, setCanScrollRight] = useState(false);
+  // A drag holds the pointer, so the arrows cannot be pressed while one is in
+  // progress. They sit over the strip's own edges, which is exactly where a
+  // drag has to rest to scroll it, so for the length of the drag they step out
+  // of the way of the hit test rather than swallowing it.
+  const dragging = useFileDragStore((state) => state.path !== null);
 
   const updateScrollBounds = useCallback(() => {
     const element = scrollRef.current;
@@ -126,7 +132,7 @@ function RootCarousel({
           type="button"
           aria-label="Scroll roots left"
           onClick={() => scrollPage(-1)}
-          className="absolute inset-y-0 left-0 z-10 flex w-6 items-center justify-center rounded-r bg-[var(--bg-app)]/95 text-[var(--text-muted)] shadow-[7px_0_18px_-3px_rgba(0,0,0,0.24)] hover:text-[var(--text-main)]"
+          className={`${dragging ? "pointer-events-none " : ""}absolute inset-y-0 left-0 z-10 flex w-6 items-center justify-center rounded-r bg-[var(--bg-app)]/95 text-[var(--text-muted)] shadow-[7px_0_18px_-3px_rgba(0,0,0,0.24)] hover:text-[var(--text-main)]`}
         >
           <ChevronLeft size={13} />
         </button>
@@ -136,7 +142,7 @@ function RootCarousel({
           type="button"
           aria-label="Scroll roots right"
           onClick={() => scrollPage(1)}
-          className="absolute inset-y-0 right-0 z-10 flex w-6 items-center justify-center rounded-l bg-[var(--bg-app)]/95 text-[var(--text-muted)] shadow-[-7px_0_18px_-3px_rgba(0,0,0,0.24)] hover:text-[var(--text-main)]"
+          className={`${dragging ? "pointer-events-none " : ""}absolute inset-y-0 right-0 z-10 flex w-6 items-center justify-center rounded-l bg-[var(--bg-app)]/95 text-[var(--text-muted)] shadow-[-7px_0_18px_-3px_rgba(0,0,0,0.24)] hover:text-[var(--text-main)]`}
         >
           <ChevronRight size={13} />
         </button>
@@ -158,6 +164,11 @@ export default function DirectoryPicker({
 }: Props) {
   const { addToast } = useToasts();
   const { menu, openMenu, closeMenu } = useContextMenu<ContextMenuTarget>();
+  // A root is a destination for a file being dragged out of the sidebar. The
+  // tree owns that gesture and says where it is pointing; the strip's part is
+  // to offer its roots to the hit test and to look like what was chosen.
+  const dragTarget = useFileDragStore((state) => state.target);
+  const draggedPath = useFileDragStore((state) => state.path);
   const settings = useSettingsStore((s) => s.settings);
   const readOnly = useActiveWorkspaceReadOnly();
   const isFavorite = (dir: string) => favorites.includes(dir);
@@ -303,12 +314,25 @@ export default function DirectoryPicker({
             const favorite = isFavorite(b);
             const active = b === directory;
             const rootCoverage = coverage[b];
+            const dropTarget = dragTarget !== null && pathsEqual(b, dragTarget);
+            // Dropping a file where it already is moves nothing, so that root
+            // says so rather than inviting the drop.
+            const alreadyHere = dropTarget && !!draggedPath
+              && pathsEqual(parentPath(draggedPath), b);
 
             return (
               <div
                 key={b}
                 data-root-active={active ? "true" : undefined}
-                className="group flex h-6 items-center rounded bg-[var(--bg-active)] transition-colors"
+                data-file-drop-root-path={b}
+                data-file-drop-target={dropTarget ? "true" : undefined}
+                className={`group flex h-6 items-center rounded bg-[var(--bg-active)] transition-colors ${
+                  dropTarget && !alreadyHere
+                    ? "ring-2 ring-inset ring-[var(--accent-blue)]"
+                    : dropTarget
+                      ? "ring-1 ring-inset ring-[var(--border-strong)]"
+                      : ""
+                }`}
                 onContextMenu={(event) =>
                   openMenu({
                     event,

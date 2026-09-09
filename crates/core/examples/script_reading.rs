@@ -7,8 +7,8 @@
 //!
 //!     cargo run --release --example script_reading -- <pdf> [needle]
 
+use wilkes_core::extract::document::DocumentExtractor;
 use wilkes_core::extract::image::serialize::{reading_regions, superseded_areas};
-use wilkes_core::extract::pdf::PdfExtractor;
 use wilkes_core::extract::ContentExtractor;
 
 fn main() -> anyhow::Result<()> {
@@ -16,7 +16,7 @@ fn main() -> anyhow::Result<()> {
     let pdf = args.next().expect("usage: <pdf> [needle]");
     let needle = args.next();
 
-    let extractor = PdfExtractor::new();
+    let extractor = DocumentExtractor::new();
     let started = std::time::Instant::now();
     let content = extractor.extract(std::path::Path::new(&pdf))?;
     println!(

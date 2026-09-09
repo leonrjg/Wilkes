@@ -1013,7 +1013,7 @@ fn validate_program(expression: &str) -> anyhow::Result<Program> {
     let sample = FileEntry {
         path: PathBuf::from("/library/example.pdf"),
         size_bytes: 1,
-        file_type: wilkes_core::types::FileType::Pdf,
+        file_type: wilkes_core::types::FileType::Paged,
         extension: "pdf".into(),
         created_at_ms: None,
         modified_at_ms: None,
@@ -1072,7 +1072,11 @@ fn context_for(root: &Path, entry: &FileEntry) -> Context<'static> {
     context.add_variable_from_value(
         "file_type",
         match entry.file_type {
-            wilkes_core::types::FileType::Pdf => "pdf",
+            wilkes_core::types::FileType::Paged => {
+                wilkes_core::extract::document::format::PagedFormat::for_path(&entry.path)
+                    .map(|format| format.query_name())
+                    .unwrap_or("paged")
+            }
             _ => "text",
         }
         .to_string(),
@@ -1166,7 +1170,7 @@ mod tests {
         let mut entries = vec![FileEntry {
             path: path.clone(),
             size_bytes: 3,
-            file_type: wilkes_core::types::FileType::Pdf,
+            file_type: wilkes_core::types::FileType::Paged,
             extension: "pdf".into(),
             created_at_ms: None,
             modified_at_ms: None,
@@ -1227,7 +1231,7 @@ mod tests {
         let make = |path: PathBuf| FileEntry {
             path,
             size_bytes: 0,
-            file_type: wilkes_core::types::FileType::Pdf,
+            file_type: wilkes_core::types::FileType::Paged,
             extension: "pdf".into(),
             created_at_ms: None,
             modified_at_ms: None,
@@ -1354,7 +1358,7 @@ mod tests {
         let entry = |name: &str, citation_count| FileEntry {
             path: dir.path().join(name),
             size_bytes: 1,
-            file_type: wilkes_core::types::FileType::Pdf,
+            file_type: wilkes_core::types::FileType::Paged,
             extension: "pdf".into(),
             created_at_ms: None,
             modified_at_ms: None,

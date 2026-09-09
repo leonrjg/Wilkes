@@ -1,7 +1,7 @@
 pub mod arxiv;
 pub mod cache;
+pub mod document;
 pub mod doi;
-pub mod pdf;
 pub mod text;
 
 use std::path::Path;

@@ -157,6 +157,28 @@ async fn preview_handler(
     Ok(Json(data))
 }
 
+/// The pages of a book, as PDF bytes.
+///
+/// `application/pdf` because that is what the body is: the reader hands it
+/// straight to pdf.js. The path is the book's, not the rendering's — there is
+/// no file for the rendering, and asking for it by the book's own path is what
+/// lets the answer be cached against that book's identity.
+async fn surrogate_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AssetQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, _) = state.workspace_snapshot();
+    let bytes = ctx
+        .surrogate_bytes(std::path::PathBuf::from(&params.path))
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/pdf")],
+        bytes,
+    ))
+}
+
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 async fn get_logs_handler() -> impl IntoResponse {
@@ -2331,6 +2353,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/related-documents", post(related_documents_handler))
         .route("/api/citation-links", post(citation_links_handler))
         .route("/api/preview", post(preview_handler))
+        .route("/api/surrogate", get(surrogate_handler))
         .route("/api/settings", get(get_settings_handler))
         .route("/api/settings", patch(update_settings_handler))
         .route(

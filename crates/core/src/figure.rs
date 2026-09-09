@@ -16,8 +16,8 @@
 
 use std::path::Path;
 
+use crate::extract::document::mupdf;
 use crate::extract::image::{digest_pixels, NativeImage};
-use crate::extract::pdf::mupdf;
 use crate::types::{ByteRange, RegionOrigin, RetainedImage};
 
 /// How a figure bears on a passage. Ordered strongest first, which is the

@@ -13,8 +13,18 @@ pub async fn preview(
 ) -> anyhow::Result<PreviewData> {
     match &match_ref.origin {
         SourceOrigin::TextFile { .. } => preview_text(&match_ref).await,
+        // A laid-out page. Only a PDF's pages are in the file the webview
+        // would fetch, though: every other format here is paginated by MuPDF
+        // in this process. So a book is answered with the pages Wilkes laid
+        // out for it, rendered to a PDF the reader can draw — same geometry as
+        // the reading, so the page and box this match carries land on the
+        // words they were taken from.
         SourceOrigin::PdfPage { page, bbox } => {
-            preview_pdf(&match_ref, *page, bbox.clone(), index).await
+            if renders_as_pdf(&match_ref.path) {
+                preview_pdf(&match_ref, *page, bbox.clone(), index).await
+            } else {
+                preview_book(match_ref.path.clone(), *page, bbox.clone()).await
+            }
         }
     }
 }
@@ -54,6 +64,57 @@ async fn preview_text(match_ref: &MatchRef) -> anyhow::Result<PreviewData> {
         highlight_line,
         highlight_range,
     })
+}
+
+/// Whether the reader can draw this file's pages from the file itself.
+///
+/// Only a PDF can. Every other format the extraction backend paginates is laid
+/// out by MuPDF in the host, and nothing of that layout exists in the bytes the
+/// webview would fetch.
+pub(crate) fn renders_as_pdf(path: &std::path::Path) -> bool {
+    matches!(
+        wilkes_core::extract::document::format::PagedFormat::for_path(path),
+        Some(wilkes_core::extract::document::format::PagedFormat::Pdf)
+    )
+}
+
+/// A book, as pages the reader can draw.
+///
+/// The bytes are not here: they are megabytes, and the interface fetches them
+/// through [`surrogate_bytes`] against the same cache this fills. What travels
+/// with the preview is what a surrogate rendering cannot carry — the book's
+/// outline and its links — plus where to open it.
+///
+/// Rendering is blocking and takes a few hundred milliseconds for a whole
+/// book, so it runs off the async executor.
+pub(crate) async fn preview_book(
+    path: std::path::PathBuf,
+    page: u32,
+    highlight_bbox: Option<wilkes_core::types::BoundingBox>,
+) -> anyhow::Result<PreviewData> {
+    let rendered = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || wilkes_core::extract::document::surrogate::surrogate(&path)
+    })
+    .await??;
+    Ok(PreviewData::Book {
+        page,
+        highlight_bbox,
+        outline: rendered.outline,
+        links: rendered.links,
+    })
+}
+
+/// The pages of a book, as a PDF.
+///
+/// Served from the same cache the preview filled, so the ordinary case is a
+/// copy rather than a re-render.
+pub async fn surrogate_bytes(path: std::path::PathBuf) -> anyhow::Result<Vec<u8>> {
+    let rendered = tokio::task::spawn_blocking(move || {
+        wilkes_core::extract::document::surrogate::surrogate(&path)
+    })
+    .await??;
+    Ok(rendered.bytes.as_ref().clone())
 }
 
 fn char_boundary_at_or_before(content: &str, offset: usize) -> usize {

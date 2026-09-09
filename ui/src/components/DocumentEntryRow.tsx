@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { pagedFormatLabel } from "../lib/documentFormats";
 import type React from "react";
 import { Folder, Tag as TagIcon } from "react-feather";
 import { Tooltip } from "@leonrjg/wilkes-reader";
@@ -117,14 +118,14 @@ export function DocumentEntryRow({
           {fileName(entry.path)}
         </span>
         <span className="min-w-0 flex-1" aria-hidden="true" />
-        {entry.file_type === "Pdf" && (
+        {pagedFormatLabel(entry.path) && (
           <Tooltip content="Type">
             <span
               className="inline-flex flex-shrink-0 items-center gap-1 text-xs font-mono tabular-nums text-[var(--accent-blue)]"
               aria-label="Type"
             >
               <TagIcon size={11} aria-hidden="true" />
-              PDF
+              {pagedFormatLabel(entry.path)}
             </span>
           </Tooltip>
         )}

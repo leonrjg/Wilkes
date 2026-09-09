@@ -22,7 +22,7 @@ struct ProjectionSpan {
 /// compensation for a defect in the stored reading: a word the typesetter
 /// broke across a line was stored broken, and only literal search knew better.
 /// The reading is now sanitized where it is produced
-/// (`extract::pdf::sanitize`), so what remains here is a view over *how a page
+/// (`extract::document::sanitize`), so what remains here is a view over *how a page
 /// set* the text — never a second opinion about what the text says.
 #[derive(Clone, Debug)]
 pub(crate) struct PdfSearchProjection {

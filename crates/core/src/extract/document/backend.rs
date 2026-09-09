@@ -6,7 +6,7 @@ use crate::types::{DeclaredOutline, ExtractedContent};
 ///
 /// Each platform provides one concrete implementation.  New backends (e.g.
 /// MuPDF for Linux) should implement this trait and be wired up in `mod.rs`.
-pub(super) trait PdfBackend: Send + Sync {
+pub(super) trait LayoutBackend: Send + Sync {
     fn extract(&self, path: &Path) -> anyhow::Result<ExtractedContent>;
 
     /// The bookmark tree, flattened to depth-tagged entries in reading order,

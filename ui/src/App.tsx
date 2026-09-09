@@ -26,6 +26,7 @@ import { activeViewerTab, useViewerStore } from "./stores/useViewerStore";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
 import { useNativeOpen } from "./hooks/useNativeOpen";
 import { pathIsWithinRoot } from "./lib/configuredRoots";
+import { relativeFolderPath, type FileTreeHandle } from "./components/FileTree";
 import { api, source, isTauri } from "./services";
 import type { AgentBackend, NativeOpenRequest } from "./lib/types";
 import type { DesktopSourceApi, PathKind, WebSourceApi } from "./services/api";
@@ -38,6 +39,9 @@ export default function App() {
   const loadWorkspaces = useWorkspaceStore((s) => s.load);
   const workspaceSwitching = useWorkspaceStore((s) => s.switching);
   const readOnly = useActiveWorkspaceReadOnly();
+  // The folder tree answers where a drag from outside the application is
+  // pointing, so a dropped file lands in the folder it was dropped on.
+  const fileTreeRef = useRef<FileTreeHandle>(null);
   const loadBookmarks = useBookmarksStore((s) => s.load);
   const openBookmarksPane = useBookmarksStore((s) => s.openPane);
   const closeBookmarksPane = useBookmarksStore((s) => s.closePane);
@@ -178,8 +182,27 @@ export default function App() {
     let unlisten: (() => void) | undefined;
 
     getCurrentWebview().onDragDropEvent(async (event) => {
-      if (event.payload.type !== "drop") return;
-      const paths = event.payload.paths;
+      const payload = event.payload;
+      if (payload.type === "leave") {
+        fileTreeRef.current?.externalDragEnd();
+        return;
+      }
+      // The shell reports the drag in physical pixels from the window's own
+      // origin; the tree hit-tests in CSS pixels from the same origin.
+      const x = payload.position.x / window.devicePixelRatio;
+      const y = payload.position.y / window.devicePixelRatio;
+      if (payload.type !== "drop") {
+        // "enter" and "over": show the folder the files would land in.
+        fileTreeRef.current?.externalDragOver(x, y);
+        return;
+      }
+      // The folder the drop was released on, decided by the same hit test that
+      // drew the highlight, so the files land where the highlight said. Null
+      // when the drop was not on a folder — outside the tree, or on its empty
+      // space, both of which mean the root.
+      const droppedOn = fileTreeRef.current?.externalDragOver(x, y) ?? null;
+      fileTreeRef.current?.externalDragEnd();
+      const paths = payload.paths;
       if (paths.length === 0) return;
       // Roots and imports both write through the workspace manifest, which the
       // backend refuses to rewrite for a workspace another application owns.
@@ -203,18 +226,26 @@ export default function App() {
       const folders = paths.filter((_, i) => kinds[i] === "directory");
       const files = paths.filter((_, i) => kinds[i] === "file");
 
-      // Files land in the root that was active when the drop happened, never in
-      // a folder the same drop is adding. The backend admits an import only
-      // into the current root, so the import has to run before the dropped
-      // folders are registered and one of them becomes active.
+      // Files land in the root that was active when the drop happened — in the
+      // folder of it they were dropped on — and never in a folder the same drop
+      // is adding. The backend admits an import only into the current root, so
+      // the import has to run before the dropped folders are registered and one
+      // of them becomes active.
       if (files.length > 0) {
         if (!directory) {
           addToast("Choose a directory before dropping files", { type: "error" });
         } else {
           try {
-            const imported = await desktopSource.importFiles(files, directory, "move");
+            const folder = droppedOn ? relativeFolderPath(directory, droppedOn) : null;
+            const imported = await desktopSource.importFiles(
+              files,
+              directory,
+              "move",
+              folder ?? undefined,
+            );
             refreshFileList();
-            addToast(`Imported ${imported.length} file${imported.length === 1 ? "" : "s"}`, {
+            const count = `${imported.length} file${imported.length === 1 ? "" : "s"}`;
+            addToast(folder ? `Imported ${count} into ${folder}` : `Imported ${count}`, {
               type: "success",
             });
           } catch (e) {
@@ -686,6 +717,7 @@ export default function App() {
           style={{ width: `${sidebarWidth}px`, minWidth: "200px" }}
         >
           <ResultList
+            fileTreeRef={fileTreeRef}
             filterText={fileFilterText}
             onFilterTextChange={setFileFilterText}
             onMatchClick={openMatch}

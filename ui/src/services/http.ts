@@ -503,6 +503,12 @@ export class HttpSearchApi implements SearchApi {
     return `/asset?path=${encodeURIComponent(path)}`;
   }
 
+  async surrogateBytes(path: string): Promise<ArrayBuffer> {
+    const res = await fetch(`/api/surrogate?path=${encodeURIComponent(path)}`);
+    if (!res.ok) throw new Error(`surrogateBytes failed: ${res.status}`);
+    return res.arrayBuffer();
+  }
+
   async isSemanticReady(): Promise<boolean> {
     const res = await fetch("/api/embed/ready");
     if (!res.ok) throw new Error(`isSemanticReady failed: ${res.status}`);

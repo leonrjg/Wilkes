@@ -4,6 +4,117 @@
 
 ### Added
 
+- EPUB, MOBI, FB2 books and CBZ/CBT comic archives are searched and indexed
+  alongside PDFs. MuPDF has
+  read all three since it was first linked here — its EPUB, HTML and MOBI
+  handlers are compiled in and registered — and nothing ever routed a file to
+  them: the extractor's `can_handle` matched `pdf` alone, and every other
+  extension fell to a plain-text reading that failed on the first byte of a zip.
+  What was missing was admission, not capability. A book now gets the same
+  reading a PDF gets, with real pages, bounding boxes, an outline where the
+  format declares one, and its own title and author, so it is searchable
+  exactly, semantically and by metadata, and its passages are quotable and
+  bookmarkable like any other document's.
+
+  Three things make that reading stable rather than merely possible. Which
+  files reach the backend is a closed list, never MuPDF's own recognition:
+  MuPDF also claims `.txt`, `.html`, `.xml`, `.zip` and `.log`, all of which
+  Wilkes already reads as plain text with exact line and column origins, and
+  admitting them would have moved every such file in every library onto a
+  paginated recipe — a full re-extraction, and every line-and-column locator
+  turned into a page. The page a reflowable book is laid out onto is named in
+  one place and carried in the extraction recipe, because a book has no
+  pagination of its own and MuPDF's defaults are not ours: relying on them
+  would let a point release repaginate a library silently, with no recipe
+  change to force a re-read. And a Kindle KF8 book is refused outright. MuPDF
+  opens one, reports success, and returns a single empty page — indistinguishable
+  from a book that genuinely holds no text — so `.azw3` is admitted only so far
+  as to fail with a reason naming KF8, which is visible and retryable, rather
+  than being omitted in silence.
+
+  A book opens as pages, and reads like any other document: the same find bar,
+  zoom, selection, bookmarks and highlights, with its own table of contents in
+  the sidebar and its footnote links live. The reader draws pages through
+  pdf.js, out of the file's own bytes, and pdf.js does not open an EPUB — so
+  Wilkes renders the pages it laid out into a PDF and hands the reader that.
+  Because both descend from the same pinned layout, the page and box a search
+  result carries land on the words they were taken from. It is built once per
+  book and kept, so returning to one is instant; a book with no pages of its
+  own also has no outline or links to draw, and those travel beside the
+  rendering because the host resolved them when it laid the book out.
+
+  A comic archive is a book with no text: its pages are images, so it reads and
+  indexes exactly as a scanned PDF does — empty unless a recognizer is
+  configured, and every page offered to that recognizer when one is. Its
+  rendering is correspondingly expensive, around seven seconds and 48 MB for a
+  196-page volume against a few hundred milliseconds and 4 MB for a novel,
+  which is why renderings are now held to a memory budget rather than a count:
+  "two documents" is 12 MB or 96 MB depending on what was opened.
+
+  Already-indexed PDFs are untouched: their recipe string is unchanged, so
+  nothing re-extracts and nothing re-embeds.
+
+### Changed
+
+- The extractor that reads documents is no longer named for the one format it
+  used to read. `PdfExtractor` is `DocumentExtractor`, `PdfBackend` is
+  `LayoutBackend`, `extract::pdf` is `extract::document`, `metadata::pdf` is
+  `metadata::document`, and `FileType::Pdf` is `FileType::Paged` — which is
+  what it has always meant, "read as laid-out pages rather than as text", and
+  what it now covers for four formats rather than one. This is not cosmetic:
+  the old names are why three separate attempts to design EPUB support
+  concluded that a new dependency was required, when the capability was linked
+  in the whole time and only `can_handle` stood in front of it.
+
+  Nothing changes on the wire. `FileType::Paged` still serializes as `"Pdf"`,
+  because that value appears in saved settings and in search results, and a
+  test now holds it there. Saved collection filters keep their exact meaning
+  too: `file_type == "pdf"` still selects PDFs rather than quietly widening to
+  every book, and books answer to `"epub"`, `"mobi"` and `"fb2"`.
+
+- Right-clicking the empty space of the sidebar's folder tree offers a new
+  folder, created where the click landed: the space around a folder's entries
+  is that folder, so it nests, and the space around the tree's own entries is
+  the root, so it becomes a sibling of the folders already there. Creating a
+  folder previously meant the strip's button and its destination dialog, which
+  is a tree of the whole library to point at a folder the pointer was already
+  on. The menu names the folder it will create in, opens it if it was closed —
+  a folder created into a closed folder is one nobody sees — and takes the name
+  inline, so the whole gesture is one right-click and a word. It is the hit
+  test a drag already uses, asked of the element the click names rather than of
+  a point; a file row answers its own right-click, and the tree does not answer
+  it twice.
+
+- A file dragged out of the sidebar can be dropped on any root in the strip at
+  the top of the window, which moves it there. Moving a document to another
+  root was a context menu, a dialog and a dropdown, while the drag that already
+  existed could only reach folders of the root being viewed. It is now the same
+  gesture and the same hit test: the root under the drag rings blue as a folder
+  does, says nothing when the file is already in it, and drops through the move
+  that rekeys the file's research notes and its place in the semantic index.
+  Resting the drag at either end of the strip scrolls it, so a root off the
+  side of the window is reachable without letting go — the strip's scroll
+  arrows stand aside for the length of the drag, since a drag holds the pointer
+  and they could not be pressed anyway. Because the drag's destination is now
+  drawn by two components that do not contain one another, what the drag is
+  over is held in one small store that the tree writes and both read. Dropping
+  files from outside the application still reaches only the folders of the open
+  root, since the import command admits no other.
+
+- A file dragged into the sidebar from the file manager lands in the folder it
+  was dropped on, not always in the root. The sidebar already highlighted a
+  folder under a row being dragged within it and moved the file there on
+  release; a drag that started outside the application is reported by the
+  desktop shell as a position rather than as pointer events, so it never
+  reached that machinery and every import went to the top level, to be dragged
+  down by hand afterwards. Both drags now run the same hover: the same hit
+  test, the same "Drop here" highlight, the same edge auto-scroll, and the same
+  spring-loaded opening of a collapsed folder the drag rests on. Dropping on
+  the empty space around the entries still means the root, and a read-only
+  workspace still offers no destination at all. The import command accordingly
+  takes a path beneath the root rather than a single folder name, each
+  component validated as before, so no drop can name its way out of the root.
+
 - Advanced > Data lists every workspace on this installation and deletes any of
   them, the corpora other applications keep here included. A managed corpus
   refuses every write — its owning application is its only writer — and that

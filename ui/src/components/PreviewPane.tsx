@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { isPdfPath } from "../lib/documentFormats";
+import { readerLinks, readerOutline } from "../lib/surrogate";
 import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud, Share2, Edit3 } from "react-feather";
 import DocumentEditor from "./DocumentEditor";
 // Everything this pane takes from the readers comes through their public
@@ -194,6 +196,32 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
     setEditing(false);
   }, [selectedMatch?.path]);
 
+  // A book's pages. They are not in the file -- Wilkes lays them out and
+  // renders them -- so there is nothing for the asset protocol to point at and
+  // the bytes come over IPC instead. Keyed on the path, which is what the
+  // reader caches the parsed document under.
+  const [bookPages, setBookPages] = useState<{ key: string; bytes: ArrayBuffer } | null>(null);
+  const bookPath =
+    selectedMatch && "PdfPage" in selectedMatch.origin && !isPdfPath(selectedMatch.path)
+      ? selectedMatch.path
+      : null;
+  useEffect(() => {
+    setBookPages(null);
+    if (!bookPath) return;
+    let cancelled = false;
+    api
+      .surrogateBytes(bookPath)
+      .then((bytes) => {
+        if (!cancelled) setBookPages({ key: bookPath, bytes });
+      })
+      .catch((error) => {
+        if (!cancelled && activeTab) reportTabLoadError(activeTab.id, error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bookPath, activeTab, reportTabLoadError]);
+
   useEffect(() => {
     if (!generationReady && sidePanel === "summary") setSidePanel(null);
   }, [generationReady, sidePanel]);
@@ -297,11 +325,20 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
     );
   }
 
-  const isPdfFile = "PdfPage" in selectedMatch.origin;
+  // Whether this document is drawn as pages. Both a PDF and a book are: the
+  // difference is only where the pages come from. A PDF's are in the file the
+  // webview fetches; a book has none of its own, so Wilkes lays them out and
+  // renders them, and the bytes arrive over IPC.
+  //
+  // Asked of the file rather than of the preview that arrived, because the
+  // preview goes briefly stale when switching documents: a `Text` preview left
+  // over from a text file must not turn a PDF into a code listing.
+  const isPagedFile = "PdfPage" in selectedMatch.origin;
+  const isBook = isPagedFile && !isPdfPath(selectedMatch.path);
   const isMarkdownFile =
-    !isPdfFile && displayData != null && "Text" in displayData && displayData.Text.language === "markdown";
+    !isPagedFile && displayData != null && "Text" in displayData && displayData.Text.language === "markdown";
   const isHtmlFile =
-    !isPdfFile && displayData != null && "Text" in displayData && displayData.Text.language === "html";
+    !isPagedFile && displayData != null && "Text" in displayData && displayData.Text.language === "html";
   // The two kinds of text document that have a second presentation. What
   // differs between them is which reader renders it, which is decided below;
   // everything else -- the toggle, the remembered choice, which palette a
@@ -309,7 +346,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   const isRenderableFile = isMarkdownFile || isHtmlFile;
   const renderedFileLabel = isHtmlFile ? "HTML" : "Markdown";
   const shouldRestoreSourceScroll =
-    !isPdfFile &&
+    !isPagedFile &&
     "TextFile" in selectedMatch.origin &&
     selectedMatch.origin.TextFile.line === 0 &&
     selectedMatch.text_range == null;
@@ -319,9 +356,15 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   // offer that instead of the glyph runs the reading dropped. It arrives with
   // the preview rather than on a call of its own: opening the document is
   // already the request that asks what showing it needs.
+  // A book's table of contents and links, in the reader's vocabulary. Null for
+  // a PDF, which has its own inside the file.
+  const bookOutline =
+    displayData && "Book" in displayData ? readerOutline(displayData.Book.outline) : null;
+  const bookLinks =
+    displayData && "Book" in displayData ? readerLinks(displayData.Book.links) : null;
   const pdfSuperseded =
     displayData && "Pdf" in displayData ? displayData.Pdf.superseded : undefined;
-  const selectedSearchMatch = isPdfFile
+  const selectedSearchMatch = isPagedFile
     ? searchResults
         .find((file) => file.path === selectedMatch.path)
         ?.matches.find((match) => isReferencedPdfMatch(match, selectedMatch))
@@ -389,7 +432,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   // Text locations stay in persisted UTF-8 document coordinates. Each renderer
   // translates only at its boundary (CodeMirror uses UTF-16; Markdown does not).
   const renderedHighlightRange =
-    !isPdfFile && displayData && "Text" in displayData
+    !isPagedFile && displayData && "Text" in displayData
       ? selectedMatch.text_range ?? displayData.Text.highlight_range
       : { start: 0, end: 0 };
   const bboxesEqual = (a: BoundingBox | null, b: BoundingBox | null) =>
@@ -412,7 +455,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
       bboxesEqual(bookmark.origin.PdfPage.bbox, pdfBbox),
   );
   const readerDecorations: Decoration[] =
-    isPdfFile && pdfBbox && !pdfSearchLocator && !targetIsBookmarked
+    isPagedFile && pdfBbox && !pdfSearchLocator && !targetIsBookmarked
       ? [
           ...bookmarkDecorations,
           {
@@ -671,7 +714,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
           </Tooltip>
         )}
 
-        {!standalone && !isPdfFile && displayData && "Text" in displayData && (
+        {!standalone && !isPagedFile && displayData && "Text" in displayData && (
           <Tooltip content={editing ? "Return to document viewer" : "Edit document"}>
             <button
               type="button"
@@ -738,10 +781,20 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
                 </div>
               </div>
             )}
-            {isPdfFile ? (
+            {isPagedFile && (!isBook || bookPages) ? (
               <PdfViewer
-                key={api.resolveAssetUrl(selectedMatch.path)}
-                source={api.resolveAssetUrl(selectedMatch.path)}
+                key={selectedMatch.path}
+                // A PDF is fetched from the file by the webview; a book has no
+                // pages in its file at all, so Wilkes renders them and they
+                // arrive as bytes with the book's path as their identity.
+                source={bookPages ?? api.resolveAssetUrl(selectedMatch.path)}
+                // Neither survives a rendering -- a page writer emits drawing
+                // operations, and an outline and a link annotation are not
+                // drawing operations -- so for a book the host supplies what it
+                // resolved when it laid the book out. A PDF carries its own,
+                // and passing nothing leaves the reader to read them.
+                outline={bookOutline}
+                links={bookLinks}
                 loadAttempt={pdfLoadAttempt}
                 page={pdfPage}
                 highlight_bbox={pdfBbox}

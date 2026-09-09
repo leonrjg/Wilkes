@@ -61,9 +61,9 @@ use image::{Rgb, RgbImage};
 use mupdf::text_page::TextBlockType;
 use mupdf::{Colorspace, Device, Document, IRect, Matrix, TextPageFlags};
 
+use wilkes_core::extract::document::typeset::{self, PageSurvey, WordBox};
 use wilkes_core::extract::image::doclayout::{self, DocLayout, Pass, Recipe};
 use wilkes_core::extract::image::{decode, LayoutRegion};
-use wilkes_core::extract::pdf::typeset::{self, PageSurvey, WordBox};
 use wilkes_core::types::{BoundingBox, RegionKind};
 
 /// The classes this probe counts as a formula proposal. `formula_number` is
@@ -246,7 +246,7 @@ struct Glyph {
 /// Read one page's labels against the page's own text layer and its ink.
 ///
 /// The text layer is asked for through the same MuPDF call and the same flags
-/// `extract::pdf::mupdf` reads a document with, so what is counted here is
+/// `extract::document::mupdf` reads a document with, so what is counted here is
 /// what the reading would have held.
 fn classify_page(page: &mupdf::Page, entry: &Entry) -> anyhow::Result<Vec<Reading>> {
     let text_page = page.to_text_page(TextPageFlags::ACCURATE_BBOXES)?;
@@ -932,7 +932,7 @@ struct PageWords {
 
 /// Close one word: the page's own segmentation, which is whitespace.
 ///
-/// `flush` in `extract::pdf::mupdf`, and the survey beside it, character for
+/// `flush` in `extract::document::mupdf`, and the survey beside it, character for
 /// character: an empty run is not a word, a word with no drawable quad is a
 /// word of the reading but not of the survey, and the word index counts words
 /// of the reading either way.
@@ -1040,7 +1040,7 @@ fn page_words(text_page: &mupdf::TextPage) -> PageSurvey {
 
 /// Survey every fixture page's words, once, before anything is detected.
 ///
-/// Under the flags `extract::pdf::mupdf` reads a document with, because the
+/// Under the flags `extract::document::mupdf` reads a document with, because the
 /// words this stage claims have to be the words that stage would have.
 fn survey_all(entries: &[Entry], names: &[String]) -> anyhow::Result<Vec<PageWords>> {
     let mut opened: Option<(PathBuf, Document)> = None;
@@ -1400,9 +1400,9 @@ fn read_anchored(
     threshold: f32,
     raw: &Path,
 ) -> anyhow::Result<()> {
+    use wilkes_core::extract::document::typeset::render as render_region;
     use wilkes_core::extract::image::ocr::{latex_parses, OcrEngine};
     use wilkes_core::extract::image::texify::Texify;
-    use wilkes_core::extract::pdf::typeset::render as render_region;
 
     let dir = model_dir();
     let threads = std::thread::available_parallelism()

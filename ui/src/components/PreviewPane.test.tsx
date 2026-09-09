@@ -60,6 +60,7 @@ vi.mock("../services", () => ({
       return Promise.resolve();
     }),
     resolveAssetUrl: vi.fn((path: string) => path),
+    surrogateBytes: vi.fn(() => Promise.resolve(new Uint8Array([1, 2, 3]).buffer)),
     relatedDocuments: vi.fn(() => Promise.resolve([])),
     chunkTopics: vi.fn(() => Promise.resolve({ topics: [] })),
     cancelChunkTopics: vi.fn(() => Promise.resolve()),
@@ -1086,6 +1087,100 @@ describe("PreviewPane", () => {
 
     expect(screen.getByTestId("pdf-viewer")).toBeInTheDocument();
     expect(screen.queryByTestId("code-viewer")).not.toBeInTheDocument();
+  });
+
+  it("draws a book from pages Wilkes rendered, not from the file", async () => {
+    // An EPUB has no pages in its own bytes -- pdf.js could not open it -- so
+    // the pane fetches the rendering and hands the reader those bytes, keyed
+    // on the book's path.
+    setViewerState({
+      selectedMatch: {
+        path: "book.epub",
+        origin: { PdfPage: { page: 12, bbox: null } },
+      } as any,
+      previewData: {
+        Book: { page: 12, highlight_bbox: null, outline: [], links: [] },
+      },
+      previewLoading: false,
+    });
+
+    render(<PreviewPane />);
+
+    await waitFor(() => expect(screen.getByTestId("pdf-viewer")).toBeInTheDocument());
+    expect(screen.queryByTestId("code-viewer")).not.toBeInTheDocument();
+    const source = mockPdfViewer.mock.lastCall?.[0].source;
+    expect(source).toMatchObject({ key: "book.epub" });
+    expect(source.bytes.byteLength).toBe(3);
+  });
+
+  it("hands the reader the book's own outline and links", async () => {
+    // A rendering carries neither -- a page writer emits drawing operations,
+    // and an outline and a link annotation are not drawing operations -- so
+    // the backend supplies what it resolved when it laid the book out.
+    setViewerState({
+      selectedMatch: {
+        path: "book.epub",
+        origin: { PdfPage: { page: 1, bbox: null } },
+      } as any,
+      previewData: {
+        Book: {
+          page: 1,
+          highlight_bbox: null,
+          outline: [
+            { title: "Segunda regla", page: 34, offset_y: 120, url: null, items: [] },
+          ],
+          links: [
+            {
+              page: 11,
+              links: [
+                {
+                  bbox: { x: 1, y: 2, width: 3, height: 4 },
+                  page: 190,
+                  offset_y: null,
+                  url: null,
+                },
+              ],
+            },
+          ],
+        },
+      },
+      previewLoading: false,
+    });
+
+    render(<PreviewPane />);
+
+    await waitFor(() => expect(screen.getByTestId("pdf-viewer")).toBeInTheDocument());
+    const props = mockPdfViewer.mock.lastCall?.[0];
+    // A page number, not a pdf.js destination: the backend resolved it against
+    // the document it laid out, which the reader never sees.
+    expect(props.outline).toEqual([
+      { title: "Segunda regla", dest: { page: 34, offsetY: 120 }, url: null, items: [] },
+    ]);
+    expect(props.links).toEqual([
+      {
+        page: 11,
+        links: [
+          { bbox: { x: 1, y: 2, width: 3, height: 4 }, page: 190, offsetY: null, url: null },
+        ],
+      },
+    ]);
+  });
+
+  it("offers no editor for a book", async () => {
+    // The pages are Wilkes' rendering, and the file behind them is a zip.
+    setViewerState({
+      selectedMatch: {
+        path: "book.epub",
+        origin: { PdfPage: { page: 1, bbox: null } },
+      } as any,
+      previewData: { Book: { page: 1, highlight_bbox: null, outline: [], links: [] } },
+      previewLoading: false,
+    });
+
+    render(<PreviewPane />);
+
+    await waitFor(() => expect(screen.getByTestId("pdf-viewer")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "Edit document" })).not.toBeInTheDocument();
   });
 
   it("closes the document from its tab", () => {

@@ -14,10 +14,14 @@ pub struct TextExcerpt {
     pub truncated: bool,
 }
 
-fn is_pdf(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+/// Whether this file is one the extraction backend reads as laid-out pages,
+/// rather than one whose bytes are already its text.
+///
+/// Asked of the backend's own list rather than matched here: a chat tool that
+/// decided "not a PDF, therefore UTF-8" would hand an EPUB to
+/// `read_to_string` and fail on the zip, which is what it used to do.
+fn is_paged_document(path: &Path) -> bool {
+    wilkes_core::extract::document::format::PagedFormat::for_path(path).is_some()
 }
 
 /// The page's own glyphs, never the enriched reading.
@@ -63,9 +67,9 @@ fn extract(path: &Path) -> anyhow::Result<ExtractedContent> {
         scope
             .spawn(|| {
                 let registry = registry();
-                let extractor = registry
-                    .find(path, None)
-                    .ok_or_else(|| anyhow::anyhow!("no PDF extractor registered"))?;
+                let extractor = registry.find(path, None).ok_or_else(|| {
+                    anyhow::anyhow!("no extractor registered for {}", path.display())
+                })?;
                 extractor.extract(path)
             })
             .join()
@@ -96,7 +100,7 @@ pub fn read_text_range(
     limit: Option<u32>,
 ) -> anyhow::Result<String> {
     let started_at = Instant::now();
-    let pdf = is_pdf(path);
+    let pdf = is_paged_document(path);
     let text = if pdf {
         let content = extract(path)?;
         match page_range {
@@ -132,7 +136,7 @@ pub fn read_active_excerpt(
     page: Option<u32>,
     max_chars: usize,
 ) -> anyhow::Result<TextExcerpt> {
-    let text = if is_pdf(path) {
+    let text = if is_paged_document(path) {
         let content = extract(path)?;
         match page {
             Some(page) => page_text_strict(&content, page).unwrap_or_default(),
