@@ -11,7 +11,7 @@
 //! yields the raw KF8 flow and the image resources. The flow is not a
 //! document: it is 162 concatenated XHTML skeletons for one measured book,
 //! with the bulk of the prose in bare fragments between them, and MuPDF reads
-//! nothing from it as it stands. Three things make it readable:
+//! nothing from it as it stands. Four things make it readable:
 //!
 //! 1. **Strip the NUL padding.** The flow begins with several hundred zero
 //!    bytes, and MuPDF's HTML parser stops at them. This alone was the
@@ -23,6 +23,14 @@
 //!    reading order, so the result reads in that order.
 //! 3. **Resolve `kindle:embed:` references** against the image records, which
 //!    are written out beside the HTML.
+//! 4. **Drop every other `kindle:` reference.** `kindle:pos:` inner links name
+//!    a fragment and an offset within it, and both live in the fragment index
+//!    this rebuild does not read; `kindle:flow:` names a stylesheet a reader
+//!    does not apply. Left in place they reach MuPDF as an unknown scheme and
+//!    become *external* links, so a footnote handed
+//!    `kindle:pos:fid:00AS:off:0000000000` to the operating system when it was
+//!    clicked. The attribute goes and the element stays: the text reads as
+//!    text rather than as a link to nowhere.
 //!
 //! **What this is not.** It is not true KF8 reassembly. A faithful reader would
 //! insert each fragment into its skeleton at the offset recorded in the INDX
@@ -31,6 +39,16 @@
 //! structure is approximate, and a book whose fragments are stored out of order
 //! would come out in that order. Doing better means parsing INDX/TAGX, which is
 //! the several-hundred-line job this exists to avoid.
+//!
+//! That is also why inner links are dropped rather than approximated. The
+//! fragment ids were measured against the books' own tables of contents to see
+//! whether they could be mapped to documents without the index: taking each
+//! entry's label and asking which document it lands on, the best candidate
+//! mapping was right about 12% of the time, against a control showing every
+//! label does match some document. Nine in ten links would have gone somewhere
+//! plausible and wrong, and in one book 396 of 550 point inside a document
+//! rather than at its start, so even a perfect document-level map would miss
+//! them.
 //!
 //! **Why the container is read here rather than by a crate.** The `mobi` crate
 //! did this at first and silently lost a large fraction of the text — 12.6%,
@@ -661,6 +679,29 @@ fn flatten(flow: &str, images: &[String]) -> anyhow::Result<String> {
         })
         .into_owned();
 
+    // Every other `kindle:` reference, which by here is one nothing can
+    // resolve: `kindle:pos:` inner links, whose targets live in the fragment
+    // index this rebuild does not read, and `kindle:flow:` stylesheets, which
+    // a reader does not apply anyway. Left alone they reach MuPDF as an
+    // unknown scheme, become *external* links, and the reader offers them as
+    // such — clicking a footnote in a Kindle book handed
+    // `kindle:pos:fid:00AS:off:0000000000` to the operating system. The
+    // attribute goes and the element stays, so the text reads as text.
+    let unresolved = std::cell::Cell::new(0usize);
+    body = kindle_references()
+        .replace_all(&body, |_: &regex::Captures<'_>| {
+            unresolved.set(unresolved.get() + 1);
+            String::new()
+        })
+        .into_owned();
+    if unresolved.get() > 0 {
+        debug!(
+            "kf8: dropped {} unresolvable kindle: references; the book's inner \
+             links are not navigable without its fragment index",
+            unresolved.get()
+        );
+    }
+
     // What came out against what went in.
     //
     // Rebuilding a book is markup surgery on a format whose own markup is not
@@ -762,6 +803,18 @@ fn strip_head_blocks(markup: &str) -> String {
     }
     out.push_str(&markup[cursor..]);
     out
+}
+
+/// A `href` or `src` naming a `kindle:` scheme, with its leading whitespace.
+///
+/// Runs after the embeds have been rewritten, so anything it still matches is
+/// a reference this rebuild cannot resolve.
+fn kindle_references() -> &'static Regex {
+    static CELL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        Regex::new("(?is)\\s*(?:href|src)\\s*=\\s*(?:\"kindle:[^\"]*\"|'kindle:[^']*')")
+            .expect("the reference pattern is a literal")
+    })
 }
 
 /// `kindle:embed:XXXX`, with the query the reference may carry.
@@ -1337,6 +1390,38 @@ mod tests {
         assert!(html.contains(r#"src="images/0001.jpg""#), "{html}");
         assert!(html.contains(r#"src="images/0002.png""#), "{html}");
         assert!(!html.contains("kindle:embed"), "{html}");
+    }
+
+    /// An inner link this rebuild cannot resolve must not reach the reader
+    /// looking live.
+    ///
+    /// `kindle:pos:` targets live in the fragment index, which this rebuild
+    /// does not read; MuPDF treats the unknown scheme as external, and the
+    /// reader then offered a footnote that handed
+    /// `kindle:pos:fid:00AS:off:0000000000` to the operating system. The text
+    /// stays, the link does not.
+    #[test]
+    fn unresolvable_kindle_references_stop_looking_like_links() {
+        let flow = concat!(
+            r#"<p>See <a href="kindle:pos:fid:00AS:off:0000000000">the note</a>.</p>"#,
+            r#"<link href="kindle:flow:0001?mime=text/css"/>"#,
+            r#"<img src='kindle:flow:0002'/>"#,
+        );
+        let html = flatten(flow, &[]).unwrap();
+
+        assert!(!html.contains("kindle:"), "{html}");
+        // The anchor and its words survive; only the destination goes.
+        assert!(html.contains("<a>the note</a>"), "{html}");
+        assert!(html.contains("See "), "{html}");
+    }
+
+    /// And a reference that *was* resolved is untouched by the same pass.
+    #[test]
+    fn resolved_images_survive_the_reference_sweep() {
+        let images = vec!["0001.jpg".to_string()];
+        let html = flatten(r#"<img src="kindle:embed:0001?mime=image/jpeg"/>"#, &images).unwrap();
+        assert!(html.contains(r#"src="images/0001.jpg""#), "{html}");
+        assert!(!html.contains("kindle:"), "{html}");
     }
 
     /// A reference with no record behind it keeps a reference, so the reader

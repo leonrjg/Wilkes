@@ -66,6 +66,28 @@ describe("useViewerStore", () => {
     ]);
   });
 
+  it("opens every paginated format at a page, not only PDFs", () => {
+    // The regression: this asked whether the path ended in `.pdf`, so a book
+    // opened from the file tree was given a text origin. The pane then took
+    // its text branches, the page-shaped preview that arrived matched none of
+    // them, and the document rendered as nothing at all — blank, for every
+    // format except PDF.
+    for (const name of [
+      "/books/a.epub",
+      "/books/b.mobi",
+      "/books/c.azw3",
+      "/books/d.fb2",
+      "/books/e.cbz",
+      "/books/f.CBT",
+    ]) {
+      useViewerStore.getState().openFile(name);
+    }
+
+    const origins = useViewerStore.getState().tabs.map((tab) => tab.match.origin);
+    expect(origins).toEqual(origins.map(() => ({ PdfPage: { page: 1, bbox: null } })));
+    expect(origins).toHaveLength(6);
+  });
+
   it("keeps standalone documents outside workspace preview, metadata, and persistence", async () => {
     vi.mocked(api.previewStandalone!).mockResolvedValue(textPreview("outside"));
     vi.mocked(api.getStandaloneFileMetadata!).mockResolvedValue(metadata);

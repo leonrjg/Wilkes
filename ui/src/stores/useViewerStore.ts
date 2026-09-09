@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { isPagedPath } from "../lib/documentFormats";
 import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
 import { api } from "../services";
 import { randomId } from "../lib/types";
@@ -72,7 +73,11 @@ interface ViewerStore {
 function directFileMatch(path: string): MatchRef {
   return {
     path,
-    origin: path.toLowerCase().endsWith(".pdf")
+    // Every format the backend paginates, not PDF alone. A book given a text
+    // origin here is one the pane never routes to a reader: it asks for the
+    // text branches, the preview that arrives is page-shaped, and the chain
+    // falls through to nothing — the document opens blank.
+    origin: isPagedPath(path)
       ? { PdfPage: { page: 1, bbox: null } }
       : { TextFile: { line: 0, col: 0 } },
   };

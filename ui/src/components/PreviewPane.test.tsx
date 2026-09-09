@@ -1113,6 +1113,72 @@ describe("PreviewPane", () => {
     expect(source.bytes.byteLength).toBe(3);
   });
 
+  it("shows a loading state while a book's pages are being fetched", async () => {
+    // The pages arrive after the preview, so `previewLoading` is already false
+    // while they are in flight. Without a state of its own the pane rendered
+    // the last `null` of its branch chain: blank, with nothing to say why.
+    let release: (bytes: ArrayBuffer) => void = () => {};
+    (api.surrogateBytes as any).mockImplementationOnce(
+      () => new Promise<ArrayBuffer>((resolve) => (release = resolve)),
+    );
+    setViewerState({
+      selectedMatch: {
+        path: "book.cbz",
+        origin: { PdfPage: { page: 1, bbox: null } },
+      } as any,
+      previewData: { Book: { page: 1, highlight_bbox: null, outline: [], links: [] } },
+      previewLoading: false,
+    });
+
+    render(<PreviewPane />);
+
+    expect(screen.getByText("Loading document…")).toBeInTheDocument();
+    expect(screen.queryByTestId("pdf-viewer")).not.toBeInTheDocument();
+
+    await act(async () => {
+      release(new Uint8Array([1, 2, 3]).buffer);
+    });
+    await waitFor(() => expect(screen.getByTestId("pdf-viewer")).toBeInTheDocument());
+    // The spinner now covers the reader's own first render, as it does for a
+    // PDF; it clears when the reader says it has drawn something.
+    await act(async () => {
+      mockPdfViewer.mock.lastCall?.[0].onRenderSuccess();
+    });
+    expect(screen.queryByText("Loading document…")).not.toBeInTheDocument();
+  });
+
+  it("fetches a book's pages once, not on every tab update", async () => {
+    // `activeTab` is a store object whose identity changes whenever any of its
+    // fields does. Depending on it re-ran the fetch mid-flight and discarded
+    // the pages it had just retrieved.
+    setViewerState({
+      selectedMatch: {
+        path: "book.cbz",
+        origin: { PdfPage: { page: 1, bbox: null } },
+      } as any,
+      previewData: { Book: { page: 1, highlight_bbox: null, outline: [], links: [] } },
+      previewLoading: false,
+    });
+
+    const { rerender } = render(<PreviewPane />);
+    await waitFor(() => expect(screen.getByTestId("pdf-viewer")).toBeInTheDocument());
+    const calls = (api.surrogateBytes as any).mock.calls.length;
+
+    // A tab update that does not change which book is open.
+    setViewerState({
+      selectedMatch: {
+        path: "book.cbz",
+        origin: { PdfPage: { page: 1, bbox: null } },
+      } as any,
+      previewData: { Book: { page: 1, highlight_bbox: null, outline: [], links: [] } },
+      previewLoading: false,
+    });
+    rerender(<PreviewPane />);
+
+    expect((api.surrogateBytes as any).mock.calls.length).toBe(calls);
+    expect(screen.getByTestId("pdf-viewer")).toBeInTheDocument();
+  });
+
   it("hands the reader the book's own outline and links", async () => {
     // A rendering carries neither -- a page writer emits drawing operations,
     // and an outline and a link annotation are not drawing operations -- so
