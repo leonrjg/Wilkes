@@ -454,6 +454,22 @@ fn wilkes_path(path: &str) {
                             started.elapsed(),
                             warm.elapsed()
                         );
+                        // Does the surrogate actually draw anything? Text and
+                        // page bounds are empty for a comic either way, so
+                        // they cannot answer this; ink can.
+                        let out = std::env::temp_dir().join("wilkes-probe-ink.pdf");
+                        std::fs::write(&out, rendered.bytes.as_ref()).unwrap();
+                        for (label, doc_path) in
+                            [("original", path.to_path_buf()), ("surrogate", out)]
+                        {
+                            match ink(&doc_path) {
+                                Ok((covered, total)) => println!(
+                                    "    {label} page 1 ink: {covered}/{total} pixels ({:.1}%)",
+                                    100.0 * covered as f64 / total.max(1) as f64
+                                ),
+                                Err(error) => println!("    {label} page 1 ink: FAILED {error}"),
+                            }
+                        }
                     }
                     Err(error) => println!("  surrogate(wilkes): FAILED: {error}"),
                 }
@@ -461,4 +477,26 @@ fn wilkes_path(path: &str) {
             Err(error) => println!(" REFUSED: {error}"),
         },
     }
+}
+
+/// How much of a document's first page is not blank paper.
+fn ink(path: &std::path::Path) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    let doc = Document::open(path.to_str().ok_or("non-UTF-8 path")?)?;
+    let page = doc.load_page(0)?;
+    let pixmap = page.to_pixmap(
+        &mupdf::Matrix::new_scale(0.5, 0.5),
+        &mupdf::Colorspace::device_rgb(),
+        false,
+        false,
+    )?;
+    let samples = pixmap.samples();
+    let mut covered = 0usize;
+    let mut total = 0usize;
+    for pixel in samples.chunks(3) {
+        total += 1;
+        if pixel.iter().any(|channel| *channel < 250) {
+            covered += 1;
+        }
+    }
+    Ok((covered, total))
 }

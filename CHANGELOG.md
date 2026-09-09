@@ -100,6 +100,16 @@
   to within 0.05%. Metadata comes from the container's own EXTH block for the
   same reason, and Wilkes gained no dependency for any of it.
 
+  A Kindle book's inner links are removed rather than offered. Their
+  targets are named by a fragment id and an offset into it, both of which live
+  in an index this rebuild does not read, so they cannot be followed; left in
+  the markup they reached the layout engine as an unknown scheme, became
+  external links, and clicking a footnote handed `kindle:pos:fid:00AS:off:…`
+  to the operating system. The text of the link stays and the link does not.
+  Approximating them was measured and rejected: matching each table-of-contents
+  entry's own label against the document a candidate mapping sends it to, the
+  best mapping was right 12% of the time.
+
     This is not a faithful KF8 reader: fragments are kept in the order the file
   stores them rather than being placed inside their skeletons at the offsets
   recorded in the format's index tables, so a book's structure is approximate

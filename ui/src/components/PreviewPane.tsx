@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { isPdfPath } from "../lib/documentFormats";
+import { isPagedPath, isPdfPath } from "../lib/documentFormats";
 import { readerLinks, readerOutline } from "../lib/surrogate";
 import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud, Share2, Edit3 } from "react-feather";
 import DocumentEditor from "./DocumentEditor";
@@ -205,6 +205,11 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
     selectedMatch && "PdfPage" in selectedMatch.origin && !isPdfPath(selectedMatch.path)
       ? selectedMatch.path
       : null;
+  // Keyed on the book's path and the tab's *id*, never on the tab object: that
+  // object's identity changes whenever any of its fields does — `previewLoading`
+  // flipping is enough — and depending on it re-ran this effect mid-flight,
+  // throwing away the pages it had just fetched and starting again.
+  const activeTabId = activeTab?.id ?? null;
   useEffect(() => {
     setBookPages(null);
     if (!bookPath) return;
@@ -215,12 +220,12 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
         if (!cancelled) setBookPages({ key: bookPath, bytes });
       })
       .catch((error) => {
-        if (!cancelled && activeTab) reportTabLoadError(activeTab.id, error);
+        if (!cancelled && activeTabId) reportTabLoadError(activeTabId, error);
       });
     return () => {
       cancelled = true;
     };
-  }, [bookPath, activeTab, reportTabLoadError]);
+  }, [bookPath, activeTabId, reportTabLoadError]);
 
   useEffect(() => {
     if (!generationReady && sidePanel === "summary") setSidePanel(null);
@@ -294,8 +299,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   // navigating to a different match within the same file.
   useEffect(() => {
     if (selectedMatch) {
-      const isPdf = selectedMatch.path.toLowerCase().endsWith(".pdf");
-      if (isPdf) {
+      if (isPagedPath(selectedMatch.path)) {
         const newUrl = api.resolveAssetUrl(selectedMatch.path);
         const isNewFile = newUrl !== prevPdfUrlRef.current;
         prevPdfUrlRef.current = newUrl;
@@ -358,6 +362,10 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   // already the request that asks what showing it needs.
   // A book's table of contents and links, in the reader's vocabulary. Null for
   // a PDF, which has its own inside the file.
+  // A book's pages are fetched after its preview arrives, so `previewLoading`
+  // is already false while they are in flight. Without this the pane renders
+  // the final `null` of the chain below — blank, with nothing to say why.
+  const waitingForBookPages = isBook && bookPages == null && !previewError;
   const bookOutline =
     displayData && "Book" in displayData ? readerOutline(displayData.Book.outline) : null;
   const bookLinks =
@@ -751,7 +759,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
                 onDelete={() => void handleDeleteBookmark()}
               />
             )}
-            {(previewLoading || isPdfRendering) && (
+            {(previewLoading || isPdfRendering || waitingForBookPages) && (
               <div className="absolute inset-0 flex items-center justify-center bg-[var(--bg-app)] z-30 pointer-events-none">
                 <div className="flex flex-col items-center gap-3">
                   <div className="w-6 h-6 border-2 border-[var(--accent-blue)] border-t-transparent rounded-full animate-spin" />

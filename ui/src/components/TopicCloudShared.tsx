@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { isPagedPath } from "../lib/documentFormats";
 import type {
   BookmarkClusterGranularity,
   ChunkTopic,
@@ -74,7 +75,7 @@ export function chunkSearchResults(
   }
   return [...byPath.entries()].map(([path, chunks]) => ({
     path,
-    file_type: path.toLowerCase().endsWith(".pdf") ? "Pdf" : "PlainText",
+    file_type: isPagedPath(path) ? "Pdf" : "PlainText",
     matches: chunks.map((chunk) => ({
       text_range:
         "TextFile" in chunk.origin ? chunk.extraction_byte_range : null,

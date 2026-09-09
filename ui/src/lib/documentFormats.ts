@@ -21,6 +21,17 @@ function extensionOf(path: string): string {
   return dot > 0 ? name.slice(dot + 1) : "";
 }
 
+/** Whether the backend reads this document as laid-out pages rather than as
+ *  text — PDF, EPUB, MOBI, AZW3, FB2 and comic archives.
+ *
+ *  The frontend's copy of the backend's `PagedFormat::for_path`, and the two
+ *  must agree. A document opened from the file tree is given its origin from
+ *  this: get it wrong and the pane asks for a page-shaped preview and receives
+ *  a text-shaped one, or the reverse, and renders nothing at all. */
+export function isPagedPath(path: string): boolean {
+  return pagedFormatLabel(path) !== null;
+}
+
 /** Whether the reader can draw this document's pages from the file itself.
  *  Only a PDF can; this is the frontend's copy of the backend's
  *  `preview::renders_as_pdf`, and the two must agree. */

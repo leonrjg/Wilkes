@@ -1,4 +1,5 @@
 import { ChatPane as AcpChatPane } from "@leonrjg/wilkes-chat";
+import { isPagedPath } from "../lib/documentFormats";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { FileText, MapPin, X } from "react-feather";
 
@@ -18,7 +19,7 @@ function fileName(path: string) {
  *  position.
  */
 export function contextFileMatchRef(path: string, page: number | null = null): MatchRef {
-  if (path.toLowerCase().endsWith(".pdf")) {
+  if (isPagedPath(path)) {
     return { path, origin: { PdfPage: { page: page ?? 1, bbox: null } } };
   }
   return { path, origin: { TextFile: { line: 0, col: 0 } } };
