@@ -6,6 +6,7 @@ import {
   ArrowDown,
   ArrowUp,
   Calendar,
+  CheckSquare,
   ChevronDown,
   Clock,
   File,
@@ -15,7 +16,7 @@ import {
   Hash,
   Info,
   Layers,
-  RefreshCw,
+  Square,
   User,
   X,
 } from "react-feather";
@@ -45,7 +46,7 @@ import type {
   SearchFieldMatch,
   SourceOrigin,
 } from "../lib/types";
-import { api, isTauri, source } from "../services";
+import { isTauri, source } from "../services";
 import type { DesktopSourceApi } from "../services/api";
 import {
   formatDocumentFullDate,
@@ -58,6 +59,7 @@ import {
   type DetailIcon,
   type DocumentDetail,
 } from "./DocumentEntryRow";
+import BulkActionsBar from "./BulkActionsBar";
 import CatalogueGapStrip, { CatalogueGapPrompt } from "./CatalogueGapStrip";
 import SearchResultsSummary from "./SearchResultsSummary";
 import {
@@ -463,6 +465,8 @@ export default function ResultList({
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
   const [expandedFiles, setExpandedFiles] = useState<Set<number>>(new Set());
   const [showOmittedFiles, setShowOmittedFiles] = useState(false);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [openSummaryKey, setOpenSummaryKey] = useState<string | null>(null);
   const [hydeOpen, setHydeOpen] = useState(false);
   const activeFilterKeyRef = useRef(
@@ -516,6 +520,29 @@ export default function ResultList({
     () => filterFileEntries(sortedOmittedFileList, filterText),
     [filterText, sortedOmittedFileList],
   );
+  const selectedPathSet = React.useMemo(() => new Set(selectedPaths), [selectedPaths]);
+  // A selection only ever names files the list is showing: filtering or
+  // switching scope must not leave actions pointing at rows that are gone.
+  useEffect(() => {
+    if (!selectionMode) return;
+    const visible = new Set(filteredVisibleFiles.map((entry) => entry.path));
+    setSelectedPaths((paths) => {
+      const next = paths.filter((path) => visible.has(path));
+      return next.length === paths.length ? paths : next;
+    });
+  }, [filteredVisibleFiles, selectionMode]);
+
+  const toggleSelectedPath = (path: string) =>
+    setSelectedPaths((paths) =>
+      paths.includes(path) ? paths.filter((candidate) => candidate !== path) : [...paths, path],
+    );
+  const exitSelectionMode = () => {
+    setSelectionMode(false);
+    setSelectedPaths([]);
+  };
+  const rowClickHandler = (path: string) =>
+    selectionMode ? () => toggleSelectedPath(path) : () => onFileClick(path);
+
   const rows = buildRows(results, expandedFiles);
 
   const { openFileMenu, fileMenu } = useFileContextMenu({
@@ -694,22 +721,34 @@ export default function ResultList({
               </Tooltip>
             </>
           )}
-          <Tooltip content="Refresh metadata (re-derive titles, publication dates, Zotero)">
+          <Tooltip content={selectionMode ? "Leave selection mode" : "Select multiple files"}>
             <button
               type="button"
-              aria-label="Refresh file metadata"
-              onClick={() => {
-                void api
-                  .refreshFileMetadata()
-                  .catch(() => {})
-                  .finally(() => useSettingsStore.getState().refreshFileList());
-              }}
-              className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-main)] hover:bg-[var(--bg-hover)]"
+              aria-label={selectionMode ? "Leave selection mode" : "Select multiple files"}
+              aria-pressed={selectionMode}
+              onClick={() => (selectionMode ? exitSelectionMode() : setSelectionMode(true))}
+              className={`flex h-6 w-6 flex-shrink-0 items-center justify-center rounded border border-[var(--border-main)] hover:bg-[var(--bg-hover)] ${
+                selectionMode
+                  ? "bg-[var(--accent-blue-muted)] text-[var(--accent-blue)]"
+                  : "bg-[var(--bg-active)] text-[var(--text-main)]"
+              }`}
             >
-              <RefreshCw size={12} aria-hidden="true" />
+              <CheckSquare size={12} aria-hidden="true" />
             </button>
           </Tooltip>
         </div>
+        {selectionMode && (
+          <BulkActionsBar
+            selected={filteredVisibleFiles
+              .map((entry) => entry.path)
+              .filter((path) => selectedPathSet.has(path))}
+            visible={filteredVisibleFiles.map((entry) => entry.path)}
+            onSelectionChange={setSelectedPaths}
+            moveRoots={configuredRoots.filter((root) => !pathsEqual(root, directory))}
+            readOnly={readOnly}
+            onExit={exitSelectionMode}
+          />
+        )}
         <div className="flex-1 overflow-y-auto">
           {fileTreeEnabled && !documents && directory ? (
             <FileTree
@@ -730,7 +769,8 @@ export default function ResultList({
                   additionalRoots={additionalRootsForPath(entry.path)}
                   selected={selectedMatch?.path === entry.path}
                   drag={drag}
-                  onClick={() => onFileClick(entry.path)}
+                  checked={selectionMode ? selectedPathSet.has(entry.path) : undefined}
+                  onClick={rowClickHandler(entry.path)}
                   onContextMenu={(event) =>
                     openFileMenu(event, {
                       kind: "file",
@@ -749,7 +789,8 @@ export default function ResultList({
                 displayFields={fileDisplayFields}
                 additionalRoots={additionalRootsForPath(entry.path)}
                 selected={selectedMatch?.path === entry.path}
-                onClick={() => onFileClick(entry.path)}
+                checked={selectionMode ? selectedPathSet.has(entry.path) : undefined}
+                onClick={rowClickHandler(entry.path)}
                 onContextMenu={(event) =>
                   openFileMenu(event, {
                     kind: "file",
@@ -1278,6 +1319,7 @@ function FileEntryRowAdapter({
   displayFields,
   additionalRoots = [],
   selected,
+  checked,
   detail,
   muted = false,
   drag,
@@ -1290,6 +1332,8 @@ function FileEntryRowAdapter({
   displayFields: FileDisplayField[];
   additionalRoots?: string[];
   selected: boolean;
+  /** Tick state while the list is in selection mode; absent when it is not. */
+  checked?: boolean;
   detail?: string;
   muted?: boolean;
   drag?: FileTreeDragProps;
@@ -1319,7 +1363,23 @@ function FileEntryRowAdapter({
     <DocumentEntryRow
       entry={entry}
       details={details}
-      nameAccessory={<AdditionalRootsIndicator roots={additionalRoots} />}
+      nameAccessory={
+        <>
+          {checked !== undefined && (
+            <span
+              className={`flex h-4 w-4 flex-shrink-0 items-center justify-center ${
+                checked ? "text-[var(--accent-blue)]" : "text-[var(--text-dim)]"
+              }`}
+              role="checkbox"
+              aria-checked={checked}
+              aria-label={`Select ${fileName(entry.path)}`}
+            >
+              {checked ? <CheckSquare size={12} /> : <Square size={12} />}
+            </span>
+          )}
+          <AdditionalRootsIndicator roots={additionalRoots} />
+        </>
+      }
       accessory={accessory}
       selected={selected}
       muted={muted}

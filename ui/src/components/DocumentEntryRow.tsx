@@ -117,7 +117,6 @@ export function DocumentEntryRow({
         >
           {fileName(entry.path)}
         </span>
-        <span className="min-w-0 flex-1" aria-hidden="true" />
         {pagedFormatLabel(entry.path) && (
           <Tooltip content="Type">
             <span
@@ -131,7 +130,7 @@ export function DocumentEntryRow({
         )}
         <Tooltip content={entry.path} className="font-mono break-all">
           <span
-            className="flex h-5 w-5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
+            className="ml-auto flex h-5 w-5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
             aria-label={`Path: ${entry.path}`}
           >
             <Folder size={12} aria-hidden="true" />
