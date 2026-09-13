@@ -3,14 +3,20 @@ import PreviewPane from "./components/PreviewPane";
 import { useToasts } from "./components/Toast";
 import { api } from "./services";
 import { useNativeOpen } from "./hooks/useNativeOpen";
+import { useWindowTitle } from "./hooks/useWindowTitle";
 import { useSettingsStore } from "./stores/useSettingsStore";
-import { useViewerStore } from "./stores/useViewerStore";
+import { activeViewerTab, useViewerStore } from "./stores/useViewerStore";
 import type { NativeOpenRequest } from "./lib/types";
 
 /** The OS-opened document shell. It intentionally has no workspace picker,
  * root, search list, or workspace-owned companion panes. */
 export default function DocumentApp() {
   const { addToast } = useToasts();
+  const activePath = useViewerStore((state) => activeViewerTab(state)?.path ?? null);
+
+  // This window belongs to no workspace or root, so its title is only the
+  // document it is showing.
+  useWindowTitle({ document: activePath });
 
   useEffect(() => {
     let disposed = false;

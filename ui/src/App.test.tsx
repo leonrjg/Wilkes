@@ -85,6 +85,11 @@ vi.mock("@tauri-apps/api/webview", () => ({
   })),
 }));
 
+const setWindowTitle = vi.fn((_title: string) => Promise.resolve());
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: vi.fn(() => ({ setTitle: setWindowTitle })),
+}));
+
 /** Deliver a native drop to the handler App registered, at the window position
  *  the shell reports it under — physical pixels, as Tauri sends them. */
 async function drop(paths: string[], position = { x: 0, y: 0 }) {
@@ -183,6 +188,51 @@ describe("App", () => {
     });
     expect(screen.getByPlaceholderText("Search…")).toBeInTheDocument();
     expect(screen.getByText("Open")).toBeInTheDocument();
+  });
+
+  it("titles the window after the workspace, root and active document", async () => {
+    await act(async () => {
+      render(
+        <ToastProvider>
+          <App />
+        </ToastProvider>
+      );
+    });
+    await waitFor(() => expect(document.title).toBe("dir — Default — Wilkes"));
+
+    const match = {
+      path: "/test/dir/notes.txt",
+      origin: { TextFile: { line: 1, col: 0 } },
+    } as const;
+    act(() => {
+      useViewerStore.setState({
+        activeTabId: "tab-1",
+        tabs: [{
+          id: "tab-1",
+          path: match.path,
+          match,
+          history: [match],
+          historyIndex: 0,
+          previewData: {
+            Text: {
+              content: "Notes",
+              language: "text",
+              highlight_line: 1,
+              highlight_range: { start: 0, end: 0 },
+            },
+          },
+          previewLoading: false,
+          previewError: null,
+          pdfLoadAttempt: 0,
+          metadata: null,
+          metadataStatus: "idle",
+          requestId: 1,
+        }],
+      });
+    });
+
+    expect(document.title).toBe("notes.txt — dir — Default — Wilkes");
+    expect(setWindowTitle).toHaveBeenLastCalledWith("notes.txt — dir — Default — Wilkes");
   });
 
   it("loads settings on mount", async () => {

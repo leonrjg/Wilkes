@@ -86,6 +86,11 @@ export function useActiveWorkspaceReadOnly(): boolean {
   return useWorkspaceStore((state) => activeWorkspace(state)?.read_only ?? false);
 }
 
+/** The active workspace's name, or null before the registry has been read. */
+export function useActiveWorkspaceName(): string | null {
+  return useWorkspaceStore((state) => activeWorkspace(state)?.name ?? null);
+}
+
 export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   workspaces: [],
   activeWorkspaceId: null,

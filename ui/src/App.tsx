@@ -21,10 +21,15 @@ import { useChatSession, useChatStore } from "./stores/useChatStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useTopicsStore } from "./stores/useTopicsStore";
 import { useCatalogueStore } from "./stores/useCatalogueStore";
-import { useActiveWorkspaceReadOnly, useWorkspaceStore } from "./stores/useWorkspaceStore";
+import {
+  useActiveWorkspaceName,
+  useActiveWorkspaceReadOnly,
+  useWorkspaceStore,
+} from "./stores/useWorkspaceStore";
 import { activeViewerTab, useViewerStore } from "./stores/useViewerStore";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
 import { useNativeOpen } from "./hooks/useNativeOpen";
+import { useWindowTitle } from "./hooks/useWindowTitle";
 import { pathIsWithinRoot } from "./lib/configuredRoots";
 import { relativeFolderPath, type FileTreeHandle } from "./components/FileTree";
 import { api, source, isTauri } from "./services";
@@ -83,6 +88,9 @@ export default function App() {
   const restoreViewerSession = useViewerStore((state) => state.restoreSession);
   const remapViewerPathPrefix = useViewerStore((state) => state.remapPathPrefix);
   const activeViewerPath = useViewerStore((state) => activeViewerTab(state)?.path ?? null);
+  const workspaceName = useActiveWorkspaceName();
+
+  useWindowTitle({ workspace: workspaceName, root: directory, document: activeViewerPath });
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);

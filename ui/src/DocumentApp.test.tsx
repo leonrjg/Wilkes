@@ -13,6 +13,7 @@ vi.mock("./services", () => ({
     onNativeOpen: vi.fn(),
     nativeOpenReady: vi.fn(),
   },
+  isTauri: false,
 }));
 
 vi.mock("./components/PreviewPane", () => ({

@@ -5,6 +5,7 @@
   "windows": ["main", "document"],
   "permissions": [
     "core:default",
+    "core:window:allow-set-title",
     "dialog:allow-open",
     "dialog:allow-ask",
     "clipboard-manager:allow-write-text"
