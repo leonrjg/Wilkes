@@ -46,17 +46,10 @@ impl OpenAlexClient {
         }
     }
 
+    /// Probe the API whether or not the integration is enabled: the settings
+    /// form asks this *before* enabling, so a short-circuit on `enabled` would
+    /// answer "disabled" and the integration could never be switched on.
     pub async fn status(&self, enabled: bool) -> anyhow::Result<IntegrationStatus> {
-        if !enabled {
-            return Ok(IntegrationStatus {
-                id: "openalex".to_string(),
-                enabled,
-                state: IntegrationState::Disabled,
-                message: "OpenAlex integration is disabled.".to_string(),
-                version: None,
-            });
-        }
-
         let status = self
             .http
             .get_status(self.lookup_url(STATUS_PROBE_DOI), &[])
@@ -268,6 +261,25 @@ fn short_openalex_id(id: &str) -> Option<String> {
 mod tests {
     use super::*;
     use mockito::Matcher;
+
+    #[tokio::test]
+    async fn status_probes_while_disabled() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"results":[]}"#)
+            .create_async()
+            .await;
+
+        let client = OpenAlexClient::new(server.url(), None);
+        let status = client.status(false).await.unwrap();
+
+        assert_eq!(status.state, IntegrationState::Ready);
+        assert!(!status.enabled);
+        mock.assert_async().await;
+    }
 
     #[tokio::test]
     async fn lookup_normalizes_doi_and_sends_mailto() {

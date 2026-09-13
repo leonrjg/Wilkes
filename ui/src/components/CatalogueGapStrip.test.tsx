@@ -6,6 +6,7 @@ vi.mock("../services", () => ({
   isTauri: true,
   api: {
     catalogueSearch: vi.fn(),
+    literatureSearch: vi.fn(() => Promise.resolve({ query: "", providers: [] })),
     catalogueStatus: vi.fn(),
     catalogueAcquire: vi.fn(),
     listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),

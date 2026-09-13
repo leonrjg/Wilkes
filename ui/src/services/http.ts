@@ -8,6 +8,7 @@ import type {
   CatalogueSearchResponse,
   CatalogueStatus,
   CatalogueSyncResponse,
+  LiteratureSearchResponse,
   EmbedDone,
   EmbedError,
   EmbedProgress,
@@ -837,6 +838,16 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw await responseError(res, "catalogueSearch");
     return res.json() as Promise<CatalogueSearchResponse>;
+  }
+
+  async literatureSearch(query: string, limit?: number): Promise<LiteratureSearchResponse> {
+    const res = await fetch("/api/literature/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(limit === undefined ? { query } : { query, limit }),
+    });
+    if (!res.ok) throw await responseError(res, "literatureSearch");
+    return res.json() as Promise<LiteratureSearchResponse>;
   }
 
   async catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse> {

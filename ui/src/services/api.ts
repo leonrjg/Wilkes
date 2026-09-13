@@ -14,6 +14,7 @@ import type {
   CatalogueSearchResponse,
   CatalogueStatus,
   CatalogueSyncResponse,
+  LiteratureSearchResponse,
   BookmarkClustersResult,
   ChunkTopicsQuery,
   ChunkTopicsResult,
@@ -204,6 +205,10 @@ export interface SearchApi {
    *  gaps should pay for one round trip, and keyed so answers can be reattached
    *  without relying on order. */
   catalogueSearch(probes: CatalogueProbe[], limit?: number): Promise<CatalogueSearchResponse>;
+  /** Every enabled literature provider asked at once. A provider that fails is
+   *  reported in its own entry beside those that answered; only a query that
+   *  could not be run at all rejects. `limit` is per provider. */
+  literatureSearch(query: string, limit?: number): Promise<LiteratureSearchResponse>;
   /** Refreshes the named providers, or every one of them when none is named.
    *  All four is a minutes-long call; name one at a time to show progress. */
   catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse>;

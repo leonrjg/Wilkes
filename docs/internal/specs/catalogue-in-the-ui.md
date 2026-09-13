@@ -123,6 +123,23 @@ candidate rows.
   and common case — the field is `Option`, and its absence is why the type's own
   comment separates admission from discovery. Such a row offers its landing URL
   and no Add button, rather than a button that fails on click.
+- **Literature is searched from the same field.** One query goes to the mirror
+  and, at once, to every enabled literature provider (`literature_search` on
+  desktop, `POST /api/literature/search` on the server; both over
+  `commands::integrations::literature::search_all`, resolved through
+  `IntegrationRegistry` exactly as the MCP tool resolves one provider). A fourth
+  filter chip, *Papers*, sits beside the grains; no chip selected still means
+  everything. The two answers are listed apart — a paper row
+  (`PaperCandidate`) shows venue, year and citations, not a grain — and are never
+  ranked against each other. A provider that fails is reported in its own entry
+  beside those that answered, and "no provider enabled" is stated as a setting
+  rather than as an empty result. A chip toggle re-asks only the half whose
+  answer no longer matches the selection, so a grain toggle does not re-send the
+  query to rate-limited remote services. A paper with a `pdf_url` is added
+  through the same uploads-then-import path as a textbook. The gap strip (§5.1)
+  stays catalogue-only: it runs unprompted after every empty search, and sending
+  each of those queries to external services is not something the user asked
+  for.
 
 ### 5.3 Prerequisites for the document in the viewer (deferred)
 

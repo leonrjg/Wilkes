@@ -544,14 +544,14 @@ export default function App() {
           <Cloud size={14} fill={topicsPaneOpen ? "currentColor" : "none"} />
         </button>
       </Tooltip>
-      <Tooltip content="Learning catalogues">
+      <Tooltip content="Catalogues & literature">
         <button
           type="button"
           onClick={() => {
             if (cataloguePaneOpen) closeCataloguePane();
             else openCataloguePane();
           }}
-          aria-label="Learning catalogues"
+          aria-label="Catalogues and literature"
           aria-pressed={cataloguePaneOpen}
           className={`w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] transition-all border border-[var(--border-main)] ${
             cataloguePaneOpen

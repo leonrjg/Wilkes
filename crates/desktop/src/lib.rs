@@ -1955,6 +1955,20 @@ async fn catalogue_search(
     wilkes_api::commands::catalogue::search(&dir, queries, limit).map_err(catalogue_failed)
 }
 
+/// Every enabled literature provider asked at once, each answering for itself:
+/// one that fails is reported beside the ones that did not.
+#[tauri::command]
+async fn literature_search(
+    app: AppHandle,
+    query: String,
+    limit: Option<usize>,
+) -> Result<wilkes_api::commands::integrations::literature::LiteratureSearchResponse, String> {
+    app_context(&app)
+        .literature_search(query, limit)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Refreshes the named providers, or all of them when none is named. Minutes,
 /// for all four — the settings panel names one at a time so it can show which,
 /// and each page lands on `catalogue-sync-progress` as it arrives.
@@ -2365,6 +2379,7 @@ pub fn run() {
             load_generation_model,
             catalogue_status,
             catalogue_search,
+            literature_search,
             catalogue_sync,
             catalogue_acquire,
             catalogue_acquire_course,

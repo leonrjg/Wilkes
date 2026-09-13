@@ -729,6 +729,32 @@ async fn catalogue_search_handler(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct LiteratureSearchBody {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Every enabled literature provider asked at once. A provider that fails is
+/// reported inside the 200 beside the ones that answered; only a request that
+/// could not be run at all — an empty query, a limit out of range — is a 400.
+async fn literature_search_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LiteratureSearchBody>,
+) -> Result<
+    Json<wilkes_api::commands::integrations::literature::LiteratureSearchResponse>,
+    (StatusCode, Json<ErrorBody>),
+> {
+    state
+        .context()
+        .literature_search(body.query, body.limit)
+        .await
+        .map(Json)
+        .map_err(|error| err(error.to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CatalogueSyncBody {
     /// Which catalogues to refresh. Absent means all of them, which is a
     /// minutes-long request; a caller wanting progress should name one at a
@@ -2396,6 +2422,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             post(chunks_search_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route("/api/catalogue/search", post(catalogue_search_handler))
+        .route("/api/literature/search", post(literature_search_handler))
         .route("/api/catalogue/sync", post(catalogue_sync_handler))
         .route("/api/catalogue/status", get(catalogue_status_handler))
         .route("/api/catalogue/acquire", post(catalogue_acquire_handler))

@@ -91,6 +91,51 @@ fn extension_for_mime(mime: &str) -> Option<&'static str> {
     }
 }
 
+/// The name a download is saved under, once the server has said what it sent.
+///
+/// A URL whose last path segment carries no extension leaves a file that
+/// nothing downstream can type: LibreTexts serves whole books from
+/// `.../download/<id>/pdf`, which yields a file literally named `pdf`, and an
+/// importer that reads the kind off the name then refuses it. When the name
+/// has no extension, one is taken from what the server said it was sending.
+///
+/// A name taken from the URL can also carry something that only *looks* like
+/// an extension: arXiv serves `.../pdf/2101.00001`, whose "extension" is
+/// `00001`. So for a URL-derived name, an extension that disagrees with a
+/// content type we can name is kept as part of the stem and the real one is
+/// appended — `2101.00001.pdf`. A name the caller chose is theirs and is only
+/// completed when it has no extension at all.
+fn name_from_content_type(
+    target: PathBuf,
+    named_by_caller: bool,
+    content_type: Option<&str>,
+) -> Result<PathBuf, String> {
+    let Some(mime) = content_type else {
+        return Ok(target);
+    };
+    match target.extension() {
+        None => {
+            let Some(extension) = extension_for_mime(mime) else {
+                return Err(format!(
+                    "Download has no file extension and its content type {mime:?} is not one \
+                     we can name; pass an explicit filename."
+                ));
+            };
+            Ok(target.with_extension(extension))
+        }
+        Some(_) if named_by_caller => Ok(target),
+        Some(current) => match extension_for_mime(mime) {
+            Some(extension) if !current.to_string_lossy().eq_ignore_ascii_case(extension) => {
+                let mut name = target.as_os_str().to_owned();
+                name.push(".");
+                name.push(extension);
+                Ok(PathBuf::from(name))
+            }
+            _ => Ok(target),
+        },
+    }
+}
+
 pub async fn download_to_root(
     root: &Path,
     params: DownloadParams,
@@ -110,6 +155,7 @@ pub async fn download_to_root(
         tracing::warn!(url = %url, scheme = url.scheme(), "download refused: unsupported scheme");
         return Err("Download URL must use HTTP or HTTPS.".to_string());
     }
+    let named_by_caller = params.filename.is_some();
     let filename = params
         .filename
         .or_else(|| {
@@ -157,29 +203,12 @@ pub async fn download_to_root(
             MAX_DOWNLOAD_BYTES / 1024 / 1024
         ));
     }
-    // A URL whose last path segment carries no extension leaves a file that
-    // nothing downstream can type: LibreTexts serves whole books from
-    // `.../download/<id>/pdf`, which yields a file literally named `pdf`, and
-    // an importer that reads the kind off the name then refuses it. When the
-    // caller did not name the file and the URL gave no extension, take one
-    // from what the server said it was sending.
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.split(';').next().unwrap_or(value).trim().to_string());
-    let target = match (target.extension(), content_type.as_deref()) {
-        (None, Some(mime)) => {
-            let Some(extension) = extension_for_mime(mime) else {
-                return Err(format!(
-                    "Download has no file extension and its content type {mime:?} is not one \
-                     we can name; pass an explicit filename."
-                ));
-            };
-            target.with_extension(extension)
-        }
-        _ => target,
-    };
+    let target = name_from_content_type(target, named_by_caller, content_type.as_deref())?;
 
     // Read the body a chunk at a time rather than in one `bytes()` call. Two
     // reasons, and only one of them is the progress bar: a body that lied about
@@ -548,6 +577,44 @@ mod tests {
         // Unknown types are refused rather than guessed: a wrong extension
         // produces a file that fails somewhere further away.
         assert_eq!(extension_for_mime("application/x-nonsense"), None);
+    }
+
+    #[test]
+    fn a_url_name_whose_dot_is_not_an_extension_gets_the_served_one_appended() {
+        let named = |name: &str, by_caller: bool, mime: Option<&str>| {
+            name_from_content_type(PathBuf::from(name), by_caller, mime)
+                .map(|path| path.to_string_lossy().into_owned())
+        };
+        // arXiv: `/pdf/2101.00001` is a PDF whose name merely contains a dot.
+        assert_eq!(
+            named("2101.00001", false, Some("application/pdf")).unwrap(),
+            "2101.00001.pdf"
+        );
+        assert_eq!(
+            named("pdf", false, Some("application/pdf")).unwrap(),
+            "pdf.pdf"
+        );
+        // A name that already agrees with what was served is left alone.
+        assert_eq!(
+            named("Book.PDF", false, Some("application/pdf")).unwrap(),
+            "Book.PDF"
+        );
+        // A type we cannot name says nothing about the extension already there.
+        assert_eq!(
+            named("paper.pdf", false, Some("application/octet-stream")).unwrap(),
+            "paper.pdf"
+        );
+        assert_eq!(named("paper.pdf", false, None).unwrap(), "paper.pdf");
+        // A caller's own name is completed, never second-guessed.
+        assert_eq!(
+            named("notes.txt", true, Some("text/html")).unwrap(),
+            "notes.txt"
+        );
+        assert_eq!(
+            named("notes", true, Some("text/html")).unwrap(),
+            "notes.html"
+        );
+        assert!(named("pdf", false, Some("application/x-nonsense")).is_err());
     }
 
     #[test]

@@ -38,17 +38,10 @@ impl SemanticScholarClient {
         }
     }
 
+    /// Probe the API whether or not the integration is enabled: the settings
+    /// form asks this *before* enabling, so a short-circuit on `enabled` would
+    /// answer "disabled" and the integration could never be switched on.
     pub async fn status(&self, enabled: bool) -> anyhow::Result<IntegrationStatus> {
-        if !enabled {
-            return Ok(IntegrationStatus {
-                id: "semantic_scholar".to_string(),
-                enabled,
-                state: IntegrationState::Disabled,
-                message: "Semantic Scholar integration is disabled.".to_string(),
-                version: None,
-            });
-        }
-
         let status = self
             .http
             .get_status(
@@ -210,6 +203,25 @@ mod tests {
         let status = client.status(true).await.unwrap();
 
         assert_eq!(status.state, IntegrationState::Ready);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn status_probes_while_disabled() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/graph/v1/paper/DOI:10.1145%2F3801158")
+            .match_query(Matcher::UrlEncoded("fields".into(), "paperId".into()))
+            .with_status(200)
+            .with_body(r#"{"paperId":"p1"}"#)
+            .create_async()
+            .await;
+
+        let client = SemanticScholarClient::new(server.url(), None);
+        let status = client.status(false).await.unwrap();
+
+        assert_eq!(status.state, IntegrationState::Ready);
+        assert!(!status.enabled);
         mock.assert_async().await;
     }
 

@@ -1022,6 +1022,24 @@ export interface LiteratureSearchResult {
   license: string | null;
 }
 
+/** What one literature provider answered to a search of every enabled
+ *  provider. Exactly one of `results` and `error` is set: an empty `results`
+ *  means the provider holds nothing on the query, which is not the same as an
+ *  error that stopped it from saying. */
+export interface LiteratureProviderAnswer {
+  provider: string;
+  name: string;
+  results: LiteratureSearchResult[] | null;
+  error: string | null;
+}
+
+export interface LiteratureSearchResponse {
+  query: string;
+  /** One entry per enabled provider, in a stable order. Empty means no
+   *  provider is enabled — a setting to change, not "nothing found". */
+  providers: LiteratureProviderAnswer[];
+}
+
 export type MetadataSourcePreference = "file" | "zotero" | "semantic_scholar" | "openalex";
 
 export interface WorkerStatus {

@@ -1,8 +1,8 @@
 import { useCallback } from "react";
 import { source } from "../services";
 import type { DesktopSourceApi } from "../services/api";
-import type { CatalogueHit } from "../lib/types";
-import { hitKey, useCatalogueStore } from "../stores/useCatalogueStore";
+import type { CatalogueHit, LiteratureSearchResult } from "../lib/types";
+import { hitKey, paperKey, useCatalogueStore } from "../stores/useCatalogueStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
 
@@ -14,7 +14,8 @@ function parentDirectory(path: string): string {
 }
 
 /**
- * Adding a catalogue candidate to the library.
+ * Adding a catalogue candidate, or a paper a literature provider found, to the
+ * library.
  *
  * Two steps, deliberately: the fetch lands in Wilkes's own uploads directory,
  * and only then is the file imported into the library root. Fetching straight
@@ -72,7 +73,8 @@ export function useCatalogueAdd() {
         await install(course.paths, course.folder);
         return course.paths[0] ?? null;
       }
-      const staged = await acquire(hit);
+      if (hit.pdf_url === null) return null;
+      const staged = await acquire({ key: hitKey(hit), url: hit.pdf_url });
       if (staged === null) return null;
       await install([staged]);
       return staged;
@@ -80,12 +82,31 @@ export function useCatalogueAdd() {
     [canAdd, acquire, acquireCourse, install],
   );
 
+  /** A paper is always one file, at the open-access URL its provider
+   *  reported. A work with no such URL has nothing to fetch, and the row says
+   *  so instead of calling this. */
+  const addPaper = useCallback(
+    async (provider: string, work: LiteratureSearchResult): Promise<string | null> => {
+      if (!canAdd || work.pdf_url === null) return null;
+      const staged = await acquire({ key: paperKey(provider, work), url: work.pdf_url });
+      if (staged === null) return null;
+      await install([staged]);
+      return staged;
+    },
+    [canAdd, acquire, install],
+  );
+
   return {
     add,
+    addPaper,
     canAdd,
     needsDirectory,
     readOnly,
     isAdding: (hit: CatalogueHit) => acquiring === hitKey(hit),
     isAdded: (hit: CatalogueHit) => hitKey(hit) in acquired,
+    isPaperAdding: (provider: string, work: LiteratureSearchResult) =>
+      acquiring === paperKey(provider, work),
+    isPaperAdded: (provider: string, work: LiteratureSearchResult) =>
+      paperKey(provider, work) in acquired,
   };
 }

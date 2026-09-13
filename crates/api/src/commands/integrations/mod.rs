@@ -1,4 +1,5 @@
 pub mod custom;
+pub mod literature;
 pub mod openalex;
 pub mod semantic_scholar;
 pub mod zotero;
