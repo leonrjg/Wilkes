@@ -11,6 +11,11 @@ import type {
   ViewerMetadataStatus,
 } from "../lib/types";
 import { useSettingsStore } from "./useSettingsStore";
+import {
+  forgetReaderPositionsWorkspace,
+  setReaderPositionPersistence,
+  switchReaderPositionsWorkspace,
+} from "./readerPositions";
 
 export const VIEWER_SESSION_STORAGE_KEY = "wilkes.viewer-session";
 let activeViewerWorkspaceId = "default";
@@ -55,7 +60,8 @@ interface ViewerStore {
   restoreSession: () => Promise<void>;
   enterStandaloneMode: () => void;
   switchWorkspace: (workspaceId: string) => Promise<void>;
-  /** Drops the persisted tab session a deleted workspace left behind. */
+  /** Drops the persisted tab session and reader positions a deleted workspace
+   *  left behind. */
   forgetWorkspace: (workspaceId: string) => void;
   openMatch: (match: MatchRef) => void;
   openFile: (path: string, origin?: SourceOrigin | null) => void;
@@ -399,6 +405,7 @@ export const useViewerStore = create<ViewerStore>()(
 
       restoreSession: async () => {
         viewerPersistenceEnabled = true;
+        setReaderPositionPersistence(true);
         if (get().sessionHydrated) return;
         if (restorePromise) return restorePromise;
         restorePromise = (async () => {
@@ -414,6 +421,7 @@ export const useViewerStore = create<ViewerStore>()(
 
       enterStandaloneMode: () => {
         viewerPersistenceEnabled = false;
+        setReaderPositionPersistence(false);
         set({
           mode: "standalone",
           tabs: [],
@@ -424,6 +432,7 @@ export const useViewerStore = create<ViewerStore>()(
 
       switchWorkspace: async (workspaceId) => {
         viewerPersistenceEnabled = true;
+        switchReaderPositionsWorkspace(workspaceId);
         let persisted: unknown = null;
         try {
           const raw = localStorage.getItem(`${VIEWER_SESSION_STORAGE_KEY}.${workspaceId}`);
@@ -442,6 +451,7 @@ export const useViewerStore = create<ViewerStore>()(
       },
 
       forgetWorkspace: (workspaceId) => {
+        forgetReaderPositionsWorkspace(workspaceId);
         try {
           localStorage.removeItem(`${VIEWER_SESSION_STORAGE_KEY}.${workspaceId}`);
         } catch (error) {

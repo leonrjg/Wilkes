@@ -4,6 +4,15 @@
 
 ### Added
 
+- Where a document was left survives a restart: a PDF's or book's page, offset
+  and zoom, a text document's scroll position on each of its surfaces and its
+  zoom, and whether a Markdown or HTML file was last read rendered or as
+  source. These used to be module-level maps inside the readers, gone with the
+  window. The readers now take a position store from their host, and Wilkes
+  keeps one per workspace in localStorage beside the tab session, capped at
+  the 500 most recently read documents. A renamed or moved document starts
+  again from its beginning, and a standalone document window remembers nothing.
+
 - EPUB, MOBI, AZW3, FB2 books and CBZ/CBT comic archives are searched, indexed
   and read alongside PDFs. MuPDF has
   read all three since it was first linked here — its EPUB, HTML and MOBI

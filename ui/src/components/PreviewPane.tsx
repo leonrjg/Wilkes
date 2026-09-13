@@ -19,7 +19,7 @@ import {
   type ReaderHostServices,
   type SelectionActionsSlot,
 } from "@leonrjg/wilkes-reader";
-import { readTextViewMode, saveTextViewMode } from "./textViewMode";
+import { readTextViewMode, readerPositionStore, saveTextViewMode } from "../stores/readerPositions";
 import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useChatSession, useChatStore } from "../stores/useChatStore";
@@ -175,6 +175,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
       colorScheme,
       pdfAutoZoomTargetPx,
       resolveLocalAsset,
+      positions: readerPositionStore,
     }),
     [colorScheme, pdfAutoZoomTargetPx, resolveLocalAsset],
   );

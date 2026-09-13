@@ -10,7 +10,7 @@ import { useTopicsStore } from "../stores/useTopicsStore";
 import { useSearchStore } from "../stores/useSearchStore";
 import { api } from "../services";
 import { useReaderHost, type ReaderHostServices } from "@leonrjg/wilkes-reader";
-import { saveTextViewMode } from "./textViewMode";
+import { readerPositionStore, saveTextViewMode } from "../stores/readerPositions";
 
 /** Invoke a reader's `selectionActions` slot and read back the chrome it
  *  produced, so tests can drive Wilkes' handlers without a real reader. */
@@ -365,6 +365,24 @@ describe("PreviewPane", () => {
     expect(readerHostValue().resolveLocalAsset?.("/corpus/figures/one.png"))
       .toBe("/corpus/figures/one.png");
     expect(api.resolveAssetUrl).toHaveBeenCalledWith("/corpus/figures/one.png");
+  });
+
+  it("hands the readers the application's remembered positions", () => {
+    setViewerState({
+      selectedMatch: { path: "/corpus/page.html", origin: { TextFile: { line: 0, col: 0 } } },
+      previewData: {
+        Text: {
+          content: "<p>Body</p>",
+          language: "html",
+          highlight_line: 0,
+          highlight_range: { start: 0, end: 0 },
+        },
+      },
+    });
+
+    render(<PreviewPane />);
+
+    expect(readerHostValue().positions).toBe(readerPositionStore);
   });
 
   it("restores the Markdown view selected for a previously opened document", () => {
