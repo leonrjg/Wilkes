@@ -47,7 +47,10 @@ pub struct ProviderHttpClient {
     /// comes from a manifest the user wrote at runtime. Built-in providers
     /// still pass a literal and pay one allocation per client.
     provider: Arc<str>,
-    http: reqwest::Client,
+    /// An initialization failure is retained and returned on use. Falling
+    /// back to `Client::new()` here would silently switch back to native-tls,
+    /// recreating the exact protocol failure this client explicitly avoids.
+    http: Result<reqwest::Client, Arc<str>>,
     retry: RetryPolicy,
 }
 
@@ -91,17 +94,27 @@ impl std::error::Error for ProviderHttpError {}
 
 impl ProviderHttpClient {
     pub fn new(provider: impl Into<Arc<str>>) -> Self {
+        let provider = provider.into();
+        let http = reqwest::Client::builder()
+            // Reqwest's default backend is native-tls when any dependency
+            // enables `default-tls`. On macOS that backend can reject
+            // TLS-1.3-only services with OSStatus -9836 ("bad protocol
+            // version"). Select rustls explicitly; Cargo features are
+            // additive, so enabling rustls alone does not select it.
+            .use_rustls_tls()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|error| {
+                let message = format!(
+                    "provider HTTP client could not initialize rustls: {}",
+                    request_error_message(&error)
+                );
+                tracing::error!(provider = %provider, "{message}");
+                Arc::<str>::from(message)
+            });
         Self {
-            provider: provider.into(),
-            http: reqwest::Client::builder()
-                .timeout(REQUEST_TIMEOUT)
-                .build()
-                .unwrap_or_else(|error| {
-                    // Only fails when the TLS backend cannot initialise, which
-                    // is fatal for every provider call this client would make.
-                    tracing::error!("provider HTTP client build failed: {error}");
-                    reqwest::Client::new()
-                }),
+            provider,
+            http,
             retry: RetryPolicy::conservative(),
         }
     }
@@ -212,12 +225,19 @@ impl ProviderHttpClient {
         url: String,
         headers: &[(&str, String)],
     ) -> Result<reqwest::Response, ProviderHttpError> {
+        let http = self.http.as_ref().map_err(|message| ProviderHttpError {
+            provider: self.provider.clone(),
+            kind: ProviderHttpErrorKind::Request,
+            status: None,
+            message: message.to_string(),
+            retry_after: None,
+        })?;
         let attempts = self.retry.max_attempts.max(1);
         let mut attempt = 0usize;
 
         loop {
             attempt += 1;
-            let response = self.send_once(&url, headers).await;
+            let response = self.send_once(http, &url, headers).await;
             match response {
                 Ok(response) if should_retry_status(response.status()) => {
                     let status = response.status();
@@ -253,10 +273,11 @@ impl ProviderHttpClient {
 
     async fn send_once(
         &self,
+        http: &reqwest::Client,
         url: &str,
         headers: &[(&str, String)],
     ) -> Result<reqwest::Response, reqwest::Error> {
-        let mut request = self.http.get(url);
+        let mut request = http.get(url);
         for (name, value) in headers {
             request = request.header(*name, value);
         }
