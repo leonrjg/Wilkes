@@ -1969,6 +1969,18 @@ async fn literature_search(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+async fn literature_resolve_download(
+    app: AppHandle,
+    provider: String,
+    result: wilkes_core::types::LiteratureSearchResult,
+) -> Result<wilkes_core::types::ResolvedLiteratureDownload, String> {
+    app_context(&app)
+        .literature_resolve_download(provider, result)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Refreshes the named providers, or all of them when none is named. Minutes,
 /// for all four — the settings panel names one at a time so it can show which,
 /// and each page lands on `catalogue-sync-progress` as it arrives.
@@ -2380,6 +2392,7 @@ pub fn run() {
             catalogue_status,
             catalogue_search,
             literature_search,
+            literature_resolve_download,
             catalogue_sync,
             catalogue_acquire,
             catalogue_acquire_course,

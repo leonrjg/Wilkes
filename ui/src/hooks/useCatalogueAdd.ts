@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { source } from "../services";
+import { api, source } from "../services";
 import type { DesktopSourceApi } from "../services/api";
 import type { CatalogueHit, LiteratureSearchResult } from "../lib/types";
 import { hitKey, paperKey, useCatalogueStore } from "../stores/useCatalogueStore";
@@ -82,13 +82,22 @@ export function useCatalogueAdd() {
     [canAdd, acquire, acquireCourse, install],
   );
 
-  /** A paper is always one file, at the open-access URL its provider
-   *  reported. A work with no such URL has nothing to fetch, and the row says
-   *  so instead of calling this. */
+  /** Resolve only after selection, then use the same staging downloader as
+   *  every other single document. A provider resolver may spend a credential;
+   *  search itself never does that once per displayed row. */
   const addPaper = useCallback(
     async (provider: string, work: LiteratureSearchResult): Promise<string | null> => {
-      if (!canAdd || work.pdf_url === null) return null;
-      const staged = await acquire({ key: paperKey(provider, work), url: work.pdf_url });
+      const acquisition = work.acquisition ?? (work.pdf_url === null ? "none" : "direct");
+      if (!canAdd || acquisition === "none") return null;
+      const resolved =
+        acquisition === "direct" && work.pdf_url !== null
+          ? { url: work.pdf_url, filename: null }
+          : await api.literatureResolveDownload(provider, work);
+      const staged = await acquire({
+        key: paperKey(provider, work),
+        url: resolved.url,
+        filename: resolved.filename ?? undefined,
+      });
       if (staged === null) return null;
       await install([staged]);
       return staged;

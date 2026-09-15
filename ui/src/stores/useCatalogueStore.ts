@@ -73,6 +73,7 @@ function sameGrains(a: CatalogueGrain[], b: CatalogueGrain[]): boolean {
 export interface Acquirable {
   key: string;
   url: string;
+  filename?: string;
 }
 
 interface CatalogueStore {
@@ -271,10 +272,13 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
     ]);
   },
 
-  acquire: async ({ key, url }) => {
+  acquire: async ({ key, url, filename }) => {
     set({ acquiring: key, acquireError: null });
     try {
-      const download = await api.catalogueAcquire(url);
+      const download =
+        filename === undefined
+          ? await api.catalogueAcquire(url)
+          : await api.catalogueAcquire(url, filename);
       set((state) => {
         const { [url]: _finished, ...downloads } = state.downloads;
         return {

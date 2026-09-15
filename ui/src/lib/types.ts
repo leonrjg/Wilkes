@@ -1020,6 +1020,17 @@ export interface LiteratureSearchResult {
   landing_page_url: string | null;
   open_access_status: string | null;
   license: string | null;
+  authors: string | null;
+  publisher: string | null;
+  language: string | null;
+  file_format: string | null;
+  file_size: string | null;
+  acquisition: "none" | "direct" | "provider";
+}
+
+export interface ResolvedLiteratureDownload {
+  url: string;
+  filename: string | null;
 }
 
 /** What one literature provider answered to a search of every enabled

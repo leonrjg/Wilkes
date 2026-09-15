@@ -8865,6 +8865,7 @@ dependencies = [
  "cc",
  "chrono",
  "dirs 5.0.1",
+ "dom_query",
  "fastembed",
  "grep-matcher",
  "grep-regex",

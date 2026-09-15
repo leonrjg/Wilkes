@@ -1,10 +1,11 @@
 # Custom integrations — Design
 
-Status: implemented for `search`, `health`, and the UI. §9's exclusions stand.
+Status: implemented for `search`, `health`, HTML/JSON projection, bounded
+download resolution, and the UI. §9 lists the remaining exclusions.
 Two decisions changed under implementation and are marked **revised** below.
 Depends on: `core/src/integrations`, `core/src/network::ProviderHttpClient`,
 `Settings.integrations`, `agent/src/mcp.rs::literature_search`
-Premise: the mapping from a service's JSON to our result types is the feature.
+Premise: the mapping from a service's JSON or HTML to our result types is the feature.
 The transport is secondary, and the code that exists today is almost entirely
 that mapping written by hand, once per provider.
 
@@ -62,6 +63,8 @@ pub trait LiteratureSource: Send + Sync {
     fn name(&self) -> &str;
     async fn search(&self, query: &str, limit: usize)
         -> anyhow::Result<Vec<LiteratureSearchResult>>;
+    async fn resolve_download(&self, result: &LiteratureSearchResult)
+        -> anyhow::Result<Option<ResolvedLiteratureDownload>>;
     async fn status(&self, enabled: bool) -> anyhow::Result<IntegrationStatus>;
 }
 ```
@@ -102,16 +105,17 @@ kind of provider produced it.
 
 Read `openalex/client.rs` and `semantic_scholar/client.rs` with the question
 *what does this actually do?* The answer, in both, is: build a URL from a
-template, GET it with a header or a query parameter for identification, walk
-into the JSON body, and project a handful of fields — with a small, closed set
-of normalizations (`normalize_doi`, first-four-chars-of-a-date, strip an id
-prefix). That is a data transformation, and it is the same one every time.
+template, GET it with a header or query parameter for identification, walk
+into the response, and project a handful of fields through a small, closed set
+of normalizations. Anna adds HTML/CSS projection and a short credentialed
+download-resolution sequence, but it is still a bounded data transformation.
 
 An embedded scripting engine (Rhai, Lua, QuickJS) would express that too, and
 also everything else: a new runtime dependency, a sandbox to get right, an
 unbounded support surface, and a manifest nobody can audit by reading it. The
-cases that need it do not currently exist. If one appears, §9 says where it
-goes — and it is not "make the manifest Turing-complete".
+concrete Anna case fits a finite resolver, so it does not justify that cost. If
+a future provider does not fit, §9 says where the boundary is — and it is not
+"make the manifest Turing-complete".
 
 Delegating to an out-of-process MCP server does not avoid the work either.
 Wilkes is an MCP *server*; it is not a client of third-party MCP servers, so
@@ -156,14 +160,16 @@ citation_count = { path = "is-referenced-by-count", coerce = "int" }
 pdf_url        = { first_of = ["link[0].URL", "resource.primary.URL"] }
 ```
 
-Three rules keep this a description rather than a program:
+Three rules keep this a description rather than a general program:
 
-**Templates are typed substitution, never concatenation.** `{query}` and
-`{limit}` are the placeholders `search` supplies (`health` supplies none); the engine owns percent-encoding,
-so a manifest author cannot produce an injection and cannot forget to encode.
-An unknown placeholder, or one the capability does not supply, is a save-time
-error. The host and scheme come from `base_url` and are fixed at save time —
-no template may change them.
+**Templates are typed substitution, never unchecked concatenation.** `{query}`
+and `{limit}` are the placeholders `search` supplies (`health` supplies none);
+download-resolution steps receive the selected result plus values declared by
+earlier steps. The engine owns percent-encoding. An unknown placeholder, or
+one the capability does not yet supply, is a save-time error. Every request
+host and scheme come from `base_url`; a resolver's final URL may be external
+because it is returned to the existing downloader rather than fetched by the
+manifest engine.
 
 **The field map is a projection.** Selector grammar: dotted keys, `[n]`, `[*]`
 for the item list, and `first_of` for an ordered fallback. No filters, no
@@ -173,12 +179,10 @@ closed vocabulary of coercions — `int`, `bool`, `normalize_doi`, `year_from_da
 exists in the tree or is three lines. Anything a manifest cannot say, it says
 loudly by failing to load, not by producing a plausible-looking wrong record.
 
-**Each capability declares one request.** The one real exception is OpenAlex's
-lookup, which retries under a different filter when the DOI filter is empty;
-that is expressible as an ordered `attempts` list tried until non-empty, and it
-is the only sequencing v1 allows. Chaining a *second* request keyed by the
-*first's output* — which is what `CitationSource` needs (§9) — is where a
-manifest becomes a program, and v1 does not go there.
+**Sequencing is finite and purpose-specific.** Search declares one GET.
+Resolving a download after selection may declare at most four ordered GETs,
+each pinned to the provider origin, with scalar projection from each response.
+There are no branches, loops, arbitrary expressions, or writes.
 
 ### 5.3 Contract per capability
 
@@ -186,6 +190,75 @@ Each capability names the required fields of its output type. `search` requires
 `id` and `title`; everything else in `LiteratureSearchResult` may be null. A
 manifest whose field map cannot supply a required field is invalid at save
 time, not empty at query time.
+
+### 5.4 HTML responses and on-demand download resolution
+
+`search.response_format = "html"` changes `items` and every field `path` or
+`first_of` entry from the JSON selector grammar to CSS. A field reads the
+matched elements' normalized text unless its object form names `attribute`.
+`capture` plus `capture_group` is the bounded escape hatch for a service that
+puts several facts in one line: Rust's linear-time regular-expression engine
+runs it, and a missing capture is a mapping error rather than an empty value.
+For repeated elements such as author links, `coerce = "join"` joins every CSS
+match with `, `; without it a field keeps the selection's ordinary text value.
+`input = "query"` (or `"limit"`) projects a typed search input instead of a
+response selector. This covers DOI lookup pages whose returned HTML identifies
+the matching hash but does not repeat the DOI needed by the download endpoint.
+
+Download resolution is separate from search. A result advertises `provider`
+acquisition, and only selecting it runs `resolve_download`. Its finite list of
+GET steps is capped at four; every step stays on `base_url`, may add parameters
+of its own, and publishes named scalar values for later steps. The final URL
+and optional filename are handed to the existing catalogue downloader. The
+manifest never writes a file and search never spends one authenticated request
+per displayed result.
+
+An Anna-style provider is therefore expressible without code:
+
+```toml
+manifest_version = 1
+id = "anna-journals"
+name = "Anna journal search"
+
+[http]
+base_url = "https://annas-archive.example"
+
+[[http.params]]
+location = "header"
+name = "User-Agent"
+value = "Mozilla/5.0"
+
+[capabilities.search]
+path = "/search?q={query}&content=journal"
+response_format = "html"
+items = '''div:has(> a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"])'''
+
+[capabilities.search.fields]
+id = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", capture = '''^/md5/([0-9a-f]+)$''' }
+title = '''div.max-w-full a[href^="/md5/"]'''
+authors = { path = '''a[href^="/search"]:has(span[class="icon-[mdi--user-edit]"])''', coerce = "join" }
+publisher = '''a[href^="/search"]:has(span[class="icon-[mdi--company]"])'''
+language = { path = "div.text-gray-800", capture = '''^\s*✅?\s*([^\[]+?)\s*\[''' }
+file_format = { path = "div.text-gray-800", capture = '''(?i)\b(EPUB|PDF|MOBI|AZW3|AZW|DJVU|CBZ|CBR|FB2|DOCX?|TXT)\b''' }
+file_size = { path = "div.text-gray-800", capture = '''(?i)(\d+(?:\.\d+)?\s*(?:MB|KB|GB|TB))''' }
+landing_page_url = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", coerce = "absolute_url" }
+
+[capabilities.resolve_download]
+url = "{download_url}"
+filename = "{title}.{file_format}"
+
+[[capabilities.resolve_download.steps]]
+path = "/dyn/api/fast_download.json?md5={id}"
+response_format = "json"
+
+[[capabilities.resolve_download.steps.params]]
+location = "query"
+name = "key"
+secret = "anna_key"
+
+[capabilities.resolve_download.steps.fields]
+download_url = "download_url"
+```
 
 ## 6. Validation is a probe, and it is mandatory
 
@@ -203,7 +276,9 @@ it. Custom integrations follow that precedent exactly:
    reported, not silently nulled. This is the whole difference between a
    mapping tool and a guessing tool.
 
-A manifest cannot be enabled until every declared capability has probed clean.
+A manifest cannot be enabled until search and its declared download resolver
+have probed clean. A health check still runs through status rather than the
+projection probe because its response body has no contract.
 At runtime a selector that stops matching (the service changed shape) is a
 logged warning per field per response, not a silent null and not a hard failure
 of the whole search — that classification lives in one place in the engine.
@@ -279,17 +354,18 @@ ids so the agent is told what it may actually name.
 
 ## 9. Deliberately excluded, and why
 
-- **`CitationSource` (`references`).** OpenAlex needs a fetch, then a batched
-  second fetch keyed by the first's output. Declarative chaining is the point
-  where a manifest turns into a program. Custom citation sources wait for a
-  real second case, and then get a *narrow* two-stage form — not a scripting
-  engine.
+- **`CitationSource` (`references`).** OpenAlex needs set-valued extraction,
+  batching, and a second request per batch. The scalar, at-most-four-step
+  download resolver deliberately cannot express that loop. Custom citation
+  sources wait for a real second case and then get their own bounded batch
+  shape — not a scripting engine.
 - **`CatalogueSource` (`fetch_all`).** Needs pagination, a dryness heuristic,
   and progress reporting (see `catalogue/providers.rs`). Manifest-expressible
   in principle, but it is a second design, not a corollary of this one.
-- **Writes.** §7.
-- **Non-JSON responses.** No XML, no HTML scraping. A provider that does not
-  serve JSON is a Rust client.
+- **Writes.** §7. Resolving a download is a read; the existing downloader
+  remains the only writer.
+- **XML responses.** JSON and HTML have concrete cases and typed selectors;
+  XML still has neither.
 - **Boolean combination**, found by §10 rather than foreseen. OpenAlex's
   `is_open_access` is `open_access.is_oa || best_oa_location.is_oa`, and
   `first_of` is *first present*, not *or*. The divergence is pinned by

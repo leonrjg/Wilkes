@@ -13,16 +13,17 @@
 //! of a sandbox, a new runtime, and a manifest nobody can audit by reading it.
 //! The three rules below are what keep this a description:
 //!
-//! 1. **Templates are typed substitution.** `{query}`, `{limit}` and `{doi}`
-//!    are the only placeholders, the engine owns their encoding, and no
+//! 1. **Templates are typed substitution.** Each capability exposes a finite
+//!    set of named values, the engine owns their encoding, and no request
 //!    template may change the host or scheme — those come from `base_url` and
 //!    are fixed when the manifest is saved.
-//! 2. **The field map is a projection.** Selection only (see [`super::selector`]),
+//! 2. **The field map is a projection.** JSON paths or CSS selection only,
 //!    with every transformation drawn from a closed vocabulary
 //!    (see [`super::coerce`]).
-//! 3. **Each capability declares one request.** Sequencing a second request
-//!    from the first's output is where a manifest becomes a program; see the
-//!    exclusions in `docs/internal/specs/custom-integrations.md` §9.
+//! 3. **Sequencing is finite and purpose-specific.** Search declares one GET;
+//!    resolving a selected download may declare at most four origin-pinned
+//!    GET steps. There are no branches, loops, arbitrary expressions, or
+//!    writes.
 //!
 //! Anything a manifest cannot say, it says loudly by failing to load — never
 //! by producing a plausible-looking wrong record.
@@ -103,6 +104,19 @@ pub struct Capabilities {
     pub health: Option<HealthCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchCapability>,
+    /// Resolve a selected search result to a file URL. Resolution is kept
+    /// separate from search so a result list never spends credentials or one
+    /// request per row merely to show itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolve_download: Option<ResolveDownloadCapability>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseFormat {
+    #[default]
+    Json,
+    Html,
 }
 
 /// A request whose only job is to prove the service answers.
@@ -120,18 +134,56 @@ pub struct HealthCapability {
 pub struct SearchCapability {
     /// Path and query, relative to `base_url`. May use `{query}` and `{limit}`.
     pub path: String,
-    /// Where the array of records is in the response body. Omitted when the
-    /// body *is* the array.
+    /// How selectors in this capability are interpreted. Omitted means JSON,
+    /// preserving every version-1 manifest written before HTML support.
+    #[serde(default)]
+    pub response_format: ResponseFormat,
+    /// Where the records are in the response: a JSON array selector, or an
+    /// HTML CSS selector. Omitted only when a JSON body is itself the array.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub items: Option<String>,
     /// Result field name → where to find it in one record.
     pub fields: BTreeMap<String, FieldSpec>,
 }
 
+/// A finite, acyclic resolver from one selected result to a downloadable URL.
+///
+/// Every step is a GET to the manifest's pinned origin. Its named fields
+/// become placeholders available only to later steps and to the final output.
+/// The final URL is returned to Wilkes' existing downloader; this capability
+/// never writes a byte itself.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveDownloadCapability {
+    #[serde(default)]
+    pub steps: Vec<ResolverStep>,
+    /// A template using result fields and values extracted by prior steps.
+    pub url: String,
+    /// Optional caller-chosen filename. When absent, the downloader derives
+    /// one from the URL and response content type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ResolverStep {
+    pub path: String,
+    #[serde(default)]
+    pub response_format: ResponseFormat,
+    /// Parameters used by this step alone. A download credential therefore
+    /// need not be sent with the provider's public search request.
+    #[serde(default)]
+    pub params: Vec<HttpParam>,
+    /// Placeholder name -> selector in this response.
+    pub fields: BTreeMap<String, FieldSpec>,
+}
+
 /// How one output field is found.
 ///
 /// The bare-string form is the common case (`title = "display_name"`); the
-/// object form adds an ordered fallback or a coercion.
+/// object form adds ordered fallback selectors, a coercion, HTML attribute
+/// extraction, or a regular-expression capture.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum FieldSpec {
@@ -145,8 +197,26 @@ pub enum FieldSpec {
         /// `ids.doi`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         first_of: Vec<String>,
+        /// Use one of the search capability's typed inputs (`query` or
+        /// `limit`) instead of selecting from the response. This is how a DOI
+        /// lookup carries the requested DOI into its later download resolver
+        /// when the HTML result does not repeat it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         coerce: Option<Coercion>,
+        /// For HTML, read this attribute from the first matched element
+        /// instead of its text. JSON selectors may not set it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attribute: Option<String>,
+        /// Apply a Rust regular expression to selected text and keep one
+        /// capture. This is deliberately a bounded transformation rather than
+        /// an embedded program; Rust's regex engine has no catastrophic
+        /// backtracking.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capture: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capture_group: Option<usize>,
     },
 }
 
@@ -169,6 +239,33 @@ impl FieldSpec {
             Self::Mapped { coerce, .. } => *coerce,
         }
     }
+
+    pub fn input(&self) -> Option<&str> {
+        match self {
+            Self::Path(_) => None,
+            Self::Mapped { input, .. } => input.as_deref(),
+        }
+    }
+
+    pub fn attribute(&self) -> Option<&str> {
+        match self {
+            Self::Path(_) => None,
+            Self::Mapped { attribute, .. } => attribute.as_deref(),
+        }
+    }
+
+    pub fn capture(&self) -> Option<(&str, usize)> {
+        match self {
+            Self::Path(_) => None,
+            Self::Mapped {
+                capture,
+                capture_group,
+                ..
+            } => capture
+                .as_deref()
+                .map(|pattern| (pattern, capture_group.unwrap_or(1))),
+        }
+    }
 }
 
 /// The output fields a search capability may name, and the type each one
@@ -188,6 +285,11 @@ pub const SEARCH_FIELDS: &[(&str, FieldType)] = &[
     ("landing_page_url", FieldType::Url),
     ("open_access_status", FieldType::Text),
     ("license", FieldType::Text),
+    ("authors", FieldType::Text),
+    ("publisher", FieldType::Text),
+    ("language", FieldType::Text),
+    ("file_format", FieldType::Text),
+    ("file_size", FieldType::Text),
 ];
 
 /// Fields without which a result cannot be used: `id` because nothing can be
@@ -224,6 +326,26 @@ pub fn search_field_type(field: &str) -> Option<FieldType> {
 /// Placeholders a capability may use, by capability.
 const SEARCH_PLACEHOLDERS: &[&str] = &["query", "limit"];
 const HEALTH_PLACEHOLDERS: &[&str] = &[];
+const RESOLVER_INPUTS: &[&str] = &[
+    "id",
+    "doi",
+    "title",
+    "year",
+    "publication_date",
+    "venue",
+    "citation_count",
+    "is_open_access",
+    "pdf_url",
+    "landing_page_url",
+    "open_access_status",
+    "license",
+    "authors",
+    "publisher",
+    "language",
+    "file_format",
+    "file_size",
+];
+const MAX_RESOLVER_STEPS: usize = 4;
 
 impl Manifest {
     pub fn parse(source: &str) -> anyhow::Result<Self> {
@@ -287,27 +409,12 @@ impl Manifest {
             Err(error) => problems.push(format!("base_url is not a URL: {error}")),
         }
 
-        for param in &self.http.params {
-            match (&param.value, &param.secret) {
-                (Some(_), Some(_)) => problems.push(format!(
-                    "param '{}' sets both value and secret; it must set exactly one",
-                    param.name
-                )),
-                (None, None) => problems.push(format!(
-                    "param '{}' sets neither value nor secret",
-                    param.name
-                )),
-                _ => {}
-            }
-            if param.name.trim().is_empty() {
-                problems.push("a param has an empty name".to_string());
-            }
-            if param.location == ParamLocation::Header && !is_header_name(&param.name) {
-                problems.push(format!("param '{}' is not a valid header name", param.name));
-            }
-        }
+        problems.extend(param_problems("http.params", &self.http.params));
 
-        if self.capabilities.health.is_none() && self.capabilities.search.is_none() {
+        if self.capabilities.health.is_none()
+            && self.capabilities.search.is_none()
+            && self.capabilities.resolve_download.is_none()
+        {
             problems.push("manifest declares no capabilities".to_string());
         }
 
@@ -325,12 +432,28 @@ impl Manifest {
                 &search.path,
                 SEARCH_PLACEHOLDERS,
             ));
-            if let Some(items) = &search.items {
-                if let Err(error) = Selector::parse(items) {
-                    problems.push(format!("search.items: {error}"));
+            match (&search.response_format, &search.items) {
+                (ResponseFormat::Html, None) => {
+                    problems.push("search.items is required for an HTML response".to_string())
                 }
+                (format, Some(items)) => {
+                    if let Err(error) = selector_problem(*format, items) {
+                        problems.push(format!("search.items: {error}"));
+                    }
+                }
+                (ResponseFormat::Json, None) => {}
             }
             problems.extend(self.search_field_problems(search));
+        }
+
+        if let Some(resolve) = &self.capabilities.resolve_download {
+            if self.capabilities.search.is_none() {
+                problems.push(
+                    "resolve_download requires search because it resolves a selected result"
+                        .to_string(),
+                );
+            }
+            problems.extend(self.resolve_download_problems(resolve));
         }
 
         problems
@@ -361,16 +484,33 @@ impl Manifest {
             };
 
             let paths = spec.paths();
-            if paths.is_empty() {
-                problems.push(format!(
-                    "search.fields.{field} names neither a path nor first_of"
-                ));
+            match (paths.is_empty(), spec.input()) {
+                (true, None) => problems.push(format!(
+                    "search.fields.{field} names neither a selector nor an input"
+                )),
+                (false, Some(_)) => problems.push(format!(
+                    "search.fields.{field} sets both response selectors and input"
+                )),
+                _ => {}
+            }
+            if let Some(input) = spec.input() {
+                if !SEARCH_PLACEHOLDERS.contains(&input) {
+                    problems.push(format!(
+                        "search.fields.{field}.input '{input}' is not available; expected query or limit"
+                    ));
+                }
             }
             for path in paths {
-                if let Err(error) = Selector::parse(path) {
+                if let Err(error) = selector_problem(search.response_format, path) {
                     problems.push(format!("search.fields.{field}: {error}"));
                 }
             }
+
+            problems.extend(field_spec_problems(
+                &format!("search.fields.{field}"),
+                search.response_format,
+                spec,
+            ));
 
             if let Some(coercion) = spec.coercion() {
                 if !coercion.produces(field_type) {
@@ -386,6 +526,85 @@ impl Manifest {
         problems
     }
 
+    fn resolve_download_problems(&self, resolve: &ResolveDownloadCapability) -> Vec<String> {
+        let mut problems = Vec::new();
+        if resolve.steps.len() > MAX_RESOLVER_STEPS {
+            problems.push(format!(
+                "resolve_download has {} steps; the limit is {MAX_RESOLVER_STEPS}",
+                resolve.steps.len()
+            ));
+        }
+
+        let mut available: Vec<String> = RESOLVER_INPUTS.iter().map(|v| (*v).to_string()).collect();
+        for (index, step) in resolve.steps.iter().enumerate() {
+            let label = format!("resolve_download.steps[{index}]");
+            problems.extend(template_problems_owned(
+                &format!("{label}.path"),
+                &step.path,
+                &available,
+                true,
+            ));
+            problems.extend(param_problems(&format!("{label}.params"), &step.params));
+            if step.fields.is_empty() {
+                problems.push(format!("{label}.fields cannot be empty"));
+            }
+            for (name, spec) in &step.fields {
+                if !is_variable(name) {
+                    problems.push(format!(
+                        "{label}.fields.{name} is not a valid placeholder name"
+                    ));
+                }
+                if available.iter().any(|existing| existing == name) {
+                    problems.push(format!(
+                        "{label}.fields.{name} shadows an existing resolver value"
+                    ));
+                }
+                let paths = spec.paths();
+                if paths.is_empty() {
+                    problems.push(format!("{label}.fields.{name} names no selector"));
+                }
+                if spec.input().is_some() {
+                    problems.push(format!(
+                        "{label}.fields.{name}.input is only available to search fields"
+                    ));
+                }
+                for path in paths {
+                    if let Err(error) = selector_problem(step.response_format, path) {
+                        problems.push(format!("{label}.fields.{name}: {error}"));
+                    }
+                }
+                problems.extend(field_spec_problems(
+                    &format!("{label}.fields.{name}"),
+                    step.response_format,
+                    spec,
+                ));
+                available.push(name.clone());
+            }
+        }
+
+        problems.extend(template_problems_owned(
+            "resolve_download.url",
+            &resolve.url,
+            &available,
+            false,
+        ));
+        if resolve.url.trim().is_empty() {
+            problems.push("resolve_download.url cannot be empty".to_string());
+        }
+        if let Some(filename) = &resolve.filename {
+            problems.extend(template_problems_owned(
+                "resolve_download.filename",
+                filename,
+                &available,
+                false,
+            ));
+            if filename.trim().is_empty() {
+                problems.push("resolve_download.filename cannot be empty".to_string());
+            }
+        }
+        problems
+    }
+
     /// The one host this manifest may contact, for the import dialog to show
     /// before anything is saved.
     pub fn host(&self) -> Option<String> {
@@ -396,27 +615,108 @@ impl Manifest {
 
     /// Names of the secrets this manifest needs supplied.
     pub fn required_secrets(&self) -> Vec<&str> {
-        self.http
+        let mut names: Vec<&str> = self
+            .http
             .params
             .iter()
             .filter_map(|param| param.secret.as_deref())
-            .collect()
+            .collect();
+        if let Some(resolve) = &self.capabilities.resolve_download {
+            names.extend(
+                resolve
+                    .steps
+                    .iter()
+                    .flat_map(|step| &step.params)
+                    .filter_map(|param| param.secret.as_deref()),
+            );
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
     }
+}
+
+fn selector_problem(format: ResponseFormat, selector: &str) -> Result<(), String> {
+    match format {
+        ResponseFormat::Json => Selector::parse(selector).map(|_| ()),
+        ResponseFormat::Html => dom_query::Matcher::new(selector)
+            .map(|_| ())
+            .map_err(|error| format!("invalid CSS selector: {error:?}")),
+    }
+}
+
+fn field_spec_problems(label: &str, format: ResponseFormat, spec: &FieldSpec) -> Vec<String> {
+    let mut problems = Vec::new();
+    if spec.input().is_some() && spec.attribute().is_some() {
+        problems.push(format!("{label}.attribute cannot be used with input"));
+    } else if format == ResponseFormat::Json && spec.attribute().is_some() {
+        problems.push(format!(
+            "{label}.attribute is only available for HTML responses"
+        ));
+    }
+    if spec.attribute().is_some_and(|name| name.trim().is_empty()) {
+        problems.push(format!("{label}.attribute cannot be empty"));
+    }
+    if matches!(
+        spec,
+        FieldSpec::Mapped {
+            capture: None,
+            capture_group: Some(_),
+            ..
+        }
+    ) {
+        problems.push(format!("{label}.capture_group requires capture"));
+    }
+    if let Some((pattern, group)) = spec.capture() {
+        match regex::Regex::new(pattern) {
+            Ok(regex) if group >= regex.captures_len() => problems.push(format!(
+                "{label}.capture_group {group} does not exist in the regular expression"
+            )),
+            Ok(_) => {}
+            Err(error) => problems.push(format!("{label}.capture is invalid: {error}")),
+        }
+    }
+    problems
+}
+
+fn param_problems(label: &str, params: &[HttpParam]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for param in params {
+        match (&param.value, &param.secret) {
+            (Some(_), Some(_)) => problems.push(format!(
+                "{label} param '{}' sets both value and secret; it must set exactly one",
+                param.name
+            )),
+            (None, None) => problems.push(format!(
+                "{label} param '{}' sets neither value nor secret",
+                param.name
+            )),
+            _ => {}
+        }
+        if param.name.trim().is_empty() {
+            problems.push(format!("{label} has an empty parameter name"));
+        }
+        if param.location == ParamLocation::Header && !is_header_name(&param.name) {
+            problems.push(format!(
+                "{label} param '{}' is not a valid header name",
+                param.name
+            ));
+        }
+    }
+    problems
 }
 
 /// Placeholders present in a template, and whether they are ones this
 /// capability supplies.
-fn template_problems(field: &str, template: &str, allowed: &[&str]) -> Vec<String> {
+fn placeholder_problems(field: &str, template: &str, allowed: &[&str]) -> Vec<String> {
     let mut problems = Vec::new();
     let mut rest = template;
 
-    while let Some(open) = rest.find('{') {
-        let after = &rest[open + 1..];
-        let Some(close) = after.find('}') else {
+    while let Some((_, after)) = rest.split_once('{') {
+        let Some((placeholder, tail)) = after.split_once('}') else {
             problems.push(format!("{field}: unclosed '{{' in template"));
             return problems;
         };
-        let placeholder = &after[..close];
         if !allowed.contains(&placeholder) {
             problems.push(match allowed.is_empty() {
                 true => format!("{field}: '{{{placeholder}}}' is not available here"),
@@ -430,14 +730,31 @@ fn template_problems(field: &str, template: &str, allowed: &[&str]) -> Vec<Strin
                 ),
             });
         }
-        rest = &after[close + 1..];
-    }
-
-    if !template.starts_with('/') {
-        problems.push(format!("{field}: must start with '/'"));
+        rest = tail;
     }
 
     problems
+}
+
+fn template_problems(field: &str, template: &str, allowed: &[&str]) -> Vec<String> {
+    let mut problems = placeholder_problems(field, template, allowed);
+    if !template.starts_with('/') {
+        problems.push(format!("{field}: must start with '/'"));
+    }
+    problems
+}
+
+fn template_problems_owned(
+    field: &str,
+    template: &str,
+    allowed: &[String],
+    require_path: bool,
+) -> Vec<String> {
+    let borrowed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+    match require_path {
+        true => template_problems(field, template, &borrowed),
+        false => placeholder_problems(field, template, &borrowed),
+    }
 }
 
 fn is_slug(value: &str) -> bool {
@@ -446,6 +763,12 @@ fn is_slug(value: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+fn is_variable(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_lowercase() || first == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 fn is_header_name(value: &str) -> bool {
@@ -486,6 +809,21 @@ doi = { path = "DOI", coerce = "normalize_doi" }
 year = { path = "published.date-parts[0][0]", coerce = "int" }
 citation_count = { path = "is-referenced-by-count", coerce = "int" }
 pdf_url = { first_of = ["link[0].URL", "resource.primary.URL"] }
+"#;
+
+    const HTML: &str = r#"
+manifest_version = 1
+id = "html"
+name = "HTML"
+[http]
+base_url = "https://example.test"
+[capabilities.search]
+path = "/search?q={query}"
+response_format = "html"
+items = '''article:has(a[href^="/work/"])'''
+[capabilities.search.fields]
+id = { path = '''a[href^="/work/"]''', attribute = "href", capture = '''^/work/(.+)$''' }
+title = "h2"
 "#;
 
     #[test]
@@ -563,5 +901,62 @@ secret = "token""#,
         let error = Manifest::parse(&source).unwrap_err().to_string();
         assert!(error.contains("citations"), "{error}");
         assert!(error.contains("{doi}"), "{error}");
+    }
+
+    #[test]
+    fn validates_html_css_attributes_and_captures() {
+        let manifest = Manifest::parse(HTML).unwrap();
+        assert_eq!(
+            manifest.capabilities.search.unwrap().response_format,
+            ResponseFormat::Html
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_css_selector_before_network_use() {
+        let error = Manifest::parse(&HTML.replace("title = \"h2\"", "title = \"h2[\""))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid CSS selector"), "{error}");
+    }
+
+    #[test]
+    fn rejects_html_attribute_extraction_on_json() {
+        let source = CROSSREF.replace(
+            r#"title = "title[0]""#,
+            r#"title = { path = "title[0]", attribute = "href" }"#,
+        );
+        let error = Manifest::parse(&source).unwrap_err().to_string();
+        assert!(
+            error.contains("attribute is only available for HTML"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn resolver_templates_cannot_read_an_undeclared_value() {
+        let source =
+            format!("{HTML}\n[capabilities.resolve_download]\nurl = \"{{not_from_any_step}}\"\n");
+        let error = Manifest::parse(&source).unwrap_err().to_string();
+        assert!(error.contains("not_from_any_step"), "{error}");
+        assert!(error.contains("not available"), "{error}");
+    }
+
+    #[test]
+    fn a_download_resolver_without_search_is_refused_as_unreachable() {
+        let source = r#"
+manifest_version = 1
+id = "orphan"
+name = "Orphan"
+[http]
+base_url = "https://example.test"
+[capabilities.resolve_download]
+url = "{id}"
+"#;
+        let error = Manifest::parse(source).unwrap_err().to_string();
+        assert!(
+            error.contains("resolve_download requires search"),
+            "{error}"
+        );
     }
 }

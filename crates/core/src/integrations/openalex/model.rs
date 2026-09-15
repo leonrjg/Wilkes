@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-use crate::types::{LiteratureSearchResult, OpenAlexWork};
+use crate::types::{LiteratureAcquisition, LiteratureSearchResult, OpenAlexWork};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct OpenAlexWorksResponse {
@@ -79,6 +79,10 @@ impl OpenAlexWorkResponse {
             .and_then(crate::metadata::doi::normalize_doi);
         let oa = self.open_access;
         let best_oa = self.best_oa_location;
+        let has_pdf = best_oa
+            .as_ref()
+            .and_then(|location| location.pdf_url.as_ref())
+            .is_some();
         LiteratureSearchResult {
             id: self.id,
             doi,
@@ -101,6 +105,16 @@ impl OpenAlexWorkResponse {
                 .or_else(|| oa.as_ref().and_then(|oa| oa.oa_url.clone())),
             open_access_status: oa.and_then(|oa| oa.oa_status),
             license: best_oa.and_then(|location| location.license),
+            authors: None,
+            publisher: None,
+            language: None,
+            file_format: None,
+            file_size: None,
+            acquisition: if has_pdf {
+                LiteratureAcquisition::Direct
+            } else {
+                LiteratureAcquisition::None
+            },
         }
     }
 

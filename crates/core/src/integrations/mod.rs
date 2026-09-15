@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::types::{IntegrationStatus, IntegrationsSettings, LiteratureSearchResult};
+use crate::types::{
+    IntegrationStatus, IntegrationsSettings, LiteratureSearchResult, ResolvedLiteratureDownload,
+};
 
 pub mod citations;
 pub mod custom;
@@ -48,6 +50,22 @@ pub trait LiteratureSource: Send + Sync {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<LiteratureSearchResult>>;
+
+    /// Resolve a selected result to a direct file URL. Built-ins already put
+    /// that URL in `pdf_url`; custom providers may override this to perform a
+    /// bounded, credentialed resolver only after the user chooses a result.
+    async fn resolve_download(
+        &self,
+        result: &LiteratureSearchResult,
+    ) -> anyhow::Result<Option<ResolvedLiteratureDownload>> {
+        Ok(result
+            .pdf_url
+            .as_ref()
+            .map(|url| ResolvedLiteratureDownload {
+                url: url.clone(),
+                filename: None,
+            }))
+    }
 
     /// Whether the service is reachable and usable right now.
     ///

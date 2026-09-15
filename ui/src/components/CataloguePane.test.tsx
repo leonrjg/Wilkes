@@ -8,6 +8,7 @@ vi.mock("../services", () => ({
     catalogueSearch: vi.fn(),
     catalogueAcquire: vi.fn(),
     literatureSearch: vi.fn(),
+    literatureResolveDownload: vi.fn(),
     listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
   },
   source: {
@@ -53,10 +54,17 @@ const WORK: LiteratureSearchResult = {
   landing_page_url: null,
   open_access_status: "gold",
   license: "cc-by",
+  authors: null,
+  publisher: null,
+  language: null,
+  file_format: null,
+  file_size: null,
+  acquisition: "direct",
 };
 
 const search = api.catalogueSearch as unknown as ReturnType<typeof vi.fn>;
 const literature = api.literatureSearch as unknown as ReturnType<typeof vi.fn>;
+const resolveDownload = api.literatureResolveDownload as unknown as ReturnType<typeof vi.fn>;
 const acquire = api.catalogueAcquire as unknown as ReturnType<typeof vi.fn>;
 const importFiles = (source as unknown as { importFiles: ReturnType<typeof vi.fn> }).importFiles;
 
@@ -161,6 +169,54 @@ describe("CataloguePane", () => {
       expect(importFiles).toHaveBeenCalledWith(["/uploads/lists.pdf"], "/library", "move", undefined);
     });
     expect(await screen.findByText("Added")).toBeTruthy();
+  });
+
+  it("resolves a provider download only after selection and preserves its filename", async () => {
+    const providerWork: LiteratureSearchResult = {
+      ...WORK,
+      id: "A1",
+      title: "Resolved Book",
+      pdf_url: null,
+      acquisition: "provider",
+      language: "English",
+      file_format: "epub",
+      file_size: "2 MB",
+    };
+    literature.mockResolvedValue({
+      query: "resolved book",
+      providers: [{ provider: "anna", name: "Anna", results: [providerWork], error: null }],
+    });
+    resolveDownload.mockResolvedValue({
+      url: "https://files.example.invalid/resolved",
+      filename: "Resolved Book.epub",
+    });
+    acquire.mockResolvedValue({
+      path: "/uploads/Resolved Book.epub",
+      bytes: 10,
+      already_present: false,
+    });
+
+    render(<CataloguePane />);
+    submit("resolved book");
+    expect(await screen.findByText("English")).toBeTruthy();
+    expect(screen.getByText("epub")).toBeTruthy();
+    expect(screen.getByText("2 MB")).toBeTruthy();
+    expect(resolveDownload).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByLabelText("Add Resolved Book to library"));
+    await waitFor(() => {
+      expect(resolveDownload).toHaveBeenCalledWith("anna", providerWork);
+      expect(acquire).toHaveBeenCalledWith(
+        "https://files.example.invalid/resolved",
+        "Resolved Book.epub",
+      );
+      expect(importFiles).toHaveBeenCalledWith(
+        ["/uploads/Resolved Book.epub"],
+        "/library",
+        "move",
+        undefined,
+      );
+    });
   });
 
   /// Two empty answers with different causes. Telling someone "nothing found"

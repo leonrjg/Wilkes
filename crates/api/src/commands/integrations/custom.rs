@@ -73,6 +73,9 @@ fn capability_names(manifest: &Manifest) -> Vec<String> {
     if manifest.capabilities.health.is_some() {
         names.push("health".to_string());
     }
+    if manifest.capabilities.resolve_download.is_some() {
+        names.push("resolve_download".to_string());
+    }
     names
 }
 

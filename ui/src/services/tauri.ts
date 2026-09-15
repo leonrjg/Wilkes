@@ -13,6 +13,8 @@ import type {
   CatalogueStatus,
   CatalogueSyncResponse,
   LiteratureSearchResponse,
+  LiteratureSearchResult,
+  ResolvedLiteratureDownload,
   EmbedDone,
   EmbedError,
   EmbedProgress,
@@ -470,6 +472,16 @@ export class TauriSearchApi implements SearchApi {
 
   async literatureSearch(query: string, limit?: number): Promise<LiteratureSearchResponse> {
     return invoke<LiteratureSearchResponse>("literature_search", { query, limit });
+  }
+
+  async literatureResolveDownload(
+    provider: string,
+    result: LiteratureSearchResult,
+  ): Promise<ResolvedLiteratureDownload> {
+    return invoke<ResolvedLiteratureDownload>("literature_resolve_download", {
+      provider,
+      result,
+    });
   }
 
   async catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse> {

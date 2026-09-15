@@ -9,6 +9,8 @@ import type {
   CatalogueStatus,
   CatalogueSyncResponse,
   LiteratureSearchResponse,
+  LiteratureSearchResult,
+  ResolvedLiteratureDownload,
   EmbedDone,
   EmbedError,
   EmbedProgress,
@@ -848,6 +850,19 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw await responseError(res, "literatureSearch");
     return res.json() as Promise<LiteratureSearchResponse>;
+  }
+
+  async literatureResolveDownload(
+    provider: string,
+    result: LiteratureSearchResult,
+  ): Promise<ResolvedLiteratureDownload> {
+    const res = await fetch("/api/literature/resolve-download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, result }),
+    });
+    if (!res.ok) throw await responseError(res, "literatureResolveDownload");
+    return res.json() as Promise<ResolvedLiteratureDownload>;
   }
 
   async catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse> {

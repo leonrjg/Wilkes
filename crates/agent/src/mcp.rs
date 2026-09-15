@@ -65,6 +65,7 @@ pub(crate) const WILKES_MCP_TOOL_NAMES: &[&str] = &[
     "list_documents",
     "search",
     "literature_search",
+    "literature_resolve_download",
     "list_smart_collections",
     "read_library",
 ];
@@ -869,6 +870,15 @@ struct LiteratureSearchParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct LiteratureResolveDownloadParams {
+    /// Provider id returned beside the selected literature result.
+    provider: String,
+    /// The complete result object returned by literature_search. Passing it
+    /// intact preserves every provider value a resolver template may require.
+    result: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetFileMetadataParams {
     /// Document to read metadata for. Required for external MCP clients; an
     /// in-app chat may omit it to use its active document.
@@ -1340,6 +1350,40 @@ impl WilkesMcp {
                 provider: params.provider,
                 results,
             }),
+            Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
+        }
+    }
+
+    #[tool(
+        description = "Resolve one result returned by literature_search to a direct HTTP(S) file URL and optional safe filename. Pass the complete result object unchanged. This does not write the file; pass its response to download only when the user asked to import or download it."
+    )]
+    async fn literature_resolve_download(
+        &self,
+        Parameters(params): Parameters<LiteratureResolveDownloadParams>,
+    ) -> CallToolResult {
+        let result: wilkes_core::types::LiteratureSearchResult =
+            match serde_json::from_value(params.result) {
+                Ok(result) => result,
+                Err(error) => {
+                    return CallToolResult::error(vec![ContentBlock::text(format!(
+                        "Invalid literature result: {error}"
+                    ))])
+                }
+            };
+        let registry = IntegrationRegistry::from_settings(&self.integrations().await);
+        let source = match registry.literature_for_search(&params.provider) {
+            Ok(source) => Arc::clone(source),
+            Err(error) => {
+                return CallToolResult::error(vec![ContentBlock::text(error.to_string())])
+            }
+        };
+        match source.resolve_download(&result).await {
+            Ok(Some(download)) => structured(download),
+            Ok(None) => CallToolResult::error(vec![ContentBlock::text(format!(
+                "{} did not provide a downloadable file for result '{}'",
+                source.name(),
+                result.id
+            ))]),
             Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
         }
     }

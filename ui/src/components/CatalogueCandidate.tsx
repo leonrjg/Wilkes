@@ -297,6 +297,7 @@ export function PaperCandidate({ provider, work }: PaperProps) {
   const doiLink =
     work.doi === null ? null : /^https?:\/\//i.test(work.doi) ? work.doi : `https://doi.org/${work.doi}`;
   const link = work.landing_page_url ?? doiLink;
+  const acquisition = work.acquisition ?? (work.pdf_url === null ? "none" : "direct");
 
   const addTitle = readOnly
     ? "This workspace is read-only"
@@ -315,7 +316,14 @@ export function PaperCandidate({ provider, work }: PaperProps) {
         </div>
         <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-[var(--text-dim)]">
           {work.year !== null && <span>{work.year}</span>}
+          {work.authors && <span className="truncate">{work.authors}</span>}
           {work.venue && <span className="truncate">{work.venue}</span>}
+          {work.publisher && work.publisher !== work.venue && (
+            <span className="truncate">{work.publisher}</span>
+          )}
+          {work.language && <span>{work.language}</span>}
+          {work.file_format && <span className="uppercase">{work.file_format}</span>}
+          {work.file_size && <span>{work.file_size}</span>}
           <span>
             {work.citation_count.toLocaleString()} citation
             {work.citation_count === 1 ? "" : "s"}
@@ -324,7 +332,7 @@ export function PaperCandidate({ provider, work }: PaperProps) {
           {work.license && <span className="uppercase tracking-wider">{work.license}</span>}
         </div>
         {adding && download !== undefined && <DownloadProgress download={download} title={title} />}
-        {work.pdf_url === null && (
+        {acquisition === "none" && (
           <span className="text-[10px] text-[var(--text-dim)]">
             {work.is_open_access
               ? "Listed as open access, but no direct file was reported — open it to find one."
@@ -335,7 +343,7 @@ export function PaperCandidate({ provider, work }: PaperProps) {
 
       <div className="flex shrink-0 items-center gap-1">
         {link !== null && <OpenLink link={link} title={title} />}
-        {work.pdf_url !== null && (
+        {acquisition !== "none" && (
           <AddButton
             title={title}
             tooltip={added ? "Added to this library" : addTitle}

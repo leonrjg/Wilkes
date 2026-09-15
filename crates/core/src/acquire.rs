@@ -109,7 +109,13 @@ fn name_from_content_type(
     target: PathBuf,
     named_by_caller: bool,
     content_type: Option<&str>,
+    disposition_extension: Option<&str>,
 ) -> Result<PathBuf, String> {
+    if target.extension().is_none() {
+        if let Some(extension) = disposition_extension {
+            return Ok(target.with_extension(extension));
+        }
+    }
     let Some(mime) = content_type else {
         return Ok(target);
     };
@@ -134,6 +140,36 @@ fn name_from_content_type(
             _ => Ok(target),
         },
     }
+}
+
+fn content_disposition_extension(value: &str) -> Option<String> {
+    let parameters: Vec<(&str, &str)> = value
+        .split(';')
+        .skip(1)
+        .filter_map(|part| part.trim().split_once('='))
+        .collect();
+    let encoded = parameters
+        .iter()
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("filename*"))
+        .and_then(|(_, raw)| {
+            let (charset, rest) = raw.trim().trim_matches('"').split_once('\'')?;
+            let (_, encoded) = rest.split_once('\'')?;
+            charset.eq_ignore_ascii_case("utf-8").then_some(encoded)
+        })
+        .and_then(|encoded| urlencoding::decode(encoded).ok())
+        .map(|value| value.into_owned());
+    let plain = parameters
+        .iter()
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("filename"))
+        .map(|(_, raw)| raw.trim().trim_matches('"').to_string());
+    let filename = encoded.or(plain).filter(|value| !value.is_empty())?;
+    let extension = Path::new(&filename).extension()?.to_str()?;
+    (!extension.is_empty()
+        && extension.chars().count() <= 16
+        && extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()))
+    .then(|| extension.to_ascii_lowercase())
 }
 
 pub async fn download_to_root(
@@ -164,7 +200,9 @@ pub async fn download_to_root(
                 .filter(|name| !name.is_empty())
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| "download.pdf".to_string());
+        // Leave an origin URL unnamed until the response says what it sent.
+        // Inventing PDF here would misname an EPUB whose final URL has no path.
+        .unwrap_or_else(|| "download".to_string());
     let filename_path = Path::new(&filename);
     if filename_path.components().count() != 1
         || !matches!(
@@ -208,7 +246,17 @@ pub async fn download_to_root(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.split(';').next().unwrap_or(value).trim().to_string());
-    let target = name_from_content_type(target, named_by_caller, content_type.as_deref())?;
+    let disposition_extension = response
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(content_disposition_extension);
+    let target = name_from_content_type(
+        target,
+        named_by_caller,
+        content_type.as_deref(),
+        disposition_extension.as_deref(),
+    )?;
 
     // Read the body a chunk at a time rather than in one `bytes()` call. Two
     // reasons, and only one of them is the progress bar: a body that lied about
@@ -580,9 +628,46 @@ mod tests {
     }
 
     #[test]
+    fn content_disposition_can_supply_the_file_extension() {
+        assert_eq!(
+            content_disposition_extension("attachment; filename=paper.epub").as_deref(),
+            Some("epub")
+        );
+        assert_eq!(
+            content_disposition_extension("attachment; filename=../../paper.PDF").as_deref(),
+            Some("pdf")
+        );
+        assert_eq!(
+            content_disposition_extension(
+                "attachment; filename=wrong.bin; filename*=UTF-8''research%20paper.epub"
+            )
+            .as_deref(),
+            Some("epub")
+        );
+        assert_eq!(
+            content_disposition_extension("attachment; filename*=utf-8'en'research%20paper.DOCX")
+                .as_deref(),
+            Some("docx")
+        );
+        assert!(
+            content_disposition_extension("attachment; filename=paper.bad-extension!").is_none()
+        );
+        assert_eq!(
+            name_from_content_type(
+                PathBuf::from("download"),
+                false,
+                Some("application/octet-stream"),
+                Some("epub"),
+            )
+            .unwrap(),
+            PathBuf::from("download.epub")
+        );
+    }
+
+    #[test]
     fn a_url_name_whose_dot_is_not_an_extension_gets_the_served_one_appended() {
         let named = |name: &str, by_caller: bool, mime: Option<&str>| {
-            name_from_content_type(PathBuf::from(name), by_caller, mime)
+            name_from_content_type(PathBuf::from(name), by_caller, mime, None)
                 .map(|path| path.to_string_lossy().into_owned())
         };
         // arXiv: `/pdf/2101.00001` is a PDF whose name merely contains a dot.

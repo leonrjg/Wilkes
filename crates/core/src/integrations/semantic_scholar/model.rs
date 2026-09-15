@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-use crate::types::{LiteratureSearchResult, SemanticScholarPaper};
+use crate::types::{LiteratureAcquisition, LiteratureSearchResult, SemanticScholarPaper};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SemanticScholarSearchResponse {
@@ -50,6 +50,7 @@ impl SemanticScholarPaperResponse {
             .and_then(|value| value.as_str())
             .map(str::to_string);
         let pdf = self.open_access_pdf;
+        let has_pdf = pdf.is_some();
         LiteratureSearchResult {
             id: self.paper_id,
             doi,
@@ -63,6 +64,16 @@ impl SemanticScholarPaperResponse {
             landing_page_url: None,
             open_access_status: pdf.as_ref().and_then(|pdf| pdf.status.clone()),
             license: pdf.and_then(|pdf| pdf.license),
+            authors: None,
+            publisher: None,
+            language: None,
+            file_format: None,
+            file_size: None,
+            acquisition: if has_pdf {
+                LiteratureAcquisition::Direct
+            } else {
+                LiteratureAcquisition::None
+            },
         }
     }
 

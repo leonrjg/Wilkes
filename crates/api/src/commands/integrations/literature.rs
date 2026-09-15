@@ -13,7 +13,9 @@
 use serde::Serialize;
 
 use wilkes_core::integrations::IntegrationRegistry;
-use wilkes_core::types::{IntegrationsSettings, LiteratureSearchResult};
+use wilkes_core::types::{
+    IntegrationsSettings, LiteratureSearchResult, ResolvedLiteratureDownload,
+};
 
 /// Works per provider when the caller does not say. The pane lists every
 /// provider's answer in turn, so this is per section, not a total.
@@ -124,9 +126,57 @@ pub async fn search_all(
     Ok(LiteratureSearchResponse { query, providers })
 }
 
+/// Resolve one selected result on demand. This never downloads the file: the
+/// returned plan goes through the catalogue downloader, keeping one owner for
+/// filesystem writes and their size/duplicate checks.
+pub async fn resolve_download(
+    settings: &IntegrationsSettings,
+    provider: String,
+    result: LiteratureSearchResult,
+) -> Result<ResolvedLiteratureDownload, LiteratureRequestError> {
+    let registry = IntegrationRegistry::from_settings(settings);
+    let source = registry
+        .literature_for_search(&provider)
+        .map_err(|error| LiteratureRequestError(error.to_string()))?;
+    source
+        .resolve_download(&result)
+        .await
+        .map_err(|error| LiteratureRequestError(error.to_string()))?
+        .ok_or_else(|| {
+            LiteratureRequestError(format!(
+                "{} did not provide a downloadable file for result '{}'",
+                source.name(),
+                result.id
+            ))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn direct_result() -> LiteratureSearchResult {
+        LiteratureSearchResult {
+            id: "W1".to_string(),
+            doi: None,
+            title: Some("A paper".to_string()),
+            year: None,
+            publication_date: None,
+            venue: None,
+            citation_count: 0,
+            is_open_access: true,
+            pdf_url: Some("https://example.test/paper.pdf".to_string()),
+            landing_page_url: None,
+            open_access_status: None,
+            license: None,
+            authors: None,
+            publisher: None,
+            language: None,
+            file_format: None,
+            file_size: None,
+            acquisition: wilkes_core::types::LiteratureAcquisition::Direct,
+        }
+    }
 
     #[tokio::test]
     async fn no_enabled_provider_is_an_empty_answer_not_an_error() {
@@ -157,5 +207,16 @@ mod tests {
                 .expect_err("out of range limit");
             assert!(error.0.contains(&limit.to_string()), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn resolving_a_builtin_result_returns_its_direct_url_without_downloading() {
+        let mut settings = IntegrationsSettings::default();
+        settings.openalex.enabled = true;
+        let resolved = resolve_download(&settings, "openalex".to_string(), direct_result())
+            .await
+            .unwrap();
+        assert_eq!(resolved.url, "https://example.test/paper.pdf");
+        assert!(resolved.filename.is_none());
     }
 }

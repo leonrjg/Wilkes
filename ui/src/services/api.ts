@@ -15,6 +15,7 @@ import type {
   CatalogueStatus,
   CatalogueSyncResponse,
   LiteratureSearchResponse,
+  ResolvedLiteratureDownload,
   BookmarkClustersResult,
   ChunkTopicsQuery,
   ChunkTopicsResult,
@@ -209,6 +210,12 @@ export interface SearchApi {
    *  reported in its own entry beside those that answered; only a query that
    *  could not be run at all rejects. `limit` is per provider. */
   literatureSearch(query: string, limit?: number): Promise<LiteratureSearchResponse>;
+  /** Resolve a selected provider result to a direct file URL. No bytes are
+   *  written until the returned plan is passed to catalogueAcquire. */
+  literatureResolveDownload(
+    provider: string,
+    result: import("../lib/types").LiteratureSearchResult,
+  ): Promise<ResolvedLiteratureDownload>;
   /** Refreshes the named providers, or every one of them when none is named.
    *  All four is a minutes-long call; name one at a time to show progress. */
   catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse>;

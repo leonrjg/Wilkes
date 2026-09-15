@@ -3049,6 +3049,38 @@ pub struct LiteratureSearchResult {
     pub landing_page_url: Option<String>,
     pub open_access_status: Option<String>,
     pub license: Option<String>,
+    #[serde(default)]
+    pub authors: Option<String>,
+    #[serde(default)]
+    pub publisher: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub file_format: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<String>,
+    /// How the selected result becomes a file. Provider resolution is
+    /// deliberately on-demand: listing ten results must not spend ten
+    /// credentialed requests before the user chooses one.
+    #[serde(default)]
+    pub acquisition: LiteratureAcquisition,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiteratureAcquisition {
+    #[default]
+    None,
+    Direct,
+    Provider,
+}
+
+/// A provider's on-demand answer to “what file does this result name?”. The
+/// caller passes this to the one existing downloader; providers never write.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedLiteratureDownload {
+    pub url: String,
+    pub filename: Option<String>,
 }
 
 /// What kind of source a catalogue record is, which decides what it can

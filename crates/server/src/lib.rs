@@ -755,6 +755,25 @@ async fn literature_search_handler(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct LiteratureResolveDownloadBody {
+    provider: String,
+    result: wilkes_core::types::LiteratureSearchResult,
+}
+
+async fn literature_resolve_download_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LiteratureResolveDownloadBody>,
+) -> Result<Json<wilkes_core::types::ResolvedLiteratureDownload>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .literature_resolve_download(body.provider, body.result)
+        .await
+        .map(Json)
+        .map_err(|error| err(error.to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CatalogueSyncBody {
     /// Which catalogues to refresh. Absent means all of them, which is a
     /// minutes-long request; a caller wanting progress should name one at a
@@ -2423,6 +2442,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/catalogue/search", post(catalogue_search_handler))
         .route("/api/literature/search", post(literature_search_handler))
+        .route(
+            "/api/literature/resolve-download",
+            post(literature_resolve_download_handler),
+        )
         .route("/api/catalogue/sync", post(catalogue_sync_handler))
         .route("/api/catalogue/status", get(catalogue_status_handler))
         .route("/api/catalogue/acquire", post(catalogue_acquire_handler))

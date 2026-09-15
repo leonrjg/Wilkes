@@ -2,7 +2,8 @@
 //!
 //! [`CustomSource`] implements [`LiteratureSource`] by reading a [`Manifest`]:
 //! it builds a URL from a template, sends the identification the manifest
-//! declares, and projects the response through [`selector`] and [`coerce`].
+//! declares, and projects JSON paths or HTML CSS selections through
+//! [`coerce`].
 //! Nothing about it is privileged or special-cased — the registry holds it
 //! next to `OpenAlexClient`, and callers cannot tell them apart.
 //!
@@ -22,17 +23,22 @@ pub mod selector;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use dom_query::{Document, Matcher, Selection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
 use self::coerce::Projected;
-use self::manifest::{search_field_type, FieldSpec, Manifest, SearchCapability};
+use self::manifest::{
+    search_field_type, FieldSpec, HttpParam, Manifest, ResolverStep, ResponseFormat,
+    SearchCapability,
+};
 use self::selector::Selector;
 use crate::integrations::LiteratureSource;
 use crate::network::{ProviderHttpClient, ProviderHttpErrorKind};
 use crate::types::{
-    CustomIntegrationConfig, IntegrationState, IntegrationStatus, LiteratureSearchResult,
+    CustomIntegrationConfig, IntegrationState, IntegrationStatus, LiteratureAcquisition,
+    LiteratureSearchResult, ResolvedLiteratureDownload,
 };
 
 /// How much of a probe's raw response is shown back to the user. Enough to see
@@ -115,10 +121,13 @@ impl CustomSource {
             );
         };
 
-        let request = match self.request(&substitute(
-            &search.path,
-            &[("query", PROBE_QUERY), ("limit", &PROBE_LIMIT.to_string())],
-        )) {
+        let request = match self.request(
+            &substitute(
+                &search.path,
+                &[("query", PROBE_QUERY), ("limit", &PROBE_LIMIT.to_string())],
+            ),
+            &[],
+        ) {
             Ok(request) => request,
             Err(error) => {
                 return ProbeReport::failed(&self.id, "search", String::new(), error.to_string())
@@ -135,27 +144,31 @@ impl CustomSource {
         let raw = String::from_utf8_lossy(&body);
         let raw_preview: String = raw.chars().take(PROBE_BODY_CHARS).collect();
 
-        let value: Value = match serde_json::from_slice(&body) {
-            Ok(value) => value,
-            Err(error) => {
-                let mut report = ProbeReport::failed(
-                    &self.id,
-                    "search",
-                    redacted,
-                    format!("response is not JSON: {error}"),
-                );
-                report.raw_response = raw_preview;
-                return report;
-            }
-        };
-
-        match self.project(search, &value) {
+        match self.project_response(search, &body, PROBE_QUERY, PROBE_LIMIT) {
             Ok(projection) => {
                 let records_seen = projection.records_seen;
                 let issues_empty = projection.issues.is_empty();
+                let resolver_error = if self.manifest.capabilities.resolve_download.is_some() {
+                    match projection.results.first() {
+                        Some(result) => self
+                            .resolve_manifest_download(result)
+                            .await
+                            .err()
+                            .map(|error| format!("resolve_download probe failed: {error:#}")),
+                        None => Some(
+                            "resolve_download probe needs one successfully projected result"
+                                .to_string(),
+                        ),
+                    }
+                } else {
+                    None
+                };
                 ProbeReport {
                     id: self.id.clone(),
-                    capability: "search".to_string(),
+                    capability: match self.manifest.capabilities.resolve_download.is_some() {
+                        true => "search + resolve_download".to_string(),
+                        false => "search".to_string(),
+                    },
                     request_url: redacted,
                     raw_response: raw_preview,
                     results: projection.results,
@@ -166,15 +179,42 @@ impl CustomSource {
                     // though every request succeeded — the manifest is not yet
                     // usable, and calling that "ok" is what would let a broken
                     // provider be enabled.
-                    ok: records_seen > 0 && issues_empty,
-                    error: None,
+                    ok: records_seen > 0 && issues_empty && resolver_error.is_none(),
+                    error: resolver_error,
                 }
             }
             Err(error) => ProbeReport::failed(&self.id, "search", redacted, error.to_string()),
         }
     }
 
-    fn project(&self, search: &SearchCapability, body: &Value) -> anyhow::Result<Projection> {
+    fn project_response(
+        &self,
+        search: &SearchCapability,
+        body: &[u8],
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Projection> {
+        match search.response_format {
+            ResponseFormat::Json => {
+                let value: Value = serde_json::from_slice(body)
+                    .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
+                self.project_json(search, &value, query, limit)
+            }
+            ResponseFormat::Html => {
+                let html = std::str::from_utf8(body)
+                    .map_err(|error| anyhow::anyhow!("response is not UTF-8 HTML: {error}"))?;
+                self.project_html(search, html, query, limit)
+            }
+        }
+    }
+
+    fn project_json(
+        &self,
+        search: &SearchCapability,
+        body: &Value,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Projection> {
         let items = match &search.items {
             Some(path) => {
                 let selector = Selector::parse(path).map_err(|e| anyhow::anyhow!("items: {e}"))?;
@@ -188,35 +228,83 @@ impl CustomSource {
             anyhow::anyhow!("items must select an array; found {}", describe_kind(items))
         })?;
 
-        let mut results = Vec::with_capacity(items.len());
+        let records_seen = items.len().min(limit);
+        let mut results = Vec::with_capacity(records_seen);
         let mut issues = Vec::new();
-        for (index, item) in items.iter().enumerate() {
-            match self.project_one(search, item, index, &mut issues) {
+        for (index, item) in items.iter().take(limit).enumerate() {
+            match self.project_one(
+                search,
+                query,
+                limit,
+                index,
+                &mut issues,
+                |spec, field_type| self.select_json(spec, item, field_type),
+            ) {
                 Some(result) => results.push(result),
-                None => issues.push(ProjectionIssue {
-                    record: index,
-                    field: "id".to_string(),
-                    selector: String::new(),
-                    problem: "record skipped: without an id it cannot be identified or downloaded"
-                        .to_string(),
-                }),
+                None => note_missing_id(index, &mut issues),
             }
         }
 
         Ok(Projection {
-            records_seen: items.len(),
+            records_seen,
             results,
             issues,
         })
     }
 
-    fn project_one(
+    fn project_html(
         &self,
         search: &SearchCapability,
-        item: &Value,
+        html: &str,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Projection> {
+        let items_path = search
+            .items
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("items is required for an HTML response"))?;
+        let matcher = Matcher::new(items_path)
+            .map_err(|error| anyhow::anyhow!("items CSS selector is invalid: {error:?}"))?;
+        let document = Document::from(html);
+        let items = document.select_matcher(&matcher);
+        if items.is_empty() {
+            anyhow::bail!("items selector '{items_path}' matched nothing in the response");
+        }
+        let records_seen = items.length().min(limit);
+        let mut results = Vec::with_capacity(records_seen);
+        let mut issues = Vec::new();
+        for (index, item) in items.iter().take(limit).enumerate() {
+            match self.project_one(
+                search,
+                query,
+                limit,
+                index,
+                &mut issues,
+                |spec, field_type| self.select_html(spec, &item, field_type),
+            ) {
+                Some(result) => results.push(result),
+                None => note_missing_id(index, &mut issues),
+            }
+        }
+        Ok(Projection {
+            records_seen,
+            results,
+            issues,
+        })
+    }
+
+    fn project_one<F>(
+        &self,
+        search: &SearchCapability,
+        query: &str,
+        limit: usize,
         index: usize,
         issues: &mut Vec<ProjectionIssue>,
-    ) -> Option<LiteratureSearchResult> {
+        mut select: F,
+    ) -> Option<LiteratureSearchResult>
+    where
+        F: FnMut(&FieldSpec, manifest::FieldType) -> Result<Option<Projected>, String>,
+    {
         let mut text: HashMap<&str, String> = HashMap::new();
         let mut integer: HashMap<&str, i64> = HashMap::new();
         let mut boolean: HashMap<&str, bool> = HashMap::new();
@@ -227,7 +315,11 @@ impl CustomSource {
             let Some(field_type) = search_field_type(field) else {
                 continue;
             };
-            match self.select(spec, item, field_type) {
+            let selected = match spec.input() {
+                Some(input) => self.select_input(spec, input, query, limit, field_type),
+                None => select(spec, field_type),
+            };
+            match selected {
                 Ok(Some(Projected::Text(value))) => {
                     text.insert(field_as_static(field), value);
                 }
@@ -248,6 +340,26 @@ impl CustomSource {
         }
 
         let id = text.remove("id").filter(|value| !value.trim().is_empty())?;
+        if !text.contains_key("title") {
+            issues.push(ProjectionIssue {
+                record: index,
+                field: "title".to_string(),
+                selector: search
+                    .fields
+                    .get("title")
+                    .map(|spec| spec.paths().join(" | "))
+                    .unwrap_or_default(),
+                problem: "required field matched nothing".to_string(),
+            });
+        }
+        let pdf_url = text.remove("pdf_url");
+        let acquisition = if self.manifest.capabilities.resolve_download.is_some() {
+            LiteratureAcquisition::Provider
+        } else if pdf_url.is_some() {
+            LiteratureAcquisition::Direct
+        } else {
+            LiteratureAcquisition::None
+        };
         Some(LiteratureSearchResult {
             id,
             doi: text.remove("doi"),
@@ -257,45 +369,225 @@ impl CustomSource {
             venue: text.remove("venue"),
             citation_count: integer.remove("citation_count").unwrap_or(0),
             is_open_access: boolean.remove("is_open_access").unwrap_or(false),
-            pdf_url: text.remove("pdf_url"),
+            pdf_url,
             landing_page_url: text.remove("landing_page_url"),
             open_access_status: text.remove("open_access_status"),
             license: text.remove("license"),
+            authors: text.remove("authors"),
+            publisher: text.remove("publisher"),
+            language: text.remove("language"),
+            file_format: text.remove("file_format"),
+            file_size: text.remove("file_size"),
+            acquisition,
         })
     }
 
-    /// Try a field's selectors in order. `Ok(None)` is an absent value, which
-    /// is ordinary; `Err` is a value that was there and could not be used,
-    /// which is not.
-    fn select(
+    fn select_json(
         &self,
         spec: &FieldSpec,
         item: &Value,
         field_type: manifest::FieldType,
     ) -> Result<Option<Projected>, String> {
-        let mut last_error = None;
-        for path in spec.paths() {
+        self.select_projected(spec, field_type, |path| {
             let selector = match Selector::parse(path) {
                 Ok(selector) => selector,
                 Err(error) => return Err(error),
             };
-            let Some(raw) = selector.resolve(item) else {
+            Ok(selector.resolve(item).cloned())
+        })
+    }
+
+    fn select_input(
+        &self,
+        spec: &FieldSpec,
+        input: &str,
+        query: &str,
+        limit: usize,
+        field_type: manifest::FieldType,
+    ) -> Result<Option<Projected>, String> {
+        let mut raw = match input {
+            "query" => Value::String(query.to_string()),
+            "limit" => Value::Number(limit.into()),
+            // Refused during manifest validation.
+            _ => return Err(format!("unknown search input '{input}'")),
+        };
+        if let Some((pattern, group)) = spec.capture() {
+            raw = capture_value(pattern, group, &raw)?;
+        }
+        coerce::project(spec.coercion(), field_type, &raw, &self.base_url)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn select_html(
+        &self,
+        spec: &FieldSpec,
+        item: &Selection<'_>,
+        field_type: manifest::FieldType,
+    ) -> Result<Option<Projected>, String> {
+        self.select_projected(spec, field_type, |path| {
+            let selected = if path == ":scope" {
+                item.clone()
+            } else {
+                let matcher = Matcher::new(path)
+                    .map_err(|error| format!("invalid CSS selector: {error:?}"))?;
+                item.select_matcher(&matcher)
+            };
+            if selected.is_empty() {
+                return Ok(None);
+            }
+            if matches!(spec.coercion(), Some(coerce::Coercion::Join)) {
+                let values: Vec<Value> = selected
+                    .iter()
+                    .filter_map(|element| match spec.attribute() {
+                        Some(attribute) => element
+                            .attr(attribute)
+                            .map(|value| Value::String(value.to_string())),
+                        None => {
+                            let value = normalize_html_text(&element.text());
+                            (!value.is_empty()).then_some(Value::String(value))
+                        }
+                    })
+                    .collect();
+                return Ok((!values.is_empty()).then_some(Value::Array(values)));
+            }
+            let value = match spec.attribute() {
+                Some(attribute) => selected.attr(attribute).map(|value| value.to_string()),
+                None => {
+                    let value = normalize_html_text(&selected.text());
+                    (!value.is_empty()).then_some(value)
+                }
+            };
+            Ok(value.map(Value::String))
+        })
+    }
+
+    fn select_projected<F>(
+        &self,
+        spec: &FieldSpec,
+        field_type: manifest::FieldType,
+        mut raw_for_path: F,
+    ) -> Result<Option<Projected>, String>
+    where
+        F: FnMut(&str) -> Result<Option<Value>, String>,
+    {
+        let mut last_error = None;
+        for path in spec.paths() {
+            let Some(mut raw) = raw_for_path(path)? else {
                 continue;
             };
-            match coerce::project(spec.coercion(), field_type, raw, &self.base_url) {
+            if let Some((pattern, group)) = spec.capture() {
+                match capture_value(pattern, group, &raw) {
+                    Ok(captured) => raw = captured,
+                    Err(problem) => {
+                        last_error = Some(format!("{path}: {problem}"));
+                        continue;
+                    }
+                }
+            }
+            match coerce::project(spec.coercion(), field_type, &raw, &self.base_url) {
                 Ok(value) => return Ok(Some(value)),
                 Err(mismatch) => last_error = Some(format!("{path}: {mismatch}")),
             }
         }
-        match last_error {
-            Some(error) => Err(error),
-            None => Ok(None),
+        last_error.map_or(Ok(None), Err)
+    }
+
+    async fn resolve_manifest_download(
+        &self,
+        result: &LiteratureSearchResult,
+    ) -> anyhow::Result<Option<ResolvedLiteratureDownload>> {
+        let Some(resolve) = &self.manifest.capabilities.resolve_download else {
+            return Ok(result
+                .pdf_url
+                .as_ref()
+                .map(|url| ResolvedLiteratureDownload {
+                    url: url.clone(),
+                    filename: None,
+                }));
+        };
+
+        let mut values = result_values(result);
+        for (index, step) in resolve.steps.iter().enumerate() {
+            let path = substitute_values(&step.path, &values, Substitution::UrlComponent)
+                .map_err(|error| anyhow::anyhow!("resolver step {}: {error}", index + 1))?;
+            let request = self.request(&path, &step.params)?;
+            let body = self.http.get_bytes(request.url, &request.headers).await?;
+            let extracted = self.extract_step(step, &body).map_err(|error| {
+                anyhow::anyhow!("resolver step {} response: {error}", index + 1)
+            })?;
+            for (name, value) in extracted {
+                values.insert(name, value);
+            }
         }
+
+        let rendered = substitute_values(&resolve.url, &values, Substitution::ExactRawOtherwiseUrl)
+            .map_err(|error| anyhow::anyhow!("resolve_download.url: {error}"))?;
+        let url = match Url::parse(&rendered) {
+            Ok(url) => url,
+            Err(_) => self.base_url.join(&rendered)?,
+        };
+        anyhow::ensure!(
+            matches!(url.scheme(), "http" | "https"),
+            "resolved download URL uses unsupported scheme '{}'",
+            url.scheme()
+        );
+        let filename = resolve
+            .filename
+            .as_ref()
+            .map(|template| substitute_values(template, &values, Substitution::Raw))
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("resolve_download.filename: {error}"))?
+            .map(|name| sanitize_filename(&name))
+            .transpose()?;
+        Ok(Some(ResolvedLiteratureDownload {
+            url: url.to_string(),
+            filename,
+        }))
+    }
+
+    fn extract_step(
+        &self,
+        step: &ResolverStep,
+        body: &[u8],
+    ) -> anyhow::Result<HashMap<String, String>> {
+        let mut out = HashMap::new();
+        match step.response_format {
+            ResponseFormat::Json => {
+                let value: Value = serde_json::from_slice(body)
+                    .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
+                for (name, spec) in &step.fields {
+                    let projected = self
+                        .select_json(spec, &value, resolver_field_type(spec))
+                        .map_err(|error| anyhow::anyhow!("field '{name}': {error}"))?
+                        .ok_or_else(|| anyhow::anyhow!("field '{name}' matched nothing"))?;
+                    out.insert(name.clone(), projected_string(projected));
+                }
+            }
+            ResponseFormat::Html => {
+                let html = std::str::from_utf8(body)
+                    .map_err(|error| anyhow::anyhow!("response is not UTF-8 HTML: {error}"))?;
+                let document = Document::from(html);
+                let root = Selection::from(document.root());
+                for (name, spec) in &step.fields {
+                    let projected = self
+                        .select_html(spec, &root, resolver_field_type(spec))
+                        .map_err(|error| anyhow::anyhow!("field '{name}': {error}"))?
+                        .ok_or_else(|| anyhow::anyhow!("field '{name}' matched nothing"))?;
+                    out.insert(name.clone(), projected_string(projected));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Assemble one request: the URL with its declared query parameters, the
     /// headers, and a copy of the URL with secrets removed for display.
-    fn request(&self, path: &str) -> anyhow::Result<PreparedRequest<'_>> {
+    fn request<'a>(
+        &'a self,
+        path: &str,
+        capability_params: &'a [HttpParam],
+    ) -> anyhow::Result<PreparedRequest<'a>> {
         let mut url = Url::parse(&format!("{}{path}", self.base))?;
         anyhow::ensure!(
             url.origin() == self.base_url.origin(),
@@ -306,7 +598,7 @@ impl CustomSource {
 
         let mut headers = Vec::new();
         let mut redacted_pairs: Vec<(String, String)> = Vec::new();
-        for param in &self.manifest.http.params {
+        for param in self.manifest.http.params.iter().chain(capability_params) {
             let (value, secret) = match (&param.value, &param.secret) {
                 (Some(value), None) => (value.clone(), false),
                 (None, Some(name)) => (
@@ -356,6 +648,168 @@ impl CustomSource {
             headers,
         })
     }
+}
+
+fn note_missing_id(index: usize, issues: &mut Vec<ProjectionIssue>) {
+    issues.push(ProjectionIssue {
+        record: index,
+        field: "id".to_string(),
+        selector: String::new(),
+        problem: "record skipped: without an id it cannot be identified or downloaded".to_string(),
+    });
+}
+
+fn normalize_html_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn capture_value(pattern: &str, group: usize, raw: &Value) -> Result<Value, String> {
+    let text = raw
+        .as_str()
+        .ok_or_else(|| "regular-expression capture requires text".to_string())?;
+    let regex = regex::Regex::new(pattern)
+        .map_err(|error| format!("invalid regular expression: {error}"))?;
+    let captured = regex
+        .captures(text)
+        .and_then(|captures| captures.get(group))
+        .map(|capture| capture.as_str().trim().to_string())
+        .filter(|capture| !capture.is_empty())
+        .ok_or_else(|| format!("capture group {group} matched nothing"))?;
+    Ok(Value::String(captured))
+}
+
+fn resolver_field_type(spec: &FieldSpec) -> manifest::FieldType {
+    match spec.coercion() {
+        Some(coerce::Coercion::Int | coerce::Coercion::YearFromDate) => {
+            manifest::FieldType::Integer
+        }
+        Some(coerce::Coercion::Bool) => manifest::FieldType::Boolean,
+        Some(coerce::Coercion::AbsoluteUrl) => manifest::FieldType::Url,
+        _ => manifest::FieldType::Text,
+    }
+}
+
+fn projected_string(value: Projected) -> String {
+    match value {
+        Projected::Text(value) => value,
+        Projected::Integer(value) => value.to_string(),
+        Projected::Boolean(value) => value.to_string(),
+    }
+}
+
+fn result_values(result: &LiteratureSearchResult) -> HashMap<String, String> {
+    let mut values = HashMap::from([
+        ("id".to_string(), result.id.clone()),
+        (
+            "citation_count".to_string(),
+            result.citation_count.to_string(),
+        ),
+        (
+            "is_open_access".to_string(),
+            result.is_open_access.to_string(),
+        ),
+    ]);
+    for (name, value) in [
+        ("doi", &result.doi),
+        ("title", &result.title),
+        ("publication_date", &result.publication_date),
+        ("venue", &result.venue),
+        ("pdf_url", &result.pdf_url),
+        ("landing_page_url", &result.landing_page_url),
+        ("open_access_status", &result.open_access_status),
+        ("license", &result.license),
+        ("authors", &result.authors),
+        ("publisher", &result.publisher),
+        ("language", &result.language),
+        ("file_format", &result.file_format),
+        ("file_size", &result.file_size),
+    ] {
+        if let Some(value) = value {
+            values.insert(name.to_string(), value.clone());
+        }
+    }
+    if let Some(year) = result.year {
+        values.insert("year".to_string(), year.to_string());
+    }
+    values
+}
+
+#[derive(Clone, Copy)]
+enum Substitution {
+    UrlComponent,
+    Raw,
+    ExactRawOtherwiseUrl,
+}
+
+fn substitute_values(
+    template: &str,
+    values: &HashMap<String, String>,
+    mode: Substitution,
+) -> Result<String, String> {
+    if let Some(name) = matches!(mode, Substitution::ExactRawOtherwiseUrl)
+        .then(|| {
+            template
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+        })
+        .flatten()
+        .filter(|_| template.chars().filter(|c| *c == '{').count() == 1)
+        .filter(|_| template.chars().filter(|c| *c == '}').count() == 1)
+    {
+        return values
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("required value '{name}' is missing"));
+    }
+
+    let encode = matches!(
+        mode,
+        Substitution::UrlComponent | Substitution::ExactRawOtherwiseUrl
+    );
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some((prefix, after)) = rest.split_once('{') {
+        out.push_str(prefix);
+        let (name, tail) = after
+            .split_once('}')
+            .ok_or_else(|| "unclosed '{' in template".to_string())?;
+        let value = values
+            .get(name)
+            .ok_or_else(|| format!("required value '{name}' is missing"))?;
+        if encode {
+            out.push_str(&urlencoding::encode(value));
+        } else {
+            out.push_str(value);
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+fn sanitize_filename(value: &str) -> anyhow::Result<String> {
+    let mut safe = String::new();
+    for character in value.trim().chars() {
+        if character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
+        {
+            safe.push('_');
+        } else {
+            safe.push(character);
+        }
+    }
+    while safe.contains("..") {
+        safe = safe.replace("..", "_");
+    }
+    let safe: String = safe.chars().take(200).collect();
+    anyhow::ensure!(
+        !safe.trim().is_empty(),
+        "resolved filename is empty after sanitizing"
+    );
+    Ok(safe)
 }
 
 /// Header names borrow from the manifest rather than being cloned: the
@@ -444,10 +898,13 @@ impl LiteratureSource for CustomSource {
             .ok_or_else(|| anyhow::anyhow!("{} cannot search", self.manifest.name))?;
         let limit = limit.clamp(1, 100);
 
-        let request = self.request(&substitute(
-            &search.path,
-            &[("query", query), ("limit", &limit.to_string())],
-        ))?;
+        let request = self.request(
+            &substitute(
+                &search.path,
+                &[("query", query), ("limit", &limit.to_string())],
+            ),
+            &[],
+        )?;
         let body = match self.http.get_bytes(request.url, &request.headers).await {
             Ok(body) => body,
             Err(error) if error.kind == ProviderHttpErrorKind::RateLimited => {
@@ -455,11 +912,7 @@ impl LiteratureSource for CustomSource {
             }
             Err(error) => return Err(error.into()),
         };
-        let value: Value = serde_json::from_slice(&body).map_err(|e| {
-            anyhow::anyhow!("{} returned a non-JSON response: {e}", self.manifest.name)
-        })?;
-
-        let projection = self.project(search, &value)?;
+        let projection = self.project_response(search, &body, query, limit)?;
         // A selector that stopped matching is the service having changed shape
         // under a manifest that was probed against the old one. It is not
         // fatal — the other fields are still right — but it is never silent.
@@ -480,6 +933,13 @@ impl LiteratureSource for CustomSource {
             );
         }
         Ok(projection.results)
+    }
+
+    async fn resolve_download(
+        &self,
+        result: &LiteratureSearchResult,
+    ) -> anyhow::Result<Option<ResolvedLiteratureDownload>> {
+        self.resolve_manifest_download(result).await
     }
 
     async fn status(&self, enabled: bool) -> anyhow::Result<IntegrationStatus> {
@@ -506,7 +966,7 @@ impl LiteratureSource for CustomSource {
             });
         };
 
-        let request = self.request(&health.path)?;
+        let request = self.request(&health.path, &[])?;
         match self.http.get_status(request.url, &request.headers).await {
             Ok(_) => Ok(IntegrationStatus {
                 id: self.id.clone(),
@@ -653,6 +1113,88 @@ license = "openAccessPdf.license"
     const OPENALEX_BODY: &str = r#"{"results":[{"id":"https://openalex.org/W1","display_name":"T","ids":{"doi":"https://doi.org/10.1/example"},"open_access":{"is_oa":true,"oa_status":"gold","oa_url":"https://example.test/article"},"best_oa_location":{"is_oa":true,"pdf_url":"https://example.test/paper.pdf","landing_page_url":"https://example.test/article","license":"cc-by"}}]}"#;
     const SEMANTIC_SCHOLAR_BODY: &str = r#"{"data":[{"paperId":"p1","externalIds":{"DOI":"10.1/example"},"title":"T","citationCount":3,"isOpenAccess":true,"openAccessPdf":{"url":"https://example.test/paper.pdf","status":"GOLD","license":"CCBY"}}]}"#;
 
+    const ANNA_MANIFEST: &str = r#"
+manifest_version = 1
+id = "anna"
+name = "Anna"
+
+[http]
+base_url = "BASE_URL"
+
+[[http.params]]
+location = "header"
+name = "User-Agent"
+value = "Mozilla/5.0 Wilkes"
+
+[capabilities.search]
+path = "/search?q={query}&content=journal"
+response_format = "html"
+items = '''div:has(> a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"])'''
+
+[capabilities.search.fields]
+id = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", capture = '''^/md5/([0-9a-f]+)$''' }
+title = '''div.max-w-full a[href^="/md5/"]'''
+authors = { path = '''div.max-w-full a[href^="/search"]:has(span[class="icon-[mdi--user-edit]"])''', coerce = "join" }
+publisher = '''div.max-w-full a[href^="/search"]:has(span[class="icon-[mdi--company]"])'''
+venue = '''div.max-w-full a[href^="/search"]:has(span[class="icon-[mdi--company]"])'''
+language = { path = "div.text-gray-800", capture = '''^\s*✅?\s*([^\[]+?)\s*\[''' }
+file_format = { path = "div.text-gray-800", capture = '''(?i)\b(EPUB|PDF|MOBI|AZW3|AZW|DJVU|CBZ|CBR|FB2|DOCX?|TXT)\b''' }
+file_size = { path = "div.text-gray-800", capture = '''(?i)(\d+(?:\.\d+)?\s*(?:MB|KB|GB|TB))''' }
+landing_page_url = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", coerce = "absolute_url" }
+
+[capabilities.resolve_download]
+url = "{download_url}"
+filename = "{title}.{file_format}"
+
+[[capabilities.resolve_download.steps]]
+path = "/dyn/api/fast_download.json?md5={id}"
+response_format = "json"
+
+[[capabilities.resolve_download.steps.params]]
+location = "query"
+name = "key"
+secret = "anna_key"
+
+[capabilities.resolve_download.steps.fields]
+download_url = "download_url"
+"#;
+
+    const ANNA_BODY: &str = r#"<!doctype html><html><body>
+<div class="result flex">
+  <a href="/md5/deadbeef" class="custom-a block mr-2 sm:mr-4 hover:opacity-80">cover</a>
+  <div class="max-w-full">
+    <a href="/md5/deadbeef">Graph: Networks</a>
+    <a href="/search?q=Ada"><span class="icon-[mdi--user-edit]"></span> Ada Lovelace </a>
+    <a href="/search?q=Grace"><span class="icon-[mdi--user-edit]"></span> Grace Hopper </a>
+    <a href="/search?q=Journal"><span class="icon-[mdi--company]"></span> Example Journal </a>
+    <div class="text-gray-800">✅ English [en] · PDF · 2.4MB · 2024</div>
+  </div>
+</div>
+</body></html>"#;
+
+    const ANNA_DOI_MANIFEST: &str = r#"
+manifest_version = 1
+id = "anna-doi"
+name = "Anna DOI"
+
+[http]
+base_url = "BASE_URL"
+
+[capabilities.search]
+path = "/scidb/{query}"
+response_format = "html"
+items = '''div:has(> a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"])'''
+
+[capabilities.search.fields]
+id = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", capture = '''^/md5/([0-9a-f]+)$''' }
+doi = { input = "query", coerce = "normalize_doi" }
+title = '''div.max-w-full a[href^="/md5/"]'''
+
+[capabilities.resolve_download]
+url = "/scidb?doi={doi}"
+filename = "{title}"
+"#;
+
     fn source(manifest: &str, base_url: &str, secrets: &[(&str, &str)]) -> CustomSource {
         let manifest = Manifest::parse(&manifest.replace("BASE_URL", base_url)).unwrap();
         CustomSource::new(
@@ -721,6 +1263,71 @@ license = "openAccessPdf.license"
 
         assert_eq!(projected, built_in);
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn anna_html_search_and_credentialed_download_resolution_are_manifest_expressible() {
+        let mut server = mockito::Server::new_async().await;
+        let search = server
+            .mock("GET", "/search")
+            .match_query(mockito::Matcher::Any)
+            .match_header("user-agent", "Mozilla/5.0 Wilkes")
+            .with_status(200)
+            .with_body(ANNA_BODY)
+            .create_async()
+            .await;
+        let resolve = server
+            .mock("GET", "/dyn/api/fast_download.json")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("md5".into(), "deadbeef".into()),
+                mockito::Matcher::UrlEncoded("key".into(), "secret".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"download_url":"https://files.example.test/book"}"#)
+            .create_async()
+            .await;
+
+        let anna = source(ANNA_MANIFEST, &server.url(), &[("anna_key", "secret")]);
+        let results = anna.search("graph networks", 1).await.unwrap();
+        assert_eq!(results.len(), 1);
+        let book = &results[0];
+        assert_eq!(book.id, "deadbeef");
+        assert_eq!(book.title.as_deref(), Some("Graph: Networks"));
+        assert_eq!(book.authors.as_deref(), Some("Ada Lovelace, Grace Hopper"));
+        assert_eq!(book.publisher.as_deref(), Some("Example Journal"));
+        assert_eq!(book.language.as_deref(), Some("English"));
+        assert_eq!(book.file_format.as_deref(), Some("PDF"));
+        assert_eq!(book.file_size.as_deref(), Some("2.4MB"));
+        assert_eq!(book.acquisition, LiteratureAcquisition::Provider);
+
+        let download = anna.resolve_download(book).await.unwrap().unwrap();
+        assert_eq!(download.url, "https://files.example.test/book");
+        assert_eq!(download.filename.as_deref(), Some("Graph_ Networks.PDF"));
+        search.assert_async().await;
+        resolve.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn anna_doi_input_can_flow_to_the_scidb_paper_download() {
+        let mut server = mockito::Server::new_async().await;
+        let search = server
+            .mock("GET", "/scidb/10.1234%2Fexample")
+            .with_status(200)
+            .with_body(ANNA_BODY)
+            .create_async()
+            .await;
+
+        let anna = source(ANNA_DOI_MANIFEST, &server.url(), &[]);
+        let result = anna.search("10.1234/example", 1).await.unwrap().remove(0);
+        assert_eq!(result.doi.as_deref(), Some("10.1234/example"));
+
+        let download = anna.resolve_download(&result).await.unwrap().unwrap();
+        assert_eq!(
+            download.url,
+            format!("{}/scidb?doi=10.1234%2Fexample", server.url())
+        );
+        assert_eq!(download.filename.as_deref(), Some("Graph_ Networks"));
+        search.assert_async().await;
     }
 
     /// The one thing the projection cannot say, pinned so it is not
@@ -794,7 +1401,7 @@ license = "openAccessPdf.license"
             "path = \"//evil.test/works?search={query}",
         );
         let pinned = source(&doubled, "https://api.openalex.org", &[]);
-        let request = pinned.request("//evil.test/works").unwrap();
+        let request = pinned.request("//evil.test/works", &[]).unwrap();
         assert!(
             request
                 .url

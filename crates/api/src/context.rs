@@ -5114,6 +5114,23 @@ impl AppContext {
         crate::commands::integrations::literature::search_all(&s.integrations, query, limit).await
     }
 
+    pub async fn literature_resolve_download(
+        &self,
+        provider: String,
+        result: wilkes_core::types::LiteratureSearchResult,
+    ) -> Result<
+        wilkes_core::types::ResolvedLiteratureDownload,
+        crate::commands::integrations::literature::LiteratureRequestError,
+    > {
+        let settings = self.get_settings().await;
+        crate::commands::integrations::literature::resolve_download(
+            &settings.integrations,
+            provider,
+            result,
+        )
+        .await
+    }
+
     /// Authoritative document metadata: file-based extraction overridden by the
     /// Zotero library record when the file resolves to an item. This is the
     /// single owner of that composition — both the on-open viewer and the
