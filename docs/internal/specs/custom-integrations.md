@@ -135,9 +135,9 @@ name = "Crossref"
 [http]
 base_url = "https://api.crossref.org"
 
-# Identification sent on every request. `value` travels with the manifest;
-# `secret` is only a name, whose value is stored separately — see §7. Exactly
-# one of the two per param.
+# Identification sent to the primary origin and same-origin resolver steps.
+# `value` travels with the manifest; `secret` is only a name, whose value is
+# stored separately — see §7. Exactly one of the two per param.
 [[http.params]]
 location = "header"               # header | query
 name = "Crossref-Plus-API-Token"
@@ -167,9 +167,10 @@ and `{limit}` are the placeholders `search` supplies (`health` supplies none);
 download-resolution steps receive the selected result plus values declared by
 earlier steps. The engine owns percent-encoding. An unknown placeholder, or
 one the capability does not yet supply, is a save-time error. Every request
-host and scheme come from `base_url`; a resolver's final URL may be external
-because it is returned to the existing downloader rather than fetched by the
-manifest engine.
+host and scheme come from a literal `base_url`: the primary one under `http`,
+or an optional override declared on a resolver step. A resolver's final URL
+may be external because it is returned to the existing downloader rather than
+fetched by the manifest engine.
 
 **The field map is a projection.** Selector grammar: dotted keys, `[n]`, `[*]`
 for the item list, and `first_of` for an ordered fallback. No filters, no
@@ -181,8 +182,8 @@ loudly by failing to load, not by producing a plausible-looking wrong record.
 
 **Sequencing is finite and purpose-specific.** Search declares one GET.
 Resolving a download after selection may declare at most four ordered GETs,
-each pinned to the provider origin, with scalar projection from each response.
-There are no branches, loops, arbitrary expressions, or writes.
+each pinned to its statically declared origin, with scalar projection from each
+response. There are no branches, loops, arbitrary expressions, or writes.
 
 ### 5.3 Contract per capability
 
@@ -207,11 +208,15 @@ the matching hash but does not repeat the DOI needed by the download endpoint.
 
 Download resolution is separate from search. A result advertises `provider`
 acquisition, and only selecting it runs `resolve_download`. Its finite list of
-GET steps is capped at four; every step stays on `base_url`, may add parameters
-of its own, and publishes named scalar values for later steps. The final URL
-and optional filename are handed to the existing catalogue downloader. The
-manifest never writes a file and search never spends one authenticated request
-per displayed result.
+GET steps is capped at four. A step inherits `http.base_url` or declares its
+own literal HTTP(S) `base_url`, may add parameters of its own, and publishes
+named scalar values for later steps. Relative values coerced with
+`absolute_url` resolve against that step's effective base. Global `http.params`
+are inherited only when the step has the primary origin; they are never copied
+to a cross-origin step. Redirects are likewise restricted to the request's
+declared origin. The final URL and optional filename are handed to the existing
+catalogue downloader. The manifest never writes a file and search never spends
+one authenticated request per displayed result.
 
 An Anna-style provider is therefore expressible without code:
 
@@ -248,6 +253,8 @@ url = "{download_url}"
 filename = "{title}.{file_format}"
 
 [[capabilities.resolve_download.steps]]
+# Optional when an intermediate API is on another declared origin:
+# base_url = "https://annas-archive.example"
 path = "/dyn/api/fast_download.json?md5={id}"
 response_format = "json"
 
@@ -299,16 +306,18 @@ never happen to something the user was not told about.
 **Secrets are referenced, never contained.** `secret` names a value stored
 separately (settings/keychain). A manifest is therefore safe to export, paste
 in a bug report, and share; importing one never carries a credential, and a
-secret is only ever sent to the host its own manifest declares.
+secret is only ever sent to the origin beside which it is declared. Primary
+parameters are not inherited by cross-origin resolver steps.
 
 **Importing is an egress decision.** A manifest is a description of who Wilkes
-will talk to, authored by whoever handed over the file. Import shows the host
-and the capabilities before saving — `custom_integration_summary`, which reads
-the manifest and touches neither the network nor the settings file. The host is
-pinned twice over: validation refuses a path that does not start with `/`, which
-is what stops `@evil.test/` from being read as userinfo, and `request` re-parses
-the assembled URL and refuses one whose origin has moved. All traffic goes through
-`ProviderHttpClient`, so retry, backoff, `Retry-After`, and rate-limit
+will talk to, authored by whoever handed over the file. Import shows every
+deduplicated origin and the capabilities before saving —
+`custom_integration_summary`, which reads the manifest and touches neither the
+network nor the settings file. Each origin is pinned three ways: a base URL is
+literal HTTP(S), validation refuses a path that does not start with `/`, and
+`request` re-parses the assembled URL and refuses one whose origin has moved.
+The manifest HTTP client also refuses cross-origin redirects. All traffic goes
+through `ProviderHttpClient`, so retry, backoff, `Retry-After`, and rate-limit
 classification are inherited rather than reimplemented — plus a response size
 cap and timeout, which the built-in path should gain at the same time.
 

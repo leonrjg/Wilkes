@@ -15,8 +15,8 @@
 //!
 //! 1. **Templates are typed substitution.** Each capability exposes a finite
 //!    set of named values, the engine owns their encoding, and no request
-//!    template may change the host or scheme — those come from `base_url` and
-//!    are fixed when the manifest is saved.
+//!    template may change the host or scheme — those come from a literal
+//!    `base_url` and are visible before the manifest is saved.
 //! 2. **The field map is a projection.** JSON paths or CSS selection only,
 //!    with every transformation drawn from a closed vocabulary
 //!    (see [`super::coerce`]).
@@ -64,10 +64,11 @@ pub struct Manifest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HttpSpec {
-    /// The one host this manifest may ever contact. Every request is this,
-    /// plus a capability's path; no template can reach anywhere else.
+    /// The origin used by health, search, and resolver steps that do not
+    /// declare their own base. Every path is pinned to its effective origin.
     pub base_url: String,
-    /// Identification the service requires, sent on every request.
+    /// Identification the primary service requires, sent to the primary
+    /// origin and resolver steps on that same origin.
     #[serde(default)]
     pub params: Vec<HttpParam>,
 }
@@ -171,10 +172,11 @@ pub struct SearchCapability {
 
 /// A finite, acyclic resolver from one selected result to a downloadable URL.
 ///
-/// Every step is a GET to the manifest's pinned origin. Its named fields
-/// become placeholders available only to later steps and to the final output.
-/// The final URL is returned to Wilkes' existing downloader; this capability
-/// never writes a byte itself.
+/// Every step is a GET to a literal, manifest-declared origin: the primary
+/// base by default, or the step's override. Its named fields become
+/// placeholders available only to later steps and to the final output. The
+/// final URL is returned to Wilkes' existing downloader; this capability never
+/// writes a byte itself.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveDownloadCapability {
@@ -191,6 +193,11 @@ pub struct ResolveDownloadCapability {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ResolverStep {
+    /// Optional literal origin override for this step. It is deliberately not
+    /// a template: every origin a manifest can contact must be visible before
+    /// the manifest is saved. When absent, this step uses `http.base_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
     pub path: String,
     #[serde(default)]
     pub response_format: ResponseFormat,
@@ -400,6 +407,7 @@ url = "{download_url}"
 filename = "{title}.{file_format}"
 
 [[capabilities.resolve_download.steps]]
+base_url = "https://downloads.example.test"
 path = "/api/download?id={id}"
 response_format = "json"
 
@@ -409,7 +417,7 @@ name = "key"
 secret = "member_key"
 
 [capabilities.resolve_download.steps.fields]
-download_url = "url"
+download_url = { path = "url", coerce = "absolute_url" }
 "#;
 
 /// A self-contained prompt for translating service documentation or an
@@ -460,7 +468,9 @@ Return exactly one TOML manifest and no Markdown fence or commentary. If the ser
 Safety and fidelity rules:
 - Use only HTTP(S) GET requests. Search is one request. Download resolution is on demand after selection and may use only the finite steps declared below.
 - Never put a credential value in the manifest. Declare `secret = "symbolic_name"`; use `value` only for public fixed values.
-- Every request step remains on `http.base_url`. A resolved final download URL may be external because Wilkes passes it to its existing bounded downloader.
+- A resolver step may set a literal `base_url` to use another HTTP(S) origin. It cannot contain placeholders. Every contacted origin is declared and shown before save.
+- `http.params` are sent to the primary origin and same-origin resolver steps. They are never copied to a cross-origin step; repeat any parameter that origin needs under that step's `params`.
+- Redirects may stay on the request's declared origin only. A resolved final download URL may be external because Wilkes passes it to its existing bounded downloader.
 - Missing or unparseable required values are errors. Do not invent defaults.
 - Prefer exact selectors and explicit coercions. JSON is the default response format; state HTML explicitly.
 
@@ -473,7 +483,7 @@ name = "Human-readable name"          # required
 [http]
 base_url = "https://one-origin.test"  # required; http or https
 
-[[http.params]]                       # optional, repeatable; sent on every request
+[[http.params]]                       # optional, repeatable; primary-origin requests, including same-origin resolver steps
 location = "header"                     # or "query"
 name = "parameter-name"
 value = "public fixed value"          # choose exactly one of value or secret
@@ -497,10 +507,11 @@ field = { input = "query", coerce = "coercion" } # input is "query" or "limit"
 # `attribute` is HTML-only. `join` collects all matching HTML elements or joins a JSON string array. Regex capture defaults to group 1.
 
 [capabilities.resolve_download]       # optional; runs only after the user selects a result
-url = "{result_or_step_value}"        # required; HTTP(S) or relative to base_url
+url = "{result_or_step_value}"        # required; HTTP(S) or relative to http.base_url
 filename = "{title}.{file_format}"   # optional; sanitized before download
 
 [[capabilities.resolve_download.steps]]
+base_url = "https://other-origin.test" # optional literal HTTP(S) base; defaults to http.base_url
 path = "/resolve?id={id}"             # result values plus outputs from earlier steps
 response_format = "json"              # optional; "json" or "html"; defaults to json
 
@@ -527,7 +538,7 @@ Search result fields:
     .unwrap();
     writeln!(
         prompt,
-        "Resolver steps are acyclic, origin-pinned, and limited to {MAX_RESOLVER_STEPS}. They have no loops, branches, arbitrary expressions, POST requests, browser JavaScript, pagination, or writes."
+        "Resolver steps are acyclic, pinned to their declared origins, and limited to {MAX_RESOLVER_STEPS}. They have no loops, branches, arbitrary expressions, POST requests, browser JavaScript, pagination, or writes."
     )
     .unwrap();
     prompt.push_str("\nValid JSON example:\n\n");
@@ -590,17 +601,7 @@ impl Manifest {
             problems.push("name cannot be empty".to_string());
         }
 
-        match Url::parse(&self.http.base_url) {
-            Ok(url) if !matches!(url.scheme(), "http" | "https") => problems.push(format!(
-                "base_url scheme '{}' is not http or https",
-                url.scheme()
-            )),
-            Ok(url) if url.host_str().is_none() => {
-                problems.push("base_url has no host".to_string())
-            }
-            Ok(_) => {}
-            Err(error) => problems.push(format!("base_url is not a URL: {error}")),
-        }
+        problems.extend(base_url_problems("base_url", &self.http.base_url));
 
         problems.extend(param_problems("http.params", &self.http.params));
 
@@ -734,6 +735,9 @@ impl Manifest {
             .collect();
         for (index, step) in resolve.steps.iter().enumerate() {
             let label = format!("resolve_download.steps[{index}]");
+            if let Some(base_url) = &step.base_url {
+                problems.extend(base_url_problems(&format!("{label}.base_url"), base_url));
+            }
             problems.extend(template_problems_owned(
                 &format!("{label}.path"),
                 &step.path,
@@ -801,12 +805,26 @@ impl Manifest {
         problems
     }
 
-    /// The one host this manifest may contact, for the import dialog to show
-    /// before anything is saved.
-    pub fn host(&self) -> Option<String> {
-        Url::parse(&self.http.base_url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_string))
+    /// Every request origin this manifest may contact, in declaration order,
+    /// for the import dialog to show before anything is saved.
+    pub fn origins(&self) -> Vec<String> {
+        let mut origins = Vec::new();
+        let candidates = std::iter::once(self.http.base_url.as_str()).chain(
+            self.capabilities
+                .resolve_download
+                .iter()
+                .flat_map(|resolve| &resolve.steps)
+                .filter_map(|step| step.base_url.as_deref()),
+        );
+        for candidate in candidates {
+            if let Ok(url) = Url::parse(candidate) {
+                let origin = url.origin().ascii_serialization();
+                if !origins.contains(&origin) {
+                    origins.push(origin);
+                }
+            }
+        }
+        origins
     }
 
     /// Names of the secrets this manifest needs supplied.
@@ -838,6 +856,23 @@ fn selector_problem(format: ResponseFormat, selector: &str) -> Result<(), String
         ResponseFormat::Html => dom_query::Matcher::new(selector)
             .map(|_| ())
             .map_err(|error| format!("invalid CSS selector: {error:?}")),
+    }
+}
+
+fn base_url_problems(label: &str, value: &str) -> Vec<String> {
+    if value.contains(['{', '}']) {
+        return vec![format!(
+            "{label} must be a literal URL without placeholders"
+        )];
+    }
+    match Url::parse(value) {
+        Ok(url) if !matches!(url.scheme(), "http" | "https") => vec![format!(
+            "{label} scheme '{}' is not http or https",
+            url.scheme()
+        )],
+        Ok(url) if url.host_str().is_none() => vec![format!("{label} has no host")],
+        Ok(_) => Vec::new(),
+        Err(error) => vec![format!("{label} is not a URL: {error}")],
     }
 }
 
@@ -1026,8 +1061,54 @@ title = "h2"
     fn parses_a_toml_manifest() {
         let manifest = Manifest::parse(CROSSREF).unwrap();
         assert_eq!(manifest.id, "crossref");
-        assert_eq!(manifest.host().as_deref(), Some("api.crossref.org"));
+        assert_eq!(manifest.origins(), vec!["https://api.crossref.org"]);
         assert!(manifest.required_secrets().is_empty());
+    }
+
+    #[test]
+    fn resolver_step_origins_are_literal_visible_and_deduplicated() {
+        let source = format!(
+            "{HTML}\n[capabilities.resolve_download]\nurl = \"{{download_url}}\"\n\
+             [[capabilities.resolve_download.steps]]\n\
+             base_url = \"https://downloads.example.test/api\"\n\
+             path = \"/resolve?id={{id}}\"\n\
+             [capabilities.resolve_download.steps.fields]\n\
+             download_url = \"url\"\n\
+             [[capabilities.resolve_download.steps]]\n\
+             base_url = \"https://downloads.example.test/other\"\n\
+             path = \"/confirm?url={{download_url}}\"\n\
+             [capabilities.resolve_download.steps.fields]\n\
+             confirmed_url = \"url\"\n"
+        );
+        let manifest = Manifest::parse(&source).unwrap();
+        assert_eq!(
+            manifest.origins(),
+            vec!["https://example.test", "https://downloads.example.test"]
+        );
+    }
+
+    #[test]
+    fn rejects_a_templated_or_non_http_resolver_base_url() {
+        let template = format!(
+            "{HTML}\n[capabilities.resolve_download]\nurl = \"{{download_url}}\"\n\
+             [[capabilities.resolve_download.steps]]\n\
+             base_url = \"https://{{mirror}}.example.test\"\n\
+             path = \"/resolve?id={{id}}\"\n\
+             [capabilities.resolve_download.steps.fields]\n\
+             download_url = \"url\"\n"
+        );
+        let error = Manifest::parse(&template).unwrap_err().to_string();
+        assert!(
+            error.contains("literal URL without placeholders"),
+            "{error}"
+        );
+
+        let non_http = template.replace(
+            "https://{mirror}.example.test",
+            "file:///private/download.json",
+        );
+        let error = Manifest::parse(&non_http).unwrap_err().to_string();
+        assert!(error.contains("not http or https"), "{error}");
     }
 
     #[test]
@@ -1190,6 +1271,8 @@ url = "{id}"
         }
         assert!(prompt.contains(AUTHORING_JSON_EXAMPLE));
         assert!(prompt.contains(AUTHORING_HTML_EXAMPLE));
+        assert!(prompt.contains("base_url = \"https://other-origin.test\""));
+        assert!(prompt.contains("never copied to a cross-origin step"));
         assert!(prompt.contains(&format!("limited to {MAX_RESOLVER_STEPS}")));
         assert!(prompt.ends_with("before sending the prompt to the model.\n"));
     }

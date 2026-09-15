@@ -3,7 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{CONTENT_LENGTH, RETRY_AFTER};
+use reqwest::header::{CONTENT_LENGTH, LOCATION, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 
@@ -94,24 +94,50 @@ impl std::error::Error for ProviderHttpError {}
 
 impl ProviderHttpClient {
     pub fn new(provider: impl Into<Arc<str>>) -> Self {
-        let provider = provider.into();
-        let http = reqwest::Client::builder()
+        Self::build(provider.into(), false)
+    }
+
+    /// Build a client whose redirects cannot leave the origin of the initial
+    /// request. Custom manifests use this because their declared origins are
+    /// part of the import-time security decision; compiled providers retain
+    /// reqwest's ordinary bounded redirect behavior.
+    pub fn new_origin_pinned(provider: impl Into<Arc<str>>) -> Self {
+        Self::build(provider.into(), true)
+    }
+
+    fn build(provider: Arc<str>, origin_pinned: bool) -> Self {
+        let builder = reqwest::Client::builder()
             // Reqwest's default backend is native-tls when any dependency
             // enables `default-tls`. On macOS that backend can reject
             // TLS-1.3-only services with OSStatus -9836 ("bad protocol
             // version"). Select rustls explicitly; Cargo features are
             // additive, so enabling rustls alone does not select it.
-            .use_rustls_tls()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|error| {
-                let message = format!(
-                    "provider HTTP client could not initialize rustls: {}",
-                    request_error_message(&error)
-                );
-                tracing::error!(provider = %provider, "{message}");
-                Arc::<str>::from(message)
-            });
+            .use_rustls_tls();
+        let builder = if origin_pinned {
+            builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() > 10 {
+                    return attempt.error("too many redirects");
+                }
+                if attempt
+                    .previous()
+                    .first()
+                    .is_some_and(|initial| initial.origin() != attempt.url().origin())
+                {
+                    return attempt.stop();
+                }
+                attempt.follow()
+            }))
+        } else {
+            builder
+        };
+        let http = builder.timeout(REQUEST_TIMEOUT).build().map_err(|error| {
+            let message = format!(
+                "provider HTTP client could not initialize rustls: {}",
+                request_error_message(&error)
+            );
+            tracing::error!(provider = %provider, "{message}");
+            Arc::<str>::from(message)
+        });
         Self {
             provider,
             http,
@@ -252,7 +278,11 @@ impl ProviderHttpClient {
                 Ok(response) => {
                     let status = response.status();
                     let retry_after = retry_after(response.headers());
-                    let body = response.text().await.unwrap_or_default();
+                    let redirect_problem = cross_origin_redirect_problem(&response);
+                    let body = match redirect_problem {
+                        Some(problem) => problem,
+                        None => response.text().await.unwrap_or_default(),
+                    };
                     return Err(self.status_error(status, body, retry_after));
                 }
                 Err(error) => {
@@ -355,6 +385,16 @@ fn error_chain_message(error: &(dyn StdError + 'static), hidden_url: Option<&str
 
 fn should_retry_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn cross_origin_redirect_problem(response: &reqwest::Response) -> Option<String> {
+    if !response.status().is_redirection() {
+        return None;
+    }
+    let location = response.headers().get(LOCATION)?.to_str().ok()?;
+    let target = response.url().join(location).ok()?;
+    (target.origin() != response.url().origin())
+        .then(|| "cross-origin provider redirect is not allowed".to_string())
 }
 
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
@@ -485,5 +525,64 @@ mod tests {
 
         assert_eq!(error.kind, ProviderHttpErrorKind::NotFound);
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn origin_pinned_client_follows_same_origin_redirects() {
+        let mut server = mockito::Server::new_async().await;
+        let redirect = server
+            .mock("GET", "/start")
+            .with_status(302)
+            .with_header("location", "/finish")
+            .create_async()
+            .await;
+        let finish = server
+            .mock("GET", "/finish")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let status = ProviderHttpClient::new_origin_pinned("test")
+            .get_status(format!("{}/start", server.url()), &[])
+            .await
+            .unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        redirect.assert_async().await;
+        finish.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn origin_pinned_client_refuses_cross_origin_redirects() {
+        let mut source = mockito::Server::new_async().await;
+        let mut target = mockito::Server::new_async().await;
+        let redirect = source
+            .mock("GET", "/start")
+            .with_status(302)
+            .with_header("location", &format!("{}/finish", target.url()))
+            .create_async()
+            .await;
+        let finish = target
+            .mock("GET", "/finish")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let error = ProviderHttpClient::new_origin_pinned("test")
+            .get_status(format!("{}/start", source.url()), &[])
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind, ProviderHttpErrorKind::Http);
+        assert!(
+            error
+                .message
+                .contains("cross-origin provider redirect is not allowed"),
+            "{}",
+            error.message
+        );
+        redirect.assert_async().await;
+        finish.assert_async().await;
     }
 }

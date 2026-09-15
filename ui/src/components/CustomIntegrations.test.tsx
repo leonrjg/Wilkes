@@ -83,7 +83,7 @@ function apiWith(overrides: Record<string, unknown> = {}) {
     customIntegrationSummary: vi.fn().mockResolvedValue({
       id: "crossref",
       name: "Crossref",
-      host: "api.crossref.org",
+      origins: ["https://api.crossref.org"],
       capabilities: ["search", "health"],
       required_secrets: [],
       problems: [],
@@ -162,15 +162,29 @@ describe("CustomIntegrations", () => {
     expect(manifest).toContain('coerce = "join"');
     expect(manifest).toContain("[capabilities.resolve_download]");
     expect(manifest).toContain("[[capabilities.resolve_download.steps.params]]");
+    expect(manifest).toContain('## base_url = "https://annas-archive.example"');
     expect(manifest).toContain('secret = "anna_key"');
     expect(manifest).toContain('input = "query"');
   });
 
-  it("names the host a manifest will contact before anything is saved", async () => {
+  it("names every origin a manifest will contact before anything is saved", async () => {
     const onUpdate = vi.fn();
+    const api = apiWith({
+      customIntegrationSummary: vi.fn().mockResolvedValue({
+        id: "crossref",
+        name: "Crossref",
+        origins: [
+          "https://libgen.li",
+          "https://annas-archive.example",
+        ],
+        capabilities: ["search", "resolve_download"],
+        required_secrets: [],
+        problems: [],
+      }),
+    });
     render(
       <CustomIntegrations
-        api={apiWith()}
+        api={api}
         settings={settings()}
         onUpdate={onUpdate}
       />,
@@ -180,7 +194,11 @@ describe("CustomIntegrations", () => {
     fireEvent.click(screen.getByText("Read manifest"));
 
     await waitFor(() => {
-      expect(screen.getByText("api.crossref.org")).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "https://libgen.li, https://annas-archive.example",
+        ),
+      ).toBeInTheDocument();
     });
     expect(onUpdate).not.toHaveBeenCalled();
   });
@@ -343,7 +361,7 @@ describe("CustomIntegrations", () => {
       customIntegrationSummary: vi.fn().mockResolvedValue({
         id: "",
         name: "",
-        host: null,
+        origins: [],
         capabilities: [],
         required_secrets: [],
         problems: ["search.fields.titel is not a result field"],
@@ -369,7 +387,7 @@ describe("CustomIntegrations", () => {
       customIntegrationSummary: vi.fn().mockResolvedValue({
         id: "crossref",
         name: "Crossref",
-        host: "api.crossref.org",
+        origins: ["https://api.crossref.org"],
         capabilities: ["search"],
         required_secrets: ["crossref_token"],
         problems: [],

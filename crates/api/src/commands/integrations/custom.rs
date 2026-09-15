@@ -21,15 +21,15 @@ use wilkes_core::types::{IntegrationStatus, Settings};
 /// saved.
 ///
 /// Importing a manifest is an egress decision — it is a description of who
-/// Wilkes will talk to, written by whoever handed over the file — so the host
-/// it will contact is named here rather than discovered from network traffic
-/// afterwards.
+/// Wilkes will talk to, written by whoever handed over the file — so every
+/// origin it may contact is named here rather than discovered from network
+/// traffic afterwards.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ManifestSummary {
     pub id: String,
     pub name: String,
-    /// The one host every request will go to.
-    pub host: Option<String>,
+    /// All declared request origins, deduplicated in declaration order.
+    pub origins: Vec<String>,
     pub capabilities: Vec<String>,
     /// Secrets the manifest names and the user must supply.
     pub required_secrets: Vec<String>,
@@ -49,7 +49,7 @@ pub fn custom_integration_summary(manifest: String) -> ManifestSummary {
         Ok(manifest) => ManifestSummary {
             id: manifest.id.clone(),
             name: manifest.name.clone(),
-            host: manifest.host(),
+            origins: manifest.origins(),
             capabilities: capability_names(&manifest),
             required_secrets: manifest
                 .required_secrets()
@@ -58,12 +58,12 @@ pub fn custom_integration_summary(manifest: String) -> ManifestSummary {
                 .collect(),
             problems: Vec::new(),
         },
-        // A manifest that does not parse has no id, name or host to report;
+        // A manifest that does not parse has no id, name or origins to report;
         // saying so with the parse errors is the whole answer.
         Err(error) => ManifestSummary {
             id: String::new(),
             name: String::new(),
-            host: None,
+            origins: Vec::new(),
             capabilities: Vec::new(),
             required_secrets: Vec::new(),
             problems: vec![error.to_string()],
@@ -137,10 +137,10 @@ title = "title[0]"
 "#;
 
     #[test]
-    fn summary_names_the_host_and_the_secrets_before_anything_is_saved() {
+    fn summary_names_the_origins_and_the_secrets_before_anything_is_saved() {
         let summary = custom_integration_summary(MANIFEST.to_string());
         assert!(summary.problems.is_empty(), "{:?}", summary.problems);
-        assert_eq!(summary.host.as_deref(), Some("api.crossref.org"));
+        assert_eq!(summary.origins, vec!["https://api.crossref.org"]);
         assert_eq!(summary.capabilities, vec!["search"]);
         assert_eq!(summary.required_secrets, vec!["crossref_token"]);
     }
@@ -151,9 +151,9 @@ title = "title[0]"
     }
 
     #[test]
-    fn a_manifest_that_does_not_parse_reports_problems_and_no_host() {
+    fn a_manifest_that_does_not_parse_reports_problems_and_no_origins() {
         let summary = custom_integration_summary("id = 'nope'".to_string());
-        assert!(summary.host.is_none());
+        assert!(summary.origins.is_empty());
         assert!(!summary.problems.is_empty());
     }
 

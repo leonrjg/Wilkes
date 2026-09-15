@@ -973,11 +973,11 @@ export interface IntegrationsSettings {
 }
 
 /** What a draft manifest declares, shown before anything is saved: importing
- *  one is an egress decision, so the host it will contact is named up front. */
+ *  one is an egress decision, so every origin it may contact is named up front. */
 export interface ManifestSummary {
   id: string;
   name: string;
-  host: string | null;
+  origins: string[];
   capabilities: string[];
   required_secrets: string[];
   /** Empty when valid. Every problem at once, never just the first. */

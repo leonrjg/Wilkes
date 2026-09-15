@@ -58,6 +58,9 @@ url = "{download_url}"
 filename = "{title}.{file_format}"
 
 [[capabilities.resolve_download.steps]]
+## Optional: uncomment to resolve on a different Anna origin. Primary-origin
+## headers and query parameters are not forwarded across this boundary.
+## base_url = "https://annas-archive.example"
 path = "/dyn/api/fast_download.json?md5={id}"
 response_format = "json"
 
@@ -77,7 +80,7 @@ download_url = "download_url"
  * Providers the user describes instead of ones Wilkes compiles.
  *
  * The order of the editor is the order of the decisions: read the manifest and
- * see which host it will contact, supply whatever secrets it names, run it once
+ * see every origin it will contact, supply whatever secrets it names, run it once
  * against the real service, and only then switch it on. Enabling is gated on
  * that run — a manifest cannot be checked by reading it, because a selector is
  * only right about a response that has arrived.
@@ -138,7 +141,7 @@ export default function CustomIntegrations({
   };
 
   // Reading a manifest touches nothing: no request, no save. It exists so the
-  // host and the required secrets are known before either.
+  // origins and the required secrets are known before either.
   const readManifest = async () => {
     if (draft === null) return;
     setBusy(true);
@@ -380,8 +383,10 @@ export default function CustomIntegrations({
             <div className="space-y-3">
               <dl className="text-xs text-[var(--text-muted)] space-y-1">
                 <div className="flex gap-2">
-                  <dt className="text-[var(--text-dim)]">Contacts</dt>
-                  <dd className="text-[var(--text-main)]">{summary.host}</dd>
+                  <dt className="text-[var(--text-dim)]">Origins</dt>
+                  <dd className="text-[var(--text-main)]">
+                    {summary.origins.join(", ")}
+                  </dd>
                 </div>
                 <div className="flex gap-2">
                   <dt className="text-[var(--text-dim)]">Capabilities</dt>

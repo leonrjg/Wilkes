@@ -7,14 +7,14 @@
 //! Nothing about it is privileged or special-cased — the registry holds it
 //! next to `OpenAlexClient`, and callers cannot tell them apart.
 //!
-//! # The host is pinned
+//! # Every origin is pinned
 //!
-//! Every request is `base_url` plus a capability's path, and the assembled URL
-//! is checked to still have `base_url`'s origin before it is sent. A template
-//! therefore cannot redirect a request — with a `//evil.test` path, an
-//! `@`-in-userinfo trick, or a scheme change — to anywhere the user did not
-//! agree to when importing the manifest. That check is the reason paths are
-//! concatenated and then re-parsed rather than trusted.
+//! Every request is a declared literal `base_url` plus a capability's path,
+//! and the assembled URL is checked to still have that base's origin before it
+//! is sent. Resolver steps may name another base, but a template cannot. Global
+//! parameters do not cross that origin boundary, and the HTTP client refuses
+//! cross-origin redirects. A manifest therefore cannot send a request or a
+//! credential anywhere the user did not see when importing it.
 
 pub mod coerce;
 pub mod manifest;
@@ -83,7 +83,7 @@ impl CustomSource {
         let base_url = Url::parse(&base)?;
         Ok(Self {
             id: format!("custom:{}", manifest.id),
-            http: ProviderHttpClient::new(manifest.name.clone()),
+            http: ProviderHttpClient::new_origin_pinned(manifest.name.clone()),
             manifest,
             base,
             base_url,
@@ -284,7 +284,7 @@ impl CustomSource {
                 limit,
                 index,
                 &mut issues,
-                |spec, field_type| self.select_json(spec, item, field_type),
+                |spec, field_type| self.select_json(spec, item, field_type, &self.base_url),
             ) {
                 Some(result) => results.push(result),
                 None => note_missing_id(index, &mut issues),
@@ -326,7 +326,7 @@ impl CustomSource {
                 limit,
                 index,
                 &mut issues,
-                |spec, field_type| self.select_html(spec, &item, field_type),
+                |spec, field_type| self.select_html(spec, &item, field_type, &self.base_url),
             ) {
                 Some(result) => results.push(result),
                 None => note_missing_id(index, &mut issues),
@@ -433,8 +433,9 @@ impl CustomSource {
         spec: &FieldSpec,
         item: &Value,
         field_type: manifest::FieldType,
+        base_url: &Url,
     ) -> Result<Option<Projected>, String> {
-        self.select_projected(spec, field_type, |path| {
+        self.select_projected(spec, field_type, base_url, |path| {
             let selector = match Selector::parse(path) {
                 Ok(selector) => selector,
                 Err(error) => return Err(error),
@@ -470,8 +471,9 @@ impl CustomSource {
         spec: &FieldSpec,
         item: &Selection<'_>,
         field_type: manifest::FieldType,
+        base_url: &Url,
     ) -> Result<Option<Projected>, String> {
-        self.select_projected(spec, field_type, |path| {
+        self.select_projected(spec, field_type, base_url, |path| {
             let selected = if path == ":scope" {
                 item.clone()
             } else {
@@ -512,6 +514,7 @@ impl CustomSource {
         &self,
         spec: &FieldSpec,
         field_type: manifest::FieldType,
+        base_url: &Url,
         mut raw_for_path: F,
     ) -> Result<Option<Projected>, String>
     where
@@ -531,7 +534,7 @@ impl CustomSource {
                     }
                 }
             }
-            match coerce::project(spec.coercion(), field_type, &raw, &self.base_url) {
+            match coerce::project(spec.coercion(), field_type, &raw, base_url) {
                 Ok(value) => return Ok(Some(value)),
                 Err(mismatch) => last_error = Some(format!("{path}: {mismatch}")),
             }
@@ -557,11 +560,24 @@ impl CustomSource {
         for (index, step) in resolve.steps.iter().enumerate() {
             let path = substitute_values(&step.path, &values, Substitution::UrlComponent)
                 .map_err(|error| anyhow::anyhow!("resolver step {}: {error}", index + 1))?;
-            let request = self.request(&path, &step.params)?;
-            let body = self.http.get_bytes(request.url, &request.headers).await?;
-            let extracted = self.extract_step(step, &body).map_err(|error| {
-                anyhow::anyhow!("resolver step {} response: {error}", index + 1)
+            let step_base_url = self.resolver_step_base_url(step).map_err(|error| {
+                anyhow::anyhow!("resolver step {} base_url: {error}", index + 1)
             })?;
+            let step_base = step_base_url.as_str().trim_end_matches('/');
+            let inherit_global_params = step_base_url.origin() == self.base_url.origin();
+            let request = self.request_against(
+                step_base,
+                &step_base_url,
+                inherit_global_params,
+                &path,
+                &step.params,
+            )?;
+            let body = self.http.get_bytes(request.url, &request.headers).await?;
+            let extracted = self
+                .extract_step(step, &body, &step_base_url)
+                .map_err(|error| {
+                    anyhow::anyhow!("resolver step {} response: {error}", index + 1)
+                })?;
             for (name, value) in extracted {
                 values.insert(name, value);
             }
@@ -596,6 +612,7 @@ impl CustomSource {
         &self,
         step: &ResolverStep,
         body: &[u8],
+        base_url: &Url,
     ) -> anyhow::Result<HashMap<String, String>> {
         let mut out = HashMap::new();
         match step.response_format {
@@ -604,7 +621,7 @@ impl CustomSource {
                     .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
                 for (name, spec) in &step.fields {
                     let projected = self
-                        .select_json(spec, &value, resolver_field_type(spec))
+                        .select_json(spec, &value, resolver_field_type(spec), base_url)
                         .map_err(|error| anyhow::anyhow!("field '{name}': {error}"))?
                         .ok_or_else(|| anyhow::anyhow!("field '{name}' matched nothing"))?;
                     out.insert(name.clone(), projected_string(projected));
@@ -617,7 +634,7 @@ impl CustomSource {
                 let root = Selection::from(document.root());
                 for (name, spec) in &step.fields {
                     let projected = self
-                        .select_html(spec, &root, resolver_field_type(spec))
+                        .select_html(spec, &root, resolver_field_type(spec), base_url)
                         .map_err(|error| anyhow::anyhow!("field '{name}': {error}"))?
                         .ok_or_else(|| anyhow::anyhow!("field '{name}' matched nothing"))?;
                     out.insert(name.clone(), projected_string(projected));
@@ -634,17 +651,40 @@ impl CustomSource {
         path: &str,
         capability_params: &'a [HttpParam],
     ) -> anyhow::Result<PreparedRequest<'a>> {
-        let mut url = Url::parse(&format!("{}{path}", self.base))?;
+        self.request_against(&self.base, &self.base_url, true, path, capability_params)
+    }
+
+    fn resolver_step_base_url(&self, step: &ResolverStep) -> anyhow::Result<Url> {
+        Url::parse(
+            step.base_url
+                .as_deref()
+                .unwrap_or(&self.manifest.http.base_url),
+        )
+        .map_err(Into::into)
+    }
+
+    fn request_against<'a>(
+        &'a self,
+        base: &str,
+        base_url: &Url,
+        inherit_global_params: bool,
+        path: &str,
+        capability_params: &'a [HttpParam],
+    ) -> anyhow::Result<PreparedRequest<'a>> {
+        let mut url = Url::parse(&format!("{}{path}", base))?;
         anyhow::ensure!(
-            url.origin() == self.base_url.origin(),
+            url.origin() == base_url.origin(),
             "path '{path}' would send the request to {} instead of {}",
             url.origin().ascii_serialization(),
-            self.base_url.origin().ascii_serialization()
+            base_url.origin().ascii_serialization()
         );
 
         let mut headers = Vec::new();
         let mut redacted_pairs: Vec<(String, String)> = Vec::new();
-        for param in self.manifest.http.params.iter().chain(capability_params) {
+        let global_params = inherit_global_params
+            .then_some(self.manifest.http.params.as_slice())
+            .unwrap_or_default();
+        for param in global_params.iter().chain(capability_params) {
             let (value, secret) = match (&param.value, &param.secret) {
                 (Some(value), None) => (value.clone(), false),
                 (None, Some(name)) => (
@@ -1349,6 +1389,54 @@ filename = "{title}"
         let download = anna.resolve_download(book).await.unwrap().unwrap();
         assert_eq!(download.url, "https://files.example.test/book");
         assert_eq!(download.filename.as_deref(), Some("Graph_ Networks.PDF"));
+        search.assert_async().await;
+        resolve.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cross_origin_resolver_uses_its_own_base_and_does_not_receive_global_params() {
+        let mut search_server = mockito::Server::new_async().await;
+        let mut resolver_server = mockito::Server::new_async().await;
+        let search = search_server
+            .mock("GET", "/search")
+            .match_query(mockito::Matcher::Any)
+            .match_header("user-agent", "Mozilla/5.0 Wilkes")
+            .with_status(200)
+            .with_body(ANNA_BODY)
+            .create_async()
+            .await;
+        let resolve = resolver_server
+            .mock("GET", "/dyn/api/fast_download.json")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("md5".into(), "deadbeef".into()),
+                mockito::Matcher::UrlEncoded("key".into(), "secret".into()),
+            ]))
+            .match_header("user-agent", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_body(r#"{"download_url":"/files/book.pdf"}"#)
+            .create_async()
+            .await;
+
+        let manifest = ANNA_MANIFEST
+            .replace(
+                "[[capabilities.resolve_download.steps]]",
+                &format!(
+                    "[[capabilities.resolve_download.steps]]\nbase_url = {:?}",
+                    resolver_server.url()
+                ),
+            )
+            .replace(
+                "download_url = \"download_url\"",
+                "download_url = { path = \"download_url\", coerce = \"absolute_url\" }",
+            );
+        let anna = source(&manifest, &search_server.url(), &[("anna_key", "secret")]);
+        let book = anna.search("graph networks", 1).await.unwrap().remove(0);
+        let download = anna.resolve_download(&book).await.unwrap().unwrap();
+
+        assert_eq!(
+            download.url,
+            format!("{}/files/book.pdf", resolver_server.url())
+        );
         search.assert_async().await;
         resolve.assert_async().await;
     }
