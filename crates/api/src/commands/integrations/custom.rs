@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use wilkes_core::integrations::custom::manifest::Manifest;
+use wilkes_core::integrations::custom::manifest::{authoring_prompt, Manifest};
 use wilkes_core::integrations::custom::{CustomSource, ProbeReport};
 use wilkes_core::integrations::LiteratureSource;
 use wilkes_core::types::{IntegrationStatus, Settings};
@@ -36,6 +36,12 @@ pub struct ManifestSummary {
     /// Empty when the manifest is valid. Every problem at once, never the
     /// first one.
     pub problems: Vec<String>,
+}
+
+/// The model-facing authoring contract. Core owns its contents beside the
+/// parser; every application surface returns this same string unchanged.
+pub fn custom_integration_authoring_prompt() -> String {
+    authoring_prompt()
 }
 
 pub fn custom_integration_summary(manifest: String) -> ManifestSummary {
@@ -136,6 +142,11 @@ title = "title[0]"
         assert_eq!(summary.host.as_deref(), Some("api.crossref.org"));
         assert_eq!(summary.capabilities, vec!["search"]);
         assert_eq!(summary.required_secrets, vec!["crossref_token"]);
+    }
+
+    #[test]
+    fn authoring_prompt_comes_from_the_core_manifest_contract() {
+        assert_eq!(custom_integration_authoring_prompt(), authoring_prompt());
     }
 
     #[test]

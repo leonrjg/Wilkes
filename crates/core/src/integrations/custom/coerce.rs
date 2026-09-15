@@ -65,6 +65,18 @@ impl std::fmt::Display for TypeMismatch {
 }
 
 impl Coercion {
+    /// Complete manifest vocabulary. Prompt generation iterates this same list
+    /// so an authoring prompt cannot quietly omit a coercion the parser accepts.
+    pub const ALL: &'static [Self] = &[
+        Self::Int,
+        Self::Bool,
+        Self::NormalizeDoi,
+        Self::YearFromDate,
+        Self::StripHtml,
+        Self::Join,
+        Self::AbsoluteUrl,
+    ];
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Int => "int",
@@ -74,6 +86,18 @@ impl Coercion {
             Self::StripHtml => "strip_html",
             Self::Join => "join",
             Self::AbsoluteUrl => "absolute_url",
+        }
+    }
+
+    pub fn authoring_hint(self) -> &'static str {
+        match self {
+            Self::Int => "number or numeric string to integer",
+            Self::Bool => "boolean, true/false string, or 0/1 number to boolean",
+            Self::NormalizeDoi => "DOI spelling to normalized text",
+            Self::YearFromDate => "leading year of a date string to integer",
+            Self::StripHtml => "HTML-bearing string to plain text",
+            Self::Join => "string array or multiple HTML matches to text",
+            Self::AbsoluteUrl => "relative or absolute URL to an absolute URL",
         }
     }
 

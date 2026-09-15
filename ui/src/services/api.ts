@@ -168,6 +168,9 @@ export interface SearchApi {
   /** What a draft manifest declares, including the one host it will contact.
    *  Offline: nothing is requested and nothing is saved. */
   customIntegrationSummary(manifest: string): Promise<ManifestSummary>;
+  /** Self-contained instructions and the current schema for asking a model to
+   *  translate service documentation or source code into a manifest. */
+  customIntegrationAuthoringPrompt(): Promise<string>;
   /** Run a draft manifest's search capability once against the real service
    *  and report what was mapped, what was not, and why. */
   customIntegrationProbe(

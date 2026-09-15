@@ -319,6 +319,10 @@ export class TauriSearchApi implements SearchApi {
     return invoke<ManifestSummary>("custom_integration_summary", { manifest });
   }
 
+  async customIntegrationAuthoringPrompt(): Promise<string> {
+    return invoke<string>("custom_integration_authoring_prompt");
+  }
+
   async customIntegrationProbe(
     manifest: string,
     secrets: Record<string, string>,

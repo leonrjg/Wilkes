@@ -79,6 +79,7 @@ const CLEAN_PROBE: ProbeReport = {
 
 function apiWith(overrides: Record<string, unknown> = {}) {
   return {
+    customIntegrationAuthoringPrompt: vi.fn().mockResolvedValue("AUTHORING PROMPT"),
     customIntegrationSummary: vi.fn().mockResolvedValue({
       id: "crossref",
       name: "Crossref",
@@ -89,11 +90,82 @@ function apiWith(overrides: Record<string, unknown> = {}) {
     }),
     customIntegrationProbe: vi.fn().mockResolvedValue(CLEAN_PROBE),
     customIntegrationStatus: vi.fn(),
+    writeClipboard: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   } as never;
 }
 
 describe("CustomIntegrations", () => {
+  it("copies the core-owned manifest generation prompt", async () => {
+    const customIntegrationAuthoringPrompt = vi
+      .fn()
+      .mockResolvedValue("GENERATE A MANIFEST");
+    const writeClipboard = vi.fn().mockResolvedValue(undefined);
+    const api = apiWith({ customIntegrationAuthoringPrompt, writeClipboard });
+
+    render(
+      <CustomIntegrations api={api} settings={settings()} onUpdate={vi.fn()} />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Copy manifest generation prompt",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(customIntegrationAuthoringPrompt).toHaveBeenCalledOnce();
+      expect(writeClipboard).toHaveBeenCalledWith("GENERATE A MANIFEST");
+    });
+    expect(
+      screen.getByRole("button", {
+        name: "Manifest generation prompt copied",
+      }),
+    ).toHaveTextContent("Prompt copied");
+  });
+
+  it("shows prompt-copy failures", async () => {
+    const api = apiWith({
+      customIntegrationAuthoringPrompt: vi
+        .fn()
+        .mockRejectedValue(new Error("prompt unavailable")),
+    });
+
+    render(
+      <CustomIntegrations api={api} settings={settings()} onUpdate={vi.fn()} />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Copy manifest generation prompt",
+      }),
+    );
+
+    expect(
+      await screen.findByText(/Could not copy to clipboard: prompt unavailable/),
+    ).toBeInTheDocument();
+  });
+
+  it("starts with the complete HTML and download-resolution vocabulary", () => {
+    render(
+      <CustomIntegrations
+        api={apiWith()}
+        settings={settings()}
+        onUpdate={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Add integration"));
+    const manifest = (screen.getByLabelText("Manifest") as HTMLTextAreaElement).value;
+    expect(manifest).toContain('response_format = "html"');
+    expect(manifest).toContain('attribute = "href"');
+    expect(manifest).toContain("capture =");
+    expect(manifest).toContain('coerce = "join"');
+    expect(manifest).toContain("[capabilities.resolve_download]");
+    expect(manifest).toContain("[[capabilities.resolve_download.steps.params]]");
+    expect(manifest).toContain('secret = "anna_key"');
+    expect(manifest).toContain('input = "query"');
+  });
+
   it("names the host a manifest will contact before anything is saved", async () => {
     const onUpdate = vi.fn();
     render(

@@ -5084,6 +5084,12 @@ impl AppContext {
         crate::commands::integrations::custom::custom_integration_summary(manifest)
     }
 
+    /// Self-contained instructions for asking a model to translate service
+    /// documentation or code into the manifest format this build accepts.
+    pub fn custom_integration_authoring_prompt(&self) -> String {
+        crate::commands::integrations::custom::custom_integration_authoring_prompt()
+    }
+
     pub async fn custom_integration_probe(
         &self,
         manifest: String,

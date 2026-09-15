@@ -1899,6 +1899,12 @@ async fn custom_integration_summary_handler(
     Json(state.context().custom_integration_summary(body.manifest))
 }
 
+async fn custom_integration_authoring_prompt_handler(
+    State(state): State<Arc<AppState>>,
+) -> String {
+    state.context().custom_integration_authoring_prompt()
+}
+
 async fn custom_integration_probe_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ProbeBody>,
@@ -2519,6 +2525,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/integrations/custom/summary",
             post(custom_integration_summary_handler),
+        )
+        .route(
+            "/api/integrations/custom/authoring-prompt",
+            get(custom_integration_authoring_prompt_handler),
         )
         .route(
             "/api/integrations/custom/probe",

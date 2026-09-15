@@ -15,6 +15,7 @@ import {
   INPUT_CLASS,
 } from "../lib/integrations/styles";
 import type { SearchApi } from "../services/api";
+import { CopyButton } from "./CopyButton";
 
 interface CustomIntegrationsProps {
   api: SearchApi;
@@ -23,34 +24,51 @@ interface CustomIntegrationsProps {
 }
 
 const STARTER_MANIFEST = `manifest_version = 1
-id = "crossref"
-name = "Crossref"
+id = "anna-journals"
+name = "Anna journal search"
 
 [http]
-base_url = "https://api.crossref.org"
+## Replace this example host with the Anna mirror you use.
+base_url = "https://annas-archive.example"
 
-# Identification the service wants on every request. Use \`value\` for
-# something that may travel with the manifest (a contact address), and
-# \`secret = "name"\` for a credential, whose value is stored separately.
 [[http.params]]
-location = "query"
-name = "mailto"
-value = "you@example.com"
-
-[capabilities.health]
-path = "/works/10.1145/3801158"
+location = "header"
+name = "User-Agent"
+value = "Mozilla/5.0"
 
 [capabilities.search]
-path = "/works?query.bibliographic={query}&rows={limit}"
-items = "message.items[*]"
+path = "/search?q={query}&content=journal"
+response_format = "html"
+items = '''div:has(> a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"])'''
 
 [capabilities.search.fields]
-id = "DOI"
-title = "title[0]"
-doi = { path = "DOI", coerce = "normalize_doi" }
-year = { path = "published.date-parts[0][0]", coerce = "int" }
-citation_count = { path = "is-referenced-by-count", coerce = "int" }
-pdf_url = { first_of = ["link[0].URL", "resource.primary.URL"] }
+id = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", capture = '''^/md5/([0-9a-f]+)$''' }
+title = '''div.max-w-full a[href^="/md5/"]'''
+authors = { path = '''a[href^="/search"]:has(span[class="icon-[mdi--user-edit]"])''', coerce = "join" }
+publisher = '''a[href^="/search"]:has(span[class="icon-[mdi--company]"])'''
+language = { path = "div.text-gray-800", capture = '''^\\s*✅?\\s*([^\\[]+?)\\s*\\[''' }
+file_format = { path = "div.text-gray-800", capture = '''(?i)\\b(EPUB|PDF|MOBI|AZW3|AZW|DJVU|CBZ|CBR|FB2|DOCX?|TXT)\\b''' }
+file_size = { path = "div.text-gray-800", capture = '''(?i)(\\d+(?:\\.\\d+)?\\s*(?:MB|KB|GB|TB))''' }
+landing_page_url = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", coerce = "absolute_url" }
+
+[capabilities.resolve_download]
+url = "{download_url}"
+filename = "{title}.{file_format}"
+
+[[capabilities.resolve_download.steps]]
+path = "/dyn/api/fast_download.json?md5={id}"
+response_format = "json"
+
+[[capabilities.resolve_download.steps.params]]
+location = "query"
+name = "key"
+secret = "anna_key"
+
+[capabilities.resolve_download.steps.fields]
+download_url = "download_url"
+
+## For a DOI-specific provider, a field may carry the search input:
+## doi = { input = "query", coerce = "normalize_doi" }
 `;
 
 /**
@@ -80,6 +98,21 @@ export default function CustomIntegrations({
   const [statuses, setStatuses] = useState<Record<string, IntegrationStatus>>({});
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [copyError, setCopyError] = useState<string | null>(null);
+
+  const reportCopyError = (error: unknown) => {
+    setCopyError(
+      `Could not copy to clipboard: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  };
+
+  const copyAuthoringPrompt = async () => {
+    setCopyError(null);
+    const prompt = await api.customIntegrationAuthoringPrompt();
+    await api.writeClipboard(prompt);
+  };
 
   const openEditor = (config?: CustomIntegrationConfig) => {
     setDraft(config?.manifest ?? STARTER_MANIFEST);
@@ -201,12 +234,24 @@ export default function CustomIntegrations({
 
   return (
     <div className="space-y-3">
-      {configured.length === 0 && draft === null && (
+      <div className="flex items-start justify-between gap-3">
         <p className="text-xs text-[var(--text-muted)]">
-          Describe a literature service with a manifest and it becomes a search
-          provider, with no new build of Wilkes.
+          Ask an LLM to translate service documentation or an existing script
+          into a manifest using the exact schema this build accepts.
         </p>
-      )}
+        <CopyButton
+          copy={copyAuthoringPrompt}
+          onCopyError={reportCopyError}
+          aria-label="Copy manifest generation prompt"
+          copiedAriaLabel="Manifest generation prompt copied"
+          copiedChildren="Prompt copied"
+          className={`${GHOST_BUTTON_CLASS} shrink-0`}
+        >
+          Copy generation prompt
+        </CopyButton>
+      </div>
+
+      {copyError && <p className={ERROR_TEXT_CLASS}>{copyError}</p>}
 
       {configured.map((config) => (
         <div
@@ -298,13 +343,16 @@ export default function CustomIntegrations({
             >
               {busy ? "Working" : "Read manifest"}
             </button>
-            <button
-              type="button"
-              onClick={() => navigator.clipboard?.writeText(draft)}
+            <CopyButton
+              copy={() => api.writeClipboard(draft)}
+              onCopyError={reportCopyError}
+              aria-label="Copy manifest"
+              copiedAriaLabel="Manifest copied"
+              copiedChildren="Copied"
               className={GHOST_BUTTON_CLASS}
             >
-              Copy
-            </button>
+              Copy manifest
+            </CopyButton>
             <button type="button" onClick={closeEditor} className={GHOST_BUTTON_CLASS}>
               Cancel
             </button>

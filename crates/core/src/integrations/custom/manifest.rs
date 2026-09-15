@@ -29,6 +29,7 @@
 //! by producing a plausible-looking wrong record.
 
 use std::collections::BTreeMap;
+use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -78,6 +79,17 @@ pub enum ParamLocation {
     Query,
 }
 
+impl ParamLocation {
+    const ALL: &'static [Self] = &[Self::Header, Self::Query];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Header => "header",
+            Self::Query => "query",
+        }
+    }
+}
+
 /// One identification parameter.
 ///
 /// `value` and `secret` are separated because they are handled differently,
@@ -117,6 +129,17 @@ pub enum ResponseFormat {
     #[default]
     Json,
     Html,
+}
+
+impl ResponseFormat {
+    const ALL: &'static [Self] = &[Self::Json, Self::Html];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Html => "html",
+        }
+    }
 }
 
 /// A request whose only job is to prove the service answers.
@@ -326,26 +349,196 @@ pub fn search_field_type(field: &str) -> Option<FieldType> {
 /// Placeholders a capability may use, by capability.
 const SEARCH_PLACEHOLDERS: &[&str] = &["query", "limit"];
 const HEALTH_PLACEHOLDERS: &[&str] = &[];
-const RESOLVER_INPUTS: &[&str] = &[
-    "id",
-    "doi",
-    "title",
-    "year",
-    "publication_date",
-    "venue",
-    "citation_count",
-    "is_open_access",
-    "pdf_url",
-    "landing_page_url",
-    "open_access_status",
-    "license",
-    "authors",
-    "publisher",
-    "language",
-    "file_format",
-    "file_size",
-];
 const MAX_RESOLVER_STEPS: usize = 4;
+
+const AUTHORING_JSON_EXAMPLE: &str = r#"manifest_version = 1
+id = "example-json"
+name = "Example JSON service"
+
+[http]
+base_url = "https://api.example.test"
+
+[capabilities.search]
+path = "/works?q={query}&limit={limit}"
+response_format = "json"
+items = "results[*]"
+
+[capabilities.search.fields]
+id = "id"
+title = "title"
+doi = { path = "doi", coerce = "normalize_doi" }
+year = { path = "published", coerce = "year_from_date" }
+pdf_url = "links.pdf"
+"#;
+
+const AUTHORING_HTML_EXAMPLE: &str = r#"manifest_version = 1
+id = "example-html"
+name = "Example HTML service"
+
+[http]
+base_url = "https://library.example.test"
+
+[[http.params]]
+location = "header"
+name = "User-Agent"
+value = "Mozilla/5.0"
+
+[capabilities.search]
+path = "/search?q={query}"
+response_format = "html"
+items = "article.result"
+
+[capabilities.search.fields]
+id = { path = "a.download", attribute = "data-id" }
+title = "h2"
+authors = { path = "a.author", coerce = "join" }
+file_format = { path = ".metadata", capture = '''(?i)\b(PDF|EPUB)\b''' }
+landing_page_url = { path = "a.details", attribute = "href", coerce = "absolute_url" }
+
+[capabilities.resolve_download]
+url = "{download_url}"
+filename = "{title}.{file_format}"
+
+[[capabilities.resolve_download.steps]]
+path = "/api/download?id={id}"
+response_format = "json"
+
+[[capabilities.resolve_download.steps.params]]
+location = "query"
+name = "key"
+secret = "member_key"
+
+[capabilities.resolve_download.steps.fields]
+download_url = "url"
+"#;
+
+/// A self-contained prompt for translating service documentation or an
+/// existing client into a manifest. The vocabulary is assembled from the same
+/// registries validation uses; examples live beside the parser and are parsed
+/// by its tests. The UI only copies this answer and owns no schema copy.
+pub fn authoring_prompt() -> String {
+    let fields = SEARCH_FIELDS
+        .iter()
+        .map(|(name, field_type)| {
+            let required = if REQUIRED_SEARCH_FIELDS.contains(name) {
+                " (required)"
+            } else {
+                ""
+            };
+            format!("- {name}: {}{required}", field_type.name())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let coercions = Coercion::ALL
+        .iter()
+        .map(|coercion| format!("- {}: {}", coercion.name(), coercion.authoring_hint()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let response_formats = ResponseFormat::ALL
+        .iter()
+        .map(|format| format.name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let param_locations = ParamLocation::ALL
+        .iter()
+        .map(|location| location.name())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut prompt = String::new();
+    writeln!(
+        prompt,
+        "You are translating an HTTP service, its documentation, or an existing client script into a Wilkes custom-integration manifest."
+    )
+    .unwrap();
+    prompt.push_str(
+        r#"
+Read all supplied source material before writing the manifest. Preserve the service's selectors, request paths, metadata parsing, headers, and authentication semantics. Do not invent endpoints or silently omit required behavior.
+
+Return exactly one TOML manifest and no Markdown fence or commentary. If the service cannot be represented by the bounded schema below, return `UNSUPPORTED: ` followed by the exact missing capability instead of producing a partial manifest.
+
+Safety and fidelity rules:
+- Use only HTTP(S) GET requests. Search is one request. Download resolution is on demand after selection and may use only the finite steps declared below.
+- Never put a credential value in the manifest. Declare `secret = "symbolic_name"`; use `value` only for public fixed values.
+- Every request step remains on `http.base_url`. A resolved final download URL may be external because Wilkes passes it to its existing bounded downloader.
+- Missing or unparseable required values are errors. Do not invent defaults.
+- Prefer exact selectors and explicit coercions. JSON is the default response format; state HTML explicitly.
+
+TOML schema (comments name optional fields and alternatives):
+
+manifest_version = 1
+id = "lowercase-slug"                 # required; a-z, 0-9, - or _; at most 64 characters
+name = "Human-readable name"          # required
+
+[http]
+base_url = "https://one-origin.test"  # required; http or https
+
+[[http.params]]                       # optional, repeatable; sent on every request
+location = "header"                     # or "query"
+name = "parameter-name"
+value = "public fixed value"          # choose exactly one of value or secret
+# secret = "symbolic_secret_name"
+
+[capabilities.health]                 # optional
+path = "/health"                      # no placeholders
+
+[capabilities.search]                 # required when resolve_download exists
+path = "/search?q={query}&limit={limit}"
+response_format = "json"              # optional; "json" or "html"; defaults to json
+items = "selector"                    # optional JSON array selector; required CSS selector for HTML
+
+[capabilities.search.fields]
+# Each key is one result field listed below. A field specification is either:
+field = "selector"
+# or an object with a primary path and/or ordered fallback paths:
+field = { path = "selector", first_of = ["fallback.selector"], coerce = "coercion", attribute = "href", capture = "regex with a capture", capture_group = 1 }
+# or a search input instead of a response selector:
+field = { input = "query", coerce = "coercion" } # input is "query" or "limit"
+# `attribute` is HTML-only. `join` collects all matching HTML elements or joins a JSON string array. Regex capture defaults to group 1.
+
+[capabilities.resolve_download]       # optional; runs only after the user selects a result
+url = "{result_or_step_value}"        # required; HTTP(S) or relative to base_url
+filename = "{title}.{file_format}"   # optional; sanitized before download
+
+[[capabilities.resolve_download.steps]]
+path = "/resolve?id={id}"             # result values plus outputs from earlier steps
+response_format = "json"              # optional; "json" or "html"; defaults to json
+
+[[capabilities.resolve_download.steps.params]]
+location = "query"                    # or "header"
+name = "parameter-name"
+value = "public fixed value"          # choose exactly one of value or secret
+# secret = "symbolic_secret_name"
+
+[capabilities.resolve_download.steps.fields]
+new_value = "selector"                # required scalar; the full field-spec object form is also allowed
+
+Search JSON selectors use dotted keys, `[n]`, and a trailing `[*]`. HTML selectors are CSS selectors. `first_of` is ordered fallback, not boolean OR.
+
+Search result fields:
+"#,
+    );
+    writeln!(prompt, "{fields}").unwrap();
+    writeln!(prompt, "\nSupported coercions:\n{coercions}").unwrap();
+    writeln!(
+        prompt,
+        "Closed enum values: response_format = {response_formats}; parameter location = {param_locations}."
+    )
+    .unwrap();
+    writeln!(
+        prompt,
+        "Resolver steps are acyclic, origin-pinned, and limited to {MAX_RESOLVER_STEPS}. They have no loops, branches, arbitrary expressions, POST requests, browser JavaScript, pagination, or writes."
+    )
+    .unwrap();
+    prompt.push_str("\nValid JSON example:\n\n");
+    prompt.push_str(AUTHORING_JSON_EXAMPLE);
+    prompt.push_str("\nValid HTML plus download-resolution example:\n\n");
+    prompt.push_str(AUTHORING_HTML_EXAMPLE);
+    prompt.push_str(
+        "\nSOURCE MATERIAL TO TRANSLATE\nPaste the service documentation, HTTP examples, or existing implementation below this line before sending the prompt to the model.\n",
+    );
+    prompt
+}
 
 impl Manifest {
     pub fn parse(source: &str) -> anyhow::Result<Self> {
@@ -535,7 +728,10 @@ impl Manifest {
             ));
         }
 
-        let mut available: Vec<String> = RESOLVER_INPUTS.iter().map(|v| (*v).to_string()).collect();
+        let mut available: Vec<String> = SEARCH_FIELDS
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
         for (index, step) in resolve.steps.iter().enumerate() {
             let label = format!("resolve_download.steps[{index}]");
             problems.extend(template_problems_owned(
@@ -958,5 +1154,43 @@ url = "{id}"
             error.contains("resolve_download requires search"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn authoring_prompt_examples_are_manifests_the_parser_accepts() {
+        Manifest::parse(AUTHORING_JSON_EXAMPLE).unwrap();
+        Manifest::parse(AUTHORING_HTML_EXAMPLE).unwrap();
+    }
+
+    #[test]
+    fn authoring_prompt_is_derived_from_the_complete_validation_vocabulary() {
+        let prompt = authoring_prompt();
+        for (field, field_type) in SEARCH_FIELDS {
+            assert!(
+                prompt.contains(&format!("- {field}: {}", field_type.name())),
+                "prompt omitted search field {field}"
+            );
+        }
+        for coercion in Coercion::ALL {
+            assert!(
+                prompt.contains(coercion.name()),
+                "prompt omitted coercion {}",
+                coercion.name()
+            );
+        }
+        for format in ResponseFormat::ALL {
+            assert!(prompt.contains(format.name()));
+        }
+        for location in ParamLocation::ALL {
+            assert!(prompt.contains(location.name()));
+        }
+        for required in REQUIRED_SEARCH_FIELDS {
+            let field_type = search_field_type(required).unwrap();
+            assert!(prompt.contains(&format!("- {required}: {} (required)", field_type.name())));
+        }
+        assert!(prompt.contains(AUTHORING_JSON_EXAMPLE));
+        assert!(prompt.contains(AUTHORING_HTML_EXAMPLE));
+        assert!(prompt.contains(&format!("limited to {MAX_RESOLVER_STEPS}")));
+        assert!(prompt.ends_with("before sending the prompt to the model.\n"));
     }
 }

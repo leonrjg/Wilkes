@@ -1774,6 +1774,11 @@ fn custom_integration_summary(manifest: String, app: AppHandle) -> ManifestSumma
 }
 
 #[tauri::command]
+fn custom_integration_authoring_prompt(app: AppHandle) -> String {
+    app_context(&app).custom_integration_authoring_prompt()
+}
+
+#[tauri::command]
 async fn custom_integration_probe(
     manifest: String,
     secrets: HashMap<String, String>,
@@ -2360,6 +2365,7 @@ pub fn run() {
             openalex_status,
             openalex_lookup,
             custom_integration_summary,
+            custom_integration_authoring_prompt,
             custom_integration_probe,
             custom_integration_status,
             pick_directory,

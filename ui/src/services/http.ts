@@ -479,6 +479,14 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<ManifestSummary>;
   }
 
+  async customIntegrationAuthoringPrompt(): Promise<string> {
+    const res = await fetch("/api/integrations/custom/authoring-prompt");
+    if (!res.ok) {
+      throw new Error(`customIntegrationAuthoringPrompt failed: ${res.status}`);
+    }
+    return res.text();
+  }
+
   async customIntegrationProbe(
     manifest: string,
     secrets: Record<string, string>,

@@ -78,6 +78,17 @@ describe("TauriSearchApi", () => {
     expect(invoke).toHaveBeenCalledWith("update_settings", { patch });
   });
 
+  it("requests the custom integration authoring prompt", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce("GENERATE A MANIFEST");
+
+    await expect(api.customIntegrationAuthoringPrompt()).resolves.toBe(
+      "GENERATE A MANIFEST",
+    );
+    expect(invoke).toHaveBeenCalledWith(
+      "custom_integration_authoring_prompt",
+    );
+  });
+
   it("manages workspaces through dedicated commands", async () => {
     (invoke as any).mockResolvedValue({ active_workspace_id: "a", workspaces: [] });
     await api.listWorkspaces();

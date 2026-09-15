@@ -45,6 +45,20 @@ describe("HttpSearchApi", () => {
     }));
   });
 
+  it("fetches the custom integration authoring prompt as text", async () => {
+    (fetch as any).mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve("GENERATE A MANIFEST"),
+    });
+
+    await expect(api.customIntegrationAuthoringPrompt()).resolves.toBe(
+      "GENERATE A MANIFEST",
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/integrations/custom/authoring-prompt",
+    );
+  });
+
   it("uses workspace registry endpoints", async () => {
     (fetch as any).mockResolvedValue({
       ok: true,
