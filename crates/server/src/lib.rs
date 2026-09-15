@@ -1885,6 +1885,7 @@ struct ProbeBody {
     manifest: String,
     #[serde(default)]
     secrets: std::collections::HashMap<String, String>,
+    query: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -1911,7 +1912,7 @@ async fn custom_integration_probe_handler(
 ) -> Result<Json<wilkes_core::integrations::custom::ProbeReport>, (StatusCode, Json<ErrorBody>)> {
     let report = state
         .context()
-        .custom_integration_probe(body.manifest, body.secrets)
+        .custom_integration_probe(body.manifest, body.secrets, body.query)
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(report))

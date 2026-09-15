@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -176,7 +177,7 @@ impl ProviderHttpClient {
                 provider: self.provider.clone(),
                 kind: ProviderHttpErrorKind::Request,
                 status: None,
-                message: e.to_string(),
+                message: request_error_message(&e),
                 retry_after: None,
             })?;
             let Some(chunk) = chunk else { break };
@@ -240,7 +241,7 @@ impl ProviderHttpClient {
                             provider: self.provider.clone(),
                             kind: ProviderHttpErrorKind::Request,
                             status: None,
-                            message: error.to_string(),
+                            message: request_error_message(&error),
                             retry_after: None,
                         });
                     }
@@ -302,6 +303,35 @@ impl ProviderHttpClient {
     }
 }
 
+/// Render every causal layer before `reqwest::Error` is reduced to the
+/// provider-neutral error type. Reqwest deliberately keeps transport details
+/// such as DNS and TLS failures in `source()`; its top-level Display is often
+/// only "error sending request", which is not enough to repair a manifest or
+/// diagnose the machine's network configuration.
+///
+/// The actual URL is omitted here. Callers already carry a separately
+/// redacted URL, and a request URL may contain a custom integration's secret
+/// query parameter.
+fn request_error_message(error: &reqwest::Error) -> String {
+    error_chain_message(error, error.url().map(reqwest::Url::as_str))
+}
+
+fn error_chain_message(error: &(dyn StdError + 'static), hidden_url: Option<&str>) -> String {
+    let mut messages = Vec::new();
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        let mut message = cause.to_string();
+        if let Some(url) = hidden_url {
+            message = message.replace(url, "<request URL>");
+        }
+        if !message.is_empty() && messages.last() != Some(&message) {
+            messages.push(message);
+        }
+        current = cause.source();
+    }
+    messages.join("\nCaused by: ")
+}
+
 fn should_retry_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
@@ -317,6 +347,67 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct NestedError {
+        message: &'static str,
+        source: Option<Box<NestedError>>,
+    }
+
+    impl fmt::Display for NestedError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.message)
+        }
+    }
+
+    impl StdError for NestedError {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            self.source
+                .as_deref()
+                .map(|source| source as &(dyn StdError + 'static))
+        }
+    }
+
+    #[test]
+    fn causal_request_details_are_preserved_and_the_actual_url_is_hidden() {
+        let error = NestedError {
+            message: "error sending request for url (https://secret.test/path)",
+            source: Some(Box::new(NestedError {
+                message: "dns error",
+                source: Some(Box::new(NestedError {
+                    message: "host not found",
+                    source: None,
+                })),
+            })),
+        };
+
+        let rendered = error_chain_message(&error, Some("https://secret.test/path"));
+
+        assert_eq!(
+            rendered,
+            "error sending request for url (<request URL>)\nCaused by: dns error\nCaused by: host not found"
+        );
+        assert!(!rendered.contains("secret.test"));
+    }
+
+    #[tokio::test]
+    async fn a_real_transport_failure_keeps_its_reqwest_cause_chain() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{address}/unreachable");
+        let client = ProviderHttpClient::new("test").with_retry_policy(RetryPolicy {
+            max_attempts: 1,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        });
+
+        let error = client.get_status(url.clone(), &[]).await.unwrap_err();
+
+        assert!(error.message.contains("<request URL>"), "{}", error.message);
+        assert!(error.message.contains("Caused by:"), "{}", error.message);
+        assert!(!error.message.contains(&url), "{}", error.message);
+    }
 
     #[tokio::test]
     async fn retries_rate_limited_request_then_succeeds() {

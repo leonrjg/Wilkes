@@ -326,8 +326,13 @@ export class TauriSearchApi implements SearchApi {
   async customIntegrationProbe(
     manifest: string,
     secrets: Record<string, string>,
+    query: string,
   ): Promise<ProbeReport> {
-    return invoke<ProbeReport>("custom_integration_probe", { manifest, secrets });
+    return invoke<ProbeReport>("custom_integration_probe", {
+      manifest,
+      secrets,
+      query,
+    });
   }
 
   async customIntegrationStatus(id: string): Promise<IntegrationStatus> {

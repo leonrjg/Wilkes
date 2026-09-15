@@ -23,6 +23,8 @@ interface CustomIntegrationsProps {
   onUpdate: (patch: Partial<Settings>) => Promise<void> | void;
 }
 
+const INITIAL_PROBE_QUERY = "graph neural networks";
+
 const STARTER_MANIFEST = `manifest_version = 1
 id = "anna-journals"
 name = "Anna journal search"
@@ -93,6 +95,7 @@ export default function CustomIntegrations({
   const [draft, setDraft] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [secrets, setSecrets] = useState<Record<string, string>>({});
+  const [probeQuery, setProbeQuery] = useState(INITIAL_PROBE_QUERY);
   const [summary, setSummary] = useState<ManifestSummary | null>(null);
   const [report, setReport] = useState<ProbeReport | null>(null);
   const [statuses, setStatuses] = useState<Record<string, IntegrationStatus>>({});
@@ -118,6 +121,7 @@ export default function CustomIntegrations({
     setDraft(config?.manifest ?? STARTER_MANIFEST);
     setEditingId(config?.id ?? null);
     setSecrets(config?.secrets ?? {});
+    setProbeQuery(INITIAL_PROBE_QUERY);
     setSummary(null);
     setReport(null);
     setSaveError(null);
@@ -127,6 +131,7 @@ export default function CustomIntegrations({
     setDraft(null);
     setEditingId(null);
     setSecrets({});
+    setProbeQuery(INITIAL_PROBE_QUERY);
     setSummary(null);
     setReport(null);
     setSaveError(null);
@@ -151,7 +156,7 @@ export default function CustomIntegrations({
     if (draft === null) return;
     setBusy(true);
     try {
-      setReport(await api.customIntegrationProbe(draft, secrets));
+      setReport(await api.customIntegrationProbe(draft, secrets, probeQuery));
     } catch (error) {
       setReport({
         id: summary?.id ?? "",
@@ -402,11 +407,30 @@ export default function CustomIntegrations({
                 </div>
               ))}
 
+              <div className="space-y-1">
+                <label className={FIELD_LABEL_CLASS} htmlFor="custom-probe-query">
+                  Example query
+                </label>
+                <input
+                  id="custom-probe-query"
+                  type="text"
+                  value={probeQuery}
+                  onChange={(event) => {
+                    setProbeQuery(event.target.value);
+                    setReport(null);
+                  }}
+                  className={INPUT_CLASS}
+                />
+                <p className="text-[10px] text-[var(--text-dim)]">
+                  Choose terms that should return at least one representative result.
+                </p>
+              </div>
+
               <div className="flex items-center gap-2">
                 <button
                   type="button"
                   onClick={probe}
-                  disabled={busy}
+                  disabled={busy || probeQuery.trim().length === 0}
                   className={BUTTON_CLASS}
                 >
                   {busy ? "Probing" : "Probe"}
@@ -453,19 +477,34 @@ export default function CustomIntegrations({
 function ProbeReportView({ report }: { report: ProbeReport }) {
   return (
     <div className="space-y-2 border-t border-[var(--border-main)] pt-2.5">
-      <p
-        className={report.ok ? "text-xs text-[var(--text-main)]" : ERROR_TEXT_CLASS}
-      >
-        {report.ok
-          ? `Mapped ${report.results.length} record${report.results.length === 1 ? "" : "s"} with nothing left over.`
-          : (report.error ??
-            `Mapped ${report.results.length} record${report.results.length === 1 ? "" : "s"}, with ${report.issues.length} value${report.issues.length === 1 ? "" : "s"} it could not use.`)}
-      </p>
+      {report.error ? (
+        <div role="alert" className="space-y-1">
+          <p className="text-[10px] uppercase tracking-wider text-[var(--text-dim)]">
+            Error
+          </p>
+          <pre className={`${ERROR_TEXT_CLASS} font-mono whitespace-pre-wrap break-words`}>
+            {report.error}
+          </pre>
+        </div>
+      ) : (
+        <p
+          className={report.ok ? "text-xs text-[var(--text-main)]" : ERROR_TEXT_CLASS}
+        >
+          {report.ok
+            ? `Mapped ${report.results.length} record${report.results.length === 1 ? "" : "s"} with nothing left over.`
+            : `Mapped ${report.results.length} record${report.results.length === 1 ? "" : "s"}, with ${report.issues.length} value${report.issues.length === 1 ? "" : "s"} it could not use.`}
+        </p>
+      )}
 
       {report.request_url && (
-        <p className="text-[10px] font-mono text-[var(--text-dim)] break-all">
-          {report.request_url}
-        </p>
+        <div className="space-y-1">
+          <p className="text-[10px] uppercase tracking-wider text-[var(--text-dim)]">
+            Request URL
+          </p>
+          <p className="text-[10px] font-mono text-[var(--text-muted)] break-all">
+            {report.request_url}
+          </p>
+        </div>
       )}
 
       {report.issues.length > 0 && (

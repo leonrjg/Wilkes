@@ -89,9 +89,10 @@ fn capability_names(manifest: &Manifest) -> Vec<String> {
 pub async fn custom_integration_probe(
     manifest: String,
     secrets: HashMap<String, String>,
+    query: String,
 ) -> anyhow::Result<ProbeReport> {
     let manifest = Manifest::parse(&manifest)?;
-    Ok(CustomSource::new(manifest, secrets)?.probe().await)
+    Ok(CustomSource::new(manifest, secrets)?.probe(&query).await)
 }
 
 pub async fn custom_integration_status(
@@ -158,9 +159,13 @@ title = "title[0]"
 
     #[tokio::test]
     async fn probing_without_a_secret_fails_before_any_request() {
-        let report = custom_integration_probe(MANIFEST.to_string(), HashMap::new())
-            .await
-            .unwrap();
+        let report = custom_integration_probe(
+            MANIFEST.to_string(),
+            HashMap::new(),
+            "test query".to_string(),
+        )
+        .await
+        .unwrap();
         assert!(!report.ok);
         assert!(report.error.unwrap().contains("secret 'crossref_token'"));
     }

@@ -89,6 +89,24 @@ describe("TauriSearchApi", () => {
     );
   });
 
+  it("sends the selected query when probing a custom integration", async () => {
+    const report = { ok: true };
+    vi.mocked(invoke).mockResolvedValueOnce(report);
+
+    await expect(
+      api.customIntegrationProbe(
+        'id = "example"',
+        { token: "secret" },
+        "protein folding",
+      ),
+    ).resolves.toEqual(report);
+    expect(invoke).toHaveBeenCalledWith("custom_integration_probe", {
+      manifest: 'id = "example"',
+      secrets: { token: "secret" },
+      query: "protein folding",
+    });
+  });
+
   it("manages workspaces through dedicated commands", async () => {
     (invoke as any).mockResolvedValue({ active_workspace_id: "a", workspaces: [] });
     await api.listWorkspaces();

@@ -185,6 +185,34 @@ describe("CustomIntegrations", () => {
     expect(onUpdate).not.toHaveBeenCalled();
   });
 
+  it("probes with the editable example query and invalidates an old verdict", async () => {
+    const customIntegrationProbe = vi.fn().mockResolvedValue(CLEAN_PROBE);
+    const api = apiWith({ customIntegrationProbe });
+    render(
+      <CustomIntegrations api={api} settings={settings()} onUpdate={vi.fn()} />,
+    );
+
+    fireEvent.click(screen.getByText("Add integration"));
+    fireEvent.click(screen.getByText("Read manifest"));
+    const query = await screen.findByLabelText("Example query");
+    expect(query).toHaveValue("graph neural networks");
+
+    fireEvent.change(query, { target: { value: "protein folding" } });
+    fireEvent.click(screen.getByText("Probe"));
+
+    await waitFor(() => {
+      expect(customIntegrationProbe).toHaveBeenCalledWith(
+        expect.stringContaining('id = "anna-journals"'),
+        {},
+        "protein folding",
+      );
+      expect(screen.getByText("Save and enable")).not.toBeDisabled();
+    });
+
+    fireEvent.change(query, { target: { value: "different terms" } });
+    expect(screen.getByText("Save and enable")).toBeDisabled();
+  });
+
   it("refuses to enable a manifest that has not probed clean", async () => {
     const api = apiWith({
       customIntegrationProbe: vi.fn().mockResolvedValue({
@@ -222,6 +250,40 @@ describe("CustomIntegrations", () => {
     });
     // A probe that reported unmapped values leaves it unavailable.
     expect(screen.getByText("Save and enable")).toBeDisabled();
+  });
+
+  it("labels the full request error and the redacted request URL separately", async () => {
+    const api = apiWith({
+      customIntegrationProbe: vi.fn().mockResolvedValue({
+        ...CLEAN_PROBE,
+        request_url:
+          "https://annas-archive.gl/search?q=graph%20neural%20networks&key=***",
+        raw_response: "",
+        results: [],
+        ok: false,
+        error:
+          "External request failed: error sending request for url (<request URL>)\nCaused by: dns error\nCaused by: host not found",
+      }),
+    });
+    render(
+      <CustomIntegrations api={api} settings={settings()} onUpdate={vi.fn()} />,
+    );
+
+    fireEvent.click(screen.getByText("Add integration"));
+    fireEvent.click(screen.getByText("Read manifest"));
+    await waitFor(() => expect(screen.getByText("Probe")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Probe"));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Error");
+    expect(alert).toHaveTextContent("dns error");
+    expect(alert).toHaveTextContent("host not found");
+    expect(screen.getByText("Request URL")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "https://annas-archive.gl/search?q=graph%20neural%20networks&key=***",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("saves and enables once the probe is clean", async () => {

@@ -352,8 +352,9 @@ async fn custom_integration_probe_for_ctx(
     ctx: Arc<AppContext>,
     manifest: String,
     secrets: HashMap<String, String>,
+    query: String,
 ) -> Result<ProbeReport, String> {
-    ctx.custom_integration_probe(manifest, secrets)
+    ctx.custom_integration_probe(manifest, secrets, query)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1782,9 +1783,10 @@ fn custom_integration_authoring_prompt(app: AppHandle) -> String {
 async fn custom_integration_probe(
     manifest: String,
     secrets: HashMap<String, String>,
+    query: String,
     app: AppHandle,
 ) -> Result<ProbeReport, String> {
-    custom_integration_probe_for_ctx(app_context(&app), manifest, secrets).await
+    custom_integration_probe_for_ctx(app_context(&app), manifest, secrets, query).await
 }
 
 #[tauri::command]

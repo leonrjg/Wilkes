@@ -176,6 +176,7 @@ export interface SearchApi {
   customIntegrationProbe(
     manifest: string,
     secrets: Record<string, string>,
+    query: string,
   ): Promise<ProbeReport>;
   customIntegrationStatus(id: string): Promise<IntegrationStatus>;
   /** A URL this application will serve a local file at, whatever the file is:

@@ -45,10 +45,6 @@ use crate::types::{
 /// the shape of a record and the key names around it; not the whole page.
 const PROBE_BODY_CHARS: usize = 8_000;
 
-/// The query a probe searches for. Fixed rather than user-supplied so a probe
-/// is reproducible and so an empty-result probe means the projection is wrong,
-/// not that the user picked an obscure term.
-const PROBE_QUERY: &str = "graph neural networks";
 const PROBE_LIMIT: usize = 3;
 
 pub struct CustomSource {
@@ -103,15 +99,45 @@ impl CustomSource {
         &self.manifest
     }
 
-    /// Run the search capability once against a fixed query and report what
-    /// happened at every stage.
+    /// Nothing derived from an external failure reaches the interface before
+    /// every configured credential has been removed. The network layer hides
+    /// request URLs, but response bodies and nested transport errors are not
+    /// required to be as disciplined.
+    fn redact_error(&self, mut message: String) -> String {
+        let mut secrets: Vec<&str> = self
+            .secrets
+            .values()
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+            .collect();
+        secrets.sort_unstable_by(|left, right| {
+            right.len().cmp(&left.len()).then_with(|| left.cmp(right))
+        });
+        secrets.dedup();
+        for secret in secrets {
+            message = message.replace(secret, "***");
+        }
+        message
+    }
+
+    /// Run the search capability once against the caller's example query and
+    /// report what happened at every stage.
     ///
     /// The probe exists because a manifest cannot be checked by reading it: a
     /// selector is only right about a response that has arrived. Enablement is
     /// gated on this (see `custom-integrations.md` §6), and it reports every
     /// unresolved field by name — a mapping tool that silently nulled them
     /// would be a guessing tool.
-    pub async fn probe(&self) -> ProbeReport {
+    pub async fn probe(&self, query: &str) -> ProbeReport {
+        let query = query.trim();
+        if query.is_empty() {
+            return ProbeReport::failed(
+                &self.id,
+                "search",
+                String::new(),
+                "probe query cannot be empty".to_string(),
+            );
+        }
         let Some(search) = &self.manifest.capabilities.search else {
             return ProbeReport::failed(
                 &self.id,
@@ -124,13 +150,18 @@ impl CustomSource {
         let request = match self.request(
             &substitute(
                 &search.path,
-                &[("query", PROBE_QUERY), ("limit", &PROBE_LIMIT.to_string())],
+                &[("query", query), ("limit", &PROBE_LIMIT.to_string())],
             ),
             &[],
         ) {
             Ok(request) => request,
             Err(error) => {
-                return ProbeReport::failed(&self.id, "search", String::new(), error.to_string())
+                return ProbeReport::failed(
+                    &self.id,
+                    "search",
+                    String::new(),
+                    self.redact_error(error.to_string()),
+                )
             }
         };
         let redacted = request.redacted_url.clone();
@@ -138,23 +169,33 @@ impl CustomSource {
         let body = match self.http.get_bytes(request.url, &request.headers).await {
             Ok(body) => body,
             Err(error) => {
-                return ProbeReport::failed(&self.id, "search", redacted, error.to_string())
+                return ProbeReport::failed(
+                    &self.id,
+                    "search",
+                    redacted,
+                    self.redact_error(error.to_string()),
+                )
             }
         };
         let raw = String::from_utf8_lossy(&body);
         let raw_preview: String = raw.chars().take(PROBE_BODY_CHARS).collect();
 
-        match self.project_response(search, &body, PROBE_QUERY, PROBE_LIMIT) {
+        match self.project_response(search, &body, query, PROBE_LIMIT) {
             Ok(projection) => {
                 let records_seen = projection.records_seen;
                 let issues_empty = projection.issues.is_empty();
                 let resolver_error = if self.manifest.capabilities.resolve_download.is_some() {
                     match projection.results.first() {
-                        Some(result) => self
-                            .resolve_manifest_download(result)
-                            .await
-                            .err()
-                            .map(|error| format!("resolve_download probe failed: {error:#}")),
+                        Some(result) => {
+                            self.resolve_manifest_download(result)
+                                .await
+                                .err()
+                                .map(|error| {
+                                    self.redact_error(format!(
+                                        "resolve_download probe failed: {error:#}"
+                                    ))
+                                })
+                        }
                         None => Some(
                             "resolve_download probe needs one successfully projected result"
                                 .to_string(),
@@ -183,7 +224,12 @@ impl CustomSource {
                     error: resolver_error,
                 }
             }
-            Err(error) => ProbeReport::failed(&self.id, "search", redacted, error.to_string()),
+            Err(error) => ProbeReport::failed(
+                &self.id,
+                "search",
+                redacted,
+                self.redact_error(error.to_string()),
+            ),
         }
     }
 
@@ -991,7 +1037,7 @@ impl LiteratureSource for CustomSource {
                 id: self.id.clone(),
                 enabled,
                 state: IntegrationState::RemoteApiDown,
-                message: error.to_string(),
+                message: self.redact_error(error.to_string()),
                 version: None,
             }),
         }
@@ -1430,7 +1476,7 @@ filename = "{title}"
             &server.url(),
             &[("api_key", "secret")],
         )
-        .probe()
+        .probe("graph neural networks")
         .await;
 
         assert!(!report.ok, "a probe with unmapped fields is not clean");
@@ -1457,7 +1503,7 @@ filename = "{title}"
             .await;
 
         let report = source(&manifest, &server.url(), &[("api_key", "hunter2")])
-            .probe()
+            .probe("custom probe terms")
             .await;
 
         assert!(report.ok, "{:?}", report.error);
@@ -1467,7 +1513,44 @@ filename = "{title}"
             report.request_url
         );
         assert!(report.request_url.contains("***"), "{}", report.request_url);
+        let request_url = Url::parse(&report.request_url).unwrap();
+        assert!(request_url
+            .query_pairs()
+            .any(|(name, value)| name == "query" && value == "custom probe terms"));
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_blank_probe_query_is_refused_before_any_request() {
+        let report = source(
+            SEMANTIC_SCHOLAR_MANIFEST,
+            "https://example.test",
+            &[("api_key", "secret")],
+        )
+        .probe("   ")
+        .await;
+
+        assert!(!report.ok);
+        assert_eq!(report.error.as_deref(), Some("probe query cannot be empty"));
+        assert!(report.request_url.is_empty());
+    }
+
+    #[test]
+    fn surfaced_errors_redact_every_configured_secret() {
+        let source = source(
+            SEMANTIC_SCHOLAR_MANIFEST,
+            "https://example.test",
+            &[("api_key", "hunter2"), ("shorter", "hunter")],
+        );
+
+        let error = source.redact_error(
+            "request failed with hunter2; nested cause repeated hunter2 and hunter".to_string(),
+        );
+
+        assert_eq!(
+            error,
+            "request failed with ***; nested cause repeated *** and ***"
+        );
     }
 
     #[tokio::test]
@@ -1487,7 +1570,7 @@ filename = "{title}"
             &server.url(),
             &[("api_key", "secret")],
         )
-        .probe()
+        .probe("graph neural networks")
         .await;
 
         assert_eq!(report.results.len(), 1);
@@ -1515,7 +1598,7 @@ filename = "{title}"
             &server.url(),
             &[("api_key", "secret")],
         )
-        .probe()
+        .probe("graph neural networks")
         .await;
 
         assert!(!report.ok);

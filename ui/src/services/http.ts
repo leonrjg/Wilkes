@@ -490,11 +490,12 @@ export class HttpSearchApi implements SearchApi {
   async customIntegrationProbe(
     manifest: string,
     secrets: Record<string, string>,
+    query: string,
   ): Promise<ProbeReport> {
     const res = await fetch("/api/integrations/custom/probe", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ manifest, secrets }),
+      body: JSON.stringify({ manifest, secrets, query }),
     });
     if (!res.ok) throw new Error(`customIntegrationProbe failed: ${res.status}`);
     return res.json() as Promise<ProbeReport>;

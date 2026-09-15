@@ -59,6 +59,33 @@ describe("HttpSearchApi", () => {
     );
   });
 
+  it("sends the selected query when probing a custom integration", async () => {
+    const report = { ok: true };
+    (fetch as any).mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(report),
+    });
+
+    await expect(
+      api.customIntegrationProbe(
+        'id = "example"',
+        { token: "secret" },
+        "protein folding",
+      ),
+    ).resolves.toEqual(report);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/integrations/custom/probe",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          manifest: 'id = "example"',
+          secrets: { token: "secret" },
+          query: "protein folding",
+        }),
+      }),
+    );
+  });
+
   it("uses workspace registry endpoints", async () => {
     (fetch as any).mockResolvedValue({
       ok: true,

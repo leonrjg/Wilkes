@@ -5094,8 +5094,10 @@ impl AppContext {
         &self,
         manifest: String,
         secrets: std::collections::HashMap<String, String>,
+        query: String,
     ) -> anyhow::Result<wilkes_core::integrations::custom::ProbeReport> {
-        crate::commands::integrations::custom::custom_integration_probe(manifest, secrets).await
+        crate::commands::integrations::custom::custom_integration_probe(manifest, secrets, query)
+            .await
     }
 
     pub async fn custom_integration_status(
