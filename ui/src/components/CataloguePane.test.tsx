@@ -7,6 +7,7 @@ vi.mock("../services", () => ({
   api: {
     catalogueSearch: vi.fn(),
     catalogueAcquire: vi.fn(),
+    literatureProviders: vi.fn(),
     literatureSearch: vi.fn(),
     literatureResolveDownload: vi.fn(),
     listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
@@ -63,6 +64,7 @@ const WORK: LiteratureSearchResult = {
 };
 
 const search = api.catalogueSearch as unknown as ReturnType<typeof vi.fn>;
+const providers = api.literatureProviders as unknown as ReturnType<typeof vi.fn>;
 const literature = api.literatureSearch as unknown as ReturnType<typeof vi.fn>;
 const resolveDownload = api.literatureResolveDownload as unknown as ReturnType<typeof vi.fn>;
 const acquire = api.catalogueAcquire as unknown as ReturnType<typeof vi.fn>;
@@ -71,10 +73,23 @@ const importFiles = (source as unknown as { importFiles: ReturnType<typeof vi.fn
 describe("CataloguePane", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
     useCatalogueStore.getState().reset();
-    useCatalogueStore.setState({ paneOpen: true, kinds: [] });
+    // The filters outlive a reset by design, so a test that means "nothing
+    // filtered" says so rather than assuming the last test left it that way.
+    useCatalogueStore.setState({
+      paneOpen: true,
+      grains: null,
+      providers: null,
+      providerOptions: [],
+      providerOptionsError: null,
+    });
     useSettingsStore.setState({ directory: "/library", refreshFileList: vi.fn() as never });
     useWorkspaceStore.setState({ workspaces: [], activeWorkspaceId: null } as never);
+    providers.mockResolvedValue([
+      { provider: "semantic_scholar", name: "Semantic Scholar", enabled: true },
+      { provider: "openalex", name: "OpenAlex", enabled: true },
+    ]);
     search.mockResolvedValue({
       results: [{ key: "pane", terms: ["python", "lists"], hits: [HIT] }],
     });
@@ -99,12 +114,22 @@ describe("CataloguePane", () => {
     expect(search.mock.calls[0][0]).toEqual([
       { key: "pane", text: "python lists", grains: null },
     ]);
-    expect(literature).toHaveBeenCalledWith("python lists");
-    // Listed apart, under headings, because they are different answers.
-    expect(within(screen.getByRole("region", { name: "Open catalogues" })).getByText("Python 3.12")).toBeTruthy();
+    // Ten records, not the backend's own default: the pane is a shortlist to
+    // consider, not a second page of search results.
+    expect(search.mock.calls[0][1]).toBe(10);
+    expect(literature).toHaveBeenCalledWith("python lists", undefined, undefined);
+    // Listed apart, under headings, because they are different answers. The
+    // live sources are "Literature", not "Papers": a provider may index a
+    // monograph or a standard, and several do.
     expect(
-      within(screen.getByRole("region", { name: "Papers" })).getByText("Persistent Lists Revisited"),
+      within(screen.getByRole("region", { name: "Open catalogues" })).getByText("Python 3.12"),
     ).toBeTruthy();
+    expect(
+      within(screen.getByRole("region", { name: "Literature" })).getByText(
+        "Persistent Lists Revisited",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Papers" })).toBeNull();
   });
 
   /// The catalogues publish at different grains and a question is rarely
@@ -114,24 +139,133 @@ describe("CataloguePane", () => {
     render(<CataloguePane />);
     submit("python lists");
     await screen.findByText("Persistent Lists Revisited");
-    fireEvent.click(screen.getByRole("button", { name: "Reference" }));
+    // Everything is selected, so clicking a grain turns that one off.
+    fireEvent.click(screen.getByRole("button", { name: "Textbooks" }));
     await waitFor(() => {
       expect(search.mock.calls[1][0]).toEqual([
-        { key: "pane", text: "python lists", grains: ["reference"] },
+        { key: "pane", text: "python lists", grains: ["course", "reference"] },
       ]);
     });
-    // Reference alone excludes papers; nothing about the literature changed.
+    // A grain chip is the mirror's business. Nothing about the live sources
+    // changed, so they are not asked again.
     expect(literature).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText("Persistent Lists Revisited")).toBeNull();
+    expect(screen.getByText("Persistent Lists Revisited")).toBeTruthy();
   });
 
-  it("searches only the literature when only papers are selected", async () => {
-    useCatalogueStore.setState({ kinds: ["paper"] });
+  /// The grain filter belongs to the catalogues and is drawn inside their
+  /// section, because it says nothing a literature provider could act on.
+  it("keeps each filter inside the section it filters", async () => {
+    render(<CataloguePane />);
+    await screen.findByRole("button", { name: "OpenAlex" });
+    const catalogues = within(screen.getByRole("region", { name: "Open catalogues" }));
+    expect(catalogues.getByRole("button", { name: "Textbooks" })).toBeTruthy();
+    expect(catalogues.queryByRole("button", { name: "OpenAlex" })).toBeNull();
+    const live = within(screen.getByRole("region", { name: "Literature" }));
+    expect(live.getByRole("button", { name: "Semantic Scholar" })).toBeTruthy();
+    expect(live.queryByRole("button", { name: "Textbooks" })).toBeNull();
+  });
+
+  /// Narrowing to one provider asks that provider alone. Filtering the answer
+  /// afterwards would have spent the request on a rate-limited service for
+  /// results it then threw away.
+  it("asks only the selected providers and remembers the choice", async () => {
+    render(<CataloguePane />);
+    await screen.findByRole("button", { name: "OpenAlex" });
+    fireEvent.click(screen.getByRole("button", { name: "Semantic Scholar" }));
+    submit("python lists");
+    await screen.findByText("Persistent Lists Revisited");
+    expect(literature).toHaveBeenCalledWith("python lists", undefined, ["openalex"]);
+    expect(JSON.parse(localStorage.getItem("wilkes.catalogue.filters") ?? "null")).toEqual({
+      grains: null,
+      providers: ["openalex"],
+    });
+  });
+
+  /// Turning a provider back off is free: its siblings' answers are held and
+  /// the row is simply no longer listed.
+  it("narrows without asking anything again", async () => {
+    literature.mockResolvedValue({
+      query: "python lists",
+      providers: [
+        { provider: "semantic_scholar", name: "Semantic Scholar", results: [], error: null },
+        { provider: "openalex", name: "OpenAlex", results: [WORK], error: null },
+      ],
+    });
+    render(<CataloguePane />);
+    await screen.findByRole("button", { name: "OpenAlex" });
+    submit("python lists");
+    await screen.findByText("Persistent Lists Revisited");
+    fireEvent.click(screen.getByRole("button", { name: "OpenAlex" }));
+    await waitFor(() => expect(screen.queryByText("Persistent Lists Revisited")).toBeNull());
+    expect(literature).toHaveBeenCalledTimes(1);
+  });
+
+  /// Re-selecting a provider asks that provider, and only that provider: the
+  /// siblings already answered this question.
+  it("asks only the provider a widened filter adds", async () => {
+    useCatalogueStore.setState({ providers: ["openalex"] });
+    render(<CataloguePane />);
+    await screen.findByRole("button", { name: "Semantic Scholar" });
+    submit("python lists");
+    await screen.findByText("Persistent Lists Revisited");
+    literature.mockResolvedValue({
+      query: "python lists",
+      providers: [
+        { provider: "semantic_scholar", name: "Semantic Scholar", results: [], error: null },
+      ],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Semantic Scholar" }));
+    await waitFor(() => {
+      expect(literature).toHaveBeenLastCalledWith("python lists", undefined, [
+        "semantic_scholar",
+      ]);
+    });
+    // The first provider's answer survived the second request.
+    expect(screen.getByText("Persistent Lists Revisited")).toBeTruthy();
+    expect(screen.getByText(/Semantic Scholar returned nothing/)).toBeTruthy();
+  });
+
+  /// A widening that fails must not take the results the user is already
+  /// reading with it.
+  it("keeps the answers it holds when a widening request fails", async () => {
+    useCatalogueStore.setState({ providers: ["openalex"] });
+    render(<CataloguePane />);
+    await screen.findByRole("button", { name: "Semantic Scholar" });
+    submit("python lists");
+    await screen.findByText("Persistent Lists Revisited");
+    literature.mockRejectedValue(new Error("network is down"));
+    fireEvent.click(screen.getByRole("button", { name: "Semantic Scholar" }));
+    expect(await screen.findByText(/network is down/)).toBeTruthy();
+    expect(screen.getByText("Persistent Lists Revisited")).toBeTruthy();
+  });
+
+  /// Deselecting every provider is a thing a user is allowed to mean. It is
+  /// not "ask them all", and it is not a search.
+  it("asks nobody when no provider is selected", async () => {
+    useCatalogueStore.setState({ providers: [] });
     render(<CataloguePane />);
     submit("python lists");
-    expect(await screen.findByText("Persistent Lists Revisited")).toBeTruthy();
-    expect(search).not.toHaveBeenCalled();
-    expect(screen.queryByRole("region", { name: "Open catalogues" })).toBeNull();
+    expect(await screen.findByText("Python 3.12")).toBeTruthy();
+    expect(literature).not.toHaveBeenCalled();
+    expect(screen.getByText(/No provider selected/)).toBeTruthy();
+  });
+
+  /// A stored filter naming a provider the user has since removed would be
+  /// refused by the backend on every search, so it is dropped on the way in.
+  it("drops a stored provider that no longer exists", async () => {
+    useCatalogueStore.setState({ providers: ["openalex", "custom:gone"] });
+    render(<CataloguePane />);
+    await waitFor(() => {
+      expect(useCatalogueStore.getState().providers).toEqual(["openalex"]);
+    });
+  });
+
+  /// The filter is offered from the registry, so a failure to read it is said
+  /// rather than shown as an empty row that reads like "none configured".
+  it("says when the provider list could not be read", async () => {
+    providers.mockRejectedValue(new Error("no backend"));
+    render(<CataloguePane />);
+    expect(await screen.findByText(/providers could not be listed/)).toBeTruthy();
   });
 
   /// A provider that is down is reported beside the ones that answered, and
@@ -151,12 +285,13 @@ describe("CataloguePane", () => {
     expect(screen.getByText("Python 3.12")).toBeTruthy();
   });
 
-  /// No provider enabled is a setting to change, not "no papers found".
+  /// No provider enabled is a setting to change, not "nothing found".
   it("says when no literature provider is enabled", async () => {
+    providers.mockResolvedValue([]);
     literature.mockResolvedValue({ query: "python lists", providers: [] });
     render(<CataloguePane />);
     submit("python lists");
-    expect(await screen.findByText(/No literature provider is enabled/)).toBeTruthy();
+    expect(await screen.findByText(/No provider is enabled/)).toBeTruthy();
   });
 
   it("adds a paper through uploads and into the library", async () => {

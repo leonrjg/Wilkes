@@ -14,6 +14,7 @@ import type {
   CatalogueSearchResponse,
   CatalogueStatus,
   CatalogueSyncResponse,
+  LiteratureProviderInfo,
   LiteratureSearchResponse,
   ResolvedLiteratureDownload,
   BookmarkClustersResult,
@@ -210,10 +211,19 @@ export interface SearchApi {
    *  gaps should pay for one round trip, and keyed so answers can be reattached
    *  without relying on order. */
   catalogueSearch(probes: CatalogueProbe[], limit?: number): Promise<CatalogueSearchResponse>;
-  /** Every enabled literature provider asked at once. A provider that fails is
-   *  reported in its own entry beside those that answered; only a query that
-   *  could not be run at all rejects. `limit` is per provider. */
-  literatureSearch(query: string, limit?: number): Promise<LiteratureSearchResponse>;
+  /** Every literature provider this installation knows, switched on or not.
+   *  What a provider filter is offered from before anything has been asked. */
+  literatureProviders(): Promise<LiteratureProviderInfo[]>;
+  /** Every enabled literature provider asked at once, or only those named by
+   *  `providers`. A provider that fails is reported in its own entry beside
+   *  those that answered; only a query that could not be run at all — an empty
+   *  query, an unknown provider, an empty filter — rejects. `limit` is per
+   *  provider. */
+  literatureSearch(
+    query: string,
+    limit?: number,
+    providers?: string[],
+  ): Promise<LiteratureSearchResponse>;
   /** Resolve a selected provider result to a direct file URL. No bytes are
    *  written until the returned plan is passed to catalogueAcquire. */
   literatureResolveDownload(

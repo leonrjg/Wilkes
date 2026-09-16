@@ -71,22 +71,27 @@ export default function CatalogueCandidate({ hit, compact = false }: Props) {
         : "Fetch this document and add it to the current directory";
 
   return (
-    <div className="flex items-start justify-between gap-3 py-2">
-      <div className="flex min-w-0 flex-col gap-1">
+    <div className="flex items-start justify-between gap-2 py-1.5">
+      {/* `flex-1` so the blurb uses the pane it was given: a description laid
+          out at the width of its own longest line left half the row empty and
+          made every row taller than it had to be. */}
+      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
         <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-[11px] font-medium text-[var(--text-main)]">{hit.title}</span>
-          <span className="px-1.5 py-0.5 rounded bg-[var(--bg-app)] border border-[var(--border-main)] text-[9px] uppercase tracking-wider text-[var(--text-dim)]">
+          <span className="text-[11px] font-medium leading-snug text-[var(--text-main)]">
+            {hit.title}
+          </span>
+          <span className="rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1 text-[9px] uppercase tracking-wider text-[var(--text-dim)]">
             {GRAIN_LABELS[hit.grain] ?? hit.grain}
           </span>
         </div>
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-[var(--text-dim)]">
+        <div className="flex flex-wrap items-center gap-x-2 text-[10px] leading-snug text-[var(--text-dim)]">
           <span>{PROVIDER_LABELS[hit.provider] ?? hit.provider}</span>
           {hit.subject && <span className="truncate">{hit.subject}</span>}
           {hit.license && <span className="uppercase tracking-wider">{hit.license}</span>}
           {hit.pages !== null && <span>{hit.pages.toLocaleString()} pp</span>}
         </div>
         {!compact && hit.summary && (
-          <p className="text-[10px] leading-relaxed text-[var(--text-muted)] line-clamp-3">
+          <p className="line-clamp-2 text-[10px] leading-snug text-[var(--text-muted)]">
             {hit.summary}
           </p>
         )}
@@ -130,16 +135,13 @@ export default function CatalogueCandidate({ hit, compact = false }: Props) {
         {adding && !isCourse && download !== undefined && (
           <DownloadProgress download={download} title={hit.title} />
         )}
+        {/* Why there is no add button, in the space a button would have
+            taken. What adding a course *does* is the button's own tooltip:
+            a paragraph of it under every OCW row was the same sentence
+            repeated down the pane. */}
         {!acquirable && (
-          <span className="text-[10px] text-[var(--text-dim)]">
-            This catalogue does not publish a downloadable copy — open it to read
-            it where it lives.
-          </span>
-        )}
-        {isCourse && !adding && !added && (
-          <span className="text-[10px] text-[var(--text-dim)]">
-            A course, not a file: adding fetches its documents and writes a
-            syllabus from the pages OCW publishes only on the web.
+          <span className="text-[10px] leading-snug text-[var(--text-dim)]">
+            No downloadable copy — open it to read it where it lives.
           </span>
         )}
       </div>
@@ -306,15 +308,17 @@ export function PaperCandidate({ provider, work }: PaperProps) {
       : "Fetch the open-access copy and add it to the current directory";
 
   return (
-    <div className="flex items-start justify-between gap-3 py-2">
-      <div className="flex min-w-0 flex-col gap-1">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-[11px] font-medium text-[var(--text-main)]">{title}</span>
-          <span className="px-1.5 py-0.5 rounded bg-[var(--bg-app)] border border-[var(--border-main)] text-[9px] uppercase tracking-wider text-[var(--text-dim)]">
-            Paper
-          </span>
-        </div>
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-[var(--text-dim)]">
+    <div className="flex items-start justify-between gap-2 py-1.5">
+      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+        {/* No kind badge. The row already sits under the name of the provider
+            that returned it, and the badge said "Paper" over every one of them
+            — over a monograph, a standard, a thesis, whatever the provider
+            happens to index. A label that is wrong for some of its rows says
+            less than the heading above them already does. */}
+        <span className="text-[11px] font-medium leading-snug text-[var(--text-main)]">
+          {title}
+        </span>
+        <div className="flex flex-wrap items-center gap-x-2 text-[10px] leading-snug text-[var(--text-dim)]">
           {work.year !== null && <span>{work.year}</span>}
           {work.authors && <span className="truncate">{work.authors}</span>}
           {work.venue && <span className="truncate">{work.venue}</span>}
@@ -333,10 +337,10 @@ export function PaperCandidate({ provider, work }: PaperProps) {
         </div>
         {adding && download !== undefined && <DownloadProgress download={download} title={title} />}
         {acquisition === "none" && (
-          <span className="text-[10px] text-[var(--text-dim)]">
+          <span className="text-[10px] leading-snug text-[var(--text-dim)]">
             {work.is_open_access
-              ? "Listed as open access, but no direct file was reported — open it to find one."
-              : "No open-access copy was reported — open it to read it where it lives."}
+              ? "Listed as open access, but no file was reported — open it to find one."
+              : "No open-access copy reported — open it to read it where it lives."}
           </span>
         )}
       </div>

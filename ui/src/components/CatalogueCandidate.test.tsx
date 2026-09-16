@@ -106,18 +106,21 @@ describe("CatalogueCandidate", () => {
   it("offers no Add for a record nothing can fetch", () => {
     render(<CatalogueCandidate hit={{ ...HIT, pdf_url: null, acquisition: "none" }} />);
     expect(screen.queryByLabelText(/Add Combinatorial Optimization/)).toBeNull();
-    expect(screen.getByText(/does not publish a downloadable copy/i)).toBeTruthy();
+    expect(screen.getByText(/No downloadable copy/i)).toBeTruthy();
     // The landing page is still offered: it is discoverable, just not fetchable.
     expect(screen.getByLabelText(/Open Combinatorial Optimization/)).toBeTruthy();
   });
 
   /// A course has no `pdf_url` and is still acquirable — the old rule, which
   /// read acquirability off `pdf_url`, would have hidden the button entirely.
-  it("offers a course its own button and says what adding one does", () => {
+  /// What adding one does is the button's own tooltip; the row says it is a
+  /// course by offering a differently-labelled button, not by explaining
+  /// itself in a paragraph under every OCW result.
+  it("offers a course its own button", () => {
     render(<CatalogueCandidate hit={COURSE} />);
     expect(screen.getByLabelText(/Add Water Quality Control to library/)).toBeTruthy();
     expect(screen.getByText(/Add course/)).toBeTruthy();
-    expect(screen.getByText(/A course, not a file/i)).toBeTruthy();
+    expect(screen.queryByText(/A course, not a file/i)).toBeNull();
   });
 
   /// Forty PDFs called `lecture5.pdf` and `ps1.pdf` loose in a library root

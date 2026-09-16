@@ -1044,6 +1044,15 @@ export interface LiteratureProviderAnswer {
   error: string | null;
 }
 
+/** One literature provider this installation knows, as the registry names it.
+ *  Disabled ones are listed too: a stored provider filter naming one must read
+ *  as "switched off in Settings", not as "gone". */
+export interface LiteratureProviderInfo {
+  provider: string;
+  name: string;
+  enabled: boolean;
+}
+
 export interface LiteratureSearchResponse {
   query: string;
   /** One entry per enabled provider, in a stable order. Empty means no

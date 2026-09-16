@@ -12,6 +12,7 @@ import type {
   CatalogueSearchResponse,
   CatalogueStatus,
   CatalogueSyncResponse,
+  LiteratureProviderInfo,
   LiteratureSearchResponse,
   LiteratureSearchResult,
   ResolvedLiteratureDownload,
@@ -479,8 +480,16 @@ export class TauriSearchApi implements SearchApi {
     return invoke<CatalogueSearchResponse>("catalogue_search", { queries: probes, limit });
   }
 
-  async literatureSearch(query: string, limit?: number): Promise<LiteratureSearchResponse> {
-    return invoke<LiteratureSearchResponse>("literature_search", { query, limit });
+  async literatureProviders(): Promise<LiteratureProviderInfo[]> {
+    return invoke<LiteratureProviderInfo[]>("literature_providers");
+  }
+
+  async literatureSearch(
+    query: string,
+    limit?: number,
+    providers?: string[],
+  ): Promise<LiteratureSearchResponse> {
+    return invoke<LiteratureSearchResponse>("literature_search", { query, limit, providers });
   }
 
   async literatureResolveDownload(

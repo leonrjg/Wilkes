@@ -106,8 +106,9 @@ already exists — it is what the user typed.
 ### 5.2 The catalogue pane (browse and add)
 
 A dockable pane in the Bookmarks / Topics / Chat idiom, opened from the top bar,
-holding a search field over the mirror, the grain filters as toggles, and the same
-candidate rows.
+holding a search field over the mirror, a filter beside each half's own heading,
+and the same candidate rows. Ten records per probe: the pane is a shortlist of
+things to consider acquiring, not a second page of search results.
 
 - **Placement is deliberate:** this belongs beside `UploadZone` and
   `DirectoryPicker` — the places documents enter a library — not beside the search
@@ -127,19 +128,40 @@ candidate rows.
   and, at once, to every enabled literature provider (`literature_search` on
   desktop, `POST /api/literature/search` on the server; both over
   `commands::integrations::literature::search_all`, resolved through
-  `IntegrationRegistry` exactly as the MCP tool resolves one provider). A fourth
-  filter chip, *Papers*, sits beside the grains; no chip selected still means
-  everything. The two answers are listed apart — a paper row
-  (`PaperCandidate`) shows venue, year and citations, not a grain — and are never
-  ranked against each other. A provider that fails is reported in its own entry
-  beside those that answered, and "no provider enabled" is stated as a setting
-  rather than as an empty result. A chip toggle re-asks only the half whose
-  answer no longer matches the selection, so a grain toggle does not re-send the
-  query to rate-limited remote services. A paper with a `pdf_url` is added
-  through the same uploads-then-import path as a textbook. The gap strip (§5.1)
-  stays catalogue-only: it runs unprompted after every empty search, and sending
-  each of those queries to external services is not something the user asked
-  for.
+  `IntegrationRegistry` exactly as the MCP tool resolves one provider). The two
+  answers are listed apart — a literature row (`PaperCandidate`) shows venue,
+  year and citations, not a grain — and are never ranked against each other. A
+  provider that fails is reported in its own entry beside those that answered,
+  and "no provider enabled" is stated as a setting rather than as an empty
+  result. A work with a `pdf_url` is added through the same uploads-then-import
+  path as a textbook. The gap strip (§5.1) stays catalogue-only: it runs
+  unprompted after every empty search, and sending each of those queries to
+  external services is not something the user asked for.
+- **Each half filters itself, under its own heading.** The grains are the
+  mirror's vocabulary and say nothing a literature provider could act on; the
+  providers are services the user configured and have no grain. So the grain
+  chips sit inside the *Open catalogues* section and a chip per enabled provider
+  sits inside *Literature*, each filtering the results beneath it. The single
+  merged chip row this replaced had to name the live half something — it said
+  *Papers* — and so labelled every provider's every row a paper, including the
+  monographs, standards and theses several of them index. The section is named
+  *Literature* and a row carries no kind badge at all: it already sits under the
+  name of the provider that returned it.
+- **Nothing selected means every one of them, including any added later.** A
+  selection is `null` by default rather than an enumeration, so a provider the
+  user enables tomorrow joins it. Deselecting every member of one filter is the
+  other end — that half is not searched, and says so.
+- **Both filters persist** to `localStorage` under `wilkes.catalogue.filters`,
+  because which sources to ask is a standing choice and not a property of one
+  question. A stored provider id that no longer exists is pruned against the
+  registry's list (`literature_providers` on desktop, `GET
+  /api/literature/providers` on the server) when the pane opens; the backend
+  refuses an unknown id rather than quietly asking nobody.
+- **The provider filter is passed down, not applied to the answer.** A provider
+  left out of it is not asked — these are rate-limited services, and narrowing
+  after the fact would have spent the request anyway. Widening asks only the
+  providers the held answer does not already cover, and merges. A grain toggle
+  re-asks the mirror alone.
 
 ### 5.3 Prerequisites for the document in the viewer (deferred)
 

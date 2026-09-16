@@ -1962,16 +1962,26 @@ async fn catalogue_search(
     wilkes_api::commands::catalogue::search(&dir, queries, limit).map_err(catalogue_failed)
 }
 
-/// Every enabled literature provider asked at once, each answering for itself:
-/// one that fails is reported beside the ones that did not.
+/// Every literature provider this installation knows, switched on or not.
+#[tauri::command]
+async fn literature_providers(
+    app: AppHandle,
+) -> Vec<wilkes_api::commands::integrations::literature::LiteratureProviderInfo> {
+    app_context(&app).literature_providers().await
+}
+
+/// Every enabled literature provider asked at once — or only those named by
+/// `providers` — each answering for itself: one that fails is reported beside
+/// the ones that did not.
 #[tauri::command]
 async fn literature_search(
     app: AppHandle,
     query: String,
     limit: Option<usize>,
+    providers: Option<Vec<String>>,
 ) -> Result<wilkes_api::commands::integrations::literature::LiteratureSearchResponse, String> {
     app_context(&app)
-        .literature_search(query, limit)
+        .literature_search(query, limit, providers)
         .await
         .map_err(|error| error.to_string())
 }
@@ -2399,6 +2409,7 @@ pub fn run() {
             load_generation_model,
             catalogue_status,
             catalogue_search,
+            literature_providers,
             literature_search,
             literature_resolve_download,
             catalogue_sync,

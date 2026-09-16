@@ -8,6 +8,7 @@ import type {
   CatalogueSearchResponse,
   CatalogueStatus,
   CatalogueSyncResponse,
+  LiteratureProviderInfo,
   LiteratureSearchResponse,
   LiteratureSearchResult,
   ResolvedLiteratureDownload,
@@ -851,11 +852,26 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<CatalogueSearchResponse>;
   }
 
-  async literatureSearch(query: string, limit?: number): Promise<LiteratureSearchResponse> {
+  async literatureProviders(): Promise<LiteratureProviderInfo[]> {
+    const res = await fetch("/api/literature/providers");
+    if (!res.ok) throw await responseError(res, "literatureProviders");
+    return res.json() as Promise<LiteratureProviderInfo[]>;
+  }
+
+  async literatureSearch(
+    query: string,
+    limit?: number,
+    providers?: string[],
+  ): Promise<LiteratureSearchResponse> {
+    // The route refuses unknown fields, so an absent filter is omitted rather
+    // than sent as null.
+    const body: Record<string, unknown> = { query };
+    if (limit !== undefined) body.limit = limit;
+    if (providers !== undefined) body.providers = providers;
     const res = await fetch("/api/literature/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(limit === undefined ? { query } : { query, limit }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) throw await responseError(res, "literatureSearch");
     return res.json() as Promise<LiteratureSearchResponse>;

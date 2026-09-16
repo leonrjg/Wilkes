@@ -5108,18 +5108,36 @@ impl AppContext {
         crate::commands::integrations::custom::custom_integration_status(s, id).await
     }
 
-    /// One query against every enabled literature provider, answered per
-    /// provider. See [`crate::commands::integrations::literature`].
+    /// Every literature provider this installation knows, each saying whether
+    /// it is switched on. What a caller offers as a provider filter before it
+    /// has asked anything.
+    pub async fn literature_providers(
+        &self,
+    ) -> Vec<crate::commands::integrations::literature::LiteratureProviderInfo> {
+        let s = self.get_settings().await;
+        crate::commands::integrations::literature::providers(&s.integrations)
+    }
+
+    /// One query against every enabled literature provider, or against the
+    /// named subset of them, answered per provider. See
+    /// [`crate::commands::integrations::literature`].
     pub async fn literature_search(
         &self,
         query: String,
         limit: Option<usize>,
+        providers: Option<Vec<String>>,
     ) -> Result<
         crate::commands::integrations::literature::LiteratureSearchResponse,
         crate::commands::integrations::literature::LiteratureRequestError,
     > {
         let s = self.get_settings().await;
-        crate::commands::integrations::literature::search_all(&s.integrations, query, limit).await
+        crate::commands::integrations::literature::search_all(
+            &s.integrations,
+            query,
+            limit,
+            providers,
+        )
+        .await
     }
 
     pub async fn literature_resolve_download(

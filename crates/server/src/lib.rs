@@ -733,11 +733,24 @@ struct LiteratureSearchBody {
     query: String,
     #[serde(default)]
     limit: Option<usize>,
+    /// The providers to ask, or every enabled one when absent. Naming an
+    /// unknown provider, or none at all, is a 400.
+    #[serde(default)]
+    providers: Option<Vec<String>>,
 }
 
-/// Every enabled literature provider asked at once. A provider that fails is
-/// reported inside the 200 beside the ones that answered; only a request that
-/// could not be run at all — an empty query, a limit out of range — is a 400.
+/// Every literature provider this installation knows, switched on or not.
+/// What a client offers as a provider filter before it has asked anything.
+async fn literature_providers_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<wilkes_api::commands::integrations::literature::LiteratureProviderInfo>> {
+    Json(state.context().literature_providers().await)
+}
+
+/// Every enabled literature provider asked at once, or only those the body
+/// names. A provider that fails is reported inside the 200 beside the ones
+/// that answered; only a request that could not be run at all — an empty
+/// query, a limit out of range, an unknown provider — is a 400.
 async fn literature_search_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<LiteratureSearchBody>,
@@ -747,7 +760,7 @@ async fn literature_search_handler(
 > {
     state
         .context()
-        .literature_search(body.query, body.limit)
+        .literature_search(body.query, body.limit, body.providers)
         .await
         .map(Json)
         .map_err(|error| err(error.to_string()))
@@ -2448,6 +2461,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             post(chunks_search_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route("/api/catalogue/search", post(catalogue_search_handler))
+        .route("/api/literature/providers", get(literature_providers_handler))
         .route("/api/literature/search", post(literature_search_handler))
         .route(
             "/api/literature/resolve-download",
