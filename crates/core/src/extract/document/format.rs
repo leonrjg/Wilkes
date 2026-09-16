@@ -56,6 +56,25 @@ pub enum PagedFormat {
 }
 
 impl PagedFormat {
+    /// Every extension this backend reads, in lower case and without the dot.
+    ///
+    /// The same set [`Self::for_path`] admits, named once so callers that need
+    /// the list rather than a lookup — the settings boundary, which keeps these
+    /// out of the user's extension list because they are never optional — do
+    /// not restate it. `extensions_match_for_path` below holds the two
+    /// together.
+    pub const EXTENSIONS: &'static [&'static str] = &[
+        "pdf", "epub", "mobi", "prc", "pdb", "azw", "azw3", "fb2", "cbz", "cbt",
+    ];
+
+    /// Whether this path is one of the documents Wilkes always reads.
+    ///
+    /// The admission question on its own, for callers that do not care which
+    /// format answered it.
+    pub fn is_document(path: &Path) -> bool {
+        Self::for_path(path).is_some()
+    }
+
     /// The format this path is admitted as, or `None` for a file this backend
     /// must not touch.
     ///
@@ -302,6 +321,27 @@ mod tests {
                 PagedFormat::for_path(Path::new(name)),
                 Some(expected),
                 "{name}"
+            );
+        }
+    }
+
+    /// [`PagedFormat::EXTENSIONS`] and [`PagedFormat::for_path`] are one list
+    /// written twice, and a format admitted by only one of them is a document
+    /// the backend reads but the settings boundary does not know is always on
+    /// — or the reverse.
+    #[test]
+    fn extensions_match_for_path() {
+        for extension in PagedFormat::EXTENSIONS {
+            assert!(
+                PagedFormat::for_path(Path::new(&format!("book.{extension}"))).is_some(),
+                "{extension} is listed in EXTENSIONS but not admitted by for_path"
+            );
+        }
+        for name in ["a.pdf", "b.epub", "c.mobi", "d.prc", "e.pdb", "f.azw3", "f.azw", "g.fb2", "h.cbz", "i.cbt"] {
+            let extension = name.split('.').next_back().unwrap();
+            assert!(
+                PagedFormat::EXTENSIONS.contains(&extension),
+                "{extension} is admitted by for_path but missing from EXTENSIONS"
             );
         }
     }

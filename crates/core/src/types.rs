@@ -336,7 +336,32 @@ pub enum FileType {
 }
 
 impl FileType {
+    /// Which reading a file gets, or `None` for one Wilkes does not read.
+    ///
+    /// **A document is not a preference.** Every format the MuPDF backend
+    /// reads — PDF, EPUB, MOBI, KF8, FB2, comic archives — is admitted here
+    /// whatever `supported_extensions` says, because Wilkes is a reader of
+    /// documents and a library with its books switched off is not a smaller
+    /// library, it is a broken one. The extension list decides which *text*
+    /// files a corpus contains, which is a real choice: a source tree's `.rs`
+    /// files are a corpus to one user and noise to another. There is no
+    /// corresponding sense in which a PDF sitting in a library is noise, and
+    /// letting one drop out of it produced the same silence either way —
+    /// a shelf of EPUBs that indexed as nothing, with no error anywhere,
+    /// because a settings file written before EPUB support existed did not
+    /// name them.
+    ///
+    /// This is the one gate: every admission in the application reaches it,
+    /// directly or through `directory_watcher::path_has_supported_extension`.
     pub fn detect(path: &std::path::Path, supported_extensions: &[String]) -> Option<Self> {
+        // `Pdf` on the wire has meant "a document read as laid-out pages"
+        // since the MuPDF backend started reading EPUB, MOBI and FB2 as well;
+        // the name is kept because it is a queryable field users have written
+        // saved filters against.
+        if crate::extract::document::format::PagedFormat::is_document(path) {
+            return Some(FileType::Paged);
+        }
+
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -347,17 +372,7 @@ impl FileType {
                 .iter()
                 .any(|s| s.to_ascii_lowercase() == *ext)
             {
-                // Which reading a file gets, asked of the one list that
-                // decides it. `Pdf` has meant "a document read as laid-out
-                // pages" since the MuPDF backend started reading EPUB, MOBI
-                // and FB2 as well; the wire name is kept because it is a
-                // queryable field users have written filters against.
-                return Some(
-                    match crate::extract::document::format::PagedFormat::for_path(path) {
-                        Some(_) => FileType::Paged,
-                        None => FileType::PlainText,
-                    },
-                );
+                return Some(FileType::PlainText);
             }
         }
 
@@ -2646,7 +2661,16 @@ pub struct Settings {
     pub integrations: IntegrationsSettings,
     #[serde(default)]
     pub primary_metadata_source: MetadataSourcePreference,
-    #[serde(default = "default_supported_extensions")]
+    /// The *text* files a corpus contains. Documents are not in here and
+    /// cannot be: [`FileType::detect`] admits every format the MuPDF backend
+    /// reads whatever this list says, so a document extension stored in it
+    /// would be a value that decides nothing while reading as though it did.
+    /// `deserialize_supported_extensions` drops them on the way in, including
+    /// from the settings files of installs written before this was true.
+    #[serde(
+        default = "default_supported_extensions",
+        deserialize_with = "deserialize_supported_extensions"
+    )]
     pub supported_extensions: Vec<String>,
     #[serde(default)]
     pub max_results: usize,
@@ -2723,18 +2747,41 @@ fn default_pdf_auto_zoom_target_px() -> f64 {
     15.5
 }
 
+/// The text files a fresh install reads. The documents — PDF, EPUB, MOBI,
+/// KF8, FB2, comic archives — are deliberately absent: they are admitted by
+/// [`FileType::detect`] itself and are never a setting.
 fn default_supported_extensions() -> Vec<String> {
-    vec![
-        "txt", "md", "json", "xml", "html", "htm", "log", "csv", "jsonl", "pdf",
-        // Read as laid-out pages by the MuPDF backend. `azw3` is admitted so
-        // that a Kindle KF8 book is refused with a reason a user can see,
-        // rather than omitted as an unsupported extension and never mentioned
-        // — see `extract::document::format::guard_container`.
-        "epub", "mobi", "prc", "pdb", "fb2", "azw", "azw3", "cbz", "cbt",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
+    ["txt", "md", "json", "xml", "html", "htm", "log", "csv", "jsonl"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// Read the extension list, less any document extension a stored settings file
+/// still names.
+///
+/// Every install predating this carries the whole document list in its
+/// `supported_extensions`, and so would every settings file the interface
+/// wrote back afterwards. Dropping them here rather than only in the interface
+/// means the list one consumer reads is the list every consumer reads, and the
+/// panel that edits it has nothing to hide.
+fn deserialize_supported_extensions<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let stored = Vec::<String>::deserialize(deserializer)?;
+    Ok(without_document_extensions(stored))
+}
+
+/// The text extensions of a list that may also name documents.
+pub fn without_document_extensions(extensions: Vec<String>) -> Vec<String> {
+    use crate::extract::document::format::PagedFormat;
+    extensions
+        .into_iter()
+        .filter(|extension| {
+            !PagedFormat::EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        })
+        .collect()
 }
 
 impl Default for Settings {
@@ -3428,7 +3475,7 @@ mod tests {
 
     #[test]
     fn test_file_type_detect() {
-        let extensions = vec!["txt".to_string(), "pdf".to_string()];
+        let extensions = vec!["txt".to_string()];
 
         assert_eq!(
             FileType::detect(Path::new("test.txt"), &extensions),
@@ -3795,12 +3842,16 @@ mod tests {
     fn books_are_detected_as_paged_documents() {
         let supported = default_supported_extensions();
         for name in [
+            "book.pdf",
             "book.epub",
             "book.mobi",
             "book.prc",
             "book.pdb",
             "book.fb2",
+            "book.azw",
             "book.azw3",
+            "book.cbz",
+            "book.cbt",
         ] {
             assert_eq!(
                 FileType::detect(std::path::Path::new(name), &supported),
@@ -3815,6 +3866,38 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// The whole point of admitting documents in `detect`: a settings file
+    /// that predates a format, or one a user pruned, still reads the books in
+    /// the corpus rather than silently omitting them.
+    #[test]
+    fn documents_are_admitted_with_no_extension_setting_at_all() {
+        for extension in crate::extract::document::format::PagedFormat::EXTENSIONS {
+            let name = format!("book.{extension}");
+            assert_eq!(
+                FileType::detect(std::path::Path::new(&name), &[]),
+                Some(FileType::Paged),
+                "{name}"
+            );
+        }
+    }
+
+    /// A stored list naming a document says nothing the reader does not
+    /// already do, so it does not survive the read: the setting holds text
+    /// extensions only, whatever an older install wrote into it.
+    #[test]
+    fn a_stored_document_extension_is_dropped_from_the_setting() {
+        let mut json = serde_json::to_value(Settings::default()).unwrap();
+        json["supported_extensions"] =
+            serde_json::json!(["txt", "pdf", "EPUB", "rs", "cbz", "azw3"]);
+
+        let settings: Settings = serde_json::from_value(json).unwrap();
+
+        assert_eq!(
+            settings.supported_extensions,
+            vec!["txt".to_string(), "rs".to_string()]
+        );
     }
 
     #[test]
@@ -3878,7 +3961,8 @@ mod tests {
     #[test]
     fn test_settings_default() {
         let s = Settings::default();
-        assert!(s.supported_extensions.contains(&"pdf".to_string()));
+        assert!(!s.supported_extensions.contains(&"pdf".to_string()));
+        assert!(s.supported_extensions.contains(&"txt".to_string()));
         assert_eq!(s.context_lines, 2);
         assert_eq!(s.chat_backend, AgentBackend::ClaudeCode);
         assert_eq!(s.pdf_auto_zoom_target_px, 15.5);

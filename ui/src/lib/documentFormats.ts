@@ -21,13 +21,44 @@ function extensionOf(path: string): string {
   return dot > 0 ? name.slice(dot + 1) : "";
 }
 
-/** Whether the backend reads this document as laid-out pages rather than as
- *  text — PDF, EPUB, MOBI, AZW3, FB2 and comic archives.
+/** Every extension the backend reads as laid-out pages, mapped to the badge it
+ *  is shown under.
  *
- *  The frontend's copy of the backend's `PagedFormat::for_path`, and the two
- *  must agree. A document opened from the file tree is given its origin from
- *  this: get it wrong and the pane asks for a page-shaped preview and receives
- *  a text-shaped one, or the reverse, and renders nothing at all. */
+ *  The frontend's copy of the backend's `PagedFormat::for_path` and
+ *  `PagedFormat::EXTENSIONS`, and the three must agree. A document opened from
+ *  the file tree is given its origin from this: get it wrong and the pane asks
+ *  for a page-shaped preview and receives a text-shaped one, or the reverse,
+ *  and renders nothing at all. */
+const PAGED_FORMATS: Readonly<Record<string, string>> = {
+  pdf: "PDF",
+  epub: "EPUB",
+  mobi: "MOBI",
+  prc: "MOBI",
+  pdb: "MOBI",
+  azw3: "AZW3",
+  azw: "AZW3",
+  fb2: "FB2",
+  cbz: "CBZ",
+  cbt: "CBZ",
+};
+
+/** The documents Wilkes always reads, in the order they are shown.
+ *
+ *  These are not a preference. `FileType::detect` admits them whatever the
+ *  extension setting holds, so the settings panel shows them as always on
+ *  rather than as entries a user can remove and be quietly disobeyed. */
+export const ALWAYS_ENABLED_DOCUMENT_EXTENSIONS: readonly string[] =
+  Object.keys(PAGED_FORMATS);
+
+/** Whether this extension is one of the always-enabled document formats.
+ *  Takes a bare extension, with or without its dot. */
+export function isDocumentExtension(extension: string): boolean {
+  const clean = extension.trim().toLowerCase().replace(/^\./, "");
+  return Object.prototype.hasOwnProperty.call(PAGED_FORMATS, clean);
+}
+
+/** Whether the backend reads this document as laid-out pages rather than as
+ *  text — PDF, EPUB, MOBI, AZW3, FB2 and comic archives. */
 export function isPagedPath(path: string): boolean {
   return pagedFormatLabel(path) !== null;
 }
@@ -43,24 +74,11 @@ export function isPdfPath(path: string): boolean {
  *  plain text. Derived from the extension because `file_type` would label an
  *  EPUB "PDF". */
 export function pagedFormatLabel(path: string): string | null {
-  switch (extensionOf(path)) {
-    case "pdf":
-      return "PDF";
-    case "epub":
-      return "EPUB";
-    case "mobi":
-    case "prc":
-    case "pdb":
-      return "MOBI";
-    case "azw3":
-    case "azw":
-      return "AZW3";
-    case "fb2":
-      return "FB2";
-    case "cbz":
-    case "cbt":
-      return "CBZ";
-    default:
-      return null;
-  }
+  const extension = extensionOf(path);
+  // An own-property check rather than a bare lookup: an extension like
+  // `constructor` would otherwise find something on the prototype and label a
+  // text file a book.
+  return Object.prototype.hasOwnProperty.call(PAGED_FORMATS, extension)
+    ? PAGED_FORMATS[extension]
+    : null;
 }

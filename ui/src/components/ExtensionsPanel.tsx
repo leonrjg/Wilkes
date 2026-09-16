@@ -1,6 +1,10 @@
 import { useState } from "react";
 import type { Settings } from "../lib/types";
 import { Tooltip } from "@leonrjg/wilkes-reader";
+import {
+  ALWAYS_ENABLED_DOCUMENT_EXTENSIONS,
+  isDocumentExtension,
+} from "../lib/documentFormats";
 
 interface ExtensionsPanelProps {
   settings: Settings;
@@ -9,21 +13,37 @@ interface ExtensionsPanelProps {
 
 export default function ExtensionsPanel({ settings, onUpdate }: ExtensionsPanelProps) {
   const [newExt, setNewExt] = useState("");
+  const [notice, setNotice] = useState<string | null>(null);
+
+  // Documents never appear in the setting — the backend strips them on read,
+  // because `FileType::detect` admits them whatever this list holds. Filtered
+  // here as well so a settings object built before that (a stale store, a test
+  // fixture) cannot show a book as a removable entry.
+  const textExtensions = settings.supported_extensions.filter(
+    (ext) => !isDocumentExtension(ext),
+  );
 
   const handleAdd = () => {
     let clean = newExt.trim().toLowerCase();
     if (clean.startsWith(".")) clean = clean.substring(1);
-    if (clean && !settings.supported_extensions.includes(clean)) {
+    if (!clean) return;
+    if (isDocumentExtension(clean)) {
+      setNotice(`.${clean} is a document format and is always read.`);
+      setNewExt("");
+      return;
+    }
+    if (!textExtensions.includes(clean)) {
       onUpdate({
-        supported_extensions: [...settings.supported_extensions, clean].sort(),
+        supported_extensions: [...textExtensions, clean].sort(),
       });
       setNewExt("");
+      setNotice(null);
     }
   };
 
   const handleRemove = (ext: string) => {
     onUpdate({
-      supported_extensions: settings.supported_extensions.filter((e) => e !== ext),
+      supported_extensions: textExtensions.filter((e) => e !== ext),
     });
   };
 
@@ -31,10 +51,32 @@ export default function ExtensionsPanel({ settings, onUpdate }: ExtensionsPanelP
     <div className="space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300 p-1">
       <section>
         <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2.5 uppercase tracking-wider">
-          Manage File Extensions
+          Documents
+        </h3>
+        <p className="text-[10px] text-[var(--text-dim)] mb-3 italic">
+          Always read, and not a setting: every document in a library is indexed and
+          searchable whatever the text extensions below say.
+        </p>
+        <div className="grid grid-cols-4 gap-2 mb-6">
+          {ALWAYS_ENABLED_DOCUMENT_EXTENSIONS.map((ext) => (
+            <Tooltip key={ext} content="Always enabled">
+              <div className="flex items-center justify-between px-2 py-1 bg-[var(--bg-active)]/30 border border-[var(--border-main)] rounded">
+                <span className="text-xs text-[var(--text-main)] font-mono">.{ext}</span>
+                <span className="text-[var(--text-dim)] text-[10px]" aria-hidden="true">
+                  🔒
+                </span>
+              </div>
+            </Tooltip>
+          ))}
+        </div>
+      </section>
+
+      <section>
+        <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2.5 uppercase tracking-wider">
+          Manage Text Extensions
         </h3>
         <p className="text-[10px] text-[var(--text-dim)] mb-4 italic">
-          Files with these extensions will be indexed and searchable. Plain text and PDF are supported.
+          Text files with these extensions will be indexed and searchable.
         </p>
 
         <div className="flex gap-2 mb-4">
@@ -55,8 +97,14 @@ export default function ExtensionsPanel({ settings, onUpdate }: ExtensionsPanelP
           </button>
         </div>
 
+        {notice && (
+          <p className="text-[10px] text-[var(--text-dim)] mb-3" role="status">
+            {notice}
+          </p>
+        )}
+
         <div className="grid grid-cols-4 gap-2 max-h-[300px] overflow-y-auto pr-1 custom-scrollbar">
-          {settings.supported_extensions.map((ext) => (
+          {textExtensions.map((ext) => (
             <div
               key={ext}
               className="flex items-center justify-between px-2 py-1 bg-[var(--bg-active)]/50 border border-[var(--border-main)] rounded group hover:border-[var(--border-strong)] transition-colors"
