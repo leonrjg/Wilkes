@@ -2929,6 +2929,16 @@ pub struct IntegrationsSettings {
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CustomIntegrationConfig {
     pub id: String,
+    /// What this installation calls the provider, when the user has renamed
+    /// it. Absent means the manifest's own `name` stands.
+    ///
+    /// Held here rather than edited into the manifest because the manifest
+    /// describes the *service* — it is the thing a user is handed, copies and
+    /// shares — while this names their copy of it. Rewriting the manifest to
+    /// rename a row would also mean re-reading and re-probing it, which is a
+    /// lot of ceremony for a label.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub enabled: bool,
     /// TOML or JSON manifest source. See

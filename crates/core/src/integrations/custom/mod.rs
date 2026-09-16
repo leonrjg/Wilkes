@@ -51,6 +51,11 @@ pub struct CustomSource {
     /// Namespaced `custom:<manifest id>`, so a manifest can never shadow a
     /// built-in and no log line is ambiguous about which kind it names.
     id: String,
+    /// What to call this provider: the name the user gave it, otherwise the
+    /// one the manifest declares. Resolved once here so that every caller —
+    /// the pane's heading, a status line, the text of a failed request — says
+    /// the same thing without each deciding for itself.
+    display_name: String,
     manifest: Manifest,
     /// The base with any trailing slash removed, for concatenating a
     /// capability's path onto. Kept separately from `base_url` because a
@@ -74,16 +79,32 @@ impl CustomSource {
             config.id,
             manifest.id
         );
-        Self::new(manifest, config.secrets.clone())
+        Self::named(manifest, config.secrets.clone(), config.name.clone())
     }
 
     pub fn new(manifest: Manifest, secrets: HashMap<String, String>) -> anyhow::Result<Self> {
+        Self::named(manifest, secrets, None)
+    }
+
+    /// The same source under a name the user chose. A blank override is no
+    /// override: a cleared rename box restores the manifest's own name rather
+    /// than leaving a provider with nothing to be called.
+    pub fn named(
+        manifest: Manifest,
+        secrets: HashMap<String, String>,
+        name: Option<String>,
+    ) -> anyhow::Result<Self> {
         manifest.validate()?;
         let base = manifest.http.base_url.trim_end_matches('/').to_string();
         let base_url = Url::parse(&base)?;
+        let display_name = name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| manifest.name.clone());
         Ok(Self {
             id: format!("custom:{}", manifest.id),
-            http: ProviderHttpClient::new_origin_pinned(manifest.name.clone()),
+            http: ProviderHttpClient::new_origin_pinned(display_name.clone()),
+            display_name,
             manifest,
             base,
             base_url,
@@ -124,10 +145,15 @@ impl CustomSource {
     /// report what happened at every stage.
     ///
     /// The probe exists because a manifest cannot be checked by reading it: a
-    /// selector is only right about a response that has arrived. Enablement is
-    /// gated on this (see `custom-integrations.md` §6), and it reports every
-    /// unresolved field by name — a mapping tool that silently nulled them
-    /// would be a guessing tool.
+    /// selector is only right about a response that has arrived. It reports
+    /// every unresolved field by name — a mapping tool that silently nulled
+    /// them would be a guessing tool.
+    ///
+    /// It is evidence and not a gate (see `custom-integrations.md` §6): a
+    /// service that is down, rate-limiting or holding nothing for the chosen
+    /// example query fails a probe without saying anything about whether the
+    /// manifest is right, so what this finds is shown to the user rather than
+    /// standing between them and saving their work.
     pub async fn probe(&self, query: &str) -> ProbeReport {
         let query = query.trim();
         if query.is_empty() {
@@ -944,7 +970,7 @@ impl LiteratureSource for CustomSource {
     }
 
     fn name(&self) -> &str {
-        &self.manifest.name
+        &self.display_name
     }
 
     async fn search(
@@ -1110,6 +1136,41 @@ mod tests {
     use super::*;
     use crate::integrations::openalex::OpenAlexClient;
     use crate::integrations::semantic_scholar::SemanticScholarClient;
+
+    /// Renaming is a label on this installation's copy, so it must not need
+    /// the manifest touched — the manifest describes the service, and editing
+    /// it to change a row's name would mean re-reading and re-probing it.
+    #[test]
+    fn a_config_name_overrides_the_manifests_own() {
+        let config = CustomIntegrationConfig {
+            id: "openalex-as-manifest".into(),
+            name: Some("My OpenAlex".into()),
+            enabled: false,
+            manifest: OPENALEX_MANIFEST.replace("BASE_URL", "https://example.test"),
+            secrets: HashMap::new(),
+        };
+        let source = CustomSource::from_config(&config).expect("loads");
+        assert_eq!(source.name(), "My OpenAlex");
+        // The id is the manifest's and is untouched by a rename: it is what
+        // every stored selection and every log line names.
+        assert_eq!(source.id(), "custom:openalex-as-manifest");
+    }
+
+    /// A cleared rename box is no override, not a nameless provider.
+    #[test]
+    fn a_blank_config_name_leaves_the_manifests_own() {
+        for name in [None, Some(String::new()), Some("   ".into())] {
+            let config = CustomIntegrationConfig {
+                id: "openalex-as-manifest".into(),
+                name,
+                enabled: false,
+                manifest: OPENALEX_MANIFEST.replace("BASE_URL", "https://example.test"),
+                secrets: HashMap::new(),
+            };
+            let source = CustomSource::from_config(&config).expect("loads");
+            assert_eq!(source.name(), "OpenAlex (manifest)");
+        }
+    }
 
     /// OpenAlex's search projection, said instead of written.
     ///

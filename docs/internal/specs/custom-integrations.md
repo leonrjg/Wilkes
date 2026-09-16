@@ -267,7 +267,7 @@ secret = "anna_key"
 download_url = "download_url"
 ```
 
-## 6. Validation is a probe, and it is mandatory
+## 6. Validation is a probe, and it is evidence
 
 `IntegrationsPanel` already refuses to enable Zotero until `zoteroStatus()`
 returns ready, and `validate_program` in `research.rs` already compiles a
@@ -283,14 +283,37 @@ it. Custom integrations follow that precedent exactly:
    reported, not silently nulled. This is the whole difference between a
    mapping tool and a guessing tool.
 
-A manifest cannot be enabled until search and its declared download resolver
-have probed clean. A health check still runs through status rather than the
-projection probe because its response body has no contract.
+**Revised: the probe informs the decision, it does not hold it.** Enabling was
+gated on a clean probe of search and the declared download resolver. The gate
+was wrong about what a failed probe means: a service that is down, rate-limited,
+or simply holding nothing for the chosen example query produces a failed probe
+and says nothing about whether the manifest is right — and refusing to save made
+the user's work hostage to someone else's uptime, with no way to keep a draft
+until the service came back. Steps 1 and 2 above are unchanged and step 3 is the
+point of the whole feature; what changed is that the report is shown beside the
+save buttons rather than in front of them, and a manifest that has not probed —
+or probed badly — says so in a line of text. Parsing still gates: a manifest the
+backend cannot load back is refused on save, which is a fact about the manifest
+rather than about the network.
+
+A health check still runs through status rather than the projection probe
+because its response body has no contract.
 At runtime a selector that stops matching (the service changed shape) is a
 logged warning per field per response, not a silent null and not a hard failure
 of the whole search — that classification lives in one place in the engine.
 
 ## 7. Storage, secrets, trust
+
+**Naming is not manifest editing.** `CustomIntegrationConfig.name` is an
+optional override of the manifest's own `name`, resolved once in
+`CustomSource::named` so that every caller — a pane heading, a status line, the
+text of a failed request — says the same thing. It is held beside the manifest
+rather than inside it because the manifest describes the *service* and is the
+thing a user is handed, copies and shares, while this names their copy of it;
+and because rewriting a manifest to change a label would drag the read and the
+probe along behind it. Blank is no override, not a nameless provider. The id is
+untouched by a rename: it is what a stored provider filter and every log line
+name it by, and it stays visible on the row beside whatever the user called it.
 
 **Revised: manifests live in settings, not in a table of their own.** The plan
 was a `custom_integrations` table beside `smart_collections`. That breaks on the

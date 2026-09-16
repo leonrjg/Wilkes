@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type {
   CustomIntegrationConfig,
   IntegrationStatus,
@@ -80,10 +80,21 @@ download_url = "download_url"
  * Providers the user describes instead of ones Wilkes compiles.
  *
  * The order of the editor is the order of the decisions: read the manifest and
- * see every origin it will contact, supply whatever secrets it names, run it once
- * against the real service, and only then switch it on. Enabling is gated on
- * that run — a manifest cannot be checked by reading it, because a selector is
- * only right about a response that has arrived.
+ * see every origin it will contact, supply whatever secrets it names, run it
+ * once against the real service, and switch it on.
+ *
+ * The probe is evidence, not a gate. A manifest cannot be checked by reading
+ * it — a selector is only right about a response that has arrived — so running
+ * one is worth doing and its report is shown in full. But a service that is
+ * down, rate-limiting, or simply holding nothing for the example query says
+ * nothing about whether the manifest is worth keeping, and refusing to save
+ * until it answers cleanly made the user's work hostage to someone else's
+ * uptime. What is saved is what the user wrote; what the probe found is shown
+ * beside it.
+ *
+ * Renaming is deliberately not part of any of that. A name is a label on this
+ * installation's copy of a provider, so it is edited in place on the row and
+ * saved on its own, without the manifest being re-read or re-probed.
  */
 export default function CustomIntegrations({
   api,
@@ -105,6 +116,40 @@ export default function CustomIntegrations({
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [copyError, setCopyError] = useState<string | null>(null);
+  /** The name each manifest declares, by id. Read from the manifest text,
+   *  which is a local parse and no request, so that a row can show what it is
+   *  called rather than its id — and so a rename box starts from the name
+   *  being replaced. */
+  const [declaredNames, setDeclaredNames] = useState<Record<string, string>>({});
+  /** Which row is being renamed, and to what. */
+  const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const named: Record<string, string> = {};
+      for (const config of configured) {
+        try {
+          const summary = await api.customIntegrationSummary(config.manifest);
+          if (summary.name) named[config.id] = summary.name;
+        } catch (error) {
+          // A manifest that cannot be read still has an id to show, and the
+          // row's other controls still work. It must not blank the list.
+          console.error(`custom integration ${config.id} could not be read:`, error);
+        }
+      }
+      if (!cancelled) setDeclaredNames(named);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [api, configured]);
+
+  /** What to call a provider: the user's name for it, else the manifest's,
+   *  else the id — which is always there and is what every stored selection
+   *  and log line names it by. */
+  const displayName = (config: CustomIntegrationConfig): string =>
+    config.name?.trim() || declaredNames[config.id] || config.id;
 
   const reportCopyError = (error: unknown) => {
     setCopyError(
@@ -193,8 +238,14 @@ export default function CustomIntegrations({
 
   const save = async (enabled: boolean) => {
     if (draft === null || !summary || summary.problems.length > 0) return;
+    // A rename is a separate act, so editing the manifest must not silently
+    // undo one. The name the user gave this provider survives the edit.
+    const previous = configured.find(
+      (existing) => existing.id === (editingId ?? summary.id),
+    );
     const config: CustomIntegrationConfig = {
       id: summary.id,
+      name: previous?.name,
       enabled,
       manifest: draft,
       secrets,
@@ -203,6 +254,21 @@ export default function CustomIntegrations({
       (existing) => existing.id !== config.id && existing.id !== editingId,
     );
     if (await writeCustom([...next, config])) closeEditor();
+  };
+
+  /** Writes a row's name and nothing else. Blank clears the override, which
+   *  restores whatever the manifest calls itself. */
+  const commitRename = async () => {
+    if (renaming === null) return;
+    const name = renaming.value.trim();
+    const ok = await writeCustom(
+      configured.map((existing) =>
+        existing.id === renaming.id
+          ? { ...existing, name: name.length > 0 ? name : undefined }
+          : existing,
+      ),
+    );
+    if (ok) setRenaming(null);
   };
 
   const setEnabled = async (config: CustomIntegrationConfig, enabled: boolean) => {
@@ -267,44 +333,90 @@ export default function CustomIntegrations({
           className="space-y-2 border border-[var(--border-main)] rounded p-2.5"
         >
           <div className="flex items-center justify-between gap-2">
-            <label className="flex items-center gap-2.5 cursor-pointer group">
-              <input
-                type="checkbox"
-                checked={config.enabled}
-                disabled={busy}
-                onChange={(e) => setEnabled(config, e.target.checked)}
-                className={CHECKBOX_CLASS}
-              />
-              <span className="text-xs text-[var(--text-main)]">{config.id}</span>
-              <span className="text-[10px] text-[var(--text-dim)]">
-                custom:{config.id}
-              </span>
-            </label>
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                onClick={() => checkStatus(config)}
-                disabled={busy}
-                className={GHOST_BUTTON_CLASS}
+            {renaming?.id === config.id ? (
+              <form
+                className="flex flex-1 items-center gap-1.5"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void commitRename();
+                }}
               >
-                Test
-              </button>
-              <button
-                type="button"
-                onClick={() => openEditor(config)}
-                className={GHOST_BUTTON_CLASS}
-              >
-                Edit
-              </button>
-              <button
-                type="button"
-                onClick={() => remove(config)}
-                disabled={busy}
-                className={GHOST_BUTTON_CLASS}
-              >
-                Remove
-              </button>
-            </div>
+                <input
+                  type="text"
+                  autoFocus
+                  aria-label={`Name for ${config.id}`}
+                  placeholder={declaredNames[config.id] ?? config.id}
+                  value={renaming.value}
+                  onChange={(e) => setRenaming({ id: config.id, value: e.target.value })}
+                  onKeyDown={(e) => e.key === "Escape" && setRenaming(null)}
+                  className={INPUT_CLASS}
+                />
+                <button type="submit" disabled={busy} className={GHOST_BUTTON_CLASS}>
+                  Save name
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRenaming(null)}
+                  className={GHOST_BUTTON_CLASS}
+                >
+                  Cancel
+                </button>
+              </form>
+            ) : (
+              <>
+                <label className="flex items-center gap-2.5 cursor-pointer group">
+                  <input
+                    type="checkbox"
+                    checked={config.enabled}
+                    disabled={busy}
+                    onChange={(e) => setEnabled(config, e.target.checked)}
+                    className={CHECKBOX_CLASS}
+                  />
+                  <span className="text-xs text-[var(--text-main)]">
+                    {displayName(config)}
+                  </span>
+                  {/* The id stays visible whatever the row is called: it is
+                      what a stored provider filter and every log line name. */}
+                  <span className="text-[10px] text-[var(--text-dim)]">
+                    custom:{config.id}
+                  </span>
+                </label>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => checkStatus(config)}
+                    disabled={busy}
+                    className={GHOST_BUTTON_CLASS}
+                  >
+                    Test
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setRenaming({ id: config.id, value: config.name ?? "" })
+                    }
+                    className={GHOST_BUTTON_CLASS}
+                  >
+                    Rename
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openEditor(config)}
+                    className={GHOST_BUTTON_CLASS}
+                  >
+                    Edit
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => remove(config)}
+                    disabled={busy}
+                    className={GHOST_BUTTON_CLASS}
+                  >
+                    Remove
+                  </button>
+                </div>
+              </>
+            )}
           </div>
           {statuses[config.id] && (
             <p className="text-xs text-[var(--text-muted)]">
@@ -451,17 +563,22 @@ export default function CustomIntegrations({
                 <button
                   type="button"
                   onClick={() => save(true)}
-                  disabled={busy || !probeIsClean}
-                  title={
-                    probeIsClean
-                      ? undefined
-                      : "Probe this manifest against the service before enabling it"
-                  }
+                  disabled={busy}
                   className={BUTTON_CLASS}
                 >
                   Save and enable
                 </button>
               </div>
+              {/* Said, not enforced. A provider that is down or rate-limiting
+                  says nothing about whether the manifest is worth keeping, so
+                  this is a note about what is known — not a locked button. */}
+              {!probeIsClean && (
+                <p className="text-[10px] text-[var(--text-dim)]">
+                  {report === null
+                    ? "Not probed. A selector can only be checked against a response that has arrived — probing first is worth it, but saving does not wait for one."
+                    : "The last probe did not come back clean. You can save anyway; the report below says what it found."}
+                </p>
+              )}
             </div>
           )}
 

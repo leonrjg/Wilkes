@@ -224,14 +224,22 @@ describe("CustomIntegrations", () => {
         {},
         "protein folding",
       );
-      expect(screen.getByText("Save and enable")).not.toBeDisabled();
+      expect(screen.getByText(/Mapped 1 record with nothing left over/)).toBeInTheDocument();
     });
 
+    // Editing the query drops the verdict it belonged to: the report on
+    // screen must never describe a question other than the one in the box.
     fireEvent.change(query, { target: { value: "different terms" } });
-    expect(screen.getByText("Save and enable")).toBeDisabled();
+    expect(
+      screen.queryByText(/Mapped 1 record with nothing left over/),
+    ).not.toBeInTheDocument();
   });
 
-  it("refuses to enable a manifest that has not probed clean", async () => {
+  /// The probe is evidence, not a gate. A service that is down, rate-limiting
+  /// or holding nothing for the example query says nothing about whether the
+  /// manifest is worth keeping — and refusing to save until it answered made
+  /// the user's work hostage to someone else's uptime.
+  it("saves a manifest that has not probed clean, and says what is known", async () => {
     const api = apiWith({
       customIntegrationProbe: vi.fn().mockResolvedValue({
         ...CLEAN_PROBE,
@@ -257,8 +265,9 @@ describe("CustomIntegrations", () => {
       expect(screen.getByText("Probe")).toBeInTheDocument(),
     );
 
-    // Enabling is unavailable until a probe has come back clean.
-    expect(screen.getByText("Save and enable")).toBeDisabled();
+    // Before any probe: available, and the row says a probe is worth running.
+    expect(screen.getByText("Save and enable")).not.toBeDisabled();
+    expect(screen.getByText(/Not probed/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByText("Probe"));
     await waitFor(() => {
@@ -266,8 +275,131 @@ describe("CustomIntegrations", () => {
         screen.getByText(/citation_count.*expected an integer/),
       ).toBeInTheDocument();
     });
-    // A probe that reported unmapped values leaves it unavailable.
-    expect(screen.getByText("Save and enable")).toBeDisabled();
+    // After a probe that found unmapped values: still available, and what the
+    // probe found is said rather than enforced.
+    expect(screen.getByText("Save and enable")).not.toBeDisabled();
+    expect(screen.getByText(/did not come back clean/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("Save and enable"));
+    await waitFor(() => {
+      expect(onUpdate).toHaveBeenCalledWith({
+        integrations: expect.objectContaining({
+          custom: [
+            expect.objectContaining({ id: "crossref", enabled: true }),
+          ],
+        }),
+      });
+    });
+  });
+
+  describe("renaming", () => {
+    const CONFIGURED: CustomIntegrationConfig[] = [
+      { id: "crossref", enabled: true, manifest: 'id = "crossref"', secrets: {} },
+    ];
+
+    /// The id is what a stored provider filter and every log line name, so it
+    /// stays on screen whatever the row is called.
+    it("shows the manifest's name, and the id beside it", async () => {
+      render(
+        <CustomIntegrations
+          api={apiWith()}
+          settings={settings(CONFIGURED)}
+          onUpdate={vi.fn()}
+        />,
+      );
+      expect(await screen.findByText("Crossref")).toBeInTheDocument();
+      expect(screen.getByText("custom:crossref")).toBeInTheDocument();
+    });
+
+    /// A name is a label on this installation's copy. Renaming must not mean
+    /// editing the manifest, and so must not mean reading or probing it again.
+    it("saves a new name without reading or probing the manifest", async () => {
+      const onUpdate = vi.fn();
+      const api = apiWith();
+      render(
+        <CustomIntegrations
+          api={api}
+          settings={settings(CONFIGURED)}
+          onUpdate={onUpdate}
+        />,
+      );
+      await screen.findByText("Crossref");
+
+      fireEvent.click(screen.getByText("Rename"));
+      fireEvent.change(screen.getByLabelText("Name for crossref"), {
+        target: { value: "  Work DOIs  " },
+      });
+      fireEvent.click(screen.getByText("Save name"));
+
+      await waitFor(() => {
+        expect(onUpdate).toHaveBeenCalledWith({
+          integrations: expect.objectContaining({
+            custom: [
+              expect.objectContaining({
+                id: "crossref",
+                name: "Work DOIs",
+                manifest: 'id = "crossref"',
+              }),
+            ],
+          }),
+        });
+      });
+      expect(api.customIntegrationProbe).not.toHaveBeenCalled();
+    });
+
+    /// Clearing the box is no override, not a nameless provider.
+    it("clears the override back to the manifest's own name", async () => {
+      const onUpdate = vi.fn();
+      render(
+        <CustomIntegrations
+          api={apiWith()}
+          settings={settings([{ ...CONFIGURED[0], name: "Work DOIs" }])}
+          onUpdate={onUpdate}
+        />,
+      );
+      expect(await screen.findByText("Work DOIs")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByText("Rename"));
+      fireEvent.change(screen.getByLabelText("Name for crossref"), {
+        target: { value: "   " },
+      });
+      fireEvent.click(screen.getByText("Save name"));
+
+      await waitFor(() => {
+        expect(onUpdate).toHaveBeenCalledWith({
+          integrations: expect.objectContaining({
+            custom: [expect.objectContaining({ name: undefined })],
+          }),
+        });
+      });
+    });
+
+    /// Editing a manifest is a different act from naming one, and must not
+    /// quietly undo the other.
+    it("keeps a name across a manifest edit", async () => {
+      const onUpdate = vi.fn();
+      render(
+        <CustomIntegrations
+          api={apiWith()}
+          settings={settings([{ ...CONFIGURED[0], name: "Work DOIs" }])}
+          onUpdate={onUpdate}
+        />,
+      );
+      await screen.findByText("Work DOIs");
+
+      fireEvent.click(screen.getByText("Edit"));
+      fireEvent.click(screen.getByText("Read manifest"));
+      await screen.findByLabelText("Example query");
+      fireEvent.click(screen.getByText("Save and enable"));
+
+      await waitFor(() => {
+        expect(onUpdate).toHaveBeenCalledWith({
+          integrations: expect.objectContaining({
+            custom: [expect.objectContaining({ name: "Work DOIs" })],
+          }),
+        });
+      });
+    });
   });
 
   it("labels the full request error and the redacted request URL separately", async () => {

@@ -957,6 +957,13 @@ export interface OpenAlexSettings {
  *  exports; everything else about the provider is derived from parsing it. */
 export interface CustomIntegrationConfig {
   id: string;
+  /** What this installation calls the provider, when the user has renamed it.
+   *  Absent means the manifest's own `name` stands. Held beside the manifest
+   *  rather than inside it: the manifest describes the service and is the
+   *  thing that gets copied and shared, while this names one copy of it — and
+   *  rewriting a manifest to change a label would mean re-reading and
+   *  re-probing it. */
+  name?: string;
   enabled: boolean;
   /** TOML or JSON manifest source. */
   manifest: string;
@@ -992,8 +999,13 @@ export interface ProjectionIssue {
   problem: string;
 }
 
-/** What one run of a capability produced. A manifest may only be enabled once
- *  this comes back `ok`. */
+/** What one run of a capability produced.
+ *
+ *  Evidence, not a gate. A probe is the only way to learn whether a selector
+ *  is right about a response that has actually arrived, so it is worth running
+ *  — but a service that is down, rate-limiting, or simply returning nothing
+ *  for the example query says nothing about whether the manifest is worth
+ *  keeping, and saving is not blocked on it. */
 export interface ProbeReport {
   id: string;
   capability: string;
