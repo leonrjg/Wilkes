@@ -1,10 +1,11 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Search, X } from "react-feather";
+import { ChevronDown, ChevronRight, Search, X } from "react-feather";
 import type { CatalogueGrain, CatalogueHit } from "../lib/types";
 import {
   ALL_GRAINS,
   enabledProviderIds,
   type LiteratureAnswer,
+  type PaneSection,
   type Selection,
   selects,
   selectsAny,
@@ -40,8 +41,10 @@ export default function CataloguePane() {
   const providers = useCatalogueStore((s) => s.providers);
   const providerOptions = useCatalogueStore((s) => s.providerOptions);
   const providerOptionsError = useCatalogueStore((s) => s.providerOptionsError);
+  const collapsed = useCatalogueStore((s) => s.collapsed);
   const toggleGrain = useCatalogueStore((s) => s.toggleGrain);
   const toggleProvider = useCatalogueStore((s) => s.toggleProvider);
+  const toggleSection = useCatalogueStore((s) => s.toggleSection);
   const loadProviders = useCatalogueStore((s) => s.loadProviders);
   const runSearch = useCatalogueStore((s) => s.search);
   const loading = useCatalogueStore((s) => s.loading);
@@ -61,6 +64,15 @@ export default function CataloguePane() {
   }, [loadProviders]);
 
   const enabled = providerOptions.filter((option) => option.enabled);
+  // What a collapsed section is hiding. A rolled-up heading that said only its
+  // name would be a place results could land unseen.
+  const catalogueCount = answer === null ? null : answer.hits.length;
+  const literatureCount =
+    literature === null
+      ? null
+      : literature.providers
+          .filter((entry) => selects(providers, entry.provider))
+          .reduce((total, entry) => total + (entry.results?.length ?? 0), 0);
   const asked =
     (selectsAny(grains) && (loading || error !== null || answer !== null)) ||
     (selectsAny(providers) &&
@@ -114,8 +126,13 @@ export default function CataloguePane() {
           <p className="py-1.5 text-[10px] leading-snug text-red-400">{acquireError}</p>
         )}
 
-        <section aria-label="Open catalogues">
-          <SectionHeading>Open catalogues</SectionHeading>
+        <Section
+          section="catalogues"
+          label="Open catalogues"
+          count={catalogueCount}
+          collapsed={collapsed.includes("catalogues")}
+          onToggle={toggleSection}
+        >
           <FilterChips
             selection={grains}
             all={ALL_GRAINS}
@@ -135,10 +152,15 @@ export default function CataloguePane() {
               )}
             </>
           )}
-        </section>
+        </Section>
 
-        <section aria-label="Literature">
-          <SectionHeading>Literature</SectionHeading>
+        <Section
+          section="literature"
+          label="Literature"
+          count={literatureCount}
+          collapsed={collapsed.includes("literature")}
+          onToggle={toggleSection}
+        >
           {providerOptionsError !== null ? (
             <p className="py-1 text-[10px] leading-snug text-red-400">
               The providers could not be listed: {providerOptionsError}
@@ -168,7 +190,7 @@ export default function CataloguePane() {
               )}
             </>
           )}
-        </section>
+        </Section>
 
         {!asked && (
           <Note>
@@ -182,11 +204,52 @@ export default function CataloguePane() {
   );
 }
 
-function SectionHeading({ children }: { children: ReactNode }) {
+/**
+ * One half of the pane: its heading, the control that rolls it up, and what it
+ * holds when it is not rolled up.
+ *
+ * The count is shown rather than only the name, because a collapsed section is
+ * still searched — collapsing decides what is *shown*, the filters decide what
+ * is *asked* — and a heading that said only "Literature" would be a place
+ * results could land unseen. A section's own filter rolls up with it, since a
+ * filter with nothing visible under it controls nothing the user can see.
+ */
+function Section({
+  section,
+  label,
+  count,
+  collapsed,
+  onToggle,
+  children,
+}: {
+  section: PaneSection;
+  label: string;
+  /** How many results the section holds, or null before it has been asked. */
+  count: number | null;
+  collapsed: boolean;
+  onToggle: (section: PaneSection) => void;
+  children: ReactNode;
+}) {
   return (
-    <h3 className="pt-2.5 pb-1 text-[10px] font-bold uppercase tracking-wider text-[var(--text-dim)]">
-      {children}
-    </h3>
+    <section aria-label={label}>
+      <h3 className="pt-2.5 pb-1">
+        <button
+          type="button"
+          onClick={() => onToggle(section)}
+          aria-expanded={!collapsed}
+          className="flex w-full items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
+        >
+          {collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+          {label}
+          {count !== null && (
+            <span className="font-normal normal-case tracking-normal text-[var(--text-muted)]">
+              {count}
+            </span>
+          )}
+        </button>
+      </h3>
+      {collapsed ? null : children}
+    </section>
   );
 }
 
@@ -318,7 +381,19 @@ function LiteratureAnswerBody({
     <div className="flex flex-col">
       {shown.map((entry) => (
         <div key={entry.provider} className="flex flex-col">
-          <span className="pt-1.5 text-[10px] text-[var(--text-dim)]">{entry.name}</span>
+          {/* The provider is the strongest label in this half: it says whose
+              index a row came from, and it is the only thing that does now
+              that no row carries a kind badge. So it reads brighter than the
+              section heading above it and sits on a rule of its own, rather
+              than as a dim line that scanned as part of the row beneath. */}
+          <h4 className="mt-2 flex items-baseline gap-1.5 border-b border-[var(--border-strong)] pb-1 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)]">
+            {entry.name}
+            {entry.results !== null && (
+              <span className="font-normal normal-case tracking-normal text-[var(--text-muted)]">
+                {entry.results.length}
+              </span>
+            )}
+          </h4>
           {entry.error !== null || entry.results === null ? (
             <p className="py-1.5 text-[10px] leading-snug text-red-400">
               {entry.name} could not answer: {entry.error ?? providerAnswerMalformed(entry.provider)}

@@ -81,6 +81,7 @@ describe("CataloguePane", () => {
       paneOpen: true,
       grains: null,
       providers: null,
+      collapsed: [],
       providerOptions: [],
       providerOptionsError: null,
     });
@@ -178,6 +179,7 @@ describe("CataloguePane", () => {
     expect(JSON.parse(localStorage.getItem("wilkes.catalogue.filters") ?? "null")).toEqual({
       grains: null,
       providers: ["openalex"],
+      collapsed: [],
     });
   });
 
@@ -248,6 +250,41 @@ describe("CataloguePane", () => {
     expect(await screen.findByText("Python 3.12")).toBeTruthy();
     expect(literature).not.toHaveBeenCalled();
     expect(screen.getByText(/No provider selected/)).toBeTruthy();
+  });
+
+  /// Collapsing is a display choice, not a filter: the half is still asked,
+  /// so opening it again shows the answer rather than a blank that needs a
+  /// re-run. The count on the heading is what says results are in there.
+  it("rolls a section up without stopping it being searched", async () => {
+    render(<CataloguePane />);
+    submit("python lists");
+    await screen.findByText("Persistent Lists Revisited");
+    fireEvent.click(screen.getByRole("button", { name: /Literature/ }));
+    expect(screen.queryByText("Persistent Lists Revisited")).toBeNull();
+    expect(screen.getByRole("button", { name: /Literature/ })).toHaveProperty(
+      "ariaExpanded",
+      "false",
+    );
+
+    submit("python lists again");
+    await waitFor(() => expect(literature).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: /Literature/ }));
+    expect(screen.getByText("Persistent Lists Revisited")).toBeTruthy();
+  });
+
+  /// The same standing-choice storage as the filters, because which half to
+  /// look at is the same kind of choice as which sources to ask.
+  it("remembers which sections were rolled up", async () => {
+    render(<CataloguePane />);
+    await screen.findByRole("button", { name: "OpenAlex" });
+    fireEvent.click(screen.getByRole("button", { name: /Open catalogues/ }));
+    expect(JSON.parse(localStorage.getItem("wilkes.catalogue.filters") ?? "null")).toEqual({
+      grains: null,
+      providers: null,
+      collapsed: ["catalogues"],
+    });
+    // A collapsed section hides its own filter with it.
+    expect(screen.queryByRole("button", { name: "Textbooks" })).toBeNull();
   });
 
   /// A stored filter naming a provider the user has since removed would be
@@ -333,9 +370,9 @@ describe("CataloguePane", () => {
 
     render(<CataloguePane />);
     submit("resolved book");
-    expect(await screen.findByText("English")).toBeTruthy();
-    expect(screen.getByText("epub")).toBeTruthy();
-    expect(screen.getByText("2 MB")).toBeTruthy();
+    // What a provider reported about the file is named in the row's one line
+    // of facts, so the user knows what an Add would fetch before clicking it.
+    expect(await screen.findByText(/English · epub · 2 MB/)).toBeTruthy();
     expect(resolveDownload).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByLabelText("Add Resolved Book to library"));

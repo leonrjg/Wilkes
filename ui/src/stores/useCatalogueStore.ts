@@ -18,7 +18,14 @@ export const ALL_GRAINS: CatalogueGrain[] = ["textbook", "course", "reference"];
  *  to scroll past is one nobody reads to the end of. */
 export const CATALOGUE_LIMIT = 10;
 
-const FILTER_STORAGE_KEY = "wilkes.catalogue.filters";
+/** Where the pane's standing choices live. Still named for the filters it
+ *  first held, so that upgrading does not silently reset one. */
+const PREFERENCES_STORAGE_KEY = "wilkes.catalogue.filters";
+
+/** The two halves of the pane, named so a preference can say which it means. */
+export type PaneSection = "catalogues" | "literature";
+
+export const ALL_SECTIONS: PaneSection[] = ["catalogues", "literature"];
 
 /**
  * What each half of the pane is filtered to.
@@ -62,20 +69,34 @@ function sameSelection<T>(a: Selection<T>, b: Selection<T>): boolean {
   return a.length === b.length && a.every((member) => b.includes(member));
 }
 
-interface StoredFilters {
+/**
+ * Everything about the pane that outlives one question.
+ *
+ * Which sources to ask and which half to look at are both standing choices
+ * about how this pane is used, so they are one stored object and one pair of
+ * helpers rather than a second storage mechanism beside the first.
+ *
+ * They are not the same kind of choice, though, and the store never conflates
+ * them: a filter decides what is *asked*, and collapsing decides what is
+ * *shown*. A collapsed section is still searched, so opening it shows the
+ * answer to the question that was asked rather than a blank that needs a
+ * re-run.
+ */
+interface PanePreferences {
   grains: Selection<CatalogueGrain>;
   providers: Selection<string>;
+  collapsed: PaneSection[];
 }
 
-function readFilters(): StoredFilters {
-  const empty: StoredFilters = { grains: null, providers: null };
+function readPreferences(): PanePreferences {
+  const empty: PanePreferences = { grains: null, providers: null, collapsed: [] };
   if (typeof localStorage === "undefined") return empty;
   try {
-    const raw = localStorage.getItem(FILTER_STORAGE_KEY);
+    const raw = localStorage.getItem(PREFERENCES_STORAGE_KEY);
     if (raw === null) return empty;
     const parsed = JSON.parse(raw) as unknown;
     if (typeof parsed !== "object" || parsed === null) return empty;
-    const stored = parsed as Partial<StoredFilters>;
+    const stored = parsed as Partial<PanePreferences>;
     return {
       grains: Array.isArray(stored.grains)
         ? stored.grains.filter((grain): grain is CatalogueGrain =>
@@ -85,20 +106,25 @@ function readFilters(): StoredFilters {
       providers: Array.isArray(stored.providers)
         ? stored.providers.filter((id): id is string => typeof id === "string")
         : null,
+      collapsed: Array.isArray(stored.collapsed)
+        ? stored.collapsed.filter((section): section is PaneSection =>
+            ALL_SECTIONS.includes(section as PaneSection),
+          )
+        : [],
     };
   } catch (error) {
-    console.error("catalogue filters could not be read from storage:", error);
+    console.error("catalogue pane preferences could not be read from storage:", error);
     return empty;
   }
 }
 
-function persistFilters(filters: StoredFilters): void {
+function persistPreferences(preferences: PanePreferences): void {
   if (typeof localStorage === "undefined") return;
   try {
-    localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(filters));
+    localStorage.setItem(PREFERENCES_STORAGE_KEY, JSON.stringify(preferences));
   } catch (error) {
-    // The filter still holds for this session; only its memory is lost.
-    console.error("catalogue filters could not be stored:", error);
+    // The choice still holds for this session; only its memory is lost.
+    console.error("catalogue pane preferences could not be stored:", error);
   }
 }
 
@@ -150,6 +176,10 @@ interface CatalogueStore {
   /** Which literature providers are asked. Held by id; the names come from
    *  `providerOptions`, which is the registry's answer and not this store's. */
   providers: Selection<string>;
+  /** Which halves of the pane are rolled up. A display choice, not a filter:
+   *  a collapsed section is still searched, so opening it shows the answer to
+   *  the question that was asked rather than a blank. */
+  collapsed: PaneSection[];
   /** Every literature provider this installation knows, enabled ones included
    *  and disabled ones too, as the backend registry orders them. Empty until
    *  `loadProviders` has answered. */
@@ -193,6 +223,7 @@ interface CatalogueStore {
   setQuery: (query: string) => void;
   toggleGrain: (grain: CatalogueGrain) => void;
   toggleProvider: (provider: string) => void;
+  toggleSection: (section: PaneSection) => void;
   /** Reads the provider list and prunes any stored selection against it, so a
    *  filter that outlived the provider it named does not refuse every search. */
   loadProviders: () => Promise<void>;
@@ -331,6 +362,12 @@ function inRegistryOrder(
   return [...answers].sort((a, b) => rank(a) - rank(b));
 }
 
+/** The stored half of the store's state, for a writer that is changing one
+ *  field of it and must not drop the others. */
+function preferences(state: CatalogueStore): PanePreferences {
+  return { grains: state.grains, providers: state.providers, collapsed: state.collapsed };
+}
+
 /** The ids of the providers the user has switched on, in registry order. A
  *  disabled one is never asked, so it is never part of a resolved selection. */
 export function enabledProviderIds(options: LiteratureProviderInfo[]): string[] {
@@ -353,7 +390,7 @@ function unasked(
 export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
   paneOpen: false,
   query: "",
-  ...readFilters(),
+  ...readPreferences(),
   providerOptions: [],
   providerOptionsError: null,
   loading: false,
@@ -386,7 +423,7 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
   toggleGrain: (grain) => {
     const next = toggled(get().grains, ALL_GRAINS, grain);
     set({ grains: next });
-    persistFilters({ grains: next, providers: get().providers });
+    persistPreferences({ ...preferences(get()), grains: next });
     const query = get().query.trim();
     if (!query) return;
     // A grain toggle touches the mirror alone. It must not send the query to
@@ -407,7 +444,7 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
     const enabled = enabledProviderIds(get().providerOptions);
     const next = toggled(get().providers, enabled, provider);
     set({ providers: next });
-    persistFilters({ grains: get().grains, providers: next });
+    persistPreferences({ ...preferences(get()), providers: next });
     const query = get().query.trim();
     if (!query) return;
     if (!selectsAny(next)) {
@@ -422,6 +459,15 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
     if (missing.length > 0) void searchLiterature(set, get, query, missing, true);
   },
 
+  toggleSection: (section) => {
+    const collapsed = get().collapsed;
+    const next = collapsed.includes(section)
+      ? collapsed.filter((member) => member !== section)
+      : [...collapsed, section];
+    set({ collapsed: next });
+    persistPreferences({ ...preferences(get()), collapsed: next });
+  },
+
   loadProviders: async () => {
     try {
       const options = await api.literatureProviders();
@@ -432,7 +478,7 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       const pruned = stored === null ? null : stored.filter((id) => known.includes(id));
       set({ providerOptions: options, providerOptionsError: null, providers: pruned });
       if (stored !== null && pruned !== null && pruned.length !== stored.length) {
-        persistFilters({ grains: get().grains, providers: pruned });
+        persistPreferences({ ...preferences(get()), providers: pruned });
       }
     } catch (e: any) {
       const message = e?.toString?.() ?? "Literature providers could not be listed";

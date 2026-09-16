@@ -75,11 +75,15 @@ describe("CatalogueCandidate", () => {
 
   /// Grain and licence are what the thing is and what may be done with it. A
   /// row that hid either would be inviting a click it cannot describe.
+  /// The grain keeps its own chip — it is what the thing *is*. The rest are
+  /// one run of text rather than a chip each, because a chip cannot be broken
+  /// across lines and three of them took three lines in a pane this narrow.
   it("shows the grain, the provider and the licence", () => {
     render(<CatalogueCandidate hit={HIT} />);
     expect(screen.getByText("Textbook")).toBeTruthy();
-    expect(screen.getByText("LibreTexts")).toBeTruthy();
-    expect(screen.getByText("CC-BY")).toBeTruthy();
+    expect(screen.getByText(/LibreTexts/)).toBeTruthy();
+    expect(screen.getByText(/CC-BY/)).toBeTruthy();
+    expect(screen.getByText("LibreTexts · Mathematics · CC-BY · 412 pp")).toBeTruthy();
   });
 
   /// The fetch lands in Wilkes's own uploads directory; the import into the

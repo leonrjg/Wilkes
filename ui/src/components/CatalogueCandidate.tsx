@@ -24,6 +24,43 @@ const PROVIDER_LABELS: Record<string, string> = {
   devdocs: "DevDocs",
 };
 
+/**
+ * A row's facts, as one run of text rather than a row of chips.
+ *
+ * Each fact used to be its own flex item, and a flex item cannot be broken
+ * across lines: three facts that did not fit side by side took three lines
+ * even when two of them were one word. Joined, the line fills to the edge and
+ * wraps where the text allows, which is the difference between a two-line row
+ * and a four-line one. Clamped at two lines, with the whole thing on hover,
+ * because these are facts to skim past, not to read.
+ */
+function MetaLine({ parts }: { parts: (string | null | undefined | false)[] }) {
+  const shown = parts.filter((part): part is string => typeof part === "string" && part !== "");
+  if (shown.length === 0) return null;
+  const text = shown.join(" · ");
+  return (
+    <p
+      title={text}
+      className="line-clamp-2 text-[10px] leading-snug text-[var(--text-dim)]"
+    >
+      {text}
+    </p>
+  );
+}
+
+/** A title long enough to take four lines is a title nobody reads to the end
+ *  of in a pane this wide. Two lines, and the rest on hover. */
+function RowTitle({ title }: { title: string }) {
+  return (
+    <span
+      title={title}
+      className="line-clamp-2 text-[11px] font-medium leading-snug text-[var(--text-main)]"
+    >
+      {title}
+    </span>
+  );
+}
+
 interface Props {
   hit: CatalogueHit;
   /** Compact drops the blurb: the strip under a search result is an offer, not
@@ -76,20 +113,20 @@ export default function CatalogueCandidate({ hit, compact = false }: Props) {
           out at the width of its own longest line left half the row empty and
           made every row taller than it had to be. */}
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-[11px] font-medium leading-snug text-[var(--text-main)]">
-            {hit.title}
-          </span>
-          <span className="rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1 text-[9px] uppercase tracking-wider text-[var(--text-dim)]">
+        <div className="flex items-start gap-1.5">
+          <RowTitle title={hit.title} />
+          <span className="mt-px shrink-0 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1 text-[9px] uppercase tracking-wider text-[var(--text-dim)]">
             {GRAIN_LABELS[hit.grain] ?? hit.grain}
           </span>
         </div>
-        <div className="flex flex-wrap items-center gap-x-2 text-[10px] leading-snug text-[var(--text-dim)]">
-          <span>{PROVIDER_LABELS[hit.provider] ?? hit.provider}</span>
-          {hit.subject && <span className="truncate">{hit.subject}</span>}
-          {hit.license && <span className="uppercase tracking-wider">{hit.license}</span>}
-          {hit.pages !== null && <span>{hit.pages.toLocaleString()} pp</span>}
-        </div>
+        <MetaLine
+          parts={[
+            PROVIDER_LABELS[hit.provider] ?? hit.provider,
+            hit.subject,
+            hit.license,
+            hit.pages !== null && `${hit.pages.toLocaleString()} pp`,
+          ]}
+        />
         {!compact && hit.summary && (
           <p className="line-clamp-2 text-[10px] leading-snug text-[var(--text-muted)]">
             {hit.summary}
@@ -315,26 +352,21 @@ export function PaperCandidate({ provider, work }: PaperProps) {
             — over a monograph, a standard, a thesis, whatever the provider
             happens to index. A label that is wrong for some of its rows says
             less than the heading above them already does. */}
-        <span className="text-[11px] font-medium leading-snug text-[var(--text-main)]">
-          {title}
-        </span>
-        <div className="flex flex-wrap items-center gap-x-2 text-[10px] leading-snug text-[var(--text-dim)]">
-          {work.year !== null && <span>{work.year}</span>}
-          {work.authors && <span className="truncate">{work.authors}</span>}
-          {work.venue && <span className="truncate">{work.venue}</span>}
-          {work.publisher && work.publisher !== work.venue && (
-            <span className="truncate">{work.publisher}</span>
-          )}
-          {work.language && <span>{work.language}</span>}
-          {work.file_format && <span className="uppercase">{work.file_format}</span>}
-          {work.file_size && <span>{work.file_size}</span>}
-          <span>
-            {work.citation_count.toLocaleString()} citation
-            {work.citation_count === 1 ? "" : "s"}
-          </span>
-          {work.is_open_access && <span className="uppercase tracking-wider">Open access</span>}
-          {work.license && <span className="uppercase tracking-wider">{work.license}</span>}
-        </div>
+        <RowTitle title={title} />
+        <MetaLine
+          parts={[
+            work.year !== null && `${work.year}`,
+            work.authors,
+            work.venue,
+            work.publisher !== work.venue && work.publisher,
+            work.language,
+            work.file_format,
+            work.file_size,
+            `${work.citation_count.toLocaleString()} citation${work.citation_count === 1 ? "" : "s"}`,
+            work.is_open_access && "Open access",
+            work.license,
+          ]}
+        />
         {adding && download !== undefined && <DownloadProgress download={download} title={title} />}
         {acquisition === "none" && (
           <span className="text-[10px] leading-snug text-[var(--text-dim)]">

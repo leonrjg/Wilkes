@@ -151,9 +151,23 @@ things to consider acquiring, not a second page of search results.
   selection is `null` by default rather than an enumeration, so a provider the
   user enables tomorrow joins it. Deselecting every member of one filter is the
   other end — that half is not searched, and says so.
-- **Both filters persist** to `localStorage` under `wilkes.catalogue.filters`,
-  because which sources to ask is a standing choice and not a property of one
-  question. A stored provider id that no longer exists is pruned against the
+- **Either half rolls up, and a rolled-up heading says how much it is
+  hiding.** Collapsing is a display choice and never a filter: the half is
+  still searched, so opening it shows the answer to the question that was
+  asked rather than a blank needing a re-run. A section's own filter rolls up
+  with it — a filter with nothing visible under it controls nothing the user
+  can see.
+- **The provider is the strongest label in the literature half.** It says whose
+  index a row came from, and since no row carries a kind badge it is the only
+  thing that does; so it reads brighter than the section heading above it and
+  sits on a rule of its own, rather than as a dim line that scanned as part of
+  the row beneath.
+- **Both filters and the roll-up persist** to `localStorage` under
+  `wilkes.catalogue.filters`,
+  because which sources to ask and which half to look at are standing choices
+  about how the pane is used, not properties of one question. One stored object
+  and one pair of helpers, rather than a second storage mechanism beside the
+  first; the key keeps its original name so upgrading does not reset a filter. A stored provider id that no longer exists is pruned against the
   registry's list (`literature_providers` on desktop, `GET
   /api/literature/providers` on the server) when the pane opens; the backend
   refuses an unknown id rather than quietly asking nobody.
