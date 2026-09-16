@@ -209,11 +209,31 @@ over a link nobody here controls.
   chunked response declares no length, so those show what has arrived and no
   bar, rather than a bar that would sit at zero for exactly the slowest
   downloads.
+- **A row reports from the click to the file being in the library.** Adding is
+  three calls — a provider may have to be asked where the file is, the file is
+  fetched, the fetched file is moved into the root — and only the middle one
+  reports bytes. A row that showed the byte stream alone said nothing during
+  the resolve, nothing between the request going out and the first byte, and
+  nothing during the move; that last silence flipped the button back to an
+  enabled *Add* while the move was still running. `AddStage` covers all three,
+  and `useCatalogueAdd` is its only writer because it is the only thing that
+  knows the whole act. It is also the one reporter of failure, so a resolver
+  that refused and a move that failed reach the user the way a failed download
+  does — both used to reject into nothing at all.
+- **Staged is not added.** `acquired` is written when the file lands in
+  uploads, which is before it is in the library, so *Added* means the stage is
+  clear and not merely that `acquired` has a key.
+- **Where there is no denominator, the bar is indeterminate rather than
+  absent.** It carries no `aria-valuenow` — which is what that means — and
+  reuses the existing `animate-shimmer` utility rather than sitting at zero or
+  vanishing for exactly the stages that take longest.
 - **Reports are lossy and never block.** `try_send` throughout: a consumer that
   stopped reading must not slow a fetch down, and the caller learns the outcome
   from the return value regardless.
-- Progress is keyed — by provider, and by the URL as it was *requested* — so
-  that two things happening at once cannot render each other's numbers.
+- Progress is keyed — by provider, by candidate, and by the URL as it was
+  *requested* — so that two things happening at once cannot render each other's
+  numbers. The add stage is keyed for the same reason: it was a single key, so
+  the second add to start erased the first row's indicator.
 
 ## 6. Settings
 

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CatalogueHit, LiteratureSearchResult } from "../lib/types";
 
@@ -389,6 +389,62 @@ describe("CataloguePane", () => {
         undefined,
       );
     });
+  });
+
+  /// A resolver is a request of its own, and a credentialed one is not fast.
+  /// It used to run before anything was marked as adding, so the row sat
+  /// completely inert — no spinner, no disabled button — until bytes moved.
+  it("reports the resolve before any byte has moved", async () => {
+    const providerWork: LiteratureSearchResult = {
+      ...WORK,
+      id: "A1",
+      title: "Resolved Book",
+      pdf_url: null,
+      acquisition: "provider",
+    };
+    literature.mockResolvedValue({
+      query: "resolved book",
+      providers: [{ provider: "anna", name: "Anna", results: [providerWork], error: null }],
+    });
+    let finishResolve = (_: { url: string; filename: string | null }) => {};
+    resolveDownload.mockImplementation(() => new Promise((resolve) => (finishResolve = resolve)));
+
+    render(<CataloguePane />);
+    submit("resolved book");
+    fireEvent.click(await screen.findByLabelText("Add Resolved Book to library"));
+    expect(await screen.findByText("Finding a copy…")).toBeTruthy();
+    expect(screen.getByRole("progressbar")).toBeTruthy();
+    expect(acquire).not.toHaveBeenCalled();
+
+    acquire.mockResolvedValue({ path: "/uploads/r.pdf", bytes: 10, already_present: false });
+    await act(async () => {
+      finishResolve({ url: "https://files.example.invalid/r", filename: null });
+    });
+    await waitFor(() => expect(acquire).toHaveBeenCalled());
+    expect(await screen.findByText("Added")).toBeTruthy();
+  });
+
+  /// A resolver that refuses is the add failing, and used to reject into
+  /// nothing at all: no message, and an unhandled rejection in the console.
+  it("reports a resolver that refuses", async () => {
+    const providerWork: LiteratureSearchResult = {
+      ...WORK,
+      id: "A1",
+      title: "Resolved Book",
+      pdf_url: null,
+      acquisition: "provider",
+    };
+    literature.mockResolvedValue({
+      query: "resolved book",
+      providers: [{ provider: "anna", name: "Anna", results: [providerWork], error: null }],
+    });
+    resolveDownload.mockRejectedValue(new Error("membership required"));
+
+    render(<CataloguePane />);
+    submit("resolved book");
+    fireEvent.click(await screen.findByLabelText("Add Resolved Book to library"));
+    expect(await screen.findByText(/membership required/)).toBeTruthy();
+    expect(useCatalogueStore.getState().adding).toEqual({});
   });
 
   /// Two empty answers with different causes. Telling someone "nothing found"

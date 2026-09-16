@@ -161,6 +161,21 @@ export interface LiteratureAnswer {
   providers: LiteratureProviderAnswer[];
 }
 
+/**
+ * How far one row's add has got.
+ *
+ * Adding is three calls, not one: a provider may have to be asked where the
+ * file is, the file has to be fetched, and the fetched file has to be moved
+ * into the library root. Only the middle one reports bytes, so a row that
+ * showed only the byte stream said nothing at all for the first and last —
+ * and for the gap between the request going out and the first byte arriving.
+ *
+ * `useCatalogueAdd` is the only writer: it is the only thing that knows the
+ * whole act. The store holds the stage so that a row can render it without
+ * the pane threading it down.
+ */
+export type AddStage = "resolving" | "fetching" | "importing";
+
 /** Something the pane can add: its store key and the URL that fetches it. */
 export interface Acquirable {
   key: string;
@@ -195,14 +210,19 @@ interface CatalogueStore {
   /** The request as a whole failed. A single provider failing is not this:
    *  it is reported in that provider's own entry. */
   literatureError: string | null;
-  /** Why the last add failed. Kept apart from the search errors so a failed
-   *  download does not replace the results the user was choosing from. */
+  /** Why the last add failed, whichever of its three calls failed. Kept apart
+   *  from the search errors so a failed download does not replace the results
+   *  the user was choosing from. */
   acquireError: string | null;
   /** Path in the uploads directory, per candidate key, for what has been
    *  fetched in this session. Keyed so a row can say "added" without the pane
    *  having to re-read the directory. */
   acquired: Record<string, string>;
-  acquiring: string | null;
+  /** How far each add in flight has got, by candidate key. Keyed like the two
+   *  progress maps below, and for the same reason: nothing stops two rows from
+   *  being added at once, and a single key meant the second add to start
+   *  erased the first row's indicator. */
+  adding: Record<string, AddStage>;
   /** Bytes so far for each download in flight, keyed by the URL that was
    *  requested. Keyed rather than singular because nothing stops two rows from
    *  being added at once, and a single figure would be attributed to whichever
@@ -218,6 +238,13 @@ interface CatalogueStore {
   courses: Record<string, CatalogueCourse>;
   noteDownloadProgress: (progress: CatalogueDownloadProgress) => void;
   noteCourseProgress: (progress: CatalogueCourseProgress) => void;
+  /** Marks how far one row's add has got, or clears it when the act is over.
+   *  Written by `useCatalogueAdd` and nothing else. */
+  setAddStage: (key: string, stage: AddStage | null) => void;
+  /** Why an add failed, or null when one begins. Also `useCatalogueAdd`'s:
+   *  one reporter for the whole act, so a resolve that failed and a move that
+   *  failed reach the user by the same route a download does. */
+  noteAddError: (message: string | null) => void;
   openPane: () => void;
   closePane: () => void;
   setQuery: (query: string) => void;
@@ -229,11 +256,15 @@ interface CatalogueStore {
   loadProviders: () => Promise<void>;
   /** Runs the query afresh against both halves, each as its filter says. */
   search: (query: string) => Promise<void>;
-  /** Fetches one file into uploads. Returns the staged path. */
-  acquire: (item: Acquirable) => Promise<string | null>;
+  /** Fetches one file into uploads. Returns the staged path, and raises if it
+   *  could not be fetched — the caller drives the whole add and is the one
+   *  place that says what became of it. */
+  acquire: (item: Acquirable) => Promise<string>;
   /** Fetches a whole course. Returns the folder it belongs in and the paths
    *  to import — the generated document first, because it is the thing that
-   *  makes the rest a course. */
+   *  makes the rest a course. Null means the hit is not a course at all,
+   *  which is a caller's mistake rather than a failed fetch; a failed fetch
+   *  raises. */
   acquireCourse: (
     hit: CatalogueHit,
   ) => Promise<{ folder: string; paths: string[] } | null>;
@@ -401,7 +432,7 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
   literatureError: null,
   acquireError: null,
   acquired: {},
-  acquiring: null,
+  adding: {},
   downloads: {},
   courseProgress: {},
   courses: {},
@@ -415,6 +446,15 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
     set((state) => ({
       courseProgress: { ...state.courseProgress, [progress.course_url]: progress },
     })),
+
+  setAddStage: (key, stage) =>
+    set((state) => {
+      if (stage !== null) return { adding: { ...state.adding, [key]: stage } };
+      const { [key]: _done, ...adding } = state.adding;
+      return { adding };
+    }),
+
+  noteAddError: (message) => set({ acquireError: message }),
 
   openPane: () => set({ paneOpen: true }),
   closePane: () => set({ paneOpen: false }),
@@ -521,7 +561,6 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
   },
 
   acquire: async ({ key, url, filename }) => {
-    set({ acquiring: key, acquireError: null });
     try {
       const download =
         filename === undefined
@@ -530,22 +569,20 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       set((state) => {
         const { [url]: _finished, ...downloads } = state.downloads;
         return {
-          acquiring: null,
           downloads,
           acquired: { ...state.acquired, [key]: download.path },
         };
       });
       return download.path;
-    } catch (e: any) {
+    } catch (error) {
+      // The byte counter is this call's own and is dropped whichever way the
+      // call ends. Saying what went wrong is the caller's: it owns the stage
+      // this failed in, and there are two other stages that can fail too.
       set((state) => {
         const { [url]: _abandoned, ...downloads } = state.downloads;
-        return {
-          acquiring: null,
-          downloads,
-          acquireError: e?.toString?.() ?? "Could not fetch that document",
-        };
+        return { downloads };
       });
-      return null;
+      throw error;
     }
   },
 
@@ -553,13 +590,11 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
     const courseUrl = hit.landing_url;
     if (hit.acquisition !== "course" || courseUrl === null) return null;
     const key = hitKey(hit);
-    set({ acquiring: key, acquireError: null });
     try {
       const course = await api.catalogueAcquireCourse(courseUrl);
       set((state) => {
         const { [courseUrl]: _finished, ...courseProgress } = state.courseProgress;
         return {
-          acquiring: null,
           courseProgress,
           courses: { ...state.courses, [key]: course },
           acquired: { ...state.acquired, [key]: course.directory },
@@ -571,16 +606,12 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
         folder: course.folder,
         paths: [course.document, ...course.documents.map((d) => d.path)],
       };
-    } catch (e: any) {
+    } catch (error) {
       set((state) => {
         const { [courseUrl]: _abandoned, ...courseProgress } = state.courseProgress;
-        return {
-          acquiring: null,
-          courseProgress,
-          acquireError: e?.toString?.() ?? "Could not fetch that course",
-        };
+        return { courseProgress };
       });
-      return null;
+      throw error;
     }
   },
 
@@ -600,7 +631,7 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       literatureLoading: false,
       acquireError: null,
       acquired: {},
-      acquiring: null,
+      adding: {},
       downloads: {},
       courseProgress: {},
       courses: {},

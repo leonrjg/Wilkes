@@ -2,7 +2,7 @@ import { useCallback } from "react";
 import { api, source } from "../services";
 import type { DesktopSourceApi } from "../services/api";
 import type { CatalogueHit, LiteratureSearchResult } from "../lib/types";
-import { hitKey, paperKey, useCatalogueStore } from "../stores/useCatalogueStore";
+import { type AddStage, hitKey, paperKey, useCatalogueStore } from "../stores/useCatalogueStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
 
@@ -32,8 +32,10 @@ export function useCatalogueAdd() {
   const readOnly = useActiveWorkspaceReadOnly();
   const acquire = useCatalogueStore((s) => s.acquire);
   const acquireCourse = useCatalogueStore((s) => s.acquireCourse);
-  const acquiring = useCatalogueStore((s) => s.acquiring);
+  const adding = useCatalogueStore((s) => s.adding);
   const acquired = useCatalogueStore((s) => s.acquired);
+  const setAddStage = useCatalogueStore((s) => s.setAddStage);
+  const noteAddError = useCatalogueStore((s) => s.noteAddError);
 
   // A desktop import needs somewhere to import to. The web build has its root
   // by construction, so it can add before the user has chosen anything.
@@ -61,25 +63,61 @@ export function useCatalogueAdd() {
     [directory, setDirectory, refreshFileList],
   );
 
+  /**
+   * One add, from the click to the file being in the library or the reason it
+   * is not.
+   *
+   * Every stage of it is marked here, because this is the only place that
+   * knows there are three: the row asked to show progress "until the file is
+   * on disk", and the download is only the middle of that. The stage is
+   * cleared however the act ends, so a failure cannot leave a row spinning.
+   */
+  const runAdd = useCallback(
+    async (key: string, act: () => Promise<string | null>): Promise<string | null> => {
+      noteAddError(null);
+      try {
+        return await act();
+      } catch (error: any) {
+        // Every failing stage reaches the user the same way. A resolver that
+        // refused and a move that failed used to reject into nothing at all.
+        console.error("adding to the library failed:", error);
+        noteAddError(error?.toString?.() ?? "Could not add that document");
+        return null;
+      } finally {
+        setAddStage(key, null);
+      }
+    },
+    [noteAddError, setAddStage],
+  );
+
   const add = useCallback(
     async (hit: CatalogueHit): Promise<string | null> => {
       if (!canAdd) return null;
+      const key = hitKey(hit);
       // A course is many files and a document describing them; a textbook is
       // one file. Which of the two this is was decided in core and travels on
       // the hit, so this does not test the provider id to find out.
       if (hit.acquisition === "course") {
-        const course = await acquireCourse(hit);
-        if (course === null) return null;
-        await install(course.paths, course.folder);
-        return course.paths[0] ?? null;
+        return runAdd(key, async () => {
+          setAddStage(key, "fetching");
+          const course = await acquireCourse(hit);
+          if (course === null) return null;
+          setAddStage(key, "importing");
+          await install(course.paths, course.folder);
+          return course.paths[0] ?? null;
+        });
       }
       if (hit.pdf_url === null) return null;
-      const staged = await acquire({ key: hitKey(hit), url: hit.pdf_url });
-      if (staged === null) return null;
-      await install([staged]);
-      return staged;
+      const url = hit.pdf_url;
+      return runAdd(key, async () => {
+        setAddStage(key, "fetching");
+        const staged = await acquire({ key, url });
+        setAddStage(key, "importing");
+        await install([staged]);
+        return staged;
+      });
     },
-    [canAdd, acquire, acquireCourse, install],
+    [canAdd, acquire, acquireCourse, install, runAdd, setAddStage],
   );
 
   /** Resolve only after selection, then use the same staging downloader as
@@ -89,20 +127,28 @@ export function useCatalogueAdd() {
     async (provider: string, work: LiteratureSearchResult): Promise<string | null> => {
       const acquisition = work.acquisition ?? (work.pdf_url === null ? "none" : "direct");
       if (!canAdd || acquisition === "none") return null;
-      const resolved =
-        acquisition === "direct" && work.pdf_url !== null
-          ? { url: work.pdf_url, filename: null }
+      const key = paperKey(provider, work);
+      return runAdd(key, async () => {
+        // Resolving is a request of its own, and a credentialed resolver is
+        // not a fast one. It is named as its own stage rather than spent
+        // before the row has said anything is happening.
+        const direct = acquisition === "direct" && work.pdf_url !== null;
+        setAddStage(key, direct ? "fetching" : "resolving");
+        const resolved = direct
+          ? { url: work.pdf_url as string, filename: null }
           : await api.literatureResolveDownload(provider, work);
-      const staged = await acquire({
-        key: paperKey(provider, work),
-        url: resolved.url,
-        filename: resolved.filename ?? undefined,
+        setAddStage(key, "fetching");
+        const staged = await acquire({
+          key,
+          url: resolved.url,
+          filename: resolved.filename ?? undefined,
+        });
+        setAddStage(key, "importing");
+        await install([staged]);
+        return staged;
       });
-      if (staged === null) return null;
-      await install([staged]);
-      return staged;
     },
-    [canAdd, acquire, install],
+    [canAdd, acquire, install, runAdd, setAddStage],
   );
 
   return {
@@ -111,10 +157,14 @@ export function useCatalogueAdd() {
     canAdd,
     needsDirectory,
     readOnly,
-    isAdding: (hit: CatalogueHit) => acquiring === hitKey(hit),
+    /** How far this row's add has got, or undefined when it is not adding.
+     *  The key is built here so a row never has to know how one is spelled. */
+    stageOf: (hit: CatalogueHit): AddStage | undefined => adding[hitKey(hit)],
+    paperStageOf: (
+      provider: string,
+      work: LiteratureSearchResult,
+    ): AddStage | undefined => adding[paperKey(provider, work)],
     isAdded: (hit: CatalogueHit) => hitKey(hit) in acquired,
-    isPaperAdding: (provider: string, work: LiteratureSearchResult) =>
-      acquiring === paperKey(provider, work),
     isPaperAdded: (provider: string, work: LiteratureSearchResult) =>
       paperKey(provider, work) in acquired,
   };

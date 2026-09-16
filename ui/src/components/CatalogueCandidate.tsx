@@ -1,8 +1,13 @@
 import { Check, Download, ExternalLink } from "react-feather";
-import type { CatalogueDownloadProgress, CatalogueHit, LiteratureSearchResult } from "../lib/types";
+import type {
+  CatalogueCourseProgress,
+  CatalogueDownloadProgress,
+  CatalogueHit,
+  LiteratureSearchResult,
+} from "../lib/types";
 import { api } from "../services";
 import { useCatalogueAdd } from "../hooks/useCatalogueAdd";
-import { hitKey, useCatalogueStore } from "../stores/useCatalogueStore";
+import { type AddStage, hitKey, useCatalogueStore } from "../stores/useCatalogueStore";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 
 function formatBytes(bytes: number): string {
@@ -77,9 +82,14 @@ interface Props {
  * be inviting a click it cannot describe.
  */
 export default function CatalogueCandidate({ hit, compact = false }: Props) {
-  const { add, canAdd, needsDirectory, readOnly, isAdding, isAdded } = useCatalogueAdd();
-  const adding = isAdding(hit);
-  const added = isAdded(hit);
+  const { add, canAdd, needsDirectory, readOnly, stageOf, isAdded } = useCatalogueAdd();
+  const stage = stageOf(hit);
+  const adding = stage !== undefined;
+  // Staged is not added. `acquired` is written when the file lands in uploads,
+  // which is before it is moved into the library, so a row that read it alone
+  // said "Added" — and offered no way to see the move — while the move was
+  // still running.
+  const added = !adding && isAdded(hit);
   // Keyed by the URL this row asked for, so two rows added at once do not
   // read each other's bytes.
   const download = useCatalogueStore((s) =>
@@ -151,31 +161,13 @@ export default function CatalogueCandidate({ hit, compact = false }: Props) {
           {hit.summary}
         </p>
       )}
-      {adding && isCourse && courseProgress !== undefined && (
-        <div className="flex flex-col gap-1 pt-0.5">
-          <span className="text-[10px] text-[var(--text-dim)]">
-            {courseProgress.stage === "manifest"
-              ? `Reading the course${courseProgress.total !== null ? ` — ${courseProgress.done} of ${courseProgress.total}` : ""}`
-              : `Document ${courseProgress.done}${courseProgress.total !== null ? ` of ${courseProgress.total}` : ""}`}
-          </span>
-          {courseProgress.total !== null && courseProgress.total > 0 && (
-            <div
-              role="progressbar"
-              aria-label={`Fetching ${hit.title}`}
-              aria-valuemin={0}
-              aria-valuemax={courseProgress.total}
-              aria-valuenow={courseProgress.done}
-              className="h-0.5 w-full overflow-hidden rounded bg-[var(--bg-app)]"
-            >
-              <div
-                className="h-full bg-[var(--accent-blue)] transition-[width] duration-200"
-                style={{
-                  width: `${Math.min(100, Math.round((courseProgress.done / courseProgress.total) * 100))}%`,
-                }}
-              />
-            </div>
-          )}
-        </div>
+      {stage !== undefined && (
+        <AddProgress
+          stage={stage}
+          title={hit.title}
+          download={download}
+          course={isCourse ? courseProgress : undefined}
+        />
       )}
       {added && course !== undefined && (
         /* What a course actually turned out to be. A gap in the sequence has
@@ -187,9 +179,6 @@ export default function CatalogueCandidate({ hit, compact = false }: Props) {
           {course.skipped.length > 0 && `, ${course.skipped.length} skipped`}
           {course.failures.length > 0 && `, ${course.failures.length} failed`}
         </span>
-      )}
-      {adding && !isCourse && download !== undefined && (
-        <DownloadProgress download={download} title={hit.title} />
       )}
       {/* Why there is no add button, in the space a button would have
           taken. What adding a course *does* is the button's own tooltip:
@@ -204,6 +193,97 @@ export default function CatalogueCandidate({ hit, compact = false }: Props) {
   );
 }
 
+/** What each stage of an add is called, in the order they happen. */
+const STAGE_LABELS: Record<AddStage, string> = {
+  resolving: "Finding a copy…",
+  fetching: "Fetching…",
+  importing: "Adding to the library…",
+};
+
+/**
+ * One row's add, reported from the click until the file is in the library.
+ *
+ * The byte counter used to be the whole of this, so a row said nothing while
+ * a provider was being asked where the file was, nothing between the request
+ * going out and the first byte arriving, and nothing while the fetched file
+ * was moved into the root — and that last silence flipped the button back to
+ * an enabled "Add" for as long as the move took.
+ *
+ * Where there is a denominator the bar shows the fraction. Where there is not
+ * — every stage but one, and a chunked response even in that one — it shows
+ * that work is happening and does not pretend to know how much is left.
+ */
+function AddProgress({
+  stage,
+  title,
+  download,
+  course,
+}: {
+  stage: AddStage;
+  title: string;
+  download?: CatalogueDownloadProgress;
+  /** A course reports its own two phases; the byte stream cannot say which of
+   *  forty documents it belongs to. */
+  course?: CatalogueCourseProgress;
+}) {
+  if (stage === "fetching" && course !== undefined) {
+    return <CourseProgress course={course} title={title} />;
+  }
+  if (stage === "fetching" && download !== undefined) {
+    return <DownloadProgress download={download} title={title} />;
+  }
+  return <Working label={STAGE_LABELS[stage]} title={title} />;
+}
+
+/** A stage that is under way with no way to say how far. The bar carries no
+ *  `aria-valuenow`, which is how a progress bar says it is indeterminate. */
+function Working({ label, title }: { label: string; title: string }) {
+  return (
+    <div className="flex flex-col gap-1 pt-0.5">
+      <span className="text-[10px] leading-snug text-[var(--text-dim)]">{label}</span>
+      <div
+        role="progressbar"
+        aria-label={`Adding ${title}`}
+        className="animate-shimmer h-0.5 w-full overflow-hidden rounded bg-[var(--bg-active)]"
+      />
+    </div>
+  );
+}
+
+function CourseProgress({
+  course,
+  title,
+}: {
+  course: CatalogueCourseProgress;
+  title: string;
+}) {
+  const label =
+    course.stage === "manifest"
+      ? `Reading the course${course.total !== null ? ` — ${course.done} of ${course.total}` : ""}`
+      : `Document ${course.done}${course.total !== null ? ` of ${course.total}` : ""}`;
+  if (course.total === null || course.total <= 0) {
+    return <Working label={label} title={title} />;
+  }
+  return (
+    <div className="flex flex-col gap-1 pt-0.5">
+      <span className="text-[10px] leading-snug text-[var(--text-dim)]">{label}</span>
+      <div
+        role="progressbar"
+        aria-label={`Fetching ${title}`}
+        aria-valuemin={0}
+        aria-valuemax={course.total}
+        aria-valuenow={course.done}
+        className="h-0.5 w-full overflow-hidden rounded bg-[var(--bg-app)]"
+      >
+        <div
+          className="h-full bg-[var(--accent-blue)] transition-[width] duration-200"
+          style={{ width: `${Math.min(100, Math.round((course.done / course.total) * 100))}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
 function DownloadProgress({
   download,
   title,
@@ -211,33 +291,32 @@ function DownloadProgress({
   download: CatalogueDownloadProgress;
   title: string;
 }) {
+  /* A chunked response has no length, so there is a figure but no fraction.
+     Saying how much has arrived is still more than an ellipsis says, and the
+     bar below it moves without claiming to know the end. */
+  if (download.total_bytes === null || download.total_bytes <= 0) {
+    return <Working label={`${formatBytes(download.received_bytes)} so far`} title={title} />;
+  }
   return (
     <div className="flex flex-col gap-1 pt-0.5">
-      <span className="text-[10px] text-[var(--text-dim)]">
-        {download.total_bytes !== null
-          ? `${formatBytes(download.received_bytes)} of ${formatBytes(download.total_bytes)}`
-          : /* A chunked response has no length, so there is a figure but
-               no fraction. Saying how much has arrived is still more than
-               an ellipsis says. */
-            `${formatBytes(download.received_bytes)} so far`}
+      <span className="text-[10px] leading-snug text-[var(--text-dim)]">
+        {formatBytes(download.received_bytes)} of {formatBytes(download.total_bytes)}
       </span>
-      {download.total_bytes !== null && download.total_bytes > 0 && (
+      <div
+        role="progressbar"
+        aria-label={`Downloading ${title}`}
+        aria-valuemin={0}
+        aria-valuemax={download.total_bytes}
+        aria-valuenow={download.received_bytes}
+        className="h-0.5 w-full overflow-hidden rounded bg-[var(--bg-app)]"
+      >
         <div
-          role="progressbar"
-          aria-label={`Downloading ${title}`}
-          aria-valuemin={0}
-          aria-valuemax={download.total_bytes}
-          aria-valuenow={download.received_bytes}
-          className="h-0.5 w-full overflow-hidden rounded bg-[var(--bg-app)]"
-        >
-          <div
-            className="h-full bg-[var(--accent-blue)] transition-[width] duration-200"
-            style={{
-              width: `${Math.min(100, Math.round((download.received_bytes / download.total_bytes) * 100))}%`,
-            }}
-          />
-        </div>
-      )}
+          className="h-full bg-[var(--accent-blue)] transition-[width] duration-200"
+          style={{
+            width: `${Math.min(100, Math.round((download.received_bytes / download.total_bytes) * 100))}%`,
+          }}
+        />
+      </div>
     </div>
   );
 }
@@ -297,7 +376,12 @@ function AddButton({
             <Check size={11} /> Added
           </>
         ) : adding ? (
-          <span aria-label="Downloading">…</span>
+          /* "Adding", not "Downloading": the button is busy for the resolve
+             and the move as well, and only the middle of that is a download. */
+          <span
+            aria-label="Adding"
+            className="h-[11px] w-[11px] animate-spin rounded-full border border-current border-t-transparent"
+          />
         ) : (
           <>
             <Download size={11} /> {label}
@@ -325,10 +409,11 @@ interface PaperProps {
  * adding either one is the same act.
  */
 export function PaperCandidate({ provider, work }: PaperProps) {
-  const { addPaper, canAdd, needsDirectory, readOnly, isPaperAdding, isPaperAdded } =
+  const { addPaper, canAdd, needsDirectory, readOnly, paperStageOf, isPaperAdded } =
     useCatalogueAdd();
-  const adding = isPaperAdding(provider, work);
-  const added = isPaperAdded(provider, work);
+  const stage = paperStageOf(provider, work);
+  const adding = stage !== undefined;
+  const added = !adding && isPaperAdded(provider, work);
   const download = useCatalogueStore((s) =>
     work.pdf_url === null ? undefined : s.downloads[work.pdf_url],
   );
@@ -391,7 +476,9 @@ export function PaperCandidate({ provider, work }: PaperProps) {
           work.license,
         ]}
       />
-      {adding && download !== undefined && <DownloadProgress download={download} title={title} />}
+      {stage !== undefined && (
+        <AddProgress stage={stage} title={title} download={download} />
+      )}
       {acquisition === "none" && (
         <span className="text-[10px] leading-snug text-[var(--text-dim)]">
           {work.is_open_access

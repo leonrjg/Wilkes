@@ -173,7 +173,7 @@ describe("CatalogueCandidate", () => {
   it("counts the manifest walk and then the documents", () => {
     render(<CatalogueCandidate hit={COURSE} />);
     act(() => {
-      useCatalogueStore.setState({ acquiring: "mit_ocw:3308" });
+      useCatalogueStore.setState({ adding: { "mit_ocw:3308": "fetching" } });
       useCatalogueStore.getState().noteCourseProgress({
         course_url: COURSE.landing_url as string,
         stage: "manifest",
@@ -244,7 +244,7 @@ describe("CatalogueCandidate", () => {
   it("shows the bytes as they arrive, against the total when there is one", () => {
     render(<CatalogueCandidate hit={HIT} />);
     act(() => {
-      useCatalogueStore.setState({ acquiring: "libretexts:42" });
+      useCatalogueStore.setState({ adding: { "libretexts:42": "fetching" } });
       useCatalogueStore.getState().noteDownloadProgress({
         url: HIT.pdf_url as string,
         filename: "book.pdf",
@@ -259,12 +259,13 @@ describe("CatalogueCandidate", () => {
     expect(bar.getAttribute("aria-valuemax")).toBe("4194304");
   });
 
-  /// A chunked response declares no length. A bar would sit at zero forever,
-  /// so there is a figure and no bar rather than an invented denominator.
-  it("shows what has arrived, and no bar, when the server declared no length", () => {
+  /// A chunked response declares no length. A filling bar would sit at zero
+  /// forever, so what has arrived is stated and the bar says only that work is
+  /// happening — indeterminate, which is what no `aria-valuenow` means.
+  it("shows what has arrived, and no fraction, when the server declared no length", () => {
     render(<CatalogueCandidate hit={HIT} />);
     act(() => {
-      useCatalogueStore.setState({ acquiring: "libretexts:42" });
+      useCatalogueStore.setState({ adding: { "libretexts:42": "fetching" } });
       useCatalogueStore.getState().noteDownloadProgress({
         url: HIT.pdf_url as string,
         filename: "book.pdf",
@@ -274,14 +275,16 @@ describe("CatalogueCandidate", () => {
       });
     });
     expect(screen.getByText("512 KB so far")).toBeTruthy();
-    expect(screen.queryByRole("progressbar")).toBeNull();
+    const bar = screen.getByRole("progressbar");
+    expect(bar.getAttribute("aria-valuenow")).toBeNull();
+    expect(bar.getAttribute("aria-valuemax")).toBeNull();
   });
 
   /// Two rows can be added at once; neither may render the other's bytes.
   it("ignores progress belonging to another download", () => {
     render(<CatalogueCandidate hit={HIT} />);
     act(() => {
-      useCatalogueStore.setState({ acquiring: "libretexts:42" });
+      useCatalogueStore.setState({ adding: { "libretexts:42": "fetching" } });
       useCatalogueStore.getState().noteDownloadProgress({
         url: "https://example.invalid/other.pdf",
         filename: "other.pdf",
@@ -290,8 +293,74 @@ describe("CatalogueCandidate", () => {
         done: false,
       });
     });
-    expect(screen.queryByRole("progressbar")).toBeNull();
     expect(screen.queryByText(/so far/)).toBeNull();
+    expect(screen.queryByText(/999/)).toBeNull();
+    // It is still adding, so it says so — with no figures it does not have.
+    expect(screen.getByText("Fetching…")).toBeTruthy();
+  });
+
+  /// The move out of uploads and into the library root is the last stage, and
+  /// it used to be silent: the row dropped back to an enabled "Add" for as
+  /// long as it took, inviting a second click on a file already downloaded.
+  it("keeps reporting while the staged file is moved into the library", async () => {
+    let finishImport = () => {};
+    importFiles.mockImplementation(
+      () => new Promise<string[]>((resolve) => (finishImport = () => resolve([]))),
+    );
+    render(<CatalogueCandidate hit={HIT} />);
+    fireEvent.click(screen.getByLabelText(/Add Combinatorial Optimization/));
+    expect(await screen.findByText("Adding to the library…")).toBeTruthy();
+    expect(screen.queryByText("Added")).toBeNull();
+    await act(async () => {
+      finishImport();
+    });
+    expect(await screen.findByText("Added")).toBeTruthy();
+    expect(screen.queryByText("Adding to the library…")).toBeNull();
+  });
+
+  /// The stage is keyed per row like the byte counters are. It used to be a
+  /// single key, so the second add to start erased the first row's indicator
+  /// and the first to finish cleared the second's.
+  it("keeps each row's progress its own when two are added at once", async () => {
+    const other: CatalogueHit = { ...HIT, external_id: "43", title: "Another Book" };
+    // One resolver per call: two imports are in flight, and a single handle
+    // would only ever release the second.
+    const pendingImports: (() => void)[] = [];
+    importFiles.mockImplementation(
+      () => new Promise<string[]>((resolve) => pendingImports.push(() => resolve([]))),
+    );
+    render(
+      <>
+        <CatalogueCandidate hit={HIT} />
+        <CatalogueCandidate hit={other} />
+      </>,
+    );
+    fireEvent.click(screen.getByLabelText(/Add Combinatorial Optimization/));
+    fireEvent.click(screen.getByLabelText(/Add Another Book/));
+    await waitFor(() => {
+      expect(screen.getAllByText("Adding to the library…")).toHaveLength(2);
+    });
+    expect(useCatalogueStore.getState().adding).toEqual({
+      "libretexts:42": "importing",
+      "libretexts:43": "importing",
+    });
+    await act(async () => {
+      pendingImports.forEach((finish) => finish());
+    });
+    await waitFor(() => expect(useCatalogueStore.getState().adding).toEqual({}));
+  });
+
+  /// A move that fails is as much "it did not get added" as a fetch that
+  /// fails, and used to reject into nothing at all.
+  it("reports a failed import instead of rejecting silently", async () => {
+    importFiles.mockRejectedValue(new Error("the root is not writable"));
+    render(<CatalogueCandidate hit={HIT} />);
+    fireEvent.click(screen.getByLabelText(/Add Combinatorial Optimization/));
+    await waitFor(() => {
+      expect(useCatalogueStore.getState().acquireError).toMatch(/not writable/);
+    });
+    // And the row is not left spinning by the failure.
+    expect(useCatalogueStore.getState().adding).toEqual({});
   });
 
   it("stops reporting bytes once the download is over", async () => {
