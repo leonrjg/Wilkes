@@ -108,95 +108,98 @@ export default function CatalogueCandidate({ hit, compact = false }: Props) {
         : "Fetch this document and add it to the current directory";
 
   return (
-    <div className="flex items-start justify-between gap-2 py-1.5">
-      {/* `flex-1` so the blurb uses the pane it was given: a description laid
-          out at the width of its own longest line left half the row empty and
-          made every row taller than it had to be. */}
-      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <div className="flex items-start gap-1.5">
+    /* The buttons share a line with the title and nothing else. They used to
+       stand beside the whole text column, so every line under the title — the
+       facts, the blurb, the progress bar — was laid out in the width left over
+       beside them: 186px of a 316px pane, and the blurb wrapped at 59% of the
+       space it had. Below the title line, the row is the pane's full width. */
+    <div className="flex flex-col gap-0.5 py-1.5">
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex min-w-0 flex-1 items-start gap-1.5">
           <RowTitle title={hit.title} />
           <span className="mt-px shrink-0 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1 text-[9px] uppercase tracking-wider text-[var(--text-dim)]">
             {GRAIN_LABELS[hit.grain] ?? hit.grain}
           </span>
         </div>
-        <MetaLine
-          parts={[
-            PROVIDER_LABELS[hit.provider] ?? hit.provider,
-            hit.subject,
-            hit.license,
-            hit.pages !== null && `${hit.pages.toLocaleString()} pp`,
-          ]}
-        />
-        {!compact && hit.summary && (
-          <p className="line-clamp-2 text-[10px] leading-snug text-[var(--text-muted)]">
-            {hit.summary}
-          </p>
-        )}
-        {adding && isCourse && courseProgress !== undefined && (
-          <div className="flex flex-col gap-1 pt-0.5">
-            <span className="text-[10px] text-[var(--text-dim)]">
-              {courseProgress.stage === "manifest"
-                ? `Reading the course${courseProgress.total !== null ? ` — ${courseProgress.done} of ${courseProgress.total}` : ""}`
-                : `Document ${courseProgress.done}${courseProgress.total !== null ? ` of ${courseProgress.total}` : ""}`}
-            </span>
-            {courseProgress.total !== null && courseProgress.total > 0 && (
-              <div
-                role="progressbar"
-                aria-label={`Fetching ${hit.title}`}
-                aria-valuemin={0}
-                aria-valuemax={courseProgress.total}
-                aria-valuenow={courseProgress.done}
-                className="h-0.5 w-full overflow-hidden rounded bg-[var(--bg-app)]"
-              >
-                <div
-                  className="h-full bg-[var(--accent-blue)] transition-[width] duration-200"
-                  style={{
-                    width: `${Math.min(100, Math.round((courseProgress.done / courseProgress.total) * 100))}%`,
-                  }}
-                />
-              </div>
-            )}
-          </div>
-        )}
-        {added && course !== undefined && (
-          /* What a course actually turned out to be. A gap in the sequence has
-             a reason, and saying "4 audiovisual" is how a reader learns the
-             lectures they cannot find were never documents. */
-          <span className="text-[10px] text-[var(--text-dim)]">
-            {course.documents.length} document
-            {course.documents.length === 1 ? "" : "s"} and a syllabus
-            {course.skipped.length > 0 && `, ${course.skipped.length} skipped`}
-            {course.failures.length > 0 && `, ${course.failures.length} failed`}
-          </span>
-        )}
-        {adding && !isCourse && download !== undefined && (
-          <DownloadProgress download={download} title={hit.title} />
-        )}
-        {/* Why there is no add button, in the space a button would have
-            taken. What adding a course *does* is the button's own tooltip:
-            a paragraph of it under every OCW row was the same sentence
-            repeated down the pane. */}
-        {!acquirable && (
-          <span className="text-[10px] leading-snug text-[var(--text-dim)]">
-            No downloadable copy — open it to read it where it lives.
-          </span>
-        )}
+
+        <div className="flex shrink-0 items-center gap-1">
+          {link !== null && <OpenLink link={link} title={hit.title} />}
+          {acquirable && (
+            <AddButton
+              title={hit.title}
+              tooltip={added ? "Added to this library" : addTitle}
+              label="Add"
+              onAdd={() => void add(hit)}
+              disabled={!canAdd || adding || added}
+              adding={adding}
+              added={added}
+            />
+          )}
+        </div>
       </div>
 
-      <div className="flex shrink-0 items-center gap-1">
-        {link !== null && <OpenLink link={link} title={hit.title} />}
-        {acquirable && (
-          <AddButton
-            title={hit.title}
-            tooltip={added ? "Added to this library" : addTitle}
-            label={isCourse ? "Add course" : "Add"}
-            onAdd={() => void add(hit)}
-            disabled={!canAdd || adding || added}
-            adding={adding}
-            added={added}
-          />
-        )}
-      </div>
+      <MetaLine
+        parts={[
+          PROVIDER_LABELS[hit.provider] ?? hit.provider,
+          hit.subject,
+          hit.license,
+          hit.pages !== null && `${hit.pages.toLocaleString()} pp`,
+        ]}
+      />
+      {!compact && hit.summary && (
+        <p className="line-clamp-2 text-[10px] leading-snug text-[var(--text-muted)]">
+          {hit.summary}
+        </p>
+      )}
+      {adding && isCourse && courseProgress !== undefined && (
+        <div className="flex flex-col gap-1 pt-0.5">
+          <span className="text-[10px] text-[var(--text-dim)]">
+            {courseProgress.stage === "manifest"
+              ? `Reading the course${courseProgress.total !== null ? ` — ${courseProgress.done} of ${courseProgress.total}` : ""}`
+              : `Document ${courseProgress.done}${courseProgress.total !== null ? ` of ${courseProgress.total}` : ""}`}
+          </span>
+          {courseProgress.total !== null && courseProgress.total > 0 && (
+            <div
+              role="progressbar"
+              aria-label={`Fetching ${hit.title}`}
+              aria-valuemin={0}
+              aria-valuemax={courseProgress.total}
+              aria-valuenow={courseProgress.done}
+              className="h-0.5 w-full overflow-hidden rounded bg-[var(--bg-app)]"
+            >
+              <div
+                className="h-full bg-[var(--accent-blue)] transition-[width] duration-200"
+                style={{
+                  width: `${Math.min(100, Math.round((courseProgress.done / courseProgress.total) * 100))}%`,
+                }}
+              />
+            </div>
+          )}
+        </div>
+      )}
+      {added && course !== undefined && (
+        /* What a course actually turned out to be. A gap in the sequence has
+           a reason, and saying "4 audiovisual" is how a reader learns the
+           lectures they cannot find were never documents. */
+        <span className="text-[10px] text-[var(--text-dim)]">
+          {course.documents.length} document
+          {course.documents.length === 1 ? "" : "s"} and a syllabus
+          {course.skipped.length > 0 && `, ${course.skipped.length} skipped`}
+          {course.failures.length > 0 && `, ${course.failures.length} failed`}
+        </span>
+      )}
+      {adding && !isCourse && download !== undefined && (
+        <DownloadProgress download={download} title={hit.title} />
+      )}
+      {/* Why there is no add button, in the space a button would have
+          taken. What adding a course *does* is the button's own tooltip:
+          a paragraph of it under every OCW row was the same sentence
+          repeated down the pane. */}
+      {!acquirable && (
+        <span className="text-[10px] leading-snug text-[var(--text-dim)]">
+          No downloadable copy — open it to read it where it lives.
+        </span>
+      )}
     </div>
   );
 }
@@ -345,52 +348,57 @@ export function PaperCandidate({ provider, work }: PaperProps) {
       : "Fetch the open-access copy and add it to the current directory";
 
   return (
-    <div className="flex items-start justify-between gap-2 py-1.5">
-      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+    /* Laid out like a catalogue row, and for the same reason: only the title
+       shares the buttons' line, so the facts below it have the whole pane. */
+    <div className="flex flex-col gap-0.5 py-1.5">
+      <div className="flex items-start justify-between gap-2">
         {/* No kind badge. The row already sits under the name of the provider
             that returned it, and the badge said "Paper" over every one of them
             — over a monograph, a standard, a thesis, whatever the provider
             happens to index. A label that is wrong for some of its rows says
             less than the heading above them already does. */}
-        <RowTitle title={title} />
-        <MetaLine
-          parts={[
-            work.year !== null && `${work.year}`,
-            work.authors,
-            work.venue,
-            work.publisher !== work.venue && work.publisher,
-            work.language,
-            work.file_format,
-            work.file_size,
-            `${work.citation_count.toLocaleString()} citation${work.citation_count === 1 ? "" : "s"}`,
-            work.is_open_access && "Open access",
-            work.license,
-          ]}
-        />
-        {adding && download !== undefined && <DownloadProgress download={download} title={title} />}
-        {acquisition === "none" && (
-          <span className="text-[10px] leading-snug text-[var(--text-dim)]">
-            {work.is_open_access
-              ? "Listed as open access, but no file was reported — open it to find one."
-              : "No open-access copy reported — open it to read it where it lives."}
-          </span>
-        )}
+        <div className="flex min-w-0 flex-1">
+          <RowTitle title={title} />
+        </div>
+
+        <div className="flex shrink-0 items-center gap-1">
+          {link !== null && <OpenLink link={link} title={title} />}
+          {acquisition !== "none" && (
+            <AddButton
+              title={title}
+              tooltip={added ? "Added to this library" : addTitle}
+              label="Add"
+              onAdd={() => void addPaper(provider, work)}
+              disabled={!canAdd || adding || added}
+              adding={adding}
+              added={added}
+            />
+          )}
+        </div>
       </div>
 
-      <div className="flex shrink-0 items-center gap-1">
-        {link !== null && <OpenLink link={link} title={title} />}
-        {acquisition !== "none" && (
-          <AddButton
-            title={title}
-            tooltip={added ? "Added to this library" : addTitle}
-            label="Add"
-            onAdd={() => void addPaper(provider, work)}
-            disabled={!canAdd || adding || added}
-            adding={adding}
-            added={added}
-          />
-        )}
-      </div>
+      <MetaLine
+        parts={[
+          work.year !== null && `${work.year}`,
+          work.authors,
+          work.venue,
+          work.publisher !== work.venue && work.publisher,
+          work.language,
+          work.file_format,
+          work.file_size,
+          `${work.citation_count.toLocaleString()} citation${work.citation_count === 1 ? "" : "s"}`,
+          work.is_open_access && "Open access",
+          work.license,
+        ]}
+      />
+      {adding && download !== undefined && <DownloadProgress download={download} title={title} />}
+      {acquisition === "none" && (
+        <span className="text-[10px] leading-snug text-[var(--text-dim)]">
+          {work.is_open_access
+            ? "Listed as open access, but no file was reported — open it to find one."
+            : "No open-access copy reported — open it to read it where it lives."}
+        </span>
+      )}
     </div>
   );
 }

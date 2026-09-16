@@ -117,13 +117,14 @@ describe("CatalogueCandidate", () => {
 
   /// A course has no `pdf_url` and is still acquirable — the old rule, which
   /// read acquirability off `pdf_url`, would have hidden the button entirely.
-  /// What adding one does is the button's own tooltip; the row says it is a
-  /// course by offering a differently-labelled button, not by explaining
-  /// itself in a paragraph under every OCW result.
-  it("offers a course its own button", () => {
+  /// The chip says it is a course and the tooltip says what fetching one
+  /// does, so the button is labelled like every other and the row does not
+  /// explain itself in a paragraph under every OCW result.
+  it("offers a course the same Add as anything else", () => {
     render(<CatalogueCandidate hit={COURSE} />);
     expect(screen.getByLabelText(/Add Water Quality Control to library/)).toBeTruthy();
-    expect(screen.getByText(/Add course/)).toBeTruthy();
+    expect(screen.getByText("Course")).toBeTruthy();
+    expect(screen.queryByText(/Add course/)).toBeNull();
     expect(screen.queryByText(/A course, not a file/i)).toBeNull();
   });
 

@@ -96,9 +96,15 @@ already exists — it is what the user typed.
   licence (and, once §4 lands, coverage). Grain is shown because it is the
   honest label of what the thing is — a documentation set and a textbook answer different questions, and
   the chip is cheaper than a paragraph explaining that.
-- **Action:** one per row, *Add to library*. Never automatic. A download is a
-  network fetch of up to 100 MB into the user's files; it is a decision, and the
-  decision is theirs.
+- **Action:** one per row, *Add*. Never automatic. A download is a network fetch
+  of up to 100 MB into the user's files; it is a decision, and the decision is
+  theirs. A course is fetched by the same button under the same label — the
+  grain chip already says the row is a course, and what fetching one does is the
+  button's tooltip.
+- **Only the title shares the buttons' line.** The buttons used to stand beside
+  the whole text column, so every line under the title was laid out in the width
+  left over beside them — 186px of a 316px pane, and the blurb wrapped at 59% of
+  the space it had. Below the title, the row is the pane's full width.
 - **Grains:** all of them by default. The store's own comment argues for the set
   over the single preferred kind, and the UI has less information than the store
   about which one the user meant, not more.
