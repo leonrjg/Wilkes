@@ -20,6 +20,88 @@ pub fn is_under(path: &Path, base: &Path) -> bool {
     canonical_path.starts_with(canonical_base)
 }
 
+/// The longest a single path component may be, in bytes.
+///
+/// `NAME_MAX` is 255 on every filesystem Wilkes writes to — APFS and HFS+,
+/// ext4, NTFS — and the kernel counts *bytes*, not characters. A name that
+/// crosses it is not truncated by the filesystem: the write fails outright,
+/// with `ENAMETOOLONG` (errno 63 on macOS), after the bytes have already been
+/// fetched. That is what a shadow-library filename does — title, authors,
+/// journal, doi, hash and provenance in one segment, percent-encoded on top —
+/// so the limit is enforced where the name is chosen rather than discovered
+/// where the file is written.
+pub const MAX_FILE_NAME_BYTES: usize = 255;
+
+/// Below this, keeping the extension costs more than it is worth: a name that
+/// is all suffix and no stem names nothing.
+const MIN_STEM_BYTES: usize = 16;
+
+/// One file name the operating system will accept.
+///
+/// Replaces what a name may not contain — control characters, the path
+/// separators, and the set Windows reserves — and then holds the result to
+/// [`MAX_FILE_NAME_BYTES`]. Both halves are the same question: whether the
+/// name can be written at all. Answering only the first is what produced a
+/// download that failed after fetching every byte of a 12 MB paper.
+///
+/// Errors rather than inventing a name when nothing usable is left, because a
+/// caller that asked to save something under a name has no use for a different
+/// one it never chose.
+pub fn sanitize_file_name(raw: &str) -> Result<String, String> {
+    let mut safe = String::new();
+    for character in raw.trim().chars() {
+        if character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
+        {
+            safe.push('_');
+        } else {
+            safe.push(character);
+        }
+    }
+    // `..` is a traversal wherever it is read as a whole component, and a name
+    // is joined to a directory by everything that calls this.
+    while safe.contains("..") {
+        safe = safe.replace("..", "_");
+    }
+    let safe = truncate_file_name(safe.trim(), MAX_FILE_NAME_BYTES);
+    if safe.is_empty() {
+        return Err("file name is empty after sanitizing".to_string());
+    }
+    Ok(safe)
+}
+
+/// Trims a name to `limit` bytes, keeping its extension.
+///
+/// The extension is kept because it is what tells the rest of Wilkes — the
+/// importer, the extractor, the viewer — what the file is; the stem is only
+/// what it is called. Characters are taken whole: a budget counted in bytes
+/// and spent in glyphs is the only way to stay under a byte limit without
+/// cutting through a multi-byte character.
+fn truncate_file_name(name: &str, limit: usize) -> String {
+    if name.len() <= limit {
+        return name.to_string();
+    }
+    let suffix = Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| format!(".{extension}"))
+        .filter(|suffix| suffix.len() + MIN_STEM_BYTES <= limit)
+        .unwrap_or_default();
+    let stem = name.strip_suffix(suffix.as_str()).unwrap_or(name);
+    let budget = limit - suffix.len();
+    let mut kept = String::with_capacity(budget);
+    for character in stem.chars() {
+        if kept.len() + character.len_utf8() > budget {
+            break;
+        }
+        kept.push(character);
+    }
+    format!("{}{suffix}", kept.trim_end())
+}
+
 /// Normalizes a path by resolving '..' and '.' components without hitting the disk.
 /// Note: This does NOT resolve symlinks. It's useful for checking paths that
 /// might not exist yet, or as a secondary check.
@@ -369,6 +451,56 @@ mod tests {
 
         assert_eq!(resolved, working);
         assert_ne!(resolved, broken);
+    }
+
+    #[test]
+    fn a_name_the_filesystem_would_refuse_is_cut_to_fit_and_keeps_its_extension() {
+        // The live case: a shadow-library name carrying title, authors,
+        // journal, date, doi and hash in one segment. The write failed with
+        // errno 63 after the whole PDF had been fetched.
+        let long = format!("{}.pdf", "a".repeat(400));
+        let safe = sanitize_file_name(&long).unwrap();
+        assert!(safe.len() <= MAX_FILE_NAME_BYTES, "{}", safe.len());
+        assert!(safe.ends_with(".pdf"));
+    }
+
+    #[test]
+    fn the_limit_is_bytes_and_a_glyph_is_never_cut_through() {
+        // 200 accented characters are 400 bytes: a cap counted in characters
+        // passes this name straight to a filesystem that refuses it.
+        let long = format!("{}.pdf", "é".repeat(200));
+        let safe = sanitize_file_name(&long).unwrap();
+        assert!(safe.len() <= MAX_FILE_NAME_BYTES, "{}", safe.len());
+        assert!(safe.chars().all(|c| c == 'é' || ".pdf".contains(c)));
+        assert!(safe.ends_with(".pdf"));
+    }
+
+    #[test]
+    fn a_name_that_fits_is_left_exactly_as_it_is() {
+        assert_eq!(
+            sanitize_file_name("Wilkes 1992 — Artificial Intelligence.pdf").unwrap(),
+            "Wilkes 1992 — Artificial Intelligence.pdf"
+        );
+    }
+
+    #[test]
+    fn separators_and_traversal_do_not_survive() {
+        assert_eq!(sanitize_file_name("../a/b.pdf").unwrap(), "__a_b.pdf");
+        assert_eq!(sanitize_file_name("Graph: Networks.PDF").unwrap(), "Graph_ Networks.PDF");
+    }
+
+    #[test]
+    fn a_name_with_nothing_left_in_it_is_refused_rather_than_invented() {
+        assert!(sanitize_file_name("   ").is_err());
+    }
+
+    #[test]
+    fn an_extension_too_long_to_be_worth_keeping_is_not_kept() {
+        // No stem would be left under it, so the name is simply cut to fit.
+        let name = format!("a.{}", "x".repeat(400));
+        let safe = sanitize_file_name(&name).unwrap();
+        assert!(safe.len() <= MAX_FILE_NAME_BYTES, "{}", safe.len());
+        assert!(safe.starts_with("a.xxx"));
     }
 
     #[test]

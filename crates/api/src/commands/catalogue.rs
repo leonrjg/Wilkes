@@ -460,8 +460,15 @@ pub async fn acquire_course(
             filename: Some(file.filename.clone()),
         };
         match download_to_root(&directory, params, download_progress.clone()).await {
+            // Named from the path it was written to, not from the name it was
+            // asked for: the downloader holds the name to what a filesystem
+            // accepts, and a course listing that reported the asked-for name
+            // would name a file that is not there.
             Ok(response) => documents.push(CourseDocument {
-                filename: file.filename.clone(),
+                filename: Path::new(&response.path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| file.filename.clone()),
                 path: response.path,
                 bytes: response.bytes,
                 already_present: response.already_present,

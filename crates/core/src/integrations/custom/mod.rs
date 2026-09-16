@@ -600,7 +600,14 @@ impl CustomSource {
             .map(|template| substitute_values(template, &values, Substitution::Raw))
             .transpose()
             .map_err(|error| anyhow::anyhow!("resolve_download.filename: {error}"))?
-            .map(|name| sanitize_filename(&name))
+            // The same answer the downloader gives: a name a manifest
+            // rendered is written by the same filesystem as any other, and two
+            // ideas of what one may contain would differ exactly where a
+            // template is long.
+            .map(|name| {
+                crate::path::sanitize_file_name(&name)
+                    .map_err(|error| anyhow::anyhow!("resolve_download.filename: {error}"))
+            })
             .transpose()?;
         Ok(Some(ResolvedLiteratureDownload {
             url: url.to_string(),
@@ -871,31 +878,6 @@ fn substitute_values(
     }
     out.push_str(rest);
     Ok(out)
-}
-
-fn sanitize_filename(value: &str) -> anyhow::Result<String> {
-    let mut safe = String::new();
-    for character in value.trim().chars() {
-        if character.is_control()
-            || matches!(
-                character,
-                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
-            )
-        {
-            safe.push('_');
-        } else {
-            safe.push(character);
-        }
-    }
-    while safe.contains("..") {
-        safe = safe.replace("..", "_");
-    }
-    let safe: String = safe.chars().take(200).collect();
-    anyhow::ensure!(
-        !safe.trim().is_empty(),
-        "resolved filename is empty after sanitizing"
-    );
-    Ok(safe)
 }
 
 /// Header names borrow from the manifest rather than being cloned: the

@@ -8,6 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::path as wilkes_path;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -89,6 +91,96 @@ fn extension_for_mime(mime: &str) -> Option<&'static str> {
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Some("docx"),
         _ => None,
     }
+}
+
+/// Provenance the shadow-library mirrors stamp into the names they serve.
+///
+/// These are not part of the work: they name the site the bytes came through,
+/// and they follow the file into the library, into the index, and into every
+/// citation made of it. They come off where the name is chosen — which is also
+/// where the name is measured, and the longest of these is a fifth of what a
+/// filesystem allows.
+///
+/// Written in the form comparison sees: lowercase, and with the typographic
+/// apostrophe folded to the ASCII one, because a name carries whichever of the
+/// two the mirror happened to use.
+const STRIPPED_NAME_MARKERS: [&str; 4] = [
+    "anna's archive",
+    "z-library.sk",
+    "1lib.sk",
+    "z-lib.sk",
+];
+
+/// The comparison form of a character: one character in, one character out, so
+/// an offset into the normalized name is an offset into the name itself.
+fn folded(character: char) -> char {
+    match character {
+        '\u{2019}' => '\'',
+        other => other.to_ascii_lowercase(),
+    }
+}
+
+/// Removes [`STRIPPED_NAME_MARKERS`] from a name, extension untouched.
+///
+/// Only the stem is searched and rewritten: a marker sits in the title, and
+/// tidying the separators it leaves behind would eat the `.pdf` if the
+/// extension were part of what is being trimmed.
+///
+/// A stem that *is* nothing but a marker is left alone. Stripping it would
+/// leave the file named by its extension alone, which is less use than the
+/// name it came with — there is nothing else here to call it.
+fn strip_source_markers(name: &str) -> String {
+    let suffix = Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_default();
+    let stem: Vec<char> = name
+        .strip_suffix(suffix.as_str())
+        .unwrap_or(name)
+        .chars()
+        .collect();
+    let normalized: Vec<char> = stem.iter().copied().map(folded).collect();
+    let mut keep = vec![true; stem.len()];
+    for marker in STRIPPED_NAME_MARKERS {
+        let needle: Vec<char> = marker.chars().collect();
+        if needle.len() > normalized.len() {
+            continue;
+        }
+        for start in 0..=normalized.len() - needle.len() {
+            if normalized[start..start + needle.len()] == needle[..] {
+                keep[start..start + needle.len()].fill(false);
+            }
+        }
+    }
+    if keep.iter().all(|kept| *kept) {
+        return name.to_string();
+    }
+    let stripped: String = stem
+        .iter()
+        .zip(&keep)
+        .filter(|(_, kept)| **kept)
+        .map(|(character, _)| *character)
+        .collect();
+    let tidied = tidy_separators(&stripped);
+    if tidied.is_empty() {
+        return name.to_string();
+    }
+    format!("{tidied}{suffix}")
+}
+
+/// Closes the gap a removed marker leaves: the run of spaces and dashes that
+/// used to join it to the rest of the name, at either end and in the middle.
+fn tidy_separators(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(character, '-' | '_' | '\u{2013}' | '\u{2014}' | ',' | ';' | '.')
+        })
+        .to_string()
 }
 
 /// The name a download is saved under, once the server has said what it sent.
@@ -192,28 +284,57 @@ pub async fn download_to_root(
         return Err("Download URL must use HTTP or HTTPS.".to_string());
     }
     let named_by_caller = params.filename.is_some();
+    if let Some(name) = params.filename.as_deref() {
+        // A caller that passed a path did not mean a name, and guessing which
+        // part of it they meant is worse than saying so.
+        let path = Path::new(name);
+        if path.components().count() != 1
+            || !matches!(
+                path.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            tracing::warn!(
+                filename = name,
+                "download refused: filename is not a single name"
+            );
+            return Err("filename must be a single file name without directories.".to_string());
+        }
+    }
     let filename = params
         .filename
         .or_else(|| {
             url.path_segments()
                 .and_then(|mut segments| segments.next_back())
                 .filter(|name| !name.is_empty())
-                .map(str::to_string)
+                // The escapes belong to the URL, not to the name. Kept, they
+                // triple the length of a long title against a limit counted in
+                // bytes, and they hide a marker inside its own `%20`s.
+                .map(|name| match urlencoding::decode(name) {
+                    Ok(decoded) => decoded.into_owned(),
+                    Err(error) => {
+                        tracing::warn!(
+                            segment = name,
+                            "download filename is not valid percent-encoded UTF-8, \
+                             using it as it stands: {error}"
+                        );
+                        name.to_string()
+                    }
+                })
         })
         // Leave an origin URL unnamed until the response says what it sent.
         // Inventing PDF here would misname an EPUB whose final URL has no path.
         .unwrap_or_else(|| "download".to_string());
-    let filename_path = Path::new(&filename);
-    if filename_path.components().count() != 1
-        || !matches!(
-            filename_path.components().next(),
-            Some(std::path::Component::Normal(_))
-        )
-    {
-        tracing::warn!(filename, "download refused: filename is not a single name");
-        return Err("filename must be a single file name without directories.".to_string());
-    }
-    let target = root.join(filename_path);
+    // Sanitized before the join, not after: a name decoded out of a URL can
+    // hold a separator of its own (`%2F` in a doi), and joining that to the
+    // root would make the last component the whole name Wilkes thinks it saved.
+    let named = wilkes_path::sanitize_file_name(&strip_source_markers(&filename)).map_err(
+        |error| {
+            tracing::warn!(filename, "download refused: {error}");
+            format!("Download filename is unusable: {error}")
+        },
+    )?;
+    let target = root.join(&named);
 
     tracing::info!(url = %url, root = %root.display(), "download started");
     let response = reqwest::Client::new()
@@ -257,15 +378,42 @@ pub async fn download_to_root(
         content_type.as_deref(),
         disposition_extension.as_deref(),
     )?;
+    // Again, because the extension settled above was appended to a name that
+    // may already have been at the limit. Idempotent on everything else.
+    let chosen = target
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or(named);
+    let safe = wilkes_path::sanitize_file_name(&chosen).map_err(|error| {
+        tracing::warn!(filename = chosen, "download refused: {error}");
+        format!("Download filename is unusable: {error}")
+    })?;
+    if safe != filename {
+        tracing::info!(from = filename, to = safe, "download filename sanitized");
+    }
+    // The sanitizer leaves no separator and no `..`, so anything still not a
+    // single plain name is one of the few that survive it whole — `.` among
+    // them — and is refused rather than joined to the root.
+    let safe_path = Path::new(&safe);
+    if safe_path.components().count() != 1
+        || !matches!(
+            safe_path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        tracing::warn!(
+            filename = safe,
+            "download refused: filename is not a single name"
+        );
+        return Err("filename must be a single file name without directories.".to_string());
+    }
+    let target = root.join(safe_path);
 
     // Read the body a chunk at a time rather than in one `bytes()` call. Two
     // reasons, and only one of them is the progress bar: a body that lied about
     // its length, or never declared one, is now refused at the moment it
     // crosses the limit instead of after it has all been buffered.
-    let saved_as = target
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| filename.clone());
+    let saved_as = safe;
     let mut response = response;
     let mut bytes: Vec<u8> = Vec::with_capacity(total_bytes.unwrap_or(0).min(1024 * 1024) as usize);
     let mut received: u64 = 0;
@@ -700,6 +848,115 @@ mod tests {
             "notes.html"
         );
         assert!(named("pdf", false, Some("application/x-nonsense")).is_err());
+    }
+
+    #[test]
+    fn a_marker_comes_off_the_name_with_the_separator_that_joined_it() {
+        assert_eq!(
+            strip_source_markers("Wilkes 1992 -- doi 10_1145 -- Anna\u{2019}s Archive.pdf"),
+            "Wilkes 1992 -- doi 10_1145.pdf"
+        );
+        // Whichever apostrophe the mirror used, and whatever it capitalized.
+        assert_eq!(
+            strip_source_markers("Wilkes 1992 - anna's archive.pdf"),
+            "Wilkes 1992.pdf"
+        );
+        assert_eq!(
+            strip_source_markers("Wilkes 1992 (z-library.sk).pdf"),
+            "Wilkes 1992 ().pdf"
+        );
+        assert_eq!(strip_source_markers("paper 1lib.sk copy.epub"), "paper copy.epub");
+        assert_eq!(strip_source_markers("z-lib.sk - paper.pdf"), "paper.pdf");
+        // Nothing to strip, nothing touched — including the separators.
+        assert_eq!(
+            strip_source_markers("Wilkes 1992 -- doi 10_1145 .pdf"),
+            "Wilkes 1992 -- doi 10_1145 .pdf"
+        );
+        // A name that is only a marker keeps it: there is nothing else to
+        // call the file.
+        assert_eq!(strip_source_markers("Anna\u{2019}s Archive.pdf"), "Anna\u{2019}s Archive.pdf");
+    }
+
+    /// The reported failure, end to end: a percent-encoded shadow-library
+    /// segment far past `NAME_MAX`, which used to be fetched in full and then
+    /// refused by the filesystem with errno 63.
+    #[tokio::test]
+    async fn a_url_name_too_long_for_the_filesystem_is_saved_under_one_that_fits() {
+        let dir = tempdir().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let encoded = "Artificial%20Intelligence%20as%20the%20year%202000%20approaches%20--%20\
+                       Maurice%20V_%20Wilkes%20--%20Communications%20of%20the%20ACM%2C%20%238%2C%20\
+                       35%2C%20pages%2017-23%2C%201992%20aug%2001%20--%20Association%20--%20doi%20\
+                       10_1145%2F135226_135237%20--%20f77458432fe5aac0f8d21873befc224e%20--%20\
+                       Anna%E2%80%99s%20Archive.pdf";
+        let mock = server
+            .mock("GET", format!("/{encoded}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/pdf")
+            .with_body(b"%PDF-1.4")
+            .create_async()
+            .await;
+
+        let saved = download_to_root(
+            dir.path(),
+            DownloadParams {
+                url: format!("{}/{encoded}", server.url()),
+                filename: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        mock.assert_async().await;
+
+        let name = Path::new(&saved.path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(name.len() <= wilkes_path::MAX_FILE_NAME_BYTES, "{name}");
+        assert!(name.ends_with(".pdf"), "{name}");
+        assert!(name.starts_with("Artificial Intelligence as the year 2000"), "{name}");
+        assert!(!name.to_lowercase().contains("anna"), "{name}");
+        assert!(!name.contains('%'), "{name}");
+        assert!(Path::new(&saved.path).exists());
+    }
+
+    /// A name the caller chose is measured too — it is written by the same
+    /// filesystem — and its marker comes off as well.
+    #[tokio::test]
+    async fn a_caller_name_is_stripped_and_cut_to_fit() {
+        let dir = tempdir().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/fetch")
+            .with_status(200)
+            .with_header("content-type", "application/pdf")
+            .with_body(b"%PDF-1.4")
+            .create_async()
+            .await;
+
+        let saved = download_to_root(
+            dir.path(),
+            DownloadParams {
+                url: format!("{}/fetch", server.url()),
+                filename: Some(format!("{} -- Anna\u{2019}s Archive.pdf", "é".repeat(200))),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        mock.assert_async().await;
+
+        let name = Path::new(&saved.path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(name.len() <= wilkes_path::MAX_FILE_NAME_BYTES, "{}", name.len());
+        assert!(name.ends_with(".pdf"), "{name}");
+        assert!(!name.to_lowercase().contains("anna"), "{name}");
+        assert!(Path::new(&saved.path).exists());
     }
 
     #[test]
