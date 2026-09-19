@@ -180,6 +180,8 @@ export default function SettingsModal({
 
   const [activeTab, setActiveTab] = useState<SettingsTab>("general");
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [maxFileSizeMbDraft, setMaxFileSizeMbDraft] = useState("");
+  const [maxFileSizeMbDirty, setMaxFileSizeMbDirty] = useState(false);
   const [customInstructionsDraft, setCustomInstructionsDraft] = useState("");
   const [externalMcpStatus, setExternalMcpStatus] = useState<ExternalMcpStatus | null>(null);
   const [externalMcpRequireToken, setExternalMcpRequireToken] = useState(false);
@@ -199,6 +201,8 @@ export default function SettingsModal({
     if (isOpen) {
       api.getSettings().then((nextSettings) => {
         setSettings(nextSettings);
+        setMaxFileSizeMbDraft(String(Math.round(nextSettings.max_file_size / (1024 * 1024))));
+        setMaxFileSizeMbDirty(false);
         setCustomInstructionsDraft(nextSettings.chat_custom_instructions ?? "");
         setExternalMcpRequireToken(nextSettings.external_mcp?.require_token ?? false);
         setExternalMcpBindAddress(nextSettings.external_mcp?.bind_address ?? "127.0.0.1");
@@ -236,6 +240,12 @@ export default function SettingsModal({
     }
   }, []);
 
+  useEffect(() => {
+    if (settings && !maxFileSizeMbDirty) {
+      setMaxFileSizeMbDraft(String(Math.round(settings.max_file_size / (1024 * 1024))));
+    }
+  }, [settings, maxFileSizeMbDirty]);
+
   const handleUpdateSettings = async (patch: Partial<Settings>) => {
     try {
       const newSettings = await api.updateSettings(patch);
@@ -260,6 +270,38 @@ export default function SettingsModal({
     }
     customInstructionsSaveTimer.current = null;
     void handleUpdateSettings({ chat_custom_instructions: value });
+  };
+
+  const persistMaxFileSize = async () => {
+    if (!settings || !maxFileSizeMbDirty) return;
+
+    const megabytes = Number(maxFileSizeMbDraft);
+    const bytes = megabytes * 1024 * 1024;
+    if (
+      maxFileSizeMbDraft.trim() === "" ||
+      !Number.isInteger(megabytes) ||
+      megabytes < 0 ||
+      !Number.isSafeInteger(bytes)
+    ) {
+      setMaxFileSizeMbDraft(String(Math.round(settings.max_file_size / (1024 * 1024))));
+      setMaxFileSizeMbDirty(false);
+      return;
+    }
+
+    if (bytes === settings.max_file_size) {
+      setMaxFileSizeMbDraft(String(megabytes));
+      setMaxFileSizeMbDirty(false);
+      return;
+    }
+
+    try {
+      await handleUpdateSettings({ max_file_size: bytes });
+      setMaxFileSizeMbDraft(String(megabytes));
+      setMaxFileSizeMbDirty(false);
+    } catch {
+      setMaxFileSizeMbDraft(String(Math.round(settings.max_file_size / (1024 * 1024))));
+      setMaxFileSizeMbDirty(false);
+    }
   };
 
   const handleCustomInstructionsChange = (value: string) => {
@@ -478,7 +520,7 @@ export default function SettingsModal({
           </div>
 
           {/* Content */}
-          <div className="flex-1 overflow-y-auto p-4 bg-[var(--bg-app)] relative">
+          <div className="flex-1 overflow-y-auto p-4 pb-12 bg-[var(--bg-app)] relative">
             <div className={activeTab === "general" ? "block h-full" : "hidden"}>
               {settings && (
                 <div className="space-y-4">
@@ -510,13 +552,23 @@ export default function SettingsModal({
 
                       <div className="space-y-1">
                         <div className="flex justify-between items-baseline">
-                          <label className="text-xs text-[var(--text-muted)]">Max file size (MB)</label>
+                          <label htmlFor="max-file-size-mb" className="text-xs text-[var(--text-muted)]">Max file size (MB)</label>
                           <p className="text-[10px] text-[var(--text-dim)] italic">Skip larger files</p>
                         </div>
                         <input
+                          id="max-file-size-mb"
                           type="number"
-                          value={Math.round(settings.max_file_size / (1024 * 1024))}
-                          onChange={(e) => handleUpdateSettings({ max_file_size: parseInt(e.target.value) * 1024 * 1024 })}
+                          min={0}
+                          step={1}
+                          value={maxFileSizeMbDraft}
+                          onChange={(e) => {
+                            setMaxFileSizeMbDraft(e.target.value);
+                            setMaxFileSizeMbDirty(true);
+                          }}
+                          onBlur={() => void persistMaxFileSize()}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") e.currentTarget.blur();
+                          }}
                           className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
                         />
                       </div>

@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, act, within } from "@testing-library/react";
+import { render, screen, fireEvent, act, within, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import SettingsModal from "./SettingsModal";
 import { useGenerationStore } from "../stores/useGenerationStore";
@@ -180,6 +180,39 @@ describe("SettingsModal", () => {
     });
     fireEvent.click(screen.getByLabelText("Respect .gitignore files"));
     expect(mockApi.updateSettings).toHaveBeenCalledWith({ respect_gitignore: false });
+  });
+
+  it("allows replacing the max file size without sending an empty value", async () => {
+    mockApi.updateSettings.mockImplementation(async (patch: any) => ({ ...mockSettings, ...patch }));
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+
+    const input = screen.getByLabelText("Max file size (MB)");
+    fireEvent.change(input, { target: { value: "" } });
+    expect(input).toHaveValue(null);
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+
+    fireEvent.change(input, { target: { value: "25" } });
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+    fireEvent.blur(input);
+
+    await waitFor(() => {
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ max_file_size: 25 * 1024 * 1024 });
+    });
+  });
+
+  it("restores the saved max file size when the field is left empty", async () => {
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+
+    const input = screen.getByLabelText("Max file size (MB)");
+    fireEvent.change(input, { target: { value: "" } });
+    fireEvent.blur(input);
+
+    expect(input).toHaveValue(1);
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
   });
 
   it("configures the file list as a collapsible folder tree", async () => {
