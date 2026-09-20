@@ -2517,17 +2517,14 @@ impl AppContext {
             ));
         }
         let settings = self.settings().await;
-        let extension = source_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        if !settings
-            .supported_extensions
-            .iter()
-            .any(|supported| supported.eq_ignore_ascii_case(extension))
-        {
+        // Asked of `FileType::detect` rather than of `supported_extensions`
+        // directly, because that list is the *text* extensions and a document
+        // is not in it — a copy of the rule here refused every PDF and EPUB
+        // the one gate admits. See `FileType::detect`.
+        if FileType::detect(&source_path, &settings.supported_extensions).is_none() {
             return Err(ConsumerError::untyped(format!(
-                "Unsupported managed import extension: {extension}"
+                "Unsupported managed import file: {}",
+                source_path.display()
             )));
         }
         let metadata = std::fs::metadata(&source_path)
@@ -10935,6 +10932,78 @@ mod tests {
         let user = scoped_ctx(personal.path(), serde_json::json!({ "kind": "user" }));
         assert!(!user.is_read_only());
         assert!(user.ensure_writable().is_ok());
+    }
+
+    /// `FileType::detect` is the one gate on what a corpus admits, and it
+    /// admits a document whatever `supported_extensions` says — that list is
+    /// the *text* extensions, and document extensions are stripped from it on
+    /// load. The managed importer used to compare the raw extension against
+    /// the list itself, a second copy of the rule that could only refuse:
+    /// every managed PDF and EPUB import failed.
+    #[tokio::test]
+    async fn test_managed_import_admits_a_document_the_extension_list_omits() {
+        let dir = tempdir().unwrap();
+        let settings = Settings {
+            supported_extensions: vec!["txt".to_string()],
+            ..Settings::default()
+        };
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string(&settings).unwrap(),
+        )
+        .unwrap();
+        let managed = scoped_ctx(
+            dir.path(),
+            serde_json::json!({
+                "kind": "application_managed",
+                "owner": "underdog",
+                "purpose": "semantic-corpus",
+                "corpus_key": "store-id",
+            }),
+        );
+        assert!(
+            !managed
+                .get_settings()
+                .await
+                .supported_extensions
+                .iter()
+                .any(|extension| extension.eq_ignore_ascii_case("pdf")),
+            "a document extension is not storable in the text list"
+        );
+
+        let document = dir.path().join("paper.pdf");
+        std::fs::write(&document, b"%PDF-1.7\n").unwrap();
+        let admitted = managed
+            .import_managed_document(
+                "store-id".to_string(),
+                "key-pdf".to_string(),
+                document.clone(),
+                None,
+                serde_json::json!({ "kind": "path", "path": document }),
+            )
+            .await
+            .expect_err("this temporary workspace holds no index to import into");
+        assert!(
+            !admitted.to_string().contains("Unsupported managed import"),
+            "a PDF must pass the admission gate: {admitted}"
+        );
+
+        let refused = dir.path().join("archive.bin");
+        std::fs::write(&refused, b"not a corpus file").unwrap();
+        let refusal = managed
+            .import_managed_document(
+                "store-id".to_string(),
+                "key-bin".to_string(),
+                refused.clone(),
+                None,
+                serde_json::json!({ "kind": "path", "path": refused }),
+            )
+            .await
+            .expect_err("a file no reader admits is still refused");
+        assert!(
+            refusal.to_string().contains("Unsupported managed import"),
+            "{refusal}"
+        );
     }
 
     /// Record a finished job whose documents ended three different ways, as an
