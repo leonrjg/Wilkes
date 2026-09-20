@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::{future::Future, pin::Pin};
@@ -89,6 +89,7 @@ pub(super) async fn supervised_manager_loop(
     active_process: ActiveProcessSlot,
     sender_slot: Arc<std::sync::Mutex<mpsc::Sender<ManagerCommand>>>,
     status: Arc<RwLock<WorkerStatus>>,
+    sealed: Arc<AtomicBool>,
 ) {
     let mut rx = initial_rx;
     let spawner: Arc<dyn WorkerProcessSpawner> = Arc::new(RealWorkerProcessSpawner);
@@ -105,6 +106,7 @@ pub(super) async fn supervised_manager_loop(
             Arc::clone(&status),
             Arc::clone(&spawner),
             Arc::clone(&residency),
+            Arc::clone(&sealed),
         );
         let handle = tokio::task::spawn(runtime.run());
         match handle.await {
@@ -175,6 +177,10 @@ struct WorkerRuntime {
     /// Whether the worker this manager last held ended by dying under a
     /// request, rather than by being stopped on purpose.
     last_stop_was_a_death: bool,
+    /// Raised while the user's cancel is in force. Read at the one place a
+    /// worker is born and the one place a request is sent, which is what makes
+    /// a kill final: see [`super::manager::WorkerManager::seal`].
+    sealed: Arc<AtomicBool>,
     /// How many workers this manager has started to replace one that died
     /// under a request, since the last deliberate stop.
     ///
@@ -256,6 +262,7 @@ impl WorkerRuntime {
         status: Arc<RwLock<WorkerStatus>>,
         spawner: Arc<dyn WorkerProcessSpawner>,
         residency_semaphore: Arc<Semaphore>,
+        sealed: Arc<AtomicBool>,
     ) -> Self {
         Self {
             paths,
@@ -273,6 +280,7 @@ impl WorkerRuntime {
             deferred: VecDeque::new(),
             residency_semaphore,
             residency: None,
+            sealed,
             last_stop_was_a_death: false,
             replacements: 0,
         }
@@ -350,6 +358,26 @@ impl WorkerRuntime {
     }
 
     async fn handle_submit(&mut self, req: Box<WorkerRequest>, reply: mpsc::Sender<WorkerEvent>) {
+        // The cancel is in force. Answering `Gone` rather than serving this is
+        // what the seal is for: every loop that submits already treats a gone
+        // worker as terminal, so a caller that was mid-document when the user
+        // pressed cancel ends here instead of loading a model to finish work
+        // nobody is waiting for. Sealed means sealed for a live worker too —
+        // it is being killed as this runs, and feeding it a request would only
+        // put a doomed round trip between the user and their cancel.
+        if self.sealed.load(Ordering::Acquire) {
+            tracing::info!(
+                "WorkerManager: refusing a {:?} request: the user cancelled and starts are sealed.",
+                req.role
+            );
+            let _ = reply
+                .send(WorkerEvent::Gone(
+                    "the user cancelled: this worker is sealed".to_string(),
+                ))
+                .await;
+            return;
+        }
+
         let req_json = match serialize_request_for_worker(&req) {
             Ok(json) => json,
             Err(e) => {
@@ -727,6 +755,7 @@ mod tests {
                 send_should_fail: false,
             }),
             residency,
+            Arc::new(AtomicBool::new(false)),
         );
         (
             runtime,
@@ -881,6 +910,55 @@ mod tests {
             1,
             "a spawn that failed left the kind barred"
         );
+    }
+
+    /// The seal is the half of a cancel that makes the kill final. A caller
+    /// that was already mid-document when the user pressed cancel submits
+    /// once more on its way out; if that submit started a process, the user
+    /// would have killed a worker and got a fresh one loading the same model
+    /// back.
+    #[tokio::test]
+    async fn a_sealed_runtime_starts_nothing_and_answers_gone() {
+        let (mut runtime, spawn_calls, _send, _shutdown, _tx, _events) = test_runtime();
+        runtime.sealed.store(true, Ordering::Release);
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(4);
+        runtime
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+
+        assert_eq!(
+            spawn_calls.load(Ordering::Relaxed),
+            0,
+            "a sealed manager started a worker"
+        );
+        // Gone rather than Error: every loop that submits already treats a
+        // gone worker as terminal, and an Error is this item's failure with
+        // the next one worth attempting.
+        assert!(
+            matches!(reply_rx.recv().await, Some(WorkerEvent::Gone(_))),
+            "a sealed manager must answer as a worker that is not coming back"
+        );
+    }
+
+    /// Sealing is not permanent. The next job the user asks for is served, and
+    /// nothing has to remember to reset anything but the seal itself.
+    #[tokio::test]
+    async fn an_unsealed_runtime_serves_again() {
+        let (mut runtime, spawn_calls, _send, _shutdown, _tx, _events) = test_runtime();
+        runtime.sealed.store(true, Ordering::Release);
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        runtime
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+        assert_eq!(spawn_calls.load(Ordering::Relaxed), 0);
+
+        runtime.sealed.store(false, Ordering::Release);
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        runtime
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+        assert_eq!(spawn_calls.load(Ordering::Relaxed), 1);
     }
 
     /// A stop somebody asked for ends the run. The next worker after an idle
@@ -1288,6 +1366,7 @@ mod tests {
                 send_should_fail: false,
             }),
             Arc::new(Semaphore::new(1)),
+            Arc::new(AtomicBool::new(false)),
         );
 
         let req = WorkerRequest {
@@ -1440,6 +1519,7 @@ mod tests {
                 send_should_fail: true,
             }),
             Arc::new(Semaphore::new(1)),
+            Arc::new(AtomicBool::new(false)),
         );
 
         let req = WorkerRequest {

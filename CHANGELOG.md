@@ -483,6 +483,57 @@
 
 ### Fixed
 
+- Cancelling an index build is over in three seconds, however deep the build
+  is. Pressing cancel used to kill politely and then wait: the workers were
+  given the roof knock — stdin closed, three seconds to notice — which a
+  worker in the middle of inference is not reading its stdin to hear, so the
+  whole budget was spent before the kill began; and the cancel then waited for
+  the build task to unwind, through the page it was rendering, an integrity
+  check over the temporary database and the merge that publishes it. None of
+  that is bounded by anything, and all of it happened with "Cancelling…" on
+  screen and a log line, "awaiting build task cleanup", that read like
+  tidying up.
+
+  A cancel now kills without a grace period and *seals* the managers, so a
+  caller that was already mid-document cannot start a replacement worker on
+  its way out, and the loops that render a book's pages for a request stop
+  when the seal goes up rather than rendering four hundred pages for a worker
+  that is gone. The user is told at the moment they ask — the cancellation
+  writes the job's verdict and announces it, rather than waiting for the build
+  to be in a position to speak for itself. What the stopped build still has to
+  do, publishing the documents it finished, now happens behind the
+  cancellation: the next build waits for it, the user does not, and quitting
+  gives it thirty seconds so an interrupted corpus is not re-read from page
+  one. A build still running at the deadline, or a worker still alive, is
+  logged as an error naming the invariant and killed again.
+
+- A search no longer starts an index build. Reaching an unindexed root used to
+  be reason enough to begin one: the search failed with "indexing has been
+  requested, please try again", and hours of inference started behind it. From
+  the interface that was merely presumptuous — the interface has its own build
+  button, and the semantic panel had already been separated from building for
+  the same reason. From an MCP tool call it was invisible: nothing on screen
+  named it, nothing offered to stop it, and the tool call that triggered it
+  then competed with it. The search now says the root is not indexed and stops
+  there, and building stays the one thing the user does deliberately.
+
+- A `search` MCP tool call answers within sixty seconds instead of timing
+  out. A combined search whose semantic lane is unavailable falls back
+  to exact matching over the corpus, which for a library of PDFs with no index
+  to read from means extracting every one of them — minutes. The interface
+  spends those minutes showing results as they arrive; an MCP client holds one
+  request open and gives up, and the search's answer was then discarded
+  unread, with the client reporting a timeout and the log reporting a closed
+  channel. The scan now stops at its budget and returns the matches it has,
+  with `complete: false` saying the corpus was not read to the end.
+
+- A combined `search` whose semantic lane was unavailable no longer reports it
+  as an error. The exact lane ran and its matches are the answer, so the
+  missing lane is a note about the search rather than a fault in it — it now
+  travels in the response's `notes`, and `stats.errors` carries only faults. A
+  client that read the reduction as a failure had no reason not to run the
+  search again, and it reduced the same way every time.
+
 - Indexing no longer takes the machine into swap collapse. How many texts the
   embedding worker puts through the model at once is now a setting, under
   Workers, and it defaults to sixteen. It is the only thing that decides the

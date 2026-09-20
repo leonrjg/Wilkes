@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
@@ -110,6 +110,11 @@ pub struct WorkerManager {
     active_process: ActiveProcessSlot,
     /// Status snapshot updated by the manager loop; readable without going through the loop.
     status: Arc<RwLock<WorkerStatus>>,
+    /// Raised by [`Self::seal`] and read by the loop before it starts a
+    /// process. Shared with the loop rather than sent to it as a command: a
+    /// seal has to be in force the instant the user's cancel is handled, and a
+    /// command queued behind an in-flight request would not be.
+    sealed: Arc<AtomicBool>,
 }
 
 impl WorkerManager {
@@ -141,6 +146,7 @@ impl WorkerManager {
             generation: None,
         }));
         let sender: SenderSlot = Arc::new(std::sync::Mutex::new(tx));
+        let sealed = Arc::new(AtomicBool::new(false));
         let fut = supervised_manager_loop(
             paths,
             kind,
@@ -150,6 +156,7 @@ impl WorkerManager {
             Arc::clone(&active_process),
             Arc::clone(&sender),
             Arc::clone(&status),
+            Arc::clone(&sealed),
         );
         (
             Self {
@@ -157,6 +164,7 @@ impl WorkerManager {
                 active_pid,
                 active_process,
                 status,
+                sealed,
             },
             event_rx,
             fut,
@@ -228,14 +236,45 @@ impl WorkerManager {
         self.stop(Stop::RoofKnock);
     }
 
-    /// Kill the worker now, without waiting for it to agree.
+    /// Kill the worker now, and let nothing start another until
+    /// [`Self::unseal`].
     ///
-    /// For a caller that knows the worker is mid-inference and so is not
-    /// reading the stdin a knock arrives on. No caller takes this path today —
-    /// cancellation goes through [`Self::request_shutdown`] like everything
-    /// else — so a worker being cancelled still gets its grace period.
-    pub fn kill_now(&self) {
+    /// What a user's cancel takes. Both halves are the cancel: a worker
+    /// mid-inference is not reading the stdin a knock arrives on, so the three
+    /// seconds of grace are three seconds of the cancellation budget spent
+    /// before the kill begins; and a kill the next submit undoes by starting a
+    /// replacement is not a kill at all. The seal is what makes the kill
+    /// final — it is read at the one place a process is born, so a loop that
+    /// was already mid-document when the user pressed cancel is answered with
+    /// [`WorkerEvent::Gone`] instead of a fresh model load.
+    pub fn seal(&self) {
+        self.sealed.store(true, Ordering::Release);
         self.stop(Stop::Now);
+    }
+
+    /// Admit starts again. The end of the cancellation, not the start of the
+    /// next job: whoever sealed lifts it when the work it cancelled has
+    /// actually stopped.
+    pub fn unseal(&self) {
+        self.sealed.store(false, Ordering::Release);
+    }
+
+    /// Whether starts are sealed. What a host-side loop asks before it does
+    /// more work for a request it would then submit — rendering a book's pages
+    /// is minutes of work in this process, and a cancel that only killed the
+    /// worker would leave it running.
+    pub fn is_sealed(&self) -> bool {
+        self.sealed.load(Ordering::Acquire)
+    }
+
+    /// The process this manager believes is alive, if any. Zeroed by the
+    /// shutdown that reaps it, so a non-zero pid after a kill is a kill that
+    /// has not landed.
+    pub fn live_pid(&self) -> Option<u32> {
+        match self.active_pid.load(Ordering::Relaxed) {
+            0 => None,
+            pid => Some(pid),
+        }
     }
 
     fn stop(&self, stop: Stop) {

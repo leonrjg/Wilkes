@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use crate::research::SearchLogTracker;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::error;
+use tracing::{error, warn};
 use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::Embedder;
 use wilkes_core::generate::Generator;
@@ -16,6 +16,11 @@ use wilkes_core::types::{
     FileMatches, IndexingConfig, RetrievalSettings, SearchDocument, SearchLogStatus, SearchMode,
     SearchQuery, SearchStats,
 };
+
+/// How long a stopped search's worker is waited for before its diagnostics are
+/// given up. Long enough for a document already being read to finish, short
+/// enough that the caller whose budget just ran out is not made to wait again.
+const STOPPED_SEARCH_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Handle to a running search. Dropping the handle cancels the search.
 pub struct SearchHandle {
@@ -90,16 +95,55 @@ impl SearchHandle {
 
     /// Consumes the search stream, executing `on_result` for each match.
     /// Returns the final SearchStats once the search is complete.
-    pub async fn run<F, Fut>(mut self, mut on_result: F) -> SearchStats
+    pub async fn run<F, Fut>(self, on_result: F) -> SearchStats
+    where
+        F: FnMut(FileMatches) -> Fut,
+        Fut: std::future::Future<Output = bool> + Send, // Return false to abort early
+    {
+        self.run_within(None, on_result).await.0
+    }
+
+    /// Consumes the search stream like [`run`](Self::run), but stops waiting
+    /// once `budget` has passed and reports whether the search got to finish.
+    ///
+    /// A caller that cannot stream is a caller with a deadline: an MCP client
+    /// holds one open HTTP request per tool call and gives up on it, and a
+    /// search that answers after that is a search whose answer is discarded.
+    /// Unindexed exact matching over a corpus of PDFs is minutes — the
+    /// interface spends them showing results as they arrive, which a single
+    /// request cannot do. So the budget bounds the wait and the caller is told
+    /// the scan was cut short, rather than the results being silently passed
+    /// off as the whole corpus's.
+    ///
+    /// Stopping is the same act a cancelled search performs: the receiver is
+    /// closed, and the lanes learn from their sender that nobody is waiting.
+    pub async fn run_within<F, Fut>(
+        mut self,
+        budget: Option<std::time::Duration>,
+        mut on_result: F,
+    ) -> (SearchStats, bool)
     where
         F: FnMut(FileMatches) -> Fut,
         Fut: std::future::Future<Output = bool> + Send, // Return false to abort early
     {
         let started = std::time::Instant::now();
+        let deadline = budget.map(|budget| tokio::time::Instant::now() + budget);
         let mut total_matches = 0;
         let mut files_with_matches = 0;
+        let mut within_budget = true;
 
-        while let Some(fm) = self.next().await {
+        loop {
+            let next = match deadline {
+                Some(deadline) => tokio::select! {
+                    next = self.next() => next,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        within_budget = false;
+                        None
+                    }
+                },
+                None => self.next().await,
+            };
+            let Some(fm) = next else { break };
             total_matches += fm.total_match_count();
             files_with_matches += 1;
             if let Some(log) = &mut self.log {
@@ -111,13 +155,34 @@ impl SearchHandle {
             }
         }
 
-        let outcome = self.worker.await.unwrap_or_else(|e| {
+        // Closing the receiver is what tells the lanes to stop; the worker then
+        // ends at its next document. Waiting for it is what collects the
+        // diagnostics it gathered, but a document already inside a model or a
+        // slow extraction is not something this caller can wait out, so the
+        // wait itself is bounded and the counters are given up rather than the
+        // results.
+        let outcome = if within_budget {
+            self.worker.await
+        } else {
+            self.rx.close();
+            warn!(
+                "search stopped after {:?}: the caller's budget ran out before the scan finished",
+                started.elapsed()
+            );
+            match tokio::time::timeout(STOPPED_SEARCH_GRACE, self.worker).await {
+                Ok(outcome) => outcome,
+                Err(_) => Ok(Vec::new().into()),
+            }
+        }
+        .unwrap_or_else(|e| {
             error!("search worker panicked: {e}");
             vec![format!("search worker panicked: {e}")].into()
         });
         let elapsed_ms = started.elapsed().as_millis() as u64;
         if let Some(log) = &mut self.log {
-            let status = if outcome.errors.iter().any(|error| {
+            let status = if !within_budget {
+                SearchLogStatus::Cancelled
+            } else if outcome.errors.iter().any(|error| {
                 error.starts_with("search failed:") || error.contains("worker panicked")
             }) {
                 SearchLogStatus::Failed
@@ -131,17 +196,20 @@ impl SearchHandle {
                 outcome.errors.first().cloned(),
             );
         }
-        SearchStats {
-            files_scanned: outcome.files_scanned.unwrap_or(files_with_matches),
-            total_matches,
-            catalog_elapsed_ms: self.catalog_elapsed_ms,
-            elapsed_ms,
-            indexed_pdf_reads: outcome.indexed_pdf_reads,
-            live_pdf_fallbacks: outcome.live_pdf_fallbacks,
-            index_unavailable_fallbacks: outcome.index_unavailable_fallbacks,
-            errors: outcome.errors,
-            hyde_documents: outcome.hyde_documents,
-        }
+        (
+            SearchStats {
+                files_scanned: outcome.files_scanned.unwrap_or(files_with_matches),
+                total_matches,
+                catalog_elapsed_ms: self.catalog_elapsed_ms,
+                elapsed_ms,
+                indexed_pdf_reads: outcome.indexed_pdf_reads,
+                live_pdf_fallbacks: outcome.live_pdf_fallbacks,
+                index_unavailable_fallbacks: outcome.index_unavailable_fallbacks,
+                errors: outcome.errors,
+                hyde_documents: outcome.hyde_documents,
+            },
+            within_budget,
+        )
     }
 }
 
@@ -506,6 +574,112 @@ mod tests {
         assert_eq!(stats.total_matches, 2);
         assert!(stats.errors.is_empty());
         assert!(stats.hyde_documents.is_empty());
+    }
+
+    /// A caller that cannot stream gives the search a budget, and what it gets
+    /// back when the budget runs out is the matches found so far plus the fact
+    /// that the scan did not finish — never a silent short list, and never a
+    /// wait the caller has already given up on.
+    #[tokio::test]
+    async fn run_within_stops_at_the_budget_and_says_the_scan_is_unfinished() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        // A named pipe with no writer blocks the extractor exactly the way a
+        // slow document does, without needing one.
+        let blocking = root.join("blocking.txt");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&blocking)
+            .status()
+            .expect("mkfifo")
+            .success());
+        // Unblock it once the budget has been asserted, so the worker thread
+        // ends with the test rather than outliving it.
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let _ = fs::write(&blocking, "hello");
+        });
+
+        let query = SearchQuery {
+            pattern: "hello".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: root.clone(),
+            max_results: 10,
+            respect_gitignore: true,
+            max_file_size: 1024 * 1024,
+            context_lines: 0,
+            mode: SearchMode::Grep,
+            scope: Default::default(),
+            supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
+        };
+
+        let handle = start_search(
+            query,
+            vec![text_document(root.join("blocking.txt"))],
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            RetrievalSettings::default(),
+            None,
+            false,
+        );
+
+        let (stats, complete) = handle
+            .run_within(Some(std::time::Duration::from_millis(100)), |_| async {
+                true
+            })
+            .await;
+
+        assert!(!complete, "the scan cannot have finished");
+        assert_eq!(stats.total_matches, 0);
+        writer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_within_a_budget_it_does_not_exhaust_completes_normally() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::write(root.join("test.txt"), "hello there").unwrap();
+
+        let query = SearchQuery {
+            pattern: "hello".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: root.clone(),
+            max_results: 10,
+            respect_gitignore: true,
+            max_file_size: 1024 * 1024,
+            context_lines: 0,
+            mode: SearchMode::Grep,
+            scope: Default::default(),
+            supported_extensions: vec!["txt".to_string()],
+            collection_id: None,
+            tag_ids: Vec::new(),
+        };
+
+        let handle = start_search(
+            query,
+            vec![text_document(root.join("test.txt"))],
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            RetrievalSettings::default(),
+            None,
+            false,
+        );
+
+        let (stats, complete) = handle
+            .run_within(Some(std::time::Duration::from_secs(30)), |_| async { true })
+            .await;
+
+        assert!(complete);
+        assert_eq!(stats.total_matches, 1);
     }
 
     #[tokio::test]

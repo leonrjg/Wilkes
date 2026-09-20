@@ -8,18 +8,34 @@ use wilkes_core::types::{
     RelatedDocumentsQuery, SearchQuery, SearchStats, SmartCollection,
 };
 
+/// How long a search started by an agent may run before it answers with what
+/// it has.
+///
+/// An MCP client waits for a tool call inside one open request and gives up on
+/// it; a search that answers after that has its answer thrown away, and the
+/// client reports a timeout rather than the exact matches the search did find.
+/// Unindexed exact matching over a corpus of PDFs is minutes, so the wait has
+/// to be bounded somewhere, and here is the only place that knows the caller
+/// cannot stream.
+pub const AGENT_SEARCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CollectedSearch {
     pub files: Vec<FileMatches>,
     pub stats: SearchStats,
+    /// More documents matched than the caller asked to be given.
     pub truncated: bool,
+    /// Whether the scan reached the end of the corpus. `false` means the
+    /// budget ran out first: what is here matched, but what is not here was
+    /// never looked at.
+    pub complete: bool,
 }
 
 /// Read-only search boundary for agent integrations.
 ///
 /// The agent crate defines only the contract. The API layer owns the actual
 /// exact/semantic search implementation because it owns settings, index state,
-/// embedders, and background reindexing.
+/// embedders, and index builds.
 #[async_trait]
 pub trait SearchService: Send + Sync {
     async fn read_library(self: Arc<Self>, kind: crate::library::LibraryKind) -> Result<serde_json::Value, String> {

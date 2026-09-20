@@ -1002,6 +1002,15 @@ impl WorkerTableStructure {
             .tempdir_in(&self.scratch_root)?;
         let mut paths = Vec::with_capacity(images.len());
         for (index, image) in images.iter().enumerate() {
+            // Host work done for a request the seal will refuse. The same
+            // question the layout and recognition staging ask: see
+            // `WorkerManager::seal`.
+            if self.manager.is_sealed() {
+                return Err(crate::worker::fault::WorkerFault::gone(format!(
+                    "the user cancelled while staging table crop {index} of {}",
+                    images.len()
+                )));
+            }
             let path = staged.path().join(format!("{index}.png"));
             image
                 .save_with_format(&path, image::ImageFormat::Png)

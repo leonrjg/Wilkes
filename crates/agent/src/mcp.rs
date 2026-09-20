@@ -1033,6 +1033,14 @@ struct SearchResponse {
     matches: Vec<SearchFileResponse>,
     stats: wilkes_core::types::SearchStats,
     truncated: bool,
+    /// Whether the scan reached the end of the corpus. `false` means the
+    /// search answered with what it had found so far.
+    complete: bool,
+    /// What this search could not do, as distinct from what went wrong with
+    /// it. A combined search whose semantic lane was unavailable found real
+    /// exact matches and is not a failed call, so it says so here rather than
+    /// in `stats.errors`.
+    notes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1307,7 +1315,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Search Wilkes-readable documents, including direct filename, cached-title and cached-author matches. mode defaults to 'combined', which finds the query text as written and passages about the same subject in different words; each returned document carries evidence=['exact_phrase'], ['related_passage'], or both, so you can tell which. Set mode='exact' for literal/regex matching only (is_regex applies to this mode alone), or mode='semantic' for meaning-based content search only; both narrow what combined already covers, so prefer the default unless the user asked for one of them. Each returned match has kind='content', 'filename', 'title', or 'author'. Searches the active workspace unless workspace names another. Set scope='all' to search every configured library root of that workspace; omit scope to search its current root. If the user asks about a specific document, set file to that document path; omit file only for corpus-wide searches."
+        description = "Search Wilkes-readable documents, including direct filename, cached-title and cached-author matches. mode defaults to 'combined', which finds the query text as written and passages about the same subject in different words; each returned document carries evidence=['exact_phrase'], ['related_passage'], or both, so you can tell which. Set mode='exact' for literal/regex matching only (is_regex applies to this mode alone), or mode='semantic' for meaning-based content search only; both narrow what combined already covers, so prefer the default unless the user asked for one of them. Each returned match has kind='content', 'filename', 'title', or 'author'. Searches the active workspace unless workspace names another. Set scope='all' to search every configured library root of that workspace; omit scope to search its current root. If the user asks about a specific document, set file to that document path; omit file only for corpus-wide searches. A search answers within a time budget: complete=false means the scan did not reach the end of the search root and the matches are those found so far. Anything the search could not do, such as a combined search whose semantic lane was unavailable, is reported in notes; stats.errors carries only faults."
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         match search_documents_for_mcp(self, params).await {
@@ -1685,18 +1693,34 @@ async fn search_documents(
             .search(query, max_files)
             .await
             // Only a semantic-only search fails for want of an index. Combined
-            // reduces instead, and says so through its stats below.
+            // reduces instead, and says so through its notes below.
             .map_err(|message| match mode {
                 SearchModeParam::Semantic => with_semantic_index_guidance(message),
                 SearchModeParam::Exact | SearchModeParam::Combined => message,
             })?;
+    // An unavailable semantic lane is the one thing in here that is not a
+    // fault: the combined search reduced to exact matching and found what it
+    // found. Reported as an error it reads as a failed call, and a client that
+    // reads it that way retries a search that will reduce the same way again.
+    let mut notes = Vec::new();
     if mode == SearchModeParam::Combined {
-        collected.stats.errors = collected
+        let (reductions, errors) = collected
             .stats
             .errors
             .into_iter()
-            .map(|error| with_index_guidance(error, COMBINED_INDEX_GUIDANCE))
-            .collect();
+            .partition::<Vec<_>, _>(|error| reports_unavailable_index(error));
+        notes.extend(
+            reductions
+                .into_iter()
+                .map(|reduction| format!("{reduction} {COMBINED_INDEX_GUIDANCE}")),
+        );
+        collected.stats.errors = errors;
+    }
+    if !collected.complete {
+        notes.push(format!(
+            "The scan stopped after {}s without reaching the end of the search root, and these are the matches found by then. Narrow the search with file or collection_id, or ask the user to build the semantic index, which reads each document once instead of per search.",
+            crate::search::AGENT_SEARCH_BUDGET.as_secs()
+        ));
     }
 
     let mut matches = Vec::with_capacity(collected.files.len());
@@ -1728,6 +1752,8 @@ async fn search_documents(
         matches,
         stats: collected.stats,
         truncated: collected.truncated,
+        complete: collected.complete,
+        notes,
     })
 }
 
@@ -1944,16 +1970,27 @@ async fn get_related_documents(
     })
 }
 
+/// Append the fall-back-to-exact guidance to a message that reports an
+/// unavailable semantic index, and leave every other message alone. Only a
+/// semantic-only search gets this sentence: the combined mode has already run
+/// its exact lane, so telling it to run an exact search would be telling it to
+/// repeat one it has the results of.
 fn with_semantic_index_guidance(message: String) -> String {
-    with_index_guidance(message, SEMANTIC_INDEX_GUIDANCE)
+    if reports_unavailable_index(&message) {
+        format!("{message} {SEMANTIC_INDEX_GUIDANCE}")
+    } else {
+        message
+    }
 }
 
-/// Append `guidance` to a message that reports an unavailable semantic index,
-/// and leave every other message alone. Which sentence is the right one depends
-/// on what the caller can still do, so the caller supplies it.
-fn with_index_guidance(message: String, guidance: &str) -> String {
+/// Whether a message reports an unavailable semantic index rather than a
+/// fault. One predicate, because the two callers — the semantic mode, which
+/// fails, and the combined mode, which reduces — must agree on which messages
+/// are about the index or the same message becomes an error in one and a note
+/// in the other.
+fn reports_unavailable_index(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    let index_unavailable = [
+    [
         "no semantic index",
         "semantic index is not ready",
         "semantic index is currently being built",
@@ -1962,14 +1999,9 @@ fn with_index_guidance(message: String, guidance: &str) -> String {
         "semantic search requires a loaded embedder and built index",
     ]
     .iter()
-    .any(|needle| lower.contains(needle));
-
-    if index_unavailable {
-        format!("{message} {guidance}")
-    } else {
-        message
-    }
+    .any(|needle| lower.contains(needle))
 }
+
 
 fn build_search_query(
     root: PathBuf,
@@ -3504,21 +3536,100 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_reduced_combined_search_says_what_it_could_not_reach() {
-        // The combined mode has already returned its exact matches, so the
-        // guidance must not send the caller back to run them again.
-        let reduced = with_index_guidance(
-            "Combined search found exact matches only — related passages need the semantic index: No semantic index found. Build the index first."
-                .to_string(),
-            COMBINED_INDEX_GUIDANCE,
-        );
-        assert!(reduced.ends_with(COMBINED_INDEX_GUIDANCE));
-        assert!(!reduced.contains("mode='exact'"));
+    fn collected(stats: SearchStats, complete: bool) -> CollectedSearch {
+        CollectedSearch {
+            files: Vec::new(),
+            stats,
+            truncated: false,
+            complete,
+        }
+    }
 
-        // An unrelated error is not an occasion to talk about the index.
-        let unrelated = with_index_guidance("Search query cannot be empty.".to_string(), COMBINED_INDEX_GUIDANCE);
-        assert_eq!(unrelated, "Search query cannot be empty.");
+    async fn combined_search_response(collected: CollectedSearch) -> SearchResponse {
+        let dir = tempdir().unwrap();
+        let service = Arc::new(FakeSearch {
+            read_only: false,
+            last_query: Mutex::new(None),
+            last_related_query: Mutex::new(None),
+            default_root: Some(dir.path().to_path_buf()),
+            library_roots: Vec::new(),
+            response: Mutex::new(Some(collected)),
+            related_response: Mutex::new(None),
+            documents: Mutex::new(None),
+            metadata: Mutex::new(None),
+        });
+        search_documents(
+            &ContextStateHandle::default(),
+            Some(service),
+            dir.path(),
+            SearchParams {
+                query: "photocatalysis".to_string(),
+                mode: SearchModeParam::Combined,
+                scope: None,
+                root: None,
+                file: None,
+                max_results: None,
+                case_sensitive: None,
+                is_regex: None,
+                context_lines: None,
+                collection_id: None,
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_reduced_combined_search_says_what_it_could_not_reach() {
+        // The exact lane ran and its matches are the answer, so the missing
+        // semantic lane is a note about this search rather than a fault in it:
+        // reported as an error, a caller reads the call as failed and runs it
+        // again, and it reduces again.
+        let response = combined_search_response(collected(
+            SearchStats {
+                errors: vec![
+                    "Combined search found exact matches only — related passages need the semantic index: No semantic index found. Build the index first."
+                        .to_string(),
+                ],
+                ..SearchStats::default()
+            },
+            true,
+        ))
+        .await;
+
+        assert!(response.stats.errors.is_empty(), "{:?}", response.stats.errors);
+        assert_eq!(response.notes.len(), 1);
+        assert!(response.notes[0].ends_with(COMBINED_INDEX_GUIDANCE));
+        // The guidance must not send the caller back to run the exact search
+        // it already has the results of.
+        assert!(!response.notes[0].contains("mode='exact'"));
+        assert!(response.complete);
+    }
+
+    #[tokio::test]
+    async fn a_combined_search_keeps_its_faults_as_errors() {
+        let response = combined_search_response(collected(
+            SearchStats {
+                errors: vec!["/corpus/broken.pdf: failed to extract".to_string()],
+                ..SearchStats::default()
+            },
+            true,
+        ))
+        .await;
+
+        assert_eq!(response.stats.errors.len(), 1);
+        assert!(response.notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_search_that_ran_out_of_budget_says_the_scan_is_unfinished() {
+        // Silence here would pass a partial scan off as the corpus's answer.
+        let response = combined_search_response(collected(SearchStats::default(), false)).await;
+
+        assert!(!response.complete);
+        assert_eq!(response.notes.len(), 1);
+        assert!(response.notes[0].contains("stopped after"));
     }
 
     #[test]
@@ -3770,6 +3881,7 @@ mod tests {
                     hyde_documents: Vec::new(),
                 },
                 truncated: false,
+                complete: true,
             })),
             related_response: Mutex::new(None),
             documents: Mutex::new(None),
@@ -3856,6 +3968,7 @@ mod tests {
                 files: Vec::new(),
                 stats: SearchStats::default(),
                 truncated: false,
+                complete: true,
             })),
             related_response: Mutex::new(None),
             documents: Mutex::new(None),
@@ -4124,6 +4237,7 @@ mod tests {
             }],
             stats: SearchStats::default(),
             truncated: false,
+            complete: true,
         });
         *service.metadata.lock().unwrap() = Some(DocumentMetadata {
             title: Some("Hit Paper".into()),

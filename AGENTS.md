@@ -125,6 +125,66 @@ and that is the accepted cost: the way to have that text is to index the file.
 It does not bind `crates/core/examples/*`, where the whole process exists to
 exercise one model.
 
+## Invariant: a cancellation is over in three seconds
+
+When the user asks for work to stop, everything they asked to stop is gone
+within `CANCEL_DEADLINE` — three seconds — and the call that carries the
+request returns inside it. The request is final: nothing it killed comes back,
+and nothing it did not finish is waited for.
+
+**Why.** Cancelling is killing; there is no cooperative token in the extraction
+path, by design. But a kill is only as final as what happens next, and two
+things used to undo it. The killing itself was polite: a user's cancel went out
+as a roof knock, which closes the worker's stdin and waits three seconds for it
+to notice — and a worker mid-inference is not reading its stdin, so the entire
+budget was spent before the kill began. And the cancel then *waited for the
+build to unwind*: `AppContext::cancel_embed` ended with `task.join.await`, so
+the user's cancel outlasted the page being rendered, the integrity check over
+the temporary database and the merge that publishes it — none of them bounded
+by anything — with "Cancelling…" on screen the whole time. The log line said
+"awaiting build task cleanup", which reads like tidying up and was the
+unbounded part.
+
+**How to hold it.**
+- **A cancel kills without a grace period, and seals.** `WorkerManager::seal`
+  is both halves: `Stop::Now` rather than `Stop::RoofKnock`, and a flag the
+  manager loop reads at the one place a process is born and a request is sent.
+  A killed worker the next submit starts again is not a killed worker — and a
+  caller that was already mid-document submits once more on its way out. While
+  sealed, every submit is answered `WorkerEvent::Gone`, which every loop
+  already treats as terminal.
+- **Host work done for a sealed worker stops too.** Rendering a book's pages
+  into the scratch directory is minutes of work in this process for a request
+  that will be refused, so the staging loops ask `WorkerManager::is_sealed`
+  before each page. The seal is the one signal; do not add a second.
+- **The cancel path holds nothing it can wait for.** The build is handed over
+  as a `BuildHandle`, which has no `.await`: not waiting is a property of the
+  type, not something each future caller has to remember. What the build still
+  has to do — publishing the documents it finished — happens behind the
+  cancellation, watched against the deadline, and the next job is held off
+  until it ends rather than the user being held off.
+- **The canceller settles, because the cancelled build cannot.** The journal
+  row is closed and the interface told at the moment the user asks.
+  `BuildSettlement::claim` decides between the two possible settlers, so the
+  verdict is written exactly once — by whoever got there first.
+- **Exiting is the one wait that outlives a cancellation**, in
+  `await_winddown`, and only so that an interrupted build's finished documents
+  reach disk. By then every model process is already dead.
+
+**Enforcement.** `BuildHandle::watch` times every cancellation and logs an
+error naming this invariant if the build is still running at the deadline;
+`audit_cancel_deadline` asks each manager for a live pid at the same moment and
+kills again, loudly, if it finds one. Zero of each is the only correct count.
+`cancelling_a_build_that_will_not_end_still_ends_the_cancellation` is the
+regression guard: it cancels a build that never ends and fails if the call does
+not return well inside the deadline.
+
+**Boundary.** This is about *stopping*, not about what a stopped build leaves
+behind. An interrupted build still publishes what it indexed, and that merge
+may take longer than three seconds — it is the user's hours being saved, it
+runs with no model loaded and nothing reading a document, and it is reported as
+what it is rather than as a cancellation still in progress.
+
 ## Invariant: every document an indexing job touches has one durable verdict
 
 For every document in an indexing job, exactly one durable record says what the

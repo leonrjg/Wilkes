@@ -209,10 +209,14 @@ impl WorkerProcess {
         let child = Arc::clone(&self.child);
         let stdin = Arc::clone(&self.stdin);
         let result = tokio::task::spawn_blocking(move || {
-            drop(stdin.lock().unwrap().take());
             let mut inner = child.lock().unwrap();
             let pid = inner.child.id();
             let Some(grace) = stop.grace() else {
+                // The kill goes first and the stdin is taken after it: a
+                // request still writing to a worker whose pipe is full holds
+                // that lock until the worker reads, and a worker mid-inference
+                // is not reading. Closing stdin first would be a kill waiting
+                // on the thing it is killing.
                 tracing::info!(
                     "WorkerProcess::shutdown: killing pid {pid} tree without a grace period"
                 );
@@ -221,8 +225,11 @@ impl WorkerProcess {
                     .child
                     .wait()
                     .map_err(|e| format!("Failed to reap worker after kill: {e}"))?;
+                drop(stdin.lock().unwrap().take());
                 return Ok(());
             };
+            // The knock itself: closing stdin is what the worker notices.
+            drop(stdin.lock().unwrap().take());
             tracing::info!(
                 "WorkerProcess::shutdown: sent EOF to pid {pid}; waiting up to {grace:?} for graceful exit"
             );

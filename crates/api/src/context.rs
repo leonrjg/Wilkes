@@ -50,8 +50,8 @@ use wilkes_core::models::progress::EmbedProgress;
 use wilkes_core::types::{
     Bookmark, BookmarkCluster, BookmarkClustersQuery, BookmarkClustersResult, ChunkTopic,
     ChunkTopicMember, ChunkTopicsQuery, ChunkTopicsResult, CitationLinks, CitationLinksQuery,
-    CitationReference, CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbedderModel,
-    FileEntry, FileListResponse, FileType, IndexStatus, IndexingConfig, MetadataConflictValue,
+    CitationReference, CollectionValidation, DocumentMetadata, DocumentTagUpdate, FileEntry,
+    FileListResponse, FileType, IndexStatus, IndexingConfig, MetadataConflictValue,
     MetadataSourcePreference, NewBookmark, NewSmartCollection, NewTag, OmittedFileReason,
     PreviewData, RelatedDocument, RelatedDocumentsQuery, RootCoverage, SearchDocument,
     SearchLogEntry, SearchMode, SearchQuery, SearchScope, SelectedEmbedder, SemanticSettings,
@@ -230,21 +230,28 @@ impl wilkes_agent::search::SearchService for AppContext {
         let handle = self.start_search_as(query, "agent").await?;
         let mut files = Vec::new();
         let mut truncated = false;
-        let stats = handle
-            .run(|file_matches| {
-                if files.len() < max_files {
-                    files.push(file_matches);
-                } else {
-                    truncated = true;
-                }
-                async { true }
-            })
+        // An agent holds one request open per call and gives up on it, so this
+        // search answers within a budget or says it was cut short. The
+        // interface has no such bound: it streams.
+        let (stats, complete) = handle
+            .run_within(
+                Some(wilkes_agent::search::AGENT_SEARCH_BUDGET),
+                |file_matches| {
+                    if files.len() < max_files {
+                        files.push(file_matches);
+                    } else {
+                        truncated = true;
+                    }
+                    async { true }
+                },
+            )
             .await;
 
         Ok(wilkes_agent::search::CollectedSearch {
             files,
             stats,
             truncated,
+            complete,
         })
     }
 
@@ -272,7 +279,147 @@ pub struct EmbedTaskHandle {
     pub operation: EmbedOperation,
     pub cancel: CancellationToken,
     pub cancel_flag: Arc<AtomicBool>,
-    pub join: JoinHandle<anyhow::Result<()>>,
+    pub join: BuildHandle,
+    /// What this build will say on its way out, said once — by the build
+    /// itself, or by the user's cancel on its behalf. See [`BuildSettlement`].
+    pub settlement: Arc<BuildSettlement>,
+}
+
+/// How long a cancellation gets, from the user asking to everything they asked
+/// to stop having stopped.
+///
+/// The same three seconds the roof knock is worth, because it is the same
+/// promise: a process that has not gone by then is killed rather than waited
+/// for. Nothing in the cancel path waits for anything that is not bounded by
+/// it.
+pub const CANCEL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long *exiting* waits for a stopped build to finish writing.
+///
+/// Not a cancellation budget and not an exception to one: by the time this is
+/// reached every model process is dead and no document is being read. What is
+/// left is a SQLite merge that publishes what the build finished, and a quit
+/// that refused to wait for it would throw away the hours it is saving. The
+/// user's cancel never waits here — only the last moments of the process do.
+const WINDDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A running build, held by callers that are not allowed to wait for it.
+///
+/// A [`JoinHandle`] offers `.await`, and the cancel path used to take it: it
+/// raised the flag, killed the workers, and then waited for the build to
+/// unwind — through whatever page it was rendering, an integrity check over
+/// the temporary database and a merge into the live one. None of those is
+/// bounded by anything, and all of them happened with the user looking at
+/// "Cancelling…". So the cancel path is handed this instead. It cannot be
+/// awaited; not waiting is a property of the type rather than something each
+/// future caller has to remember.
+pub struct BuildHandle(JoinHandle<anyhow::Result<()>>);
+
+impl BuildHandle {
+    pub fn new(join: JoinHandle<anyhow::Result<()>>) -> Self {
+        Self(join)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
+
+    /// End the task at its next await point.
+    ///
+    /// Only honest for work that *is* endable that way — a download, which
+    /// spends its life waiting on a socket. A build spends its life on a
+    /// blocking thread, where an abort reaches nothing; what ends a build is
+    /// the cancel flag and the killed workers.
+    pub fn abort(&self) {
+        self.0.abort();
+    }
+
+    /// Watch the task against `deadline` and report how long it actually took.
+    ///
+    /// Consumes the handle: this is the only way to observe a build ending,
+    /// and it observes it from a task of its own, so "when did the build
+    /// stop" can never become something the user is made to wait for. An
+    /// overrun is logged as an error naming the invariant, on the reasoning
+    /// `WorkerRuntime` uses for workers started in a loop — the shape that
+    /// produces it lives in the build, and this is the only place that can see
+    /// it happen.
+    pub fn watch(
+        self,
+        what: &'static str,
+        deadline: std::time::Duration,
+        when_ended: impl FnOnce(std::time::Duration, bool) + Send + 'static,
+    ) {
+        let mut join = self.0;
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut overran = false;
+            if tokio::time::timeout(deadline, &mut join).await.is_err() {
+                overran = true;
+                error!(
+                    "{what} was still running {deadline:?} after the user cancelled it. A \
+                     cancellation is over in three seconds: everything it kills is killed \
+                     without a grace period, and nothing it does waits on work that is not \
+                     bounded by that. Whatever this is waiting on belongs in a process that can \
+                     be killed, or behind a check of the cancel flag. See the \"a cancelled \
+                     build is over in three seconds\" invariant in AGENTS.md."
+                );
+                let _ = (&mut join).await;
+            }
+            let elapsed = started.elapsed();
+            if overran {
+                error!("{what} finally ended {elapsed:?} after the user cancelled it.");
+            } else {
+                info!("{what} ended {elapsed:?} after the user cancelled it.");
+            }
+            when_ended(elapsed, overran);
+        });
+    }
+}
+
+/// What a build says on its way out, said exactly once.
+///
+/// A build settles itself: it closes its job in the journal and tells the
+/// interface which terminal state it reached. A *cancelled* build cannot,
+/// because the user has to be told at the moment they ask and the build may be
+/// seconds from answering — still rendering a page, checking the temporary
+/// database, merging it. So the canceller settles on the build's behalf, and
+/// this is what keeps the two from both doing it, or neither.
+pub struct BuildSettlement {
+    /// The job this build opened, once it has opened one. Empty while the
+    /// scope is still being walked, and for a build whose journal could not be
+    /// opened at all — which is logged where it happens and is not a reason to
+    /// refuse to build.
+    job: PLMutex<Option<(Arc<Mutex<IndexJobJournal>>, i64)>>,
+    settled: AtomicBool,
+}
+
+impl BuildSettlement {
+    pub fn new() -> Self {
+        Self {
+            job: PLMutex::new(None),
+            settled: AtomicBool::new(false),
+        }
+    }
+
+    fn record_job(&self, job: Option<(Arc<Mutex<IndexJobJournal>>, i64)>) {
+        *self.job.lock() = job;
+    }
+
+    fn job(&self) -> Option<(Arc<Mutex<IndexJobJournal>>, i64)> {
+        self.job.lock().clone()
+    }
+
+    /// Claim the right to say how this build ended. The first caller gets it;
+    /// everyone after it has nothing left to report.
+    fn claim(&self) -> bool {
+        !self.settled.swap(true, Ordering::AcqRel)
+    }
+}
+
+impl Default for BuildSettlement {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -1345,6 +1492,10 @@ pub struct AppContext {
     directory_watcher: PLMutex<Option<DirectoryWatcher>>,
     embed_task: PLMutex<Option<EmbedTaskHandle>>,
     embed_cancel_in_progress: AtomicBool,
+    /// Notified when a stopped build has finished winding down — the tail the
+    /// cancellation deliberately does not wait for. Only the exit path waits
+    /// on it, and only so the build's finished documents reach disk.
+    winddown: Arc<tokio::sync::Notify>,
     shutting_down: AtomicBool,
     pub worker_manager: WorkerManager,
     /// Generation runs in its own process with its own manager. Sharing the
@@ -1466,6 +1617,7 @@ impl AppContext {
             directory_watcher: PLMutex::new(None),
             embed_task: PLMutex::new(None),
             embed_cancel_in_progress: AtomicBool::new(false),
+            winddown: Arc::new(tokio::sync::Notify::new()),
             shutting_down: AtomicBool::new(false),
             worker_manager,
             generate_manager,
@@ -5390,10 +5542,33 @@ impl AppContext {
         guard.as_ref().is_some_and(|task| !task.join.is_finished())
     }
 
+    /// Why the next job cannot start yet. A cancelled build's wind-down is a
+    /// different answer from a build that is still indexing, and the user who
+    /// just pressed cancel is exactly the one who will see it — the cancel
+    /// returned to them at once, and the writing it left behind did not.
+    fn embed_busy_reason(&self) -> Option<&'static str> {
+        if self.embed_cancel_in_progress.load(Ordering::Acquire) {
+            return Some(
+                "The cancelled build is still saving what it indexed. Try again in a moment.",
+            );
+        }
+        let guard = self.embed_task.lock();
+        guard
+            .as_ref()
+            .is_some_and(|task| !task.join.is_finished())
+            .then_some("A build is already in progress.")
+    }
+
+    /// The job is over — finished, failed, or cancelled and finally wound
+    /// down. Workers are admitted again before the flag drops, because the
+    /// flag is what lets the next build start and a build that started into
+    /// sealed managers would be refused its first request.
     fn clear_embed_task(&self) {
         *self.embed_task.lock() = None;
+        self.unseal_all_workers();
         self.embed_cancel_in_progress
             .store(false, Ordering::Release);
+        self.winddown.notify_waiters();
     }
 
     async fn validate_index_root(
@@ -6490,13 +6665,15 @@ impl AppContext {
         };
 
         if !root_ready {
-            self.request_semantic_reindex_for_root(
-                &index_arc,
-                Arc::clone(&embedder),
-                &query_root_canonical,
-            );
+            // Saying so is the whole answer. A search that discovered an
+            // unindexed root used to start indexing it, which is hours of
+            // inference nobody asked for — reachable from an MCP tool call,
+            // where there is no window to watch it in and no button to stop
+            // it. Building is an act the user performs, from the interface
+            // that offers it; `useSemanticStore.refreshCoverage` records the
+            // same separation on the other side.
             return Err(format!(
-                "Semantic index is not ready for search root {}. Indexing has been requested; please try again when indexing finishes.",
+                "Semantic index is not ready for search root {}.",
                 root.display()
             ));
         }
@@ -6543,51 +6720,6 @@ impl AppContext {
                 supported_extensions: settings.supported_extensions.clone(),
             },
         })
-    }
-
-    fn request_semantic_reindex_for_root(
-        self: &Arc<Self>,
-        index_arc: &Arc<Mutex<Option<SemanticIndex>>>,
-        embedder: Arc<dyn Embedder>,
-        root: &Path,
-    ) {
-        if self.is_application_managed() {
-            info!(
-                "not reindexing {}: an application-managed corpus is written only by its import API",
-                root.display()
-            );
-            return;
-        }
-        let already_building = {
-            let guard = self.embed_task.lock();
-            guard.as_ref().is_some_and(|t| !t.join.is_finished())
-                || self.embed_cancel_in_progress.load(Ordering::Acquire)
-        };
-        if already_building {
-            info!("semantic read: root changed but reindex already in progress, skipping");
-            return;
-        }
-
-        info!("semantic read: root changed, triggering background reindex");
-        let engine = {
-            let guard = index_arc.lock().unwrap_or_else(|p| p.into_inner());
-            guard
-                .as_ref()
-                .map(|idx| idx.status().engine)
-                .unwrap_or_default()
-        };
-        let selected = SelectedEmbedder {
-            engine,
-            model: EmbedderModel(embedder.model_id().to_string()),
-            dimension: embedder.dimension(),
-        };
-        let ctx = Arc::clone(self);
-        let root_str = root.to_string_lossy().to_string();
-        tokio::spawn(async move {
-            if let Err(e) = ctx.start_build_index(root_str, selected).await {
-                error!("background reindex failed: {e}");
-            }
-        });
     }
 
     /// Resolve semantic state (if needed) and start the search. Handles both
@@ -7286,18 +7418,21 @@ impl AppContext {
 
         let cancel = CancellationToken::new();
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        let settlement = Arc::new(BuildSettlement::new());
         let join = Arc::clone(&self).spawn_build_index_task(
             plan,
             selected,
             cancel.clone(),
             Arc::clone(&cancel_flag),
+            Arc::clone(&settlement),
         );
 
         *self.embed_task.lock() = Some(EmbedTaskHandle {
             operation: EmbedOperation::Build,
             cancel,
             cancel_flag,
-            join,
+            join: BuildHandle::new(join),
+            settlement,
         });
         info!("AppContext::start_build_index: build task registered");
         Ok(())
@@ -7330,7 +7465,8 @@ impl AppContext {
             operation: EmbedOperation::Download,
             cancel,
             cancel_flag: Arc::new(AtomicBool::new(false)),
-            join,
+            join: BuildHandle::new(join),
+            settlement: Arc::new(BuildSettlement::new()),
         });
         info!("AppContext::start_download_model: download task registered");
         Ok(())
@@ -7342,8 +7478,8 @@ impl AppContext {
         selected: &SelectedEmbedder,
         documents: Option<JobScope>,
     ) -> Result<BuildIndexPlan, String> {
-        if self.embed_task_is_running() {
-            return Err("A build is already in progress.".into());
+        if let Some(reason) = self.embed_busy_reason() {
+            return Err(reason.into());
         }
 
         let root_path = PathBuf::from(root);
@@ -7481,8 +7617,8 @@ impl AppContext {
         &self,
         selected: &SelectedEmbedder,
     ) -> Result<DownloadModelPlan, String> {
-        if self.embed_task_is_running() {
-            return Err("A build is already in progress.".into());
+        if let Some(reason) = self.embed_busy_reason() {
+            return Err(reason.into());
         }
 
         let settings = self.settings().await;
@@ -7728,6 +7864,7 @@ impl AppContext {
         selected: SelectedEmbedder,
         cancel: CancellationToken,
         cancel_flag: Arc<AtomicBool>,
+        settlement: Arc<BuildSettlement>,
     ) -> JoinHandle<anyhow::Result<()>> {
         let manager = self.worker_manager.clone();
         // The index is the workspace's; the model artefacts are the
@@ -7796,6 +7933,10 @@ impl AppContext {
             );
 
             let job = ctx.begin_job(&plan.root_path, &documents, plan.continues);
+            // Recorded where the canceller can reach it: a cancel closes the
+            // job at the moment it is asked for, and by then this task may be
+            // seconds from being able to answer for itself.
+            settlement.record_job(job.clone());
             let reporter = match job.clone() {
                 Some((journal, job_id)) => BuildReporter::journalled(progress_tx, journal, job_id),
                 None => BuildReporter::without_journal(progress_tx),
@@ -7828,27 +7969,40 @@ impl AppContext {
                         cancel_flag.store(true, Ordering::Relaxed);
                         // Every worker, not the embedder alone: the build is
                         // waiting on whichever one it last submitted to, and a
-                        // kill that misses that one is not a kill.
-                        ctx.kill_all_workers();
+                        // kill that misses that one is not a kill. Sealed as
+                        // well as killed, so that this build cannot start one
+                        // again on its way out.
+                        ctx.seal_all_workers();
                     }
 
                     res = &mut build_fut => {
                         info!("AppContext::spawn_build_index_task: build future completed");
+                        // A cancelled build has already been settled — by the
+                        // canceller, at the moment the user asked, because a
+                        // verdict delivered whenever this thread finished
+                        // unwinding is one the user waited for. The claim is
+                        // what says so; the disk it leaves behind is still
+                        // this task's to tidy.
+                        let ours = settlement.claim();
                         match res {
                             Ok(embedder) => {
                                 if cancel_flag.load(Ordering::Relaxed) {
                                     Self::cleanup_partial_index_files(&data_dir);
-                                    ctx.end_job(&job, JobState::Cancelled, None);
-                                    terminal_event.terminal = Some(TerminalEvent::Cancelled);
-                                    ctx.emit_embed_error("Build", "");
+                                    if ours {
+                                        ctx.end_job(&job, JobState::Cancelled, None);
+                                        terminal_event.terminal = Some(TerminalEvent::Cancelled);
+                                        ctx.emit_embed_error("Build", "");
+                                    }
                                 } else if let Err(err) = ctx
                                     .finish_build_index(&plan, &selected, &data_dir, embedder)
                                     .await
                                 {
-                                    ctx.end_job(&job, JobState::Failed, Some(&err));
-                                    terminal_event.terminal = Some(TerminalEvent::Cancelled);
-                                    ctx.emit_embed_error("Build", err);
-                                } else {
+                                    if ours {
+                                        ctx.end_job(&job, JobState::Failed, Some(&err));
+                                        terminal_event.terminal = Some(TerminalEvent::Cancelled);
+                                        ctx.emit_embed_error("Build", err);
+                                    }
+                                } else if ours {
                                     ctx.end_job(&job, JobState::Completed, None);
                                     terminal_event.terminal = Some(TerminalEvent::Done);
                                 }
@@ -7856,14 +8010,18 @@ impl AppContext {
                             Err(e) => {
                                 if cancel_flag.load(Ordering::Relaxed) {
                                     Self::cleanup_partial_index_files(&data_dir);
-                                    ctx.end_job(&job, JobState::Cancelled, None);
-                                    terminal_event.terminal = Some(TerminalEvent::Cancelled);
-                                    ctx.emit_embed_error("Build", "");
+                                    if ours {
+                                        ctx.end_job(&job, JobState::Cancelled, None);
+                                        terminal_event.terminal = Some(TerminalEvent::Cancelled);
+                                        ctx.emit_embed_error("Build", "");
+                                    }
                                 } else {
                                     let detail = format!("{e:#}");
-                                    ctx.end_job(&job, JobState::Failed, Some(&detail));
-                                    terminal_event.terminal = Some(TerminalEvent::Cancelled);
-                                    ctx.emit_embed_error("Build", detail);
+                                    if ours {
+                                        ctx.end_job(&job, JobState::Failed, Some(&detail));
+                                        terminal_event.terminal = Some(TerminalEvent::Cancelled);
+                                        ctx.emit_embed_error("Build", detail);
+                                    }
                                 }
                             }
                         }
@@ -7974,7 +8132,24 @@ impl AppContext {
 
     // ── Embed lifecycle ───────────────────────────────────────────────────────
 
-    pub async fn cancel_embed(&self) {
+    /// Stop what the user asked to stop, and be done before they can ask
+    /// twice.
+    ///
+    /// Everything this does is bounded: the flag goes up, every worker the
+    /// build can reach is sealed and killed without a grace period, and the
+    /// build's verdict is written and announced *here* rather than whenever
+    /// the thread that was cancelled gets round to unwinding. Nothing is
+    /// awaited that is not bounded by [`CANCEL_DEADLINE`].
+    ///
+    /// This used to end by waiting for the build task, which reads as tidying
+    /// up and is not: a build unwinds through the page it was rendering, an
+    /// integrity check over the temporary database and a merge into the live
+    /// one, none of them bounded by anything, all of them with the user
+    /// looking at "Cancelling…". That work still happens — it is what saves
+    /// the documents the build finished — but it happens behind the
+    /// cancellation rather than inside it, watched against the deadline and
+    /// killed off the user's path.
+    pub async fn cancel_embed(self: &Arc<Self>) {
         info!("AppContext::cancel_embed: requested");
         let Some(task) = self.embed_task.lock().take() else {
             info!("AppContext::cancel_embed: no active task");
@@ -7993,26 +8168,73 @@ impl AppContext {
         task.cancel_flag.store(true, Ordering::Relaxed);
         task.cancel.cancel();
 
-        info!("AppContext::cancel_embed: killing every worker immediately");
-        self.kill_all_workers();
+        info!("AppContext::cancel_embed: sealing and killing every worker");
+        self.seal_all_workers();
 
         match task.operation {
             EmbedOperation::Build => {
-                info!(
-                    "AppContext::cancel_embed: worker shutdown requested; awaiting build task cleanup"
-                );
-                let _ = task.join.await;
+                // The user is told now, by the one asked to stop rather than
+                // by the one being stopped. A build that has already settled
+                // itself — it finished as the cancel arrived — keeps its own
+                // verdict; the claim is what decides between them.
+                if task.settlement.claim() {
+                    let job = task.settlement.job();
+                    self.end_job(&job, JobState::Cancelled, None);
+                    self.events
+                        .emit("manager-event", serde_json::json!("ReindexingCancelled"));
+                    self.emit_embed_error("Build", "");
+                }
+                self.audit_cancel_deadline();
+                let ctx = Arc::clone(self);
+                task.join
+                    .watch("The build", CANCEL_DEADLINE, move |_elapsed, _overran| {
+                        // Whatever it was doing, it is not doing it any more:
+                        // admit workers again and let the next job start. Here
+                        // rather than only at the end of the build task, because a
+                        // build task that panicked would otherwise leave the
+                        // application refusing to build for the rest of the
+                        // session.
+                        ctx.clear_embed_task();
+                    });
             }
             EmbedOperation::Download => {
                 info!("AppContext::cancel_embed: aborting download task");
                 self.emit_embed_error(task.operation.as_str(), "");
                 task.join.abort();
-                let _ = task.join.await;
+                self.clear_embed_task();
             }
         }
 
-        self.clear_embed_task();
         info!("AppContext::cancel_embed: completed");
+    }
+
+    /// Check, at the deadline, that what the user cancelled is gone.
+    ///
+    /// The seal means nothing can have started since, so a worker still alive
+    /// three seconds after a kill is a kill that did not land. It is killed
+    /// again and named in the log, loud rather than silent: a cancellation the
+    /// application has to repeat is one the user has already waited out.
+    fn audit_cancel_deadline(self: &Arc<Self>) {
+        let ctx = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(CANCEL_DEADLINE).await;
+            if !ctx.embed_cancel_in_progress.load(Ordering::Acquire) {
+                return;
+            }
+            for manager in ctx.managers() {
+                let Some(pid) = manager.live_pid() else {
+                    continue;
+                };
+                error!(
+                    "AppContext::cancel_embed: worker pid {pid} was still alive \
+                     {CANCEL_DEADLINE:?} after the user cancelled; killing it again. Everything a \
+                     cancellation kills is killed without a grace period and is gone within the \
+                     deadline. See the \"a cancelled build is over in three seconds\" invariant \
+                     in AGENTS.md."
+                );
+                manager.seal();
+            }
+        });
     }
 
     /// Whether [`Self::shutdown`] has run. For callers that own several
@@ -8021,13 +8243,14 @@ impl AppContext {
         self.shutting_down.load(Ordering::Acquire)
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(self: &Arc<Self>) {
         if self.shutting_down.swap(true, Ordering::AcqRel) {
             return;
         }
         self.stop_directory_watcher();
         self.cancel_all_completions();
         self.cancel_embed().await;
+        self.await_winddown().await;
         if let Some(task) = self.cluster_label_task.lock().take() {
             task.abort();
         }
@@ -8161,6 +8384,50 @@ impl AppContext {
     pub fn kill_all_workers(&self) {
         for manager in self.managers() {
             manager.request_shutdown();
+        }
+    }
+
+    /// What a cancellation does to the workers: kill without a grace period,
+    /// and let nothing start another until the cancelled work has stopped.
+    ///
+    /// The generation worker is killed like the others but not sealed. No
+    /// build submits to it, and sealing it would answer the user's next
+    /// question with a dead worker for as long as the cancelled build took to
+    /// finish writing — a cancel taking a feature down with it.
+    pub fn seal_all_workers(&self) {
+        self.worker_manager.seal();
+        self.recognize_manager.seal();
+        self.generate_manager.request_shutdown();
+    }
+
+    fn unseal_all_workers(&self) {
+        self.worker_manager.unseal();
+        self.recognize_manager.unseal();
+    }
+
+    /// Wait, at exit only, for a stopped build to finish publishing what it
+    /// indexed.
+    ///
+    /// The one wait in the application that outlives a cancellation, and it is
+    /// not a cancellation budget: by the time it is reached every model
+    /// process is dead and no document is being read. What is left is the
+    /// merge that saves the documents the build finished, and a quit that
+    /// refused to wait for it would throw away the hours it is saving.
+    async fn await_winddown(&self) {
+        let waiter = self.winddown.notified();
+        tokio::pin!(waiter);
+        if !self.embed_task_is_running() {
+            return;
+        }
+        info!(
+            "AppContext::shutdown: waiting up to {WINDDOWN_GRACE:?} for the stopped build to \
+             finish writing"
+        );
+        if tokio::time::timeout(WINDDOWN_GRACE, waiter).await.is_err() {
+            warn!(
+                "AppContext::shutdown: the stopped build was still writing after \
+                 {WINDDOWN_GRACE:?}; exiting without it."
+            );
         }
     }
 
@@ -11213,10 +11480,11 @@ mod tests {
             operation: EmbedOperation::Build,
             cancel: CancellationToken::new(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
-            join: tokio::spawn(async {
+            join: BuildHandle::new(tokio::spawn(async {
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
                 Ok(())
-            }),
+            })),
+            settlement: Arc::new(BuildSettlement::new()),
         }
     }
 
@@ -12339,6 +12607,7 @@ mod tests {
             selected,
             cancel,
             Arc::clone(&cancel_flag),
+            Arc::new(BuildSettlement::new()),
         );
 
         handle.await.unwrap().unwrap();
@@ -12414,6 +12683,7 @@ exit 0
             selected,
             cancel,
             Arc::clone(&cancel_flag),
+            Arc::new(BuildSettlement::new()),
         );
 
         handle.await.unwrap().unwrap();
@@ -12596,7 +12866,8 @@ exit 0
             operation: EmbedOperation::Download,
             cancel,
             cancel_flag: Arc::new(AtomicBool::new(false)),
-            join,
+            join: BuildHandle::new(join),
+            settlement: Arc::new(BuildSettlement::new()),
         });
 
         ctx.cancel_embed().await; // Should not panic
@@ -12606,6 +12877,125 @@ exit 0
         assert!(events_guard.iter().any(|(name, payload)| {
             name == "embed-error" && payload["operation"] == "Download" && payload["message"] == ""
         }));
+    }
+
+    /// The promise the user is given when they press cancel, as a test that
+    /// fails if it is ever taken back: the cancellation is over when they ask
+    /// for it, not when the work they cancelled agrees to end.
+    ///
+    /// The build here never ends, which is the case that matters. A real build
+    /// runs on a blocking thread — through the page it is rendering, an
+    /// integrity check and a merge — and none of that is abortable, so a
+    /// cancel that waited for it waited for an unbounded amount of work with
+    /// "Cancelling…" on screen.
+    #[tokio::test]
+    async fn cancelling_a_build_that_will_not_end_still_ends_the_cancellation() {
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let emitter = Arc::new(MockEmitter {
+            events: Arc::clone(&events),
+        });
+        let (ctx, _rx, _loop) = AppContext::new(
+            dir.path().to_path_buf(),
+            dir.path().join("settings.json"),
+            WorkerPaths {
+                python_path: PathBuf::from("p"),
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                venv_dir: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: dir.path().to_path_buf(),
+            },
+            emitter,
+        );
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let wedged = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        *ctx.embed_task.lock() = Some(EmbedTaskHandle {
+            operation: EmbedOperation::Build,
+            cancel: CancellationToken::new(),
+            cancel_flag: Arc::clone(&cancel_flag),
+            join: BuildHandle::new(wedged),
+            settlement: Arc::new(BuildSettlement::new()),
+        });
+
+        let started = std::time::Instant::now();
+        ctx.cancel_embed().await;
+        let took = started.elapsed();
+
+        assert!(
+            took < CANCEL_DEADLINE,
+            "the cancellation took {took:?}, which is longer than the {CANCEL_DEADLINE:?} it \
+             promises: something on this path is waiting for work it cannot kill"
+        );
+        assert!(
+            cancel_flag.load(Ordering::Relaxed),
+            "the build was not told"
+        );
+        assert!(
+            ctx.worker_manager.is_sealed() && ctx.recognize_manager.is_sealed(),
+            "a killed worker the next submit can start again is not a killed worker"
+        );
+        // Told by the canceller, because the build that was cancelled is in no
+        // position to say anything.
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|(name, payload)| {
+            name == "embed-error" && payload["operation"] == "Build" && payload["message"] == ""
+        }));
+        assert!(events.iter().any(|(name, payload)| {
+            name == "manager-event" && payload == &serde_json::json!("ReindexingCancelled")
+        }));
+    }
+
+    /// The build is still winding down — publishing what it indexed — and
+    /// until it has, the next one may not start on top of it and the workers
+    /// stay sealed. This is the cost of not waiting, and it is paid where the
+    /// user is not watching.
+    #[tokio::test]
+    async fn a_build_that_has_not_wound_down_holds_the_next_one_off() {
+        let (_dir, ctx) = test_ctx();
+        let wedged = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        *ctx.embed_task.lock() = Some(EmbedTaskHandle {
+            operation: EmbedOperation::Build,
+            cancel: CancellationToken::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            join: BuildHandle::new(wedged),
+            settlement: Arc::new(BuildSettlement::new()),
+        });
+
+        ctx.cancel_embed().await;
+
+        assert!(
+            ctx.embed_task_is_running(),
+            "the wind-down is still running"
+        );
+        assert!(ctx.worker_manager.is_sealed());
+
+        // And when it finally ends, everything it held is given back without
+        // anyone having to ask.
+        ctx.clear_embed_task();
+        assert!(!ctx.embed_task_is_running());
+        assert!(
+            !ctx.worker_manager.is_sealed() && !ctx.recognize_manager.is_sealed(),
+            "the seal outlived the cancellation it belonged to"
+        );
+    }
+
+    /// Two settlers, one verdict. Whoever gets there first speaks for the
+    /// build: the canceller when the user cancelled, the build itself when it
+    /// finished on its own.
+    #[test]
+    fn a_build_is_settled_once() {
+        let settlement = BuildSettlement::new();
+        assert!(settlement.claim());
+        assert!(!settlement.claim());
+        assert!(!settlement.claim());
     }
 
     #[tokio::test]
@@ -12640,7 +13030,8 @@ exit 0
             operation: EmbedOperation::Build,
             cancel,
             cancel_flag: Arc::new(AtomicBool::new(false)),
-            join,
+            join: BuildHandle::new(join),
+            settlement: Arc::new(BuildSettlement::new()),
         });
 
         ctx.shutdown().await;
@@ -12683,7 +13074,8 @@ exit 0
             operation: EmbedOperation::Build,
             cancel,
             cancel_flag: Arc::new(AtomicBool::new(false)),
-            join,
+            join: BuildHandle::new(join),
+            settlement: Arc::new(BuildSettlement::new()),
         });
 
         let cancel_ctx = Arc::clone(&ctx);
@@ -12697,7 +13089,12 @@ exit 0
             .prepare_build_index(&root.to_string_lossy(), &selected, None)
             .await
             .unwrap_err();
-        assert_eq!(err, "A build is already in progress.");
+        // Named for what it is: the cancel itself returned at once, and what
+        // holds the next build off is the stopped one finishing its writing.
+        assert_eq!(
+            err,
+            "The cancelled build is still saving what it indexed. Try again in a moment."
+        );
 
         cancel_task.await.unwrap();
     }
@@ -13447,7 +13844,8 @@ exit 0
             operation: EmbedOperation::Build,
             cancel,
             cancel_flag: Arc::new(AtomicBool::new(false)),
-            join,
+            join: BuildHandle::new(join),
+            settlement: Arc::new(BuildSettlement::new()),
         });
 
         let res = ctx
@@ -13529,7 +13927,8 @@ exit 0
             operation: EmbedOperation::Build,
             cancel,
             cancel_flag: Arc::new(AtomicBool::new(false)),
-            join,
+            join: BuildHandle::new(join),
+            settlement: Arc::new(BuildSettlement::new()),
         });
 
         let query = SearchQuery {
@@ -13922,7 +14321,8 @@ exit 0
             operation: EmbedOperation::Build,
             cancel,
             cancel_flag: Arc::new(AtomicBool::new(false)),
-            join,
+            join: BuildHandle::new(join),
+            settlement: Arc::new(BuildSettlement::new()),
         });
 
         let res = ctx
@@ -13988,8 +14388,25 @@ exit 0
         );
     }
 
+    /// A build is an act the user performs. A search that discovered an
+    /// unindexed root used to begin one on the strength of that discovery,
+    /// which put hours of inference behind an MCP tool call — invisible, and
+    /// stoppable only by quitting the application.
+    /// Nothing announced a build. The wait is what makes the absence mean
+    /// something: a build would have emitted this within it.
+    async fn assert_no_reindex(events: &Arc<Mutex<Vec<(String, serde_json::Value)>>>) {
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+        let events_guard = events.lock().unwrap();
+        assert!(
+            !events_guard
+                .iter()
+                .any(|e| e.0 == "manager-event" && e.1 == serde_json::json!("Reindexing")),
+            "a search started an index build: {events_guard:?}"
+        );
+    }
+
     #[tokio::test]
-    async fn test_start_search_semantic_root_mismatch() {
+    async fn test_start_search_semantic_root_mismatch_does_not_build_an_index() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -14058,30 +14475,24 @@ exit 0
             tag_ids: Vec::new(),
         };
 
-        // This should trigger a background reindex because root2 != root1
+        // The search says the root is not indexed and stops there. It does not
+        // start indexing it: that is hours of inference, and a search is not
+        // where the user asked for it.
         let err = match ctx.clone().start_search(query).await {
             Err(err) => err,
             Ok(_) => panic!("expected semantic root mismatch"),
         };
         assert!(err.contains("Semantic index is not ready"));
+        assert!(
+            !err.contains("try again"),
+            "a search must not promise an index it is not building: {err}"
+        );
 
-        let mut saw_reindex = false;
-        for _ in 0..20 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
-            let events_guard = events.lock().unwrap();
-            if events_guard
-                .iter()
-                .any(|e| e.0 == "manager-event" && e.1 == serde_json::json!("Reindexing"))
-            {
-                saw_reindex = true;
-                break;
-            }
-        }
-        assert!(saw_reindex);
+        assert_no_reindex(&events).await;
     }
 
     #[tokio::test]
-    async fn test_start_search_semantic_root_mismatch_without_indexed_root_reindexes() {
+    async fn test_start_search_semantic_without_indexed_root_does_not_build_one() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -14150,28 +14561,7 @@ exit 0
         };
         assert!(err.contains("Semantic index is not ready"));
 
-        let mut saw_reindex = false;
-        for _ in 0..20 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
-            let events_guard = events.lock().unwrap();
-            if events_guard
-                .iter()
-                .any(|e| e.0 == "manager-event" && e.1 == serde_json::json!("Reindexing"))
-            {
-                saw_reindex = true;
-                break;
-            }
-        }
-        assert!(saw_reindex);
-
-        let events_guard = events.lock().unwrap();
-        assert!(
-            events_guard
-                .iter()
-                .filter(|e| e.0 == "manager-event" && e.1 == serde_json::json!("Reindexing"))
-                .count()
-                >= 1
-        );
+        assert_no_reindex(&events).await;
     }
 
     #[tokio::test]

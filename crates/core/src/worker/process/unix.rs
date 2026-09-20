@@ -76,15 +76,24 @@ impl WorkerProcess {
 
     pub(crate) async fn shutdown(&self, pid_slot: &AtomicU32, stop: Stop) {
         let pid = self.child.lock().await.child.id().unwrap_or(0);
-        drop(self.stdin.lock().await.take());
         let Some(grace) = stop.grace() else {
+            // The kill goes first and the stdin is taken after it. A request
+            // still writing to a worker whose pipe is full holds that lock
+            // until the worker reads, and a worker mid-inference is not
+            // reading — so closing stdin first is a kill that waits on the
+            // thing it is killing. Nothing about killing needs the pipe
+            // closed; the write fails once the process is gone.
             tracing::info!("WorkerProcess::shutdown: killing pid {pid} without a grace period");
             let mut child = self.child.lock().await;
             let _ = child.child.kill().await;
             let _ = child.child.wait().await;
+            drop(child);
+            drop(self.stdin.lock().await.take());
             pid_slot.store(0, Ordering::Relaxed);
             return;
         };
+        // The knock itself: closing stdin is what the worker notices.
+        drop(self.stdin.lock().await.take());
         tracing::info!(
             "WorkerProcess::shutdown: sent EOF to pid {pid}; waiting up to {grace:?} for graceful exit"
         );

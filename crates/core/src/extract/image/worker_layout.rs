@@ -93,6 +93,17 @@ impl WorkerLayout {
         let mut paths = Vec::with_capacity(page_count);
         let mut of_page = Vec::with_capacity(page_count);
         for index in 0..page_count {
+            // Rendering a book at this size is minutes of work in the host,
+            // and it is work done *for* a request that the seal has already
+            // decided will not be served. A cancel that killed the detector
+            // and left this loop running would be a cancel the user waited out
+            // page by page, so the loop asks the same question the manager
+            // will: see `WorkerManager::seal`.
+            if self.manager.is_sealed() {
+                return Err(WorkerFault::gone(format!(
+                    "the user cancelled while staging page {index} of {page_count} for detection"
+                )));
+            }
             let Ok(page) = render(index) else {
                 continue;
             };

@@ -48,8 +48,9 @@ pub(super) const ROOF_KNOCK_TIMEOUT: Duration = Duration::from_secs(3);
 /// [`Stop::Now`] kills without the knock, for a caller that knows the worker
 /// will not answer one. A worker in the middle of inference is not reading its
 /// stdin, so the knock is three seconds it was never going to use — which is
-/// most of a cancellation budget, spent before the kill begins. Nothing takes
-/// this path today; cancellation still knocks first.
+/// the whole cancellation budget, spent before the kill begins. This is the
+/// path a user's cancel takes, through
+/// [`WorkerManager::seal`](crate::worker::manager::WorkerManager::seal).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stop {
     RoofKnock,
@@ -542,6 +543,59 @@ exit 0
             .unwrap();
         proc.shutdown(&active_pid, Stop::RoofKnock).await;
         assert_eq!(active_pid.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// What a user's cancel costs: no grace period, and no waiting for a
+    /// worker that is not listening. The worker here ignores its stdin
+    /// entirely, which is what one in the middle of inference does — under a
+    /// roof knock it would cost the full [`ROOF_KNOCK_TIMEOUT`], which is the
+    /// whole cancellation budget.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_kill_without_a_grace_period_does_not_wait_for_the_worker() {
+        let dir = tempdir().unwrap();
+        let worker_bin = dir.path().join("worker.sh");
+        // Ignores EOF on stdin and outlives any deadline this test has.
+        write_executable(&worker_bin, "#!/bin/sh\nsleep 300\nexit 0\n");
+
+        let paths = WorkerPaths {
+            python_path: dir.path().join("python"),
+            python_package_dir: dir.path().to_path_buf(),
+            requirements_path: dir.path().join("requirements.txt"),
+            venv_dir: dir.path().join("venv"),
+            worker_bin: worker_bin.clone(),
+            data_dir: dir.path().to_path_buf(),
+        };
+        std::fs::write(&paths.requirements_path, "torch\n").unwrap();
+
+        let req = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
+            mode: "embed".to_string(),
+            role: WorkerRole::Embed(EmbeddingEngine::Candle),
+            model: "m".to_string(),
+            model_dir: dir.path().to_path_buf(),
+            device: "cpu".to_string(),
+            texts: Some(vec!["hello".to_string()]),
+            generate: None,
+            recognize: None,
+            layout: None,
+            table: None,
+        };
+
+        let active_pid = AtomicU32::new(0);
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        proc.shutdown(&active_pid, Stop::Now).await;
+        let took = started.elapsed();
+
+        assert_eq!(active_pid.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(
+            took < ROOF_KNOCK_TIMEOUT,
+            "a kill without a grace period took {took:?}, which is the grace period it was \
+             supposed to skip"
+        );
     }
 
     #[tokio::test]

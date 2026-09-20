@@ -97,6 +97,15 @@ impl WorkerOcr {
             .tempdir_in(&self.scratch_root)?;
         let mut paths = Vec::with_capacity(images.len());
         for (index, image) in images.iter().enumerate() {
+            // Same question the layout staging asks, for the same reason: this
+            // is host work done for a request the seal will refuse. See
+            // `WorkerManager::seal`.
+            if self.manager.is_sealed() {
+                return Err(WorkerFault::gone(format!(
+                    "the user cancelled while staging image {index} of {} for recognition",
+                    images.len()
+                )));
+            }
             let path = staged.path().join(format!("{index}.png"));
             image
                 .save_with_format(&path, image::ImageFormat::Png)
