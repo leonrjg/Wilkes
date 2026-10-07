@@ -860,8 +860,9 @@ struct LiteratureSearchParams {
     /// Scholarly works search query.
     query: String,
     /// Id of an enabled literature provider, as reported by list_context in
-    /// literature_providers. Built-in ids are semantic_scholar and openalex;
-    /// a provider the user defined is named custom:<id>.
+    /// literature_providers. Providers shipped with Wilkes are named by their
+    /// plain id (openalex, semantic_scholar); one the user defined is named
+    /// custom:<id>.
     provider: String,
     /// Maximum works to return (1-100, default 10).
     #[serde(default, deserialize_with = "deserialize_optional_integer")]
@@ -1289,7 +1290,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Read full bibliographic metadata for a document in any configured Wilkes library root: title, author, DOI, publication date, and any Semantic Scholar / OpenAlex enrichment. Reads the active workspace unless workspace names another. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document."
+        description = "Read full bibliographic metadata for a document in any configured Wilkes library root: title, author, DOI, publication date, and any enrichment from an enabled literature provider (under `providers`, keyed by provider id). Reads the active workspace unless workspace names another. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document."
     )]
     async fn get_file_metadata(
         &self,
@@ -4097,8 +4098,7 @@ mod tests {
             author: Some("Ada".into()),
             doi: Some("10.1/deep".into()),
             created_at: Some("2024-05".into()),
-            semantic_scholar: None,
-            openalex: None,
+            providers: Default::default(),
         });
         let mcp = WilkesMcp::new(
             McpContext::Library(ExternalMcpContext::default()),
@@ -4244,8 +4244,7 @@ mod tests {
             author: Some("Bo".into()),
             doi: Some("10.1/hit".into()),
             created_at: None,
-            semantic_scholar: None,
-            openalex: None,
+            providers: Default::default(),
         });
         let context = ContextStateHandle::default();
 

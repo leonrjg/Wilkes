@@ -12,7 +12,10 @@ import type {
   CatalogueSearchResponse,
   CatalogueStatus,
   CatalogueSyncResponse,
+  BrowseRequest,
+  LiteratureProviderAnswer,
   LiteratureProviderInfo,
+  ProviderWork,
   LiteratureSearchResponse,
   LiteratureSearchResult,
   ResolvedLiteratureDownload,
@@ -42,14 +45,12 @@ import type {
   DocumentMetadata,
   EmbedderCapabilityManifest,
   NewBookmark,
-  OpenAlexWork,
   PreviewData,
   CitationLinks,
   CitationLinksQuery,
   RelatedDocument,
   RelatedDocumentsQuery,
   SelectedEmbedder,
-  SemanticScholarPaper,
   SearchQuery,
   SearchStats,
   SearchResultsSummaryInput,
@@ -304,18 +305,6 @@ export class TauriSearchApi implements SearchApi {
     return invoke<CitationResult>("zotero_generate_citation", { path });
   }
 
-  async semanticScholarStatus(): Promise<IntegrationStatus> {
-    return invoke<IntegrationStatus>("semantic_scholar_status");
-  }
-
-  async semanticScholarLookup(doi: string): Promise<SemanticScholarPaper> {
-    return invoke<SemanticScholarPaper>("semantic_scholar_lookup", { doi });
-  }
-
-  async openAlexStatus(): Promise<IntegrationStatus> {
-    return invoke<IntegrationStatus>("openalex_status");
-  }
-
   async customIntegrationSummary(manifest: string): Promise<ManifestSummary> {
     return invoke<ManifestSummary>("custom_integration_summary", { manifest });
   }
@@ -334,14 +323,6 @@ export class TauriSearchApi implements SearchApi {
       secrets,
       query,
     });
-  }
-
-  async customIntegrationStatus(id: string): Promise<IntegrationStatus> {
-    return invoke<IntegrationStatus>("custom_integration_status", { id });
-  }
-
-  async openAlexLookup(doi: string): Promise<OpenAlexWork> {
-    return invoke<OpenAlexWork>("openalex_lookup", { doi });
   }
 
   resolveAssetUrl(path: string): string {
@@ -490,6 +471,21 @@ export class TauriSearchApi implements SearchApi {
     providers?: string[],
   ): Promise<LiteratureSearchResponse> {
     return invoke<LiteratureSearchResponse>("literature_search", { query, limit, providers });
+  }
+
+  async literatureBrowse(
+    provider: string,
+    request: BrowseRequest,
+  ): Promise<LiteratureProviderAnswer> {
+    return invoke<LiteratureProviderAnswer>("literature_browse", { provider, request });
+  }
+
+  async literatureProviderStatus(provider: string): Promise<IntegrationStatus> {
+    return invoke<IntegrationStatus>("literature_provider_status", { provider });
+  }
+
+  async literatureProviderLookup(provider: string, doi: string): Promise<ProviderWork> {
+    return invoke<ProviderWork>("literature_provider_lookup", { provider, doi });
   }
 
   async literatureResolveDownload(

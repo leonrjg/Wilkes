@@ -15,7 +15,8 @@ import { useResearchStore } from "../stores/useResearchStore";
 import { useGenerationStore } from "../stores/useGenerationStore";
 import { useChatSession, useChatStore } from "../stores/useChatStore";
 import { useTopicsStore } from "../stores/useTopicsStore";
-import type { FileEntry, GenerationStreamEvent } from "../lib/types";
+import { useCatalogueStore } from "../stores/useCatalogueStore";
+import type { FileEntry, GenerationStreamEvent, LiteratureProviderInfo } from "../lib/types";
 
 const {
   mockOpenPath,
@@ -619,6 +620,22 @@ describe("ResultList", () => {
   });
 
   it("marks metadata fields with multiple source values and exposes them in the tooltip", () => {
+    // A provider is named by what the registry says it is called, so a
+    // source id is shown as that name — and a source the registry does not
+    // know is shown as the id it was written under.
+    const provider = (id: string, name: string): LiteratureProviderInfo => ({
+      provider: id,
+      name,
+      enabled: true,
+      builtin: true,
+      base_url: "https://example.test",
+      default_base_url: "https://example.test",
+      capabilities: { browse: null, lookup: true, references: false, resolve_download: false },
+      secrets: [],
+    });
+    useCatalogueStore.setState({
+      providerOptions: [provider("openalex", "OpenAlex"), provider("semantic_scholar", "Semantic Scholar")],
+    });
     useSettingsStore.setState({
       fileDisplayFields: ["title", "citations"],
       fileList: [

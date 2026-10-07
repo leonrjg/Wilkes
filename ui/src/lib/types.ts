@@ -389,8 +389,11 @@ export interface DocumentMetadata {
   author: string | null;
   doi: string | null;
   created_at: string | null;
-  semantic_scholar?: SemanticScholarPaper | null;
-  openalex?: OpenAlexWork | null;
+  /** What each enabled literature provider's lookup said about this document,
+   *  keyed by provider id (`openalex`, `custom:crossref`). Provider-neutral:
+   *  the id is the key, never a field, so a provider added tomorrow appears
+   *  here with no change to this type. */
+  providers?: Record<string, ProviderWork>;
 }
 
 export type IntegrationState =
@@ -423,20 +426,11 @@ export interface CitationResult {
   low_confidence: boolean;
 }
 
-export interface SemanticScholarPaper {
+/** One work as a literature provider's lookup describes it. Mirrors
+ *  `wilkes_core::types::ProviderWork`. */
+export interface ProviderWork {
   doi: string;
-  paper_id: string;
-  title: string | null;
-  year: number | null;
-  publication_date: string | null;
-  venue: string | null;
-  citation_count: number;
-  external_ids: Record<string, unknown>;
-  cached_at_ms: number;
-}
-
-export interface OpenAlexWork {
-  doi: string;
+  /** The provider's own identifier for the work. */
   work_id: string;
   title: string | null;
   year: number | null;
@@ -940,19 +934,20 @@ export interface ZoteroSettings {
   citation_style: string;
 }
 
-export interface SemanticScholarSettings {
+/** This installation's part of a provider shipped with Wilkes. The manifest
+ *  itself ships with the build and is not stored: what is stored is the user's
+ *  own choices about it. */
+export interface BuiltinProviderState {
   enabled: boolean;
-  base_url: string;
-  api_key: string | null;
+  /** A mirror or proxy to use instead of the manifest's own origin. Absent
+   *  means the manifest's. */
+  base_url?: string;
+  /** Values for the secrets the manifest names (an email address, an API
+   *  key), by the name the manifest gives them. */
+  secrets?: Record<string, string>;
 }
 
-export interface OpenAlexSettings {
-  enabled: boolean;
-  base_url: string;
-  email: string | null;
-}
-
-/** One provider the user described rather than one Wilkes compiled.
+/** One provider the user described rather than one Wilkes shipped.
  *  The manifest is kept as written — it is the document the user edits and
  *  exports; everything else about the provider is derived from parsing it. */
 export interface CustomIntegrationConfig {
@@ -974,8 +969,9 @@ export interface CustomIntegrationConfig {
 
 export interface IntegrationsSettings {
   zotero: ZoteroSettings;
-  semantic_scholar: SemanticScholarSettings;
-  openalex: OpenAlexSettings;
+  /** The user's part of each provider shipped with Wilkes, by provider id. A
+   *  provider with no entry is off and uses its manifest's own origin. */
+  builtin?: Record<string, BuiltinProviderState>;
   custom?: CustomIntegrationConfig[];
 }
 
@@ -986,9 +982,18 @@ export interface ManifestSummary {
   name: string;
   origins: string[];
   capabilities: string[];
+  /** Secrets the user must supply before the manifest can send a request. */
   required_secrets: string[];
+  /** Secrets that improve a request but are not needed to send it. */
+  optional_secrets: string[];
+  /** Every secret, once, as a form needs to render it. */
+  secrets: SecretSlot[];
   /** Empty when valid. Every problem at once, never just the first. */
   problems: string[];
+  /** When the manifest was written before version 2, the same manifest as
+   *  version 2. Nothing has been saved or changed: it is what the editor
+   *  offers to replace the text with. */
+  upgraded?: string | null;
 }
 
 /** One field of one record a manifest could not map. */
@@ -1056,13 +1061,85 @@ export interface LiteratureProviderAnswer {
   error: string | null;
 }
 
+/** A value a provider asks the user for. */
+export interface SecretSlot {
+  name: string;
+  label: string;
+  kind: "text" | "email" | "password";
+  optional: boolean;
+}
+
+export interface ControlOption {
+  value: string;
+  label: string;
+}
+
+/** One filter a provider's listing offers. A `choice` takes one of its
+ *  options, a `flag` is on or off, and a `range` is an integer lower and/or
+ *  upper bound. */
+export interface FilterControl {
+  name: string;
+  label: string;
+  kind: "choice" | "flag" | "range";
+  options: ControlOption[];
+  has_min: boolean;
+  has_max: boolean;
+}
+
+/** What a provider's browse capability offers, declared by its manifest. The
+ *  interface renders its filter panel from this and knows nothing about which
+ *  service it is talking to. */
+export interface BrowseControls {
+  /** Whether the listing takes a keyword beside the filters. */
+  keyword: boolean;
+  sort: {
+    default: string;
+    /** Used instead of `default` when a keyword is given. */
+    keyword_default: string | null;
+    options: ControlOption[];
+  } | null;
+  filters: FilterControl[];
+}
+
+export interface ProviderCapabilities {
+  browse: BrowseControls | null;
+  lookup: boolean;
+  references: boolean;
+  resolve_download: boolean;
+}
+
+/** A request to list a provider's works by filter and sort. A `range` filter
+ *  is two keys, `<name>.min` and `<name>.max`. */
+export interface BrowseRequest {
+  query?: string | null;
+  filters?: Record<string, string>;
+  sort?: string | null;
+  /** 1-based. */
+  page?: number | null;
+  limit?: number | null;
+}
+
 /** One literature provider this installation knows, as the registry names it.
  *  Disabled ones are listed too: a stored provider filter naming one must read
- *  as "switched off in Settings", not as "gone". */
+ *  as "switched off in Settings", not as "gone".
+ *
+ *  Everything the interface needs to render a provider — what it is called,
+ *  what it can do, which values it asks the user for — comes from its
+ *  manifest through here, so the interface holds nothing about any particular
+ *  provider. */
 export interface LiteratureProviderInfo {
   provider: string;
   name: string;
   enabled: boolean;
+  /** Shipped with Wilkes rather than written by the user. */
+  builtin: boolean;
+  /** The origin requests go to now. */
+  base_url: string;
+  /** The origin the shipped manifest declares, for a built-in. A base URL
+   *  equal to it is no override. */
+  default_base_url: string | null;
+  capabilities: ProviderCapabilities;
+  secrets: SecretSlot[];
 }
 
 export interface LiteratureSearchResponse {
@@ -1072,7 +1149,10 @@ export interface LiteratureSearchResponse {
   providers: LiteratureProviderAnswer[];
 }
 
-export type MetadataSourcePreference = "file" | "zotero" | "semantic_scholar" | "openalex";
+/** Which source wins when several know a document's title, author, DOI or
+ *  date: `"file"`, `"zotero"`, or the id of a literature provider
+ *  (`"openalex"`, `"custom:crossref"`). */
+export type MetadataSourcePreference = string;
 
 export interface WorkerStatus {
   active: boolean;

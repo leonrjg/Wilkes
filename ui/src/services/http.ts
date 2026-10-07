@@ -8,7 +8,10 @@ import type {
   CatalogueSearchResponse,
   CatalogueStatus,
   CatalogueSyncResponse,
+  BrowseRequest,
+  LiteratureProviderAnswer,
   LiteratureProviderInfo,
+  ProviderWork,
   LiteratureSearchResponse,
   LiteratureSearchResult,
   ResolvedLiteratureDownload,
@@ -40,12 +43,10 @@ import type {
   CitationLinks,
   CitationLinksQuery,
   NewBookmark,
-  OpenAlexWork,
   PreviewData,
   RelatedDocument,
   RelatedDocumentsQuery,
   SelectedEmbedder,
-  SemanticScholarPaper,
   SearchQuery,
   SearchStats,
   SearchResultsSummaryInput,
@@ -438,38 +439,6 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<CitationResult>;
   }
 
-  async semanticScholarStatus(): Promise<IntegrationStatus> {
-    const res = await fetch("/api/integrations/semantic-scholar/status");
-    if (!res.ok) throw new Error(`semanticScholarStatus failed: ${res.status}`);
-    return res.json() as Promise<IntegrationStatus>;
-  }
-
-  async semanticScholarLookup(doi: string): Promise<SemanticScholarPaper> {
-    const res = await fetch("/api/integrations/semantic-scholar/lookup", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ doi }),
-    });
-    if (!res.ok) throw new Error(`semanticScholarLookup failed: ${res.status}`);
-    return res.json() as Promise<SemanticScholarPaper>;
-  }
-
-  async openAlexStatus(): Promise<IntegrationStatus> {
-    const res = await fetch("/api/integrations/openalex/status");
-    if (!res.ok) throw new Error(`openAlexStatus failed: ${res.status}`);
-    return res.json() as Promise<IntegrationStatus>;
-  }
-
-  async openAlexLookup(doi: string): Promise<OpenAlexWork> {
-    const res = await fetch("/api/integrations/openalex/lookup", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ doi }),
-    });
-    if (!res.ok) throw new Error(`openAlexLookup failed: ${res.status}`);
-    return res.json() as Promise<OpenAlexWork>;
-  }
-
   async customIntegrationSummary(manifest: string): Promise<ManifestSummary> {
     const res = await fetch("/api/integrations/custom/summary", {
       method: "POST",
@@ -500,16 +469,6 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw new Error(`customIntegrationProbe failed: ${res.status}`);
     return res.json() as Promise<ProbeReport>;
-  }
-
-  async customIntegrationStatus(id: string): Promise<IntegrationStatus> {
-    const res = await fetch("/api/integrations/custom/status", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id }),
-    });
-    if (!res.ok) throw new Error(`customIntegrationStatus failed: ${res.status}`);
-    return res.json() as Promise<IntegrationStatus>;
   }
 
   resolveAssetUrl(path: string): string {
@@ -875,6 +834,39 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw await responseError(res, "literatureSearch");
     return res.json() as Promise<LiteratureSearchResponse>;
+  }
+
+  async literatureBrowse(
+    provider: string,
+    request: BrowseRequest,
+  ): Promise<LiteratureProviderAnswer> {
+    const res = await fetch("/api/literature/browse", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, request }),
+    });
+    if (!res.ok) throw await responseError(res, "literatureBrowse");
+    return res.json() as Promise<LiteratureProviderAnswer>;
+  }
+
+  async literatureProviderStatus(provider: string): Promise<IntegrationStatus> {
+    const res = await fetch("/api/literature/status", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider }),
+    });
+    if (!res.ok) throw await responseError(res, "literatureProviderStatus");
+    return res.json() as Promise<IntegrationStatus>;
+  }
+
+  async literatureProviderLookup(provider: string, doi: string): Promise<ProviderWork> {
+    const res = await fetch("/api/literature/lookup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, doi }),
+    });
+    if (!res.ok) throw await responseError(res, "literatureProviderLookup");
+    return res.json() as Promise<ProviderWork>;
   }
 
   async literatureResolveDownload(

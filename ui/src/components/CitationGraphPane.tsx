@@ -65,7 +65,7 @@ export default function CitationGraphPane({
 
   useEffect(load, [load, refreshVersion]);
 
-  // OpenAlex fills citation edges asynchronously. Refetch an open pane when
+  // A literature provider fills citation edges asynchronously. Refetch an open pane when
   // metadata for its anchor changes instead of retaining an early empty result.
   useEffect(() => {
     let mounted = true;

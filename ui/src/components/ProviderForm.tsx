@@ -1,10 +1,7 @@
 import { useState } from "react";
 import type { IntegrationStatus, Settings } from "../lib/types";
-import type { BuiltInProvider, ProviderField } from "../lib/integrations/providers";
-import {
-  isUsableProviderStatus,
-  providerSettings,
-} from "../lib/integrations/providers";
+import type { ProviderField, ProviderRow } from "../lib/integrations/providers";
+import { isUsableProviderStatus } from "../lib/integrations/providers";
 import {
   BUTTON_CLASS,
   CHECKBOX_CLASS,
@@ -14,21 +11,21 @@ import {
 import type { SearchApi } from "../services/api";
 
 interface ProviderFormProps {
-  provider: BuiltInProvider;
+  provider: ProviderRow;
   api: SearchApi;
   settings: Settings;
   onUpdate: (patch: Partial<Settings>) => Promise<void> | void;
 }
 
 /**
- * One built-in provider, rendered from its row in `BUILT_IN_PROVIDERS`.
+ * One provider, rendered from its row (see `lib/integrations/providers`).
  *
- * The three providers this replaces were three near-identical forms with one
- * subtle disagreement between them: Zotero checked its status *before*
- * enabling, while the remote two enabled first and reverted if the check came
- * back unusable. The observable outcome was the same, so this keeps the
- * simpler of the two — check, then enable only if usable — and there is now
- * one place for that rule to live.
+ * The forms this replaces were near-identical, with one subtle disagreement
+ * between them: Zotero checked its status *before* enabling, while the remote
+ * ones enabled first and reverted if the check came back unusable. The
+ * observable outcome was the same, so this keeps the simpler of the two —
+ * check, then enable only if usable — and there is now one place for that rule
+ * to live.
  */
 export default function ProviderForm({
   provider,
@@ -36,18 +33,14 @@ export default function ProviderForm({
   settings,
   onUpdate,
 }: ProviderFormProps) {
-  const config = providerSettings(provider, settings.integrations);
-  const values = config as unknown as Record<string, unknown>;
+  const values = provider.read(settings.integrations);
   const [status, setStatus] = useState<IntegrationStatus | null>(null);
   const [testing, setTesting] = useState(false);
 
   const patch = (changes: Record<string, unknown>) =>
     onUpdate({
-      integrations: {
-        ...settings.integrations,
-        [provider.key]: { ...config, ...changes },
-      },
-    } as Partial<Settings>);
+      integrations: provider.write(settings.integrations, changes),
+    });
 
   const unreachable = (error: unknown): IntegrationStatus => ({
     id: provider.key,
@@ -167,6 +160,7 @@ function Field({
           id={`provider-field-${field.key}`}
           type={field.kind}
           value={text}
+          placeholder={field.placeholder}
           onChange={(e) => emit(e.target.value)}
           className={INPUT_CLASS}
         />

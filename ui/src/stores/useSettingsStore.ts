@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import { api } from "../services";
 import { useResearchStore } from "./useResearchStore";
+import { useCatalogueStore } from "./useCatalogueStore";
 import type {
   AgentBackend,
   BookmarkDock,
@@ -185,6 +186,10 @@ export const useSettingsStore = create<SettingsStore>()(
         omittedFileList: [],
         directoryList: [],
       });
+      // What to call a provider is the registry's answer, and it is read with
+      // the settings that decide which providers exist, so a metadata source
+      // is labelled by name from the first render that shows one.
+      void useCatalogueStore.getState().loadProviders();
     },
 
     setDirectory: (dir: string) => {
@@ -352,14 +357,6 @@ export const useSettingsStore = create<SettingsStore>()(
                     ...settings.integrations.zotero,
                     ...patch.integrations.zotero,
                   },
-                  semantic_scholar: {
-                    ...settings.integrations.semantic_scholar,
-                    ...patch.integrations.semantic_scholar,
-                  },
-                  openalex: {
-                    ...settings.integrations.openalex,
-                    ...patch.integrations.openalex,
-                  },
                 }
               : settings.integrations,
           },
@@ -392,6 +389,10 @@ export const useSettingsStore = create<SettingsStore>()(
       }
       if (patch.chat_backend) {
         set({ chatBackend: patch.chat_backend });
+      }
+      if (patch.integrations) {
+        // A provider added, removed or renamed changes the names on offer.
+        void useCatalogueStore.getState().loadProviders();
       }
       if (patch.primary_metadata_source) {
         get().refreshFileList();

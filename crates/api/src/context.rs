@@ -40,8 +40,7 @@ use wilkes_core::generate::tasks::search_results_summary::{
     summarize_search_results as generate_search_results_summary, SearchResultsSummaryInput,
 };
 use wilkes_core::generate::{Generated, GenerationEngine, Generator};
-use wilkes_core::integrations::openalex::OpenAlexClient;
-use wilkes_core::integrations::semantic_scholar::SemanticScholarClient;
+use wilkes_core::integrations::{IntegrationRegistry, LiteratureSource};
 use wilkes_core::integrations::zotero::model::ZoteroItem;
 use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
@@ -555,12 +554,7 @@ fn library_roots(settings: &Settings) -> (Vec<PathBuf>, Vec<String>) {
 }
 
 fn metadata_source_preference(source: &MetadataSourcePreference) -> MetadataSource {
-    match source {
-        MetadataSourcePreference::File => MetadataSource::File,
-        MetadataSourcePreference::Zotero => MetadataSource::Zotero,
-        MetadataSourcePreference::SemanticScholar => MetadataSource::SemanticScholar,
-        MetadataSourcePreference::OpenAlex => MetadataSource::OpenAlex,
-    }
+    MetadataSource::from(source)
 }
 
 /// Outcome of `load_generator`. The three cases are distinct at every call
@@ -4645,10 +4639,10 @@ impl AppContext {
                     let Some(identity) = FileIdentity::from_entry(entry) else {
                         continue;
                     };
-                    match guard.get_valid_with_primary(&entry.path, identity, primary_source) {
+                    match guard.get_valid_with_primary(&entry.path, identity, primary_source.clone()) {
                         Ok(Some(cached)) => {
                             let meta = cached.metadata;
-                            let citation_count = provider_citation_count(&meta);
+                            let citation_count = meta.citation_count();
                             entry.title = meta.title;
                             entry.author = meta.author;
                             entry.doi = meta.doi;
@@ -4896,7 +4890,9 @@ impl AppContext {
             // fast first paint before the Zotero upgrade.
             let exts = settings.supported_extensions.clone();
             let cache1 = Arc::clone(&cache);
+            let pass1_primary_source = primary_source.clone();
             let pass1 = tokio::task::spawn_blocking(move || {
+                let primary_source = pass1_primary_source;
                 let registry = crate::commands::metadata::build_registry(exts);
                 let mut eligible: Vec<(PathBuf, FileIdentity, DocumentMetadata)> = Vec::new();
                 let mut updates: Vec<serde_json::Value> = Vec::new();
@@ -4910,7 +4906,7 @@ impl AppContext {
                                 &cache1,
                                 &path,
                                 identity,
-                                primary_source,
+                                &primary_source,
                                 &metadata,
                             ));
                             eligible.push((path, identity, metadata));
@@ -4923,7 +4919,7 @@ impl AppContext {
                                 &cache1,
                                 &path,
                                 identity,
-                                primary_source,
+                                &primary_source,
                                 &metadata,
                             ));
                         }
@@ -4982,7 +4978,7 @@ impl AppContext {
                                 &cache,
                                 path,
                                 *identity,
-                                primary_source,
+                                &primary_source,
                                 metadata,
                             ));
                         }
@@ -4993,62 +4989,48 @@ impl AppContext {
                 }
             }
 
-            // Pass 3: Semantic Scholar citation enrichment. This writes into
-            // the same file_metadata rows as publication_date, keyed by the
-            // composed DOI for each file.
-            if settings.integrations.semantic_scholar.enabled {
-                let client =
-                    SemanticScholarClient::from_settings(&settings.integrations.semantic_scholar);
-                let mut s2_updates: Vec<serde_json::Value> = Vec::new();
+            // Pass 3: provider enrichment. Every enabled provider that can look
+            // a work up by DOI is asked about each file that has one, and what
+            // it answers is written under that provider's id, keyed by the
+            // composed DOI. Which providers exist, and what each can do, is
+            // the registry's answer; nothing here names one.
+            let registry = IntegrationRegistry::from_settings(&settings.integrations);
+            for entry in registry.literature_sources().filter(|entry| entry.enabled) {
+                let source = Arc::clone(entry.source());
+                let capabilities = source.capabilities();
+                if !capabilities.lookup && !capabilities.references {
+                    continue;
+                }
+                let provider = entry.id().to_string();
+                let mut updates: Vec<serde_json::Value> = Vec::new();
                 for (path, identity, metadata) in composed.iter_mut() {
-                    if let Some(enriched) = semantic_scholar_enrichment_for(&client, metadata).await
-                    {
-                        metadata.semantic_scholar = Some(enriched);
-                        if let Ok(guard) = cache.lock() {
-                            if let Err(e) = guard.upsert(
-                                path,
-                                *identity,
-                                metadata,
-                                MetadataSource::SemanticScholar,
-                            ) {
-                                error!(
-                                    "metadata cache semantic scholar upsert {}: {e:#}",
-                                    path.display()
-                                );
+                    let mut enriched = false;
+                    if capabilities.lookup {
+                        if let Some(work) = enrichment_for(source.as_ref(), metadata).await {
+                            metadata.providers.insert(provider.clone(), work);
+                            if let Ok(guard) = cache.lock() {
+                                if let Err(e) = guard.upsert(
+                                    path,
+                                    *identity,
+                                    metadata,
+                                    MetadataSource::provider(&provider),
+                                ) {
+                                    error!(
+                                        "metadata cache {provider} upsert {}: {e:#}",
+                                        path.display()
+                                    );
+                                }
                             }
+                            enriched = true;
                         }
-                        s2_updates.push(metadata_update_json_from_cache(
-                            &cache,
-                            path,
-                            *identity,
-                            primary_source,
-                            metadata,
-                        ));
                     }
-                }
-                if !s2_updates.is_empty() {
-                    events.emit("file-metadata-updated", serde_json::json!(s2_updates));
-                }
-            }
-
-            if settings.integrations.openalex.enabled {
-                let client = OpenAlexClient::from_settings(&settings.integrations.openalex);
-                let mut openalex_updates: Vec<serde_json::Value> = Vec::new();
-                for (path, identity, metadata) in composed.iter_mut() {
-                    if let Some(enriched) = openalex_enrichment_for(&client, metadata).await {
-                        metadata.openalex = Some(enriched);
-                        if let Ok(guard) = cache.lock() {
-                            if let Err(e) =
-                                guard.upsert(path, *identity, metadata, MetadataSource::OpenAlex)
-                            {
-                                error!("metadata cache openalex upsert {}: {e:#}", path.display());
-                            }
-                        }
-                        // Populate the citation graph from the same enrichment
-                        // pass. Edges are keyed by DOI, so this is independent
-                        // of whether the referenced papers are in the library.
+                    // Populate the citation graph from the same pass. Edges are
+                    // keyed by DOI, so this is independent of whether the
+                    // referenced papers are in the library. Asked only of a
+                    // work the provider knows, when it can say so.
+                    if capabilities.references && (enriched || !capabilities.lookup) {
                         if let Some(doi) = metadata.doi.clone() {
-                            match client.references(&doi).await {
+                            match source.references(&doi).await {
                                 Ok(targets) => {
                                     if let Ok(guard) = cache.lock() {
                                         if let Err(e) = guard.replace_citations(&doi, &targets) {
@@ -5058,21 +5040,24 @@ impl AppContext {
                                             );
                                         }
                                     }
+                                    enriched = true;
                                 }
-                                Err(e) => info!("openalex references {doi}: {e:#}"),
+                                Err(e) => info!("{provider} references {doi}: {e:#}"),
                             }
                         }
-                        openalex_updates.push(metadata_update_json_from_cache(
+                    }
+                    if enriched {
+                        updates.push(metadata_update_json_from_cache(
                             &cache,
                             path,
                             *identity,
-                            primary_source,
+                            &primary_source,
                             metadata,
                         ));
                     }
                 }
-                if !openalex_updates.is_empty() {
-                    events.emit("file-metadata-updated", serde_json::json!(openalex_updates));
+                if !updates.is_empty() {
+                    events.emit("file-metadata-updated", serde_json::json!(updates));
                 }
             }
         });
@@ -5189,38 +5174,32 @@ impl AppContext {
         crate::commands::integrations::zotero::zotero_status(s).await
     }
 
-    pub async fn semantic_scholar_status(
+    /// Whether one literature provider is reachable and usable now, shipped or
+    /// pasted in. Answers whether or not it is enabled, so a settings form can
+    /// check it before switching it on.
+    pub async fn literature_provider_status(
         &self,
+        provider: String,
     ) -> anyhow::Result<wilkes_core::types::IntegrationStatus> {
         let s = self.get_settings().await;
-        crate::commands::integrations::semantic_scholar::semantic_scholar_status(s).await
+        crate::commands::integrations::literature::status(&s.integrations, &provider).await
     }
 
-    pub async fn semantic_scholar_lookup(
+    /// One provider's record of a work, from the metadata cache when it holds
+    /// one and from the provider when it does not.
+    pub async fn literature_provider_lookup(
         &self,
+        provider: String,
         doi: String,
-    ) -> anyhow::Result<wilkes_core::types::SemanticScholarPaper> {
+    ) -> anyhow::Result<wilkes_core::types::ProviderWork> {
         let s = self.get_settings().await;
-        crate::commands::integrations::semantic_scholar::semantic_scholar_lookup(
-            s,
+        crate::commands::integrations::literature::lookup(
+            &s.integrations,
             self.metadata_cache(),
-            doi,
+            &provider,
+            &doi,
         )
         .await
-    }
-
-    pub async fn openalex_status(&self) -> anyhow::Result<wilkes_core::types::IntegrationStatus> {
-        let s = self.get_settings().await;
-        crate::commands::integrations::openalex::openalex_status(s).await
-    }
-
-    pub async fn openalex_lookup(
-        &self,
-        doi: String,
-    ) -> anyhow::Result<wilkes_core::types::OpenAlexWork> {
-        let s = self.get_settings().await;
-        crate::commands::integrations::openalex::openalex_lookup(s, self.metadata_cache(), doi)
-            .await
     }
 
     /// What a draft manifest declares. Takes no settings: a manifest being
@@ -5247,14 +5226,6 @@ impl AppContext {
     ) -> anyhow::Result<wilkes_core::integrations::custom::ProbeReport> {
         crate::commands::integrations::custom::custom_integration_probe(manifest, secrets, query)
             .await
-    }
-
-    pub async fn custom_integration_status(
-        &self,
-        id: String,
-    ) -> anyhow::Result<wilkes_core::types::IntegrationStatus> {
-        let s = self.get_settings().await;
-        crate::commands::integrations::custom::custom_integration_status(s, id).await
     }
 
     /// Every literature provider this installation knows, each saying whether
@@ -5302,6 +5273,26 @@ impl AppContext {
             &settings.integrations,
             provider,
             result,
+        )
+        .await
+    }
+
+    /// One provider's listing by filter and sort. What may be asked is what the
+    /// provider's manifest declares; see
+    /// [`crate::commands::integrations::literature::browse`].
+    pub async fn literature_browse(
+        &self,
+        provider: String,
+        request: wilkes_core::types::BrowseRequest,
+    ) -> Result<
+        crate::commands::integrations::literature::LiteratureProviderAnswer,
+        crate::commands::integrations::literature::LiteratureRequestError,
+    > {
+        let settings = self.get_settings().await;
+        crate::commands::integrations::literature::browse(
+            &settings.integrations,
+            provider,
+            request,
         )
         .await
     }
@@ -5911,8 +5902,7 @@ impl AppContext {
         };
         self.on_directory_setting_maybe_changed(&before, &updated);
         self.on_zotero_settings_maybe_changed(&before, &updated);
-        self.on_semantic_scholar_settings_maybe_changed(&before, &updated);
-        self.on_openalex_settings_maybe_changed(&before, &updated);
+        self.on_literature_provider_settings_maybe_changed(&before, &updated);
         self.on_search_runtime_settings_maybe_changed(&before, &updated);
         self.on_generation_settings_maybe_changed(&before, &updated);
         self.on_image_analysis_settings_maybe_changed(&before, &updated);
@@ -6067,66 +6057,54 @@ impl AppContext {
         }
     }
 
-    fn on_semantic_scholar_settings_maybe_changed(&self, before: &Settings, after: &Settings) {
-        let s_before = &before.integrations.semantic_scholar;
-        let s_after = &after.integrations.semantic_scholar;
-        let relevant_changed = s_before.enabled != s_after.enabled
-            || s_before.base_url != s_after.base_url
-            || s_before.api_key != s_after.api_key;
-        if !relevant_changed {
+    /// Keep the metadata cache coherent with the literature providers the user
+    /// has configured. For every provider whose configuration changed — enabled
+    /// or disabled, a different secret or base URL, an edited manifest, or gone
+    /// altogether — what it recorded about files is dropped, and a provider
+    /// that is now enabled and can look a work up is asked again.
+    ///
+    /// One rule for every provider. It used to be two near-identical methods,
+    /// one per compiled-in provider, and a provider the user described had none
+    /// at all.
+    fn on_literature_provider_settings_maybe_changed(&self, before: &Settings, after: &Settings) {
+        let before_state = IntegrationRegistry::fingerprints(&before.integrations);
+        let after_state = IntegrationRegistry::fingerprints(&after.integrations);
+        let changed: Vec<&String> = before_state
+            .keys()
+            .chain(after_state.keys())
+            .filter(|id| before_state.get(*id) != after_state.get(*id))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if changed.is_empty() {
             return;
         }
 
         if let Some(cache) = self.metadata_cache() {
             if let Ok(guard) = cache.lock() {
-                if let Err(e) = guard.invalidate_semantic_scholar() {
-                    error!("metadata cache invalidate_semantic_scholar: {e:#}");
+                for id in &changed {
+                    if let Err(e) = guard.invalidate_provider(id) {
+                        error!("metadata cache invalidate_provider {id}: {e:#}");
+                    }
                 }
             }
         }
 
-        if s_after.enabled {
-            self.spawn_semantic_scholar_backfill(after.clone());
-        }
-    }
-
-    fn spawn_semantic_scholar_backfill(&self, settings: Settings) {
-        let Some(cache) = self.metadata_cache() else {
-            return;
-        };
-        let paths = match cache.lock() {
-            Ok(guard) => guard.all_paths().unwrap_or_default(),
-            Err(_) => return,
-        };
-        if !paths.is_empty() {
-            self.spawn_metadata_fill(paths, settings, cache);
-        }
-    }
-
-    fn on_openalex_settings_maybe_changed(&self, before: &Settings, after: &Settings) {
-        let o_before = &before.integrations.openalex;
-        let o_after = &after.integrations.openalex;
-        let relevant_changed = o_before.enabled != o_after.enabled
-            || o_before.base_url != o_after.base_url
-            || o_before.email != o_after.email;
-        if !relevant_changed {
-            return;
-        }
-
-        if let Some(cache) = self.metadata_cache() {
-            if let Ok(guard) = cache.lock() {
-                if let Err(e) = guard.invalidate_openalex() {
-                    error!("metadata cache invalidate_openalex: {e:#}");
+        let registry = IntegrationRegistry::from_settings(&after.integrations);
+        let backfill = changed.iter().any(|id| {
+            registry.literature(id).is_some_and(|entry| {
+                entry.enabled && {
+                    let capabilities = entry.source().capabilities();
+                    capabilities.lookup || capabilities.references
                 }
-            }
-        }
-
-        if o_after.enabled {
-            self.spawn_openalex_backfill(after.clone());
+            })
+        });
+        if backfill {
+            self.spawn_provider_backfill(after.clone());
         }
     }
 
-    fn spawn_openalex_backfill(&self, settings: Settings) {
+    fn spawn_provider_backfill(&self, settings: Settings) {
         let Some(cache) = self.metadata_cache() else {
             return;
         };
@@ -6182,7 +6160,7 @@ impl AppContext {
                         &cache,
                         &row.path,
                         row.identity,
-                        primary_source,
+                        &primary_source,
                         &z,
                     ));
                 }
@@ -9030,24 +9008,16 @@ fn metadata_update_json(
         "author": metadata.author,
         "doi": metadata.doi,
         "publication_date": metadata.created_at,
-        "citation_count": provider_citation_count(metadata),
+        "citation_count": metadata.citation_count(),
         "metadata_conflicts": metadata_conflicts,
     })
-}
-
-fn provider_citation_count(metadata: &DocumentMetadata) -> Option<i64> {
-    metadata
-        .semantic_scholar
-        .as_ref()
-        .map(|paper| paper.citation_count)
-        .or_else(|| metadata.openalex.as_ref().map(|work| work.citation_count))
 }
 
 fn metadata_update_json_from_cache(
     cache: &Arc<Mutex<MetadataCache>>,
     path: &Path,
     identity: FileIdentity,
-    primary_source: MetadataSource,
+    primary_source: &MetadataSource,
     fallback: &DocumentMetadata,
 ) -> serde_json::Value {
     match cache
@@ -9055,7 +9025,7 @@ fn metadata_update_json_from_cache(
         .ok()
         .and_then(|guard| {
             guard
-                .get_valid_with_primary(path, identity, primary_source)
+                .get_valid_with_primary(path, identity, primary_source.clone())
                 .ok()
         })
         .flatten()
@@ -9125,29 +9095,18 @@ async fn zotero_override_for(
     }
 }
 
-async fn semantic_scholar_enrichment_for(
-    client: &SemanticScholarClient,
+/// One provider's record of the work this document's DOI names, when the
+/// document has one and the provider knows it. A provider that does not is
+/// not a failure: most files are not indexed by most providers.
+async fn enrichment_for(
+    source: &dyn LiteratureSource,
     metadata: &DocumentMetadata,
-) -> Option<wilkes_core::types::SemanticScholarPaper> {
+) -> Option<wilkes_core::types::ProviderWork> {
     let doi = metadata.doi.as_deref()?;
-    match client.lookup_by_doi(doi).await {
-        Ok(paper) => Some(paper),
-        Err(e) => {
-            info!("semantic scholar lookup {doi}: {e:#}");
-            None
-        }
-    }
-}
-
-async fn openalex_enrichment_for(
-    client: &OpenAlexClient,
-    metadata: &DocumentMetadata,
-) -> Option<wilkes_core::types::OpenAlexWork> {
-    let doi = metadata.doi.as_deref()?;
-    match client.lookup_by_doi(doi).await {
+    match source.lookup(doi).await {
         Ok(work) => Some(work),
         Err(e) => {
-            info!("openalex lookup {doi}: {e:#}");
+            info!("{} lookup {doi}: {e:#}", source.id());
             None
         }
     }

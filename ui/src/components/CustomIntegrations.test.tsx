@@ -33,16 +33,7 @@ function settings(custom: CustomIntegrationConfig[] = []): Settings {
         base_url: "http://127.0.0.1:23119",
         citation_style: "chicago-note-bibliography",
       },
-      semantic_scholar: {
-        enabled: false,
-        base_url: "https://api.semanticscholar.org",
-        api_key: null,
-      },
-      openalex: {
-        enabled: false,
-        base_url: "https://api.openalex.org",
-        email: null,
-      },
+      builtin: {},
       custom,
     },
     supported_extensions: ["pdf"],
@@ -86,10 +77,12 @@ function apiWith(overrides: Record<string, unknown> = {}) {
       origins: ["https://api.crossref.org"],
       capabilities: ["search", "health"],
       required_secrets: [],
+      optional_secrets: [],
+      secrets: [],
       problems: [],
     }),
     customIntegrationProbe: vi.fn().mockResolvedValue(CLEAN_PROBE),
-    customIntegrationStatus: vi.fn(),
+    literatureProviderStatus: vi.fn(),
     writeClipboard: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   } as never;
@@ -159,12 +152,19 @@ describe("CustomIntegrations", () => {
     expect(manifest).toContain('response_format = "html"');
     expect(manifest).toContain('attribute = "href"');
     expect(manifest).toContain("capture =");
-    expect(manifest).toContain('coerce = "join"');
+    // Version 2: headers and parameters are maps, and what used to be a
+    // coercion is a function in the expression.
+    expect(manifest).toContain("manifest_version = 2");
+    expect(manifest).toContain("[http.headers]");
+    expect(manifest).toContain('all = true, then = "join(\', \', @)"');
+    expect(manifest).toContain('then = "absolute_url(@)"');
     expect(manifest).toContain("[capabilities.resolve_download]");
-    expect(manifest).toContain("[[capabilities.resolve_download.steps.params]]");
+    expect(manifest).toContain("[capabilities.resolve_download.steps.query]");
     expect(manifest).toContain('## base_url = "https://annas-archive.example"');
-    expect(manifest).toContain('secret = "anna_key"');
+    expect(manifest).toContain('key = { secret = "anna_key" }');
     expect(manifest).toContain('input = "query"');
+    expect(manifest).not.toContain("[[http.params]]");
+    expect(manifest).not.toContain("coerce");
   });
 
   it("names every origin a manifest will contact before anything is saved", async () => {
@@ -179,6 +179,8 @@ describe("CustomIntegrations", () => {
         ],
         capabilities: ["search", "resolve_download"],
         required_secrets: [],
+        optional_secrets: [],
+        secrets: [],
         problems: [],
       }),
     });
@@ -496,6 +498,8 @@ describe("CustomIntegrations", () => {
         origins: [],
         capabilities: [],
         required_secrets: [],
+        optional_secrets: [],
+        secrets: [],
         problems: ["search.fields.titel is not a result field"],
       }),
     });
@@ -522,6 +526,10 @@ describe("CustomIntegrations", () => {
         origins: ["https://api.crossref.org"],
         capabilities: ["search"],
         required_secrets: ["crossref_token"],
+        optional_secrets: [],
+        secrets: [
+          { name: "crossref_token", label: "crossref_token", kind: "password", optional: false },
+        ],
         problems: [],
       }),
     });
@@ -544,6 +552,112 @@ describe("CustomIntegrations", () => {
     const saved = onUpdate.mock.calls[0][0].integrations.custom[0];
     expect(saved.secrets).toEqual({ crossref_token: "hunter2" });
     expect(saved.manifest).not.toContain("hunter2");
+  });
+
+  /// A secret a manifest marks optional is still offered — the integration
+  /// works without it and better with it — but is not presented as required.
+  it("offers an optional secret as optional, with the type the manifest gives it", async () => {
+    const api = apiWith({
+      customIntegrationSummary: vi.fn().mockResolvedValue({
+        id: "crossref",
+        name: "Crossref",
+        origins: ["https://api.crossref.org"],
+        capabilities: ["search"],
+        required_secrets: [],
+        optional_secrets: ["email"],
+        secrets: [{ name: "email", label: "Contact email", kind: "email", optional: true }],
+        problems: [],
+      }),
+    });
+    const onUpdate = vi.fn().mockResolvedValue(undefined);
+    render(
+      <CustomIntegrations api={api} settings={settings()} onUpdate={onUpdate} />,
+    );
+
+    fireEvent.click(screen.getByText("Add integration"));
+    fireEvent.click(screen.getByText("Read manifest"));
+    const field = await screen.findByLabelText("Secret email");
+    expect(field).toHaveAttribute("type", "email");
+    expect(screen.getByText(/Secret: email \(optional\)/)).toBeInTheDocument();
+
+    // Saved without a value for it: nothing requires one.
+    fireEvent.click(screen.getByText("Save disabled"));
+    await waitFor(() => expect(onUpdate).toHaveBeenCalled());
+    expect(onUpdate.mock.calls[0][0].integrations.custom[0].secrets).toEqual({});
+  });
+
+  it("tests a saved provider by asking the registry for it under its namespaced id", async () => {
+    const literatureProviderStatus = vi.fn().mockResolvedValue({
+      id: "custom:crossref",
+      enabled: true,
+      state: "ready",
+      message: "Crossref is reachable.",
+      version: null,
+    });
+    render(
+      <CustomIntegrations
+        api={apiWith({ literatureProviderStatus })}
+        settings={settings([
+          { id: "crossref", enabled: true, manifest: "manifest_version = 2", secrets: {} },
+        ])}
+        onUpdate={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByText("Test"));
+    expect(await screen.findByText("Crossref is reachable.")).toBeInTheDocument();
+    expect(literatureProviderStatus).toHaveBeenCalledWith("custom:crossref");
+  });
+
+  /// A manifest from before version 2 is refused, but the refusal comes with
+  /// an answer the user can act on: replacing the text is theirs to do, and
+  /// nothing is saved by it.
+  it("offers to convert a version 1 manifest, replacing the text and saving nothing", async () => {
+    const upgraded = 'manifest_version = 2\nid = "crossref"\n';
+    const api = apiWith({
+      customIntegrationSummary: vi.fn().mockResolvedValue({
+        id: "",
+        name: "",
+        origins: [],
+        capabilities: [],
+        required_secrets: [],
+        optional_secrets: [],
+        secrets: [],
+        problems: ["manifest_version 1 is not supported (this build reads version 2)"],
+        upgraded,
+      }),
+    });
+    const onUpdate = vi.fn();
+    render(<CustomIntegrations api={api} settings={settings()} onUpdate={onUpdate} />);
+
+    fireEvent.click(screen.getByText("Add integration"));
+    fireEvent.click(screen.getByText("Read manifest"));
+    fireEvent.click(await screen.findByText("Convert to version 2"));
+
+    expect((screen.getByLabelText("Manifest") as HTMLTextAreaElement).value).toBe(upgraded);
+    // The old verdict described the old text.
+    expect(screen.queryByText(/not supported/)).toBeNull();
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+
+  it("offers no conversion for a manifest that is wrong in some other way", async () => {
+    const api = apiWith({
+      customIntegrationSummary: vi.fn().mockResolvedValue({
+        id: "",
+        name: "",
+        origins: [],
+        capabilities: [],
+        required_secrets: [],
+        optional_secrets: [],
+        secrets: [],
+        problems: ["search.fields.titel is not a result field"],
+        upgraded: null,
+      }),
+    });
+    render(<CustomIntegrations api={api} settings={settings()} onUpdate={vi.fn()} />);
+    fireEvent.click(screen.getByText("Add integration"));
+    fireEvent.click(screen.getByText("Read manifest"));
+    await screen.findByText(/not a result field/);
+    expect(screen.queryByText("Convert to version 2")).toBeNull();
   });
 
   it("lists a configured integration and toggles it without reopening the editor", async () => {

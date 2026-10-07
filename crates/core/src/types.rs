@@ -1458,10 +1458,25 @@ pub struct DocumentMetadata {
     pub author: Option<String>,
     pub doi: Option<String>,
     pub created_at: Option<String>,
-    #[serde(default)]
-    pub semantic_scholar: Option<SemanticScholarPaper>,
-    #[serde(default)]
-    pub openalex: Option<OpenAlexWork>,
+    /// What each enabled provider's `lookup` said about this document, keyed
+    /// by provider id (`openalex`, `custom:crossref`). Provider-neutral: the
+    /// id is the key, never a field, so a provider added tomorrow appears here
+    /// with no change to this type.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub providers: std::collections::BTreeMap<String, ProviderWork>,
+}
+
+impl DocumentMetadata {
+    /// How often the document is cited, by the provider that comes first in
+    /// [`crate::integrations::builtin::precedence`] among those that recorded
+    /// a work. Providers count differently, so one is chosen rather than the
+    /// counts being mixed.
+    pub fn citation_count(&self) -> Option<i64> {
+        self.providers
+            .iter()
+            .min_by_key(|(id, _)| crate::integrations::builtin::precedence(id))
+            .map(|(_, work)| work.citation_count)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2751,10 +2766,12 @@ fn default_pdf_auto_zoom_target_px() -> f64 {
 /// KF8, FB2, comic archives — are deliberately absent: they are admitted by
 /// [`FileType::detect`] itself and are never a setting.
 fn default_supported_extensions() -> Vec<String> {
-    ["txt", "md", "json", "xml", "html", "htm", "log", "csv", "jsonl"]
-        .into_iter()
-        .map(String::from)
-        .collect()
+    [
+        "txt", "md", "json", "xml", "html", "htm", "log", "csv", "jsonl",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 /// Read the extension list, less any document extension a stored settings file
@@ -2875,14 +2892,48 @@ pub enum FileDisplayField {
     Size,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+/// Which source wins when several know a document's title, author, DOI or
+/// date. `File` and `Zotero` are the two that are not literature providers; any
+/// other value names a provider by id (`openalex`, `semantic_scholar`,
+/// `custom:crossref`), so a provider added tomorrow is selectable with no
+/// change here.
+///
+/// Serialized as the bare string the settings file has always held, so a value
+/// stored when only two providers existed still reads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum MetadataSourcePreference {
     File,
     #[default]
     Zotero,
-    SemanticScholar,
-    OpenAlex,
+    Provider(String),
+}
+
+impl MetadataSourcePreference {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::File => "file",
+            Self::Zotero => "zotero",
+            Self::Provider(id) => id,
+        }
+    }
+}
+
+impl Serialize for MetadataSourcePreference {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for MetadataSourcePreference {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "file" => Self::File,
+            "zotero" => Self::Zotero,
+            "" => return Err(serde::de::Error::custom("metadata source cannot be empty")),
+            _ => Self::Provider(value),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -2900,23 +2951,145 @@ pub enum BookmarkDock {
     Right,
 }
 
+/// Which integrations exist and how this installation has them configured.
+///
+/// Deserialization reads two older shapes: the `semantic_scholar` and
+/// `openalex` objects written before those providers became manifests, and
+/// custom manifests written before manifest version 2. Both are rewritten into
+/// today's shape as they load, so nothing past this boundary ever meets them,
+/// and the next save writes only the new form.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(from = "IntegrationsSettingsWire")]
 pub struct IntegrationsSettings {
-    #[serde(default)]
     pub zotero: ZoteroSettings,
-    #[serde(default)]
-    pub semantic_scholar: SemanticScholarSettings,
-    #[serde(default)]
-    pub openalex: OpenAlexSettings,
-    /// Providers the user described rather than ones Wilkes compiled.
+    /// This installation's part of each provider shipped with Wilkes, by
+    /// provider id: whether it is switched on, the values for the secrets its
+    /// manifest names, an optional base URL. The manifest itself ships with
+    /// the build and is not stored.
+    pub builtin: std::collections::BTreeMap<String, BuiltinProviderState>,
+    /// Providers the user described rather than ones Wilkes shipped.
     ///
     /// Here, and not in a table of their own, because a provider must reach
     /// every consumer that already receives settings — the MCP server is
     /// handed an `IntegrationsSettings` by value and can reach no database —
     /// and a second configuration channel for the same question is exactly the
     /// duplication this feature exists to remove.
-    #[serde(default)]
     pub custom: Vec<CustomIntegrationConfig>,
+}
+
+/// The user's part of a shipped provider.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuiltinProviderState {
+    #[serde(default)]
+    pub enabled: bool,
+    /// A mirror or proxy to use instead of the manifest's own origin. Absent
+    /// means the manifest's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Values for the secrets the manifest names (`email`, `api_key`). Held
+    /// here and never in the manifest, which ships with the build.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub secrets: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct IntegrationsSettingsWire {
+    #[serde(default)]
+    zotero: ZoteroSettings,
+    #[serde(default)]
+    builtin: std::collections::BTreeMap<String, BuiltinProviderState>,
+    #[serde(default)]
+    custom: Vec<CustomIntegrationConfig>,
+    #[serde(default)]
+    semantic_scholar: Option<LegacyRemoteSettings>,
+    #[serde(default)]
+    openalex: Option<LegacyRemoteSettings>,
+}
+
+/// What `semantic_scholar` and `openalex` held before they were manifests: an
+/// enable flag, a base URL, and one optional credential under a name of its
+/// own (`api_key` or `email`).
+#[derive(Deserialize)]
+struct LegacyRemoteSettings {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+impl LegacyRemoteSettings {
+    /// The same installation's choices, in today's shape. A base URL equal to
+    /// the one the manifest ships with is no override.
+    fn into_state(self, shipped_base_url: &str, secret_name: &str) -> BuiltinProviderState {
+        let credential = self
+            .api_key
+            .or(self.email)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        BuiltinProviderState {
+            enabled: self.enabled,
+            base_url: self
+                .base_url
+                .map(|url| url.trim().trim_end_matches('/').to_string())
+                .filter(|url| !url.is_empty() && url != shipped_base_url),
+            secrets: credential
+                .map(|value| HashMap::from([(secret_name.to_string(), value)]))
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl From<IntegrationsSettingsWire> for IntegrationsSettings {
+    fn from(wire: IntegrationsSettingsWire) -> Self {
+        let mut builtin = wire.builtin;
+        // A value already in today's shape wins: it was written after the
+        // older one, by a build that no longer wrote the older key.
+        if let Some(legacy) = wire.semantic_scholar {
+            builtin
+                .entry("semantic_scholar".to_string())
+                .or_insert_with(|| legacy.into_state("https://api.semanticscholar.org", "api_key"));
+        }
+        if let Some(legacy) = wire.openalex {
+            builtin
+                .entry("openalex".to_string())
+                .or_insert_with(|| legacy.into_state("https://api.openalex.org", "email"));
+        }
+
+        let custom = wire
+            .custom
+            .into_iter()
+            .map(|mut config| {
+                match crate::integrations::custom::legacy::upgrade(&config.manifest) {
+                    Ok(Some(upgraded)) => {
+                        tracing::info!(
+                            integration = %config.id,
+                            "custom integration was rewritten as a version 2 manifest; \
+                             comments in the original text are not kept"
+                        );
+                        config.manifest = upgraded;
+                    }
+                    Ok(None) => {}
+                    // Left as stored: the registry reports it unloadable, by
+                    // name, instead of this guessing at what it meant.
+                    Err(error) => tracing::error!(
+                        integration = %config.id,
+                        "custom integration could not be converted to manifest version 2: {error:#}"
+                    ),
+                }
+                config
+            })
+            .collect();
+
+        Self {
+            zotero: wire.zotero,
+            builtin,
+            custom,
+        }
+    }
 }
 
 /// One stored custom integration.
@@ -2979,54 +3152,6 @@ fn default_zotero_citation_style() -> String {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SemanticScholarSettings {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_semantic_scholar_base_url")]
-    pub base_url: String,
-    #[serde(default)]
-    pub api_key: Option<String>,
-}
-
-impl Default for SemanticScholarSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            base_url: default_semantic_scholar_base_url(),
-            api_key: None,
-        }
-    }
-}
-
-fn default_semantic_scholar_base_url() -> String {
-    "https://api.semanticscholar.org".to_string()
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OpenAlexSettings {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_openalex_base_url")]
-    pub base_url: String,
-    #[serde(default)]
-    pub email: Option<String>,
-}
-
-impl Default for OpenAlexSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            base_url: default_openalex_base_url(),
-            email: None,
-        }
-    }
-}
-
-fn default_openalex_base_url() -> String {
-    "https://api.openalex.org".to_string()
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegrationState {
     Disabled,
@@ -3065,10 +3190,17 @@ pub struct CitationResult {
     pub low_confidence: bool,
 }
 
+/// One work as an external provider's `lookup` capability describes it, which
+/// is what the metadata cache stores about a file once the file has a DOI.
+///
+/// Provider-neutral: the provider that produced it is the key it is stored and
+/// listed under, never a field of it, so the same shape holds whatever service
+/// answered.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SemanticScholarPaper {
+pub struct ProviderWork {
     pub doi: String,
-    pub paper_id: String,
+    /// The provider's own identifier for the work.
+    pub work_id: String,
     pub title: Option<String>,
     pub year: Option<i64>,
     pub publication_date: Option<String>,
@@ -3078,17 +3210,27 @@ pub struct SemanticScholarPaper {
     pub cached_at_ms: i64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OpenAlexWork {
-    pub doi: String,
-    pub work_id: String,
-    pub title: Option<String>,
-    pub year: Option<i64>,
-    pub publication_date: Option<String>,
-    pub venue: Option<String>,
-    pub citation_count: i64,
-    pub external_ids: HashMap<String, serde_json::Value>,
-    pub cached_at_ms: i64,
+/// A request to list a provider's works by filter and sort rather than by
+/// keyword alone. What may be asked is declared by the provider's `browse`
+/// capability; anything else is refused by name.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowseRequest {
+    /// A keyword to combine with the filters. Empty means none.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Filter name → value. A `choice` takes one of its option values, a
+    /// `flag` takes `"true"`, and a `range` is two keys, `<name>.min` and
+    /// `<name>.max`, each an integer.
+    #[serde(default)]
+    pub filters: std::collections::BTreeMap<String, String>,
+    /// One of the provider's sort option values. Empty means its default.
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// 1-based.
+    #[serde(default)]
+    pub page: Option<usize>,
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// Provider-neutral result returned by external literature searches.
@@ -4076,5 +4218,133 @@ mod tests {
             serde_json::from_value::<GenerationStreamEvent>(json).unwrap(),
             event
         );
+    }
+
+    // ── Integrations settings: the shapes older builds wrote ─────────────────
+
+    fn integrations_from(json: &str) -> IntegrationsSettings {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn settings_written_before_providers_were_manifests_are_read_into_todays_shape() {
+        let json = r#"{
+            "zotero": {"enabled": true, "base_url": "http://127.0.0.1:23119", "citation_style": "apa"},
+            "semantic_scholar": {"enabled": true, "base_url": "https://api.semanticscholar.org", "api_key": " key-1 "},
+            "openalex": {"enabled": true, "base_url": "https://mirror.example.test/", "email": "me@example.org"}
+        }"#;
+        let settings = integrations_from(json);
+
+        let s2 = &settings.builtin["semantic_scholar"];
+        assert!(s2.enabled);
+        assert_eq!(s2.secrets["api_key"], "key-1");
+        // The shipped origin is no override.
+        assert_eq!(s2.base_url, None);
+
+        let openalex = &settings.builtin["openalex"];
+        assert!(openalex.enabled);
+        assert_eq!(openalex.secrets["email"], "me@example.org");
+        assert_eq!(
+            openalex.base_url.as_deref(),
+            Some("https://mirror.example.test")
+        );
+        assert!(settings.zotero.enabled);
+    }
+
+    #[test]
+    fn a_blank_legacy_credential_is_no_credential() {
+        let json = r#"{"openalex": {"enabled": false, "email": "  "}}"#;
+        let settings = integrations_from(json);
+        assert!(settings.builtin["openalex"].secrets.is_empty());
+    }
+
+    #[test]
+    fn a_value_in_todays_shape_wins_over_the_older_key_and_only_today_is_written_back() {
+        let json = r#"{
+            "openalex": {"enabled": true, "email": "old@example.org"},
+            "builtin": {"openalex": {"enabled": false, "secrets": {"email": "new@example.org"}}}
+        }"#;
+        let settings = integrations_from(json);
+        let openalex = &settings.builtin["openalex"];
+        assert!(!openalex.enabled);
+        assert_eq!(openalex.secrets["email"], "new@example.org");
+
+        let written = serde_json::to_value(&settings).unwrap();
+        assert!(written.get("openalex").is_none());
+        assert!(written.get("semantic_scholar").is_none());
+        assert!(written["builtin"]["openalex"].is_object());
+        // And it reads back as itself.
+        let again: IntegrationsSettings = serde_json::from_value(written).unwrap();
+        assert_eq!(again.builtin, settings.builtin);
+    }
+
+    #[test]
+    fn a_stored_version_one_manifest_is_rewritten_as_version_two_when_settings_load() {
+        let v1 = r#"
+manifest_version = 1
+id = "crossref"
+name = "Crossref"
+[http]
+base_url = "https://api.crossref.org"
+[[http.params]]
+location = "query"
+name = "mailto"
+value = "team@example.com"
+[capabilities.search]
+path = "/works?query.bibliographic={query}&rows={limit}"
+items = "message.items[*]"
+[capabilities.search.fields]
+id = "DOI"
+title = "title[0]"
+doi = { path = "DOI", coerce = "normalize_doi" }
+"#;
+        let json = serde_json::json!({
+            "custom": [{"id": "crossref", "enabled": true, "manifest": v1}]
+        });
+        let settings: IntegrationsSettings = serde_json::from_value(json).unwrap();
+        let config = &settings.custom[0];
+        assert!(config.enabled);
+        assert!(
+            config.manifest.contains("manifest_version = 2"),
+            "{}",
+            config.manifest
+        );
+        // The rewrite is a manifest the engine loads.
+        crate::integrations::custom::CustomSource::from_config(config).unwrap();
+    }
+
+    #[test]
+    fn a_version_one_manifest_that_cannot_be_converted_is_left_as_stored() {
+        let broken = "manifest_version = 1\nid = \"x\"\nname = \"X\"\n[http]\nbase_url = \"https://x.test\"\n[capabilities.search]\npath = \"/s\"\n[capabilities.search.fields]\nid = \"a..b\"\n";
+        let json = serde_json::json!({ "custom": [{"id": "x", "manifest": broken}] });
+        let settings: IntegrationsSettings = serde_json::from_value(json).unwrap();
+        // Unchanged: the registry will report it by name instead of this
+        // guessing at what it meant.
+        assert_eq!(settings.custom[0].manifest, broken);
+    }
+
+    #[test]
+    fn a_metadata_source_preference_is_the_bare_string_it_always_was() {
+        for (stored, expected) in [
+            ("file", MetadataSourcePreference::File),
+            ("zotero", MetadataSourcePreference::Zotero),
+            (
+                "openalex",
+                MetadataSourcePreference::Provider("openalex".into()),
+            ),
+            (
+                "custom:crossref",
+                MetadataSourcePreference::Provider("custom:crossref".into()),
+            ),
+        ] {
+            let parsed: MetadataSourcePreference =
+                serde_json::from_value(serde_json::json!(stored)).unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(
+                serde_json::to_value(&parsed).unwrap(),
+                serde_json::json!(stored)
+            );
+        }
+        assert!(serde_json::from_value::<MetadataSourcePreference>(serde_json::json!("")).is_err());
     }
 }

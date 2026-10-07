@@ -25,7 +25,7 @@ interface CustomIntegrationsProps {
 
 const INITIAL_PROBE_QUERY = "graph neural networks";
 
-const STARTER_MANIFEST = `manifest_version = 1
+const STARTER_MANIFEST = `manifest_version = 2
 id = "anna-journals"
 name = "Anna journal search"
 
@@ -33,10 +33,8 @@ name = "Anna journal search"
 ## Replace this example host with the Anna mirror you use.
 base_url = "https://annas-archive.example"
 
-[[http.params]]
-location = "header"
-name = "User-Agent"
-value = "Mozilla/5.0"
+[http.headers]
+User-Agent = "Mozilla/5.0"
 
 [capabilities.search]
 path = "/search?q={query}&content=journal"
@@ -46,12 +44,12 @@ items = '''div:has(> a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:o
 [capabilities.search.fields]
 id = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", capture = '''^/md5/([0-9a-f]+)$''' }
 title = '''div.max-w-full a[href^="/md5/"]'''
-authors = { path = '''a[href^="/search"]:has(span[class="icon-[mdi--user-edit]"])''', coerce = "join" }
+authors = { path = '''a[href^="/search"]:has(span[class="icon-[mdi--user-edit]"])''', all = true, then = "join(', ', @)" }
 publisher = '''a[href^="/search"]:has(span[class="icon-[mdi--company]"])'''
 language = { path = "div.text-gray-800", capture = '''^\\s*✅?\\s*([^\\[]+?)\\s*\\[''' }
 file_format = { path = "div.text-gray-800", capture = '''(?i)\\b(EPUB|PDF|MOBI|AZW3|AZW|DJVU|CBZ|CBR|FB2|DOCX?|TXT)\\b''' }
 file_size = { path = "div.text-gray-800", capture = '''(?i)(\\d+(?:\\.\\d+)?\\s*(?:MB|KB|GB|TB))''' }
-landing_page_url = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", coerce = "absolute_url" }
+landing_page_url = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", then = "absolute_url(@)" }
 
 [capabilities.resolve_download]
 url = "{download_url}"
@@ -64,16 +62,14 @@ filename = "{title}.{file_format}"
 path = "/dyn/api/fast_download.json?md5={id}"
 response_format = "json"
 
-[[capabilities.resolve_download.steps.params]]
-location = "query"
-name = "key"
-secret = "anna_key"
+[capabilities.resolve_download.steps.query]
+key = { secret = "anna_key" }
 
 [capabilities.resolve_download.steps.fields]
 download_url = "download_url"
 
 ## For a DOI-specific provider, a field may carry the search input:
-## doi = { input = "query", coerce = "normalize_doi" }
+## doi = { input = "query", then = "normalize_doi(@)" }
 `;
 
 /**
@@ -286,7 +282,7 @@ export default function CustomIntegrations({
   const checkStatus = async (config: CustomIntegrationConfig) => {
     setBusy(true);
     try {
-      const status = await api.customIntegrationStatus(config.id);
+      const status = await api.literatureProviderStatus(`custom:${config.id}`);
       setStatuses((current) => ({ ...current, [config.id]: status }));
     } catch (error) {
       setStatuses((current) => ({
@@ -491,6 +487,23 @@ export default function CustomIntegrations({
             </ul>
           )}
 
+          {/* A manifest written before version 2 is refused, and what it would
+              be as version 2 is on offer — replacing the text is the user's
+              act, and nothing is saved by it. */}
+          {summary?.upgraded && (
+            <button
+              type="button"
+              onClick={() => {
+                setDraft(summary.upgraded ?? null);
+                setSummary(null);
+                setReport(null);
+              }}
+              className={BUTTON_CLASS}
+            >
+              Convert to version 2
+            </button>
+          )}
+
           {summary && summary.problems.length === 0 && (
             <div className="space-y-3">
               <dl className="text-xs text-[var(--text-muted)] space-y-1">
@@ -506,17 +519,20 @@ export default function CustomIntegrations({
                 </div>
               </dl>
 
-              {summary.required_secrets.map((name) => (
-                <div key={name} className="space-y-1">
-                  <label className={FIELD_LABEL_CLASS}>Secret: {name}</label>
+              {summary.secrets.map((slot) => (
+                <div key={slot.name} className="space-y-1">
+                  <label className={FIELD_LABEL_CLASS}>
+                    Secret: {slot.name}
+                    {slot.optional ? " (optional)" : ""}
+                  </label>
                   <input
-                    type="password"
-                    aria-label={`Secret ${name}`}
-                    value={secrets[name] ?? ""}
+                    type={slot.kind}
+                    aria-label={`Secret ${slot.name}`}
+                    value={secrets[slot.name] ?? ""}
                     onChange={(e) =>
                       setSecrets((current) => ({
                         ...current,
-                        [name]: e.target.value,
+                        [slot.name]: e.target.value,
                       }))
                     }
                     className={INPUT_CLASS}

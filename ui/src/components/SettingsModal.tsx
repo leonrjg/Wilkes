@@ -1,6 +1,11 @@
 import { useState, useEffect, useRef } from "react";
 import type { SearchApi } from "../services/api";
-import type { ExternalMcpStatus, HttpApiStatus, Settings } from "../lib/types";
+import type {
+  ExternalMcpStatus,
+  HttpApiStatus,
+  LiteratureProviderInfo,
+  Settings,
+} from "../lib/types";
 import SemanticPanel from "./SemanticPanel";
 import GenerationPanel from "./GenerationPanel";
 import ImageAnalysisPanel from "./ImageAnalysisPanel";
@@ -29,12 +34,27 @@ const CHAT_BACKENDS: { value: AgentBackend; label: string }[] = [
   { value: "Nanocoder", label: "Nanocoder" },
 ];
 
-const METADATA_SOURCES: { value: MetadataSourcePreference; label: string }[] = [
-  { value: "file", label: "File" },
-  { value: "zotero", label: "Zotero" },
-  { value: "semantic_scholar", label: "Semantic Scholar" },
-  { value: "openalex", label: "OpenAlex" },
-];
+/** The sources a document's metadata can prefer: the two that are not literature
+ *  providers, then every provider that can look a work up. A provider is
+ *  listed because its manifest declares `lookup`, so one added tomorrow is on
+ *  offer with no change here. The stored choice is always kept on the list,
+ *  including one whose provider has since been removed, so the select never
+ *  shows a value it does not hold. */
+function metadataSources(
+  providers: readonly LiteratureProviderInfo[],
+  stored: MetadataSourcePreference,
+): { value: MetadataSourcePreference; label: string }[] {
+  const sources = [
+    { value: "file", label: "File" },
+    { value: "zotero", label: "Zotero" },
+    ...providers
+      .filter((provider) => provider.capabilities.lookup)
+      .map((provider) => ({ value: provider.provider, label: provider.name })),
+  ];
+  return sources.some((source) => source.value === stored)
+    ? sources
+    : [...sources, { value: stored, label: stored }];
+}
 
 interface SettingsModalProps {
   api: SearchApi;
@@ -180,6 +200,7 @@ export default function SettingsModal({
 
   const [activeTab, setActiveTab] = useState<SettingsTab>("general");
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [literatureProviders, setLiteratureProviders] = useState<LiteratureProviderInfo[]>([]);
   const [maxFileSizeMbDraft, setMaxFileSizeMbDraft] = useState("");
   const [maxFileSizeMbDirty, setMaxFileSizeMbDirty] = useState(false);
   const [customInstructionsDraft, setCustomInstructionsDraft] = useState("");
@@ -210,6 +231,7 @@ export default function SettingsModal({
         setHttpApiBindAddress(nextSettings.http_api?.bind_address ?? "127.0.0.1");
         setHttpApiPort(nextSettings.http_api?.port ?? 2020);
       }).catch(console.error);
+      api.literatureProviders().then(setLiteratureProviders).catch(console.error);
       if (api.getExternalMcpStatus) {
         api.getExternalMcpStatus()
           .then((status) => {
@@ -601,7 +623,10 @@ export default function SettingsModal({
                           }
                           className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
                         >
-                          {METADATA_SOURCES.map((source) => (
+                          {metadataSources(
+                            literatureProviders,
+                            settings.primary_metadata_source ?? "zotero",
+                          ).map((source) => (
                             <option key={source.value} value={source.value}>
                               {source.label}
                             </option>

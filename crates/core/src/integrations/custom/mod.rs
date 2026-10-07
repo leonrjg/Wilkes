@@ -1,26 +1,27 @@
-//! A literature provider the user described rather than one we compiled.
+//! A literature provider, described rather than compiled.
 //!
 //! [`CustomSource`] implements [`LiteratureSource`] by reading a [`Manifest`]:
 //! it builds a URL from a template, sends the identification the manifest
-//! declares, and projects JSON paths or HTML CSS selections through
-//! [`coerce`].
-//! Nothing about it is privileged or special-cased — the registry holds it
-//! next to `OpenAlexClient`, and callers cannot tell them apart.
+//! declares, and projects JSON (by JMESPath expression) or HTML (by CSS
+//! selection) through [`expr`]. It is the *only* implementation: OpenAlex and
+//! Semantic Scholar are manifests embedded in the binary
+//! ([`super::builtin`]), loaded through the same door as a manifest a user
+//! pasted in this morning, and no caller can tell them apart.
 //!
 //! # Every origin is pinned
 //!
 //! Every request is a declared literal `base_url` plus a capability's path,
 //! and the assembled URL is checked to still have that base's origin before it
 //! is sent. Resolver steps may name another base, but a template cannot. Global
-//! parameters do not cross that origin boundary, and the HTTP client refuses
-//! cross-origin redirects. A manifest therefore cannot send a request or a
-//! credential anywhere the user did not see when importing it.
+//! headers and query parameters do not cross that origin boundary, and the HTTP
+//! client refuses cross-origin redirects. A manifest therefore cannot send a
+//! request or a credential anywhere the user did not see when importing it.
 
-pub mod coerce;
+pub mod expr;
+pub mod legacy;
 pub mod manifest;
-pub mod selector;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use async_trait::async_trait;
 use dom_query::{Document, Matcher, Selection};
@@ -28,17 +29,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
-use self::coerce::Projected;
+use self::expr::{Evaluator, Projected};
 use self::manifest::{
-    search_field_type, FieldSpec, HttpParam, Manifest, ResolverStep, ResponseFormat,
+    lookup_field_type, search_field_type, BrowseCapability, FieldSpec, FieldType, FilterSpec,
+    LookupCapability, Manifest, ParamValue, ReferencesCapability, ResolverStep, ResponseFormat,
     SearchCapability,
 };
-use self::selector::Selector;
-use crate::integrations::LiteratureSource;
+use crate::integrations::{LiteratureSource, ProviderCapabilities};
+use crate::metadata::doi::normalize_doi;
 use crate::network::{ProviderHttpClient, ProviderHttpErrorKind};
 use crate::types::{
-    CustomIntegrationConfig, IntegrationState, IntegrationStatus, LiteratureAcquisition,
-    LiteratureSearchResult, ResolvedLiteratureDownload,
+    BrowseRequest, CustomIntegrationConfig, IntegrationState, IntegrationStatus,
+    LiteratureAcquisition, LiteratureSearchResult, ProviderWork, ResolvedLiteratureDownload,
 };
 
 /// How much of a probe's raw response is shown back to the user. Enough to see
@@ -47,9 +49,20 @@ const PROBE_BODY_CHARS: usize = 8_000;
 
 const PROBE_LIMIT: usize = 3;
 
+/// Most any one request is asked for. The same ceiling the MCP tool clamps to.
+const MAX_LIMIT: usize = 100;
+
+/// Whether a source was shipped with Wilkes or written by the user. It decides
+/// the id and nothing else: a built-in is `openalex`, a custom provider is
+/// `custom:<id>`, so a manifest can never shadow a built-in and no log line is
+/// ambiguous about which kind it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    BuiltIn,
+    Custom,
+}
+
 pub struct CustomSource {
-    /// Namespaced `custom:<manifest id>`, so a manifest can never shadow a
-    /// built-in and no log line is ambiguous about which kind it names.
     id: String,
     /// What to call this provider: the name the user gave it, otherwise the
     /// one the manifest declares. Resolved once here so that every caller —
@@ -79,11 +92,16 @@ impl CustomSource {
             config.id,
             manifest.id
         );
-        Self::named(manifest, config.secrets.clone(), config.name.clone())
+        Self::build(
+            manifest,
+            config.secrets.clone(),
+            config.name.clone(),
+            Standing::Custom,
+        )
     }
 
     pub fn new(manifest: Manifest, secrets: HashMap<String, String>) -> anyhow::Result<Self> {
-        Self::named(manifest, secrets, None)
+        Self::build(manifest, secrets, None, Standing::Custom)
     }
 
     /// The same source under a name the user chose. A blank override is no
@@ -94,6 +112,15 @@ impl CustomSource {
         secrets: HashMap<String, String>,
         name: Option<String>,
     ) -> anyhow::Result<Self> {
+        Self::build(manifest, secrets, name, Standing::Custom)
+    }
+
+    pub fn build(
+        manifest: Manifest,
+        secrets: HashMap<String, String>,
+        name: Option<String>,
+        standing: Standing,
+    ) -> anyhow::Result<Self> {
         manifest.validate()?;
         let base = manifest.http.base_url.trim_end_matches('/').to_string();
         let base_url = Url::parse(&base)?;
@@ -102,7 +129,10 @@ impl CustomSource {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| manifest.name.clone());
         Ok(Self {
-            id: format!("custom:{}", manifest.id),
+            id: match standing {
+                Standing::BuiltIn => manifest.id.clone(),
+                Standing::Custom => format!("custom:{}", manifest.id),
+            },
             http: ProviderHttpClient::new_origin_pinned(display_name.clone()),
             display_name,
             manifest,
@@ -259,6 +289,8 @@ impl CustomSource {
         }
     }
 
+    // ── Projection ───────────────────────────────────────────────────────────
+
     fn project_response(
         &self,
         search: &SearchCapability,
@@ -287,31 +319,23 @@ impl CustomSource {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Projection> {
-        let items = match &search.items {
-            Some(path) => {
-                let selector = Selector::parse(path).map_err(|e| anyhow::anyhow!("items: {e}"))?;
-                selector.resolve(body).ok_or_else(|| {
-                    anyhow::anyhow!("items selector '{path}' matched nothing in the response")
-                })?
-            }
-            None => body,
-        };
-        let items = items.as_array().ok_or_else(|| {
-            anyhow::anyhow!("items must select an array; found {}", describe_kind(items))
-        })?;
+        let evaluator = Evaluator::new(&self.base_url);
+        let items = records_in(&evaluator, search.items.as_deref(), body, "items")?;
 
         let records_seen = items.len().min(limit);
         let mut results = Vec::with_capacity(records_seen);
         let mut issues = Vec::new();
         for (index, item) in items.iter().take(limit).enumerate() {
-            match self.project_one(
-                search,
-                query,
-                limit,
+            let fields = self.project_fields(
+                &search.fields,
+                search_field_type,
+                Some((query, limit)),
                 index,
                 &mut issues,
-                |spec, field_type| self.select_json(spec, item, field_type, &self.base_url),
-            ) {
+                &evaluator,
+                |spec, field_type| self.select_json(spec, item, field_type, &evaluator),
+            );
+            match self.search_result(fields, &search.fields, index, &mut issues) {
                 Some(result) => results.push(result),
                 None => note_missing_id(index, &mut issues),
             }
@@ -342,18 +366,21 @@ impl CustomSource {
         if items.is_empty() {
             anyhow::bail!("items selector '{items_path}' matched nothing in the response");
         }
+        let evaluator = Evaluator::new(&self.base_url);
         let records_seen = items.length().min(limit);
         let mut results = Vec::with_capacity(records_seen);
         let mut issues = Vec::new();
         for (index, item) in items.iter().take(limit).enumerate() {
-            match self.project_one(
-                search,
-                query,
-                limit,
+            let fields = self.project_fields(
+                &search.fields,
+                search_field_type,
+                Some((query, limit)),
                 index,
                 &mut issues,
-                |spec, field_type| self.select_html(spec, &item, field_type, &self.base_url),
-            ) {
+                &evaluator,
+                |spec, field_type| self.select_html(spec, &item, field_type, &evaluator),
+            );
+            match self.search_result(fields, &search.fields, index, &mut issues) {
                 Some(result) => results.push(result),
                 None => note_missing_id(index, &mut issues),
             }
@@ -365,41 +392,40 @@ impl CustomSource {
         })
     }
 
-    fn project_one<F>(
+    /// Project every declared field of one record, recording what could not be
+    /// mapped. Typed inputs (`query`, `limit`) are answered here, whatever the
+    /// response format; everything else is the format's own `select`.
+    #[allow(clippy::too_many_arguments)]
+    fn project_fields<F>(
         &self,
-        search: &SearchCapability,
-        query: &str,
-        limit: usize,
+        fields: &BTreeMap<String, FieldSpec>,
+        type_of: fn(&str) -> Option<FieldType>,
+        inputs: Option<(&str, usize)>,
         index: usize,
         issues: &mut Vec<ProjectionIssue>,
+        evaluator: &Evaluator,
         mut select: F,
-    ) -> Option<LiteratureSearchResult>
+    ) -> Fields
     where
-        F: FnMut(&FieldSpec, manifest::FieldType) -> Result<Option<Projected>, String>,
+        F: FnMut(&FieldSpec, FieldType) -> Result<Option<Projected>, String>,
     {
-        let mut text: HashMap<&str, String> = HashMap::new();
-        let mut integer: HashMap<&str, i64> = HashMap::new();
-        let mut boolean: HashMap<&str, bool> = HashMap::new();
-
-        for (field, spec) in &search.fields {
+        let mut out = HashMap::new();
+        for (field, spec) in fields {
             // Unknown field names are refused when the manifest is saved, so
             // one here means a manifest that reached storage another way.
-            let Some(field_type) = search_field_type(field) else {
+            let Some(field_type) = type_of(field) else {
                 continue;
             };
-            let selected = match spec.input() {
-                Some(input) => self.select_input(spec, input, query, limit, field_type),
-                None => select(spec, field_type),
+            let selected = match (spec.input(), inputs) {
+                (Some(input), Some((query, limit))) => {
+                    self.select_input(spec, input, query, limit, field_type, evaluator)
+                }
+                (Some(input), None) => Err(format!("input '{input}' is not available here")),
+                (None, _) => select(spec, field_type),
             };
             match selected {
-                Ok(Some(Projected::Text(value))) => {
-                    text.insert(field_as_static(field), value);
-                }
-                Ok(Some(Projected::Integer(value))) => {
-                    integer.insert(field_as_static(field), value);
-                }
-                Ok(Some(Projected::Boolean(value))) => {
-                    boolean.insert(field_as_static(field), value);
+                Ok(Some(value)) => {
+                    out.insert(field.clone(), value);
                 }
                 Ok(None) => {}
                 Err(problem) => issues.push(ProjectionIssue {
@@ -410,21 +436,30 @@ impl CustomSource {
                 }),
             }
         }
+        Fields(out)
+    }
 
-        let id = text.remove("id").filter(|value| !value.trim().is_empty())?;
-        if !text.contains_key("title") {
+    fn search_result(
+        &self,
+        mut fields: Fields,
+        specs: &BTreeMap<String, FieldSpec>,
+        index: usize,
+        issues: &mut Vec<ProjectionIssue>,
+    ) -> Option<LiteratureSearchResult> {
+        let id = fields.text("id").filter(|value| !value.trim().is_empty())?;
+        let title = fields.text("title");
+        if title.is_none() {
             issues.push(ProjectionIssue {
                 record: index,
                 field: "title".to_string(),
-                selector: search
-                    .fields
+                selector: specs
                     .get("title")
                     .map(|spec| spec.paths().join(" | "))
                     .unwrap_or_default(),
                 problem: "required field matched nothing".to_string(),
             });
         }
-        let pdf_url = text.remove("pdf_url");
+        let pdf_url = fields.text("pdf_url");
         let acquisition = if self.manifest.capabilities.resolve_download.is_some() {
             LiteratureAcquisition::Provider
         } else if pdf_url.is_some() {
@@ -434,22 +469,22 @@ impl CustomSource {
         };
         Some(LiteratureSearchResult {
             id,
-            doi: text.remove("doi"),
-            title: text.remove("title"),
-            year: integer.remove("year"),
-            publication_date: text.remove("publication_date"),
-            venue: text.remove("venue"),
-            citation_count: integer.remove("citation_count").unwrap_or(0),
-            is_open_access: boolean.remove("is_open_access").unwrap_or(false),
+            doi: fields.text("doi"),
+            title,
+            year: fields.int("year"),
+            publication_date: fields.text("publication_date"),
+            venue: fields.text("venue"),
+            citation_count: fields.int("citation_count").unwrap_or(0),
+            is_open_access: fields.boolean("is_open_access").unwrap_or(false),
             pdf_url,
-            landing_page_url: text.remove("landing_page_url"),
-            open_access_status: text.remove("open_access_status"),
-            license: text.remove("license"),
-            authors: text.remove("authors"),
-            publisher: text.remove("publisher"),
-            language: text.remove("language"),
-            file_format: text.remove("file_format"),
-            file_size: text.remove("file_size"),
+            landing_page_url: fields.text("landing_page_url"),
+            open_access_status: fields.text("open_access_status"),
+            license: fields.text("license"),
+            authors: fields.text("authors"),
+            publisher: fields.text("publisher"),
+            language: fields.text("language"),
+            file_format: fields.text("file_format"),
+            file_size: fields.text("file_size"),
             acquisition,
         })
     }
@@ -458,15 +493,11 @@ impl CustomSource {
         &self,
         spec: &FieldSpec,
         item: &Value,
-        field_type: manifest::FieldType,
-        base_url: &Url,
+        field_type: FieldType,
+        evaluator: &Evaluator,
     ) -> Result<Option<Projected>, String> {
-        self.select_projected(spec, field_type, base_url, |path| {
-            let selector = match Selector::parse(path) {
-                Ok(selector) => selector,
-                Err(error) => return Err(error),
-            };
-            Ok(selector.resolve(item).cloned())
+        self.select_projected(spec, field_type, evaluator, |path| {
+            evaluator.eval(path, item)
         })
     }
 
@@ -476,30 +507,26 @@ impl CustomSource {
         input: &str,
         query: &str,
         limit: usize,
-        field_type: manifest::FieldType,
+        field_type: FieldType,
+        evaluator: &Evaluator,
     ) -> Result<Option<Projected>, String> {
-        let mut raw = match input {
+        let raw = match input {
             "query" => Value::String(query.to_string()),
             "limit" => Value::Number(limit.into()),
             // Refused during manifest validation.
             _ => return Err(format!("unknown search input '{input}'")),
         };
-        if let Some((pattern, group)) = spec.capture() {
-            raw = capture_value(pattern, group, &raw)?;
-        }
-        coerce::project(spec.coercion(), field_type, &raw, &self.base_url)
-            .map(Some)
-            .map_err(|error| error.to_string())
+        self.finish(spec, raw, field_type, evaluator)
     }
 
     fn select_html(
         &self,
         spec: &FieldSpec,
         item: &Selection<'_>,
-        field_type: manifest::FieldType,
-        base_url: &Url,
+        field_type: FieldType,
+        evaluator: &Evaluator,
     ) -> Result<Option<Projected>, String> {
-        self.select_projected(spec, field_type, base_url, |path| {
+        self.select_projected(spec, field_type, evaluator, |path| {
             let selected = if path == ":scope" {
                 item.clone()
             } else {
@@ -510,7 +537,7 @@ impl CustomSource {
             if selected.is_empty() {
                 return Ok(None);
             }
-            if matches!(spec.coercion(), Some(coerce::Coercion::Join)) {
+            if spec.all() {
                 let values: Vec<Value> = selected
                     .iter()
                     .filter_map(|element| match spec.attribute() {
@@ -536,11 +563,13 @@ impl CustomSource {
         })
     }
 
+    /// Try each of the field's selectors in order until one yields a value that
+    /// survives the field's own post-processing.
     fn select_projected<F>(
         &self,
         spec: &FieldSpec,
-        field_type: manifest::FieldType,
-        base_url: &Url,
+        field_type: FieldType,
+        evaluator: &Evaluator,
         mut raw_for_path: F,
     ) -> Result<Option<Projected>, String>
     where
@@ -548,25 +577,348 @@ impl CustomSource {
     {
         let mut last_error = None;
         for path in spec.paths() {
-            let Some(mut raw) = raw_for_path(path)? else {
-                continue;
-            };
-            if let Some((pattern, group)) = spec.capture() {
-                match capture_value(pattern, group, &raw) {
-                    Ok(captured) => raw = captured,
-                    Err(problem) => {
-                        last_error = Some(format!("{path}: {problem}"));
-                        continue;
-                    }
+            let raw = match raw_for_path(path) {
+                Ok(Some(raw)) => raw,
+                Ok(None) => continue,
+                // A selector that cannot be evaluated is this selector's
+                // failure; a later alternative may still resolve.
+                Err(problem) => {
+                    last_error = Some(format!("{path}: {problem}"));
+                    continue;
                 }
-            }
-            match coerce::project(spec.coercion(), field_type, &raw, base_url) {
-                Ok(value) => return Ok(Some(value)),
-                Err(mismatch) => last_error = Some(format!("{path}: {mismatch}")),
+            };
+            match self.finish(spec, raw, field_type, evaluator) {
+                Ok(Some(value)) => return Ok(Some(value)),
+                Ok(None) => {}
+                Err(problem) => last_error = Some(format!("{path}: {problem}")),
             }
         }
         last_error.map_or(Ok(None), Err)
     }
+
+    /// What happens to a value once it has been found: a regular-expression
+    /// capture, the field's `then` expression, and the strict type check.
+    fn finish(
+        &self,
+        spec: &FieldSpec,
+        mut raw: Value,
+        field_type: FieldType,
+        evaluator: &Evaluator,
+    ) -> Result<Option<Projected>, String> {
+        if let Some((pattern, group)) = spec.capture() {
+            raw = capture_value(pattern, group, &raw)?;
+        }
+        if let Some(then) = spec.then() {
+            raw = match evaluator.eval(then, &raw)? {
+                Some(value) => value,
+                None => return Ok(None),
+            };
+        }
+        expr::project(field_type, &raw, &self.base_url)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    // ── Search, browse ───────────────────────────────────────────────────────
+
+    async fn fetch(&self, request: PreparedRequest<'_>) -> anyhow::Result<Vec<u8>> {
+        match self.http.get_bytes(request.url, &request.headers).await {
+            Ok(body) => Ok(body),
+            Err(error) if error.kind == ProviderHttpErrorKind::RateLimited => {
+                anyhow::bail!("{} rate limit reached", self.manifest.name)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// A selector that stopped matching is the service having changed shape
+    /// under a manifest that was probed against the old one. It is not fatal —
+    /// the other fields are still right — but it is never silent.
+    fn warn_unmapped(&self, projection: &Projection) {
+        if projection.issues.is_empty() {
+            return;
+        }
+        let mut fields: Vec<&str> = projection
+            .issues
+            .iter()
+            .map(|issue| issue.field.as_str())
+            .collect();
+        fields.sort_unstable();
+        fields.dedup();
+        tracing::warn!(
+            integration = %self.id,
+            records = projection.records_seen,
+            unmapped = projection.issues.len(),
+            "custom integration could not map fields: {}",
+            fields.join(", ")
+        );
+    }
+
+    async fn run_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<LiteratureSearchResult>> {
+        let query = query.trim();
+        anyhow::ensure!(
+            !query.is_empty(),
+            "{} search query cannot be empty",
+            self.manifest.name
+        );
+        let search = self
+            .manifest
+            .capabilities
+            .search
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{} cannot search", self.manifest.name))?;
+        let limit = limit.clamp(1, MAX_LIMIT);
+
+        let request = self.request(
+            &substitute(
+                &search.path,
+                &[("query", query), ("limit", &limit.to_string())],
+            ),
+            &[],
+        )?;
+        let body = self.fetch(request).await?;
+        let projection = self.project_response(search, &body, query, limit)?;
+        self.warn_unmapped(&projection);
+        Ok(projection.results)
+    }
+
+    async fn run_browse(
+        &self,
+        request: &BrowseRequest,
+    ) -> anyhow::Result<Vec<LiteratureSearchResult>> {
+        let name = &self.manifest.name;
+        let browse = self
+            .manifest
+            .capabilities
+            .browse
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{name} does not offer browse"))?;
+        let search = self
+            .manifest
+            .capabilities
+            .search
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{name} cannot search"))?;
+        let limit = request.limit.unwrap_or(10).clamp(1, MAX_LIMIT);
+        let page = request.page.unwrap_or(1).max(1);
+        let query = request
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty());
+
+        let extra = browse_parameters(browse, request, query)
+            .map_err(|problem| anyhow::anyhow!("{name} browse: {problem}"))?;
+        let prepared = self.request(
+            &substitute(
+                &browse.path,
+                &[("limit", &limit.to_string()), ("page", &page.to_string())],
+            ),
+            &extra,
+        )?;
+        let body = self.fetch(prepared).await?;
+        let projection = self.project_response(search, &body, query.unwrap_or(""), limit)?;
+        self.warn_unmapped(&projection);
+        Ok(projection.results)
+    }
+
+    // ── Lookup, references ───────────────────────────────────────────────────
+
+    async fn run_lookup(&self, doi: &str) -> anyhow::Result<ProviderWork> {
+        let doi = normalize_doi(doi).ok_or_else(|| anyhow::anyhow!("Invalid DOI: {doi}"))?;
+        let lookup = self.lookup_capability()?;
+        let evaluator = Evaluator::new(&self.base_url);
+
+        for path in &lookup.paths {
+            let request = self.request(&substitute(path, &[("doi", &doi)]), &[])?;
+            let body = match self.http.get_bytes(request.url, &request.headers).await {
+                Ok(body) => body,
+                // "No record under this key" — the next request may know the
+                // work under another.
+                Err(error) if error.kind == ProviderHttpErrorKind::NotFound => continue,
+                Err(error) if error.kind == ProviderHttpErrorKind::RateLimited => {
+                    anyhow::bail!("{} rate limit reached", self.manifest.name)
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let value: Value = serde_json::from_slice(&body)
+                .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
+            let record = match &lookup.record {
+                Some(expression) => evaluator
+                    .eval(expression, &value)
+                    .map_err(|error| anyhow::anyhow!("lookup.record: {error}"))?,
+                None => Some(value),
+            };
+            let Some(record) = record else { continue };
+            return self.work_from_record(lookup, &record, &evaluator, doi);
+        }
+        anyhow::bail!("{} has no record for DOI {doi}", self.manifest.name)
+    }
+
+    fn work_from_record(
+        &self,
+        lookup: &LookupCapability,
+        record: &Value,
+        evaluator: &Evaluator,
+        doi: String,
+    ) -> anyhow::Result<ProviderWork> {
+        let mut issues = Vec::new();
+        let mut fields = self.project_fields(
+            &lookup.fields,
+            lookup_field_type,
+            None,
+            0,
+            &mut issues,
+            evaluator,
+            |spec, field_type| self.select_json(spec, record, field_type, evaluator),
+        );
+        // A lookup is one record, and a field that is present but unusable is
+        // a record the cache must not store half of.
+        if let Some(issue) = issues.first() {
+            anyhow::bail!(
+                "{} lookup could not read '{}': {}",
+                self.manifest.name,
+                issue.field,
+                issue.problem
+            );
+        }
+        let work_id = fields
+            .text("id")
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("{} lookup record has no id", self.manifest.name))?;
+        Ok(ProviderWork {
+            doi,
+            work_id,
+            title: fields.text("title"),
+            year: fields.int("year"),
+            publication_date: fields.text("publication_date"),
+            venue: fields.text("venue"),
+            citation_count: fields.int("citation_count").unwrap_or(0),
+            external_ids: fields
+                .object("external_ids")
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            cached_at_ms: now_ms(),
+        })
+    }
+
+    fn lookup_capability(&self) -> anyhow::Result<&LookupCapability> {
+        self.manifest
+            .capabilities
+            .lookup
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{} does not offer lookup", self.manifest.name))
+    }
+
+    fn references_capability(&self) -> anyhow::Result<&ReferencesCapability> {
+        self.manifest
+            .capabilities
+            .references
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{} does not offer references", self.manifest.name))
+    }
+
+    async fn run_references(&self, doi: &str) -> anyhow::Result<Vec<String>> {
+        let doi = normalize_doi(doi).ok_or_else(|| anyhow::anyhow!("Invalid DOI: {doi}"))?;
+        let references = self.references_capability()?;
+        let evaluator = Evaluator::new(&self.base_url);
+
+        let work = self
+            .request(&substitute(&references.path, &[("doi", &doi)]), &[])
+            .map(|request| (request.url, request.headers))?;
+        let body = self.fetch_raw(work.0, &work.1).await?;
+        let value: Value = serde_json::from_slice(&body)
+            .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
+        let identifiers = match evaluator
+            .eval(&references.ids, &value)
+            .map_err(|error| anyhow::anyhow!("references.ids: {error}"))?
+        {
+            None => return Ok(Vec::new()),
+            Some(Value::Array(items)) => items
+                .into_iter()
+                .map(|item| match item {
+                    Value::String(id) => Ok(id),
+                    other => Err(anyhow::anyhow!(
+                        "references.ids must yield strings; found {other}"
+                    )),
+                })
+                .collect::<anyhow::Result<Vec<String>>>()?,
+            Some(other) => anyhow::bail!("references.ids must yield an array; found {other}"),
+        };
+        if identifiers.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let resolve = &references.resolve;
+        let mut dois = Vec::new();
+        let mut without_doi = 0usize;
+        for chunk in identifiers.chunks(resolve.chunk) {
+            // Each identifier is encoded; the separator is the service's OR
+            // operator and stays literal.
+            let joined = chunk
+                .iter()
+                .map(|id| urlencoding::encode(id).into_owned())
+                .collect::<Vec<_>>()
+                .join(&resolve.join);
+            let path = resolve
+                .path
+                .replace("{ids}", &joined)
+                .replace("{count}", &chunk.len().to_string());
+            let request = self.request(&path, &[]).map(|r| (r.url, r.headers))?;
+            let body = self.fetch_raw(request.0, &request.1).await?;
+            let value: Value = serde_json::from_slice(&body)
+                .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
+            let records = records_in(
+                &evaluator,
+                resolve.items.as_deref(),
+                &value,
+                "references.resolve.items",
+            )?;
+            for record in &records {
+                let found = evaluator
+                    .eval(&resolve.doi, record)
+                    .map_err(|error| anyhow::anyhow!("references.resolve.doi: {error}"))?;
+                match found
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .and_then(normalize_doi)
+                {
+                    Some(doi) => dois.push(doi),
+                    None => without_doi += 1,
+                }
+            }
+        }
+        if without_doi > 0 {
+            // References the provider cannot resolve to a DOI (books, datasets,
+            // works without a registered one) can never join a DOI-keyed
+            // library, so they are not edges. Counted, not silent.
+            tracing::debug!(
+                integration = %self.id,
+                without_doi,
+                "references without a usable DOI left out of the citation graph"
+            );
+        }
+        dois.sort();
+        dois.dedup();
+        Ok(dois)
+    }
+
+    async fn fetch_raw(&self, url: String, headers: &[(&str, String)]) -> anyhow::Result<Vec<u8>> {
+        match self.http.get_bytes(url, headers).await {
+            Ok(body) => Ok(body),
+            Err(error) if error.kind == ProviderHttpErrorKind::RateLimited => {
+                anyhow::bail!("{} rate limit reached", self.manifest.name)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    // ── Download resolution ──────────────────────────────────────────────────
 
     async fn resolve_manifest_download(
         &self,
@@ -590,13 +942,15 @@ impl CustomSource {
                 anyhow::anyhow!("resolver step {} base_url: {error}", index + 1)
             })?;
             let step_base = step_base_url.as_str().trim_end_matches('/');
-            let inherit_global_params = step_base_url.origin() == self.base_url.origin();
+            let inherit_global = step_base_url.origin() == self.base_url.origin();
             let request = self.request_against(
                 step_base,
                 &step_base_url,
-                inherit_global_params,
+                inherit_global,
                 &path,
-                &step.params,
+                &step.headers,
+                &step.query,
+                &[],
             )?;
             let body = self.http.get_bytes(request.url, &request.headers).await?;
             let extracted = self
@@ -647,6 +1001,9 @@ impl CustomSource {
         body: &[u8],
         base_url: &Url,
     ) -> anyhow::Result<HashMap<String, String>> {
+        // `absolute_url` resolves against the step's own base: a relative URL
+        // in a response from another origin means *that* origin.
+        let evaluator = Evaluator::new(base_url);
         let mut out = HashMap::new();
         match step.response_format {
             ResponseFormat::Json => {
@@ -654,7 +1011,7 @@ impl CustomSource {
                     .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
                 for (name, spec) in &step.fields {
                     let projected = self
-                        .select_json(spec, &value, resolver_field_type(spec), base_url)
+                        .select_json(spec, &value, FieldType::Text, &evaluator)
                         .map_err(|error| anyhow::anyhow!("field '{name}': {error}"))?
                         .ok_or_else(|| anyhow::anyhow!("field '{name}' matched nothing"))?;
                     out.insert(name.clone(), projected_string(projected));
@@ -667,7 +1024,7 @@ impl CustomSource {
                 let root = Selection::from(document.root());
                 for (name, spec) in &step.fields {
                     let projected = self
-                        .select_html(spec, &root, resolver_field_type(spec), base_url)
+                        .select_html(spec, &root, FieldType::Text, &evaluator)
                         .map_err(|error| anyhow::anyhow!("field '{name}': {error}"))?
                         .ok_or_else(|| anyhow::anyhow!("field '{name}' matched nothing"))?;
                     out.insert(name.clone(), projected_string(projected));
@@ -677,14 +1034,26 @@ impl CustomSource {
         Ok(out)
     }
 
-    /// Assemble one request: the URL with its declared query parameters, the
-    /// headers, and a copy of the URL with secrets removed for display.
+    // ── Requests ─────────────────────────────────────────────────────────────
+
+    /// Assemble one request against the primary origin: the URL with its
+    /// declared query parameters, the headers, and a copy of the URL with
+    /// secrets removed for display. `extra` are query pairs the caller
+    /// composed (a browse's filters), encoded here.
     fn request<'a>(
         &'a self,
         path: &str,
-        capability_params: &'a [HttpParam],
+        extra: &[(String, String)],
     ) -> anyhow::Result<PreparedRequest<'a>> {
-        self.request_against(&self.base, &self.base_url, true, path, capability_params)
+        self.request_against(
+            &self.base,
+            &self.base_url,
+            true,
+            path,
+            &EMPTY_PARAMS,
+            &EMPTY_PARAMS,
+            extra,
+        )
     }
 
     fn resolver_step_base_url(&self, step: &ResolverStep) -> anyhow::Result<Url> {
@@ -696,15 +1065,41 @@ impl CustomSource {
         .map_err(Into::into)
     }
 
+    /// The value of one declared parameter, and whether it is a secret.
+    /// `None` is an optional secret nobody has set: the parameter is left off
+    /// the request rather than sent empty.
+    fn param_value(&self, value: &ParamValue) -> anyhow::Result<Option<(String, bool)>> {
+        match value {
+            ParamValue::Literal(value) => Ok(Some((value.clone(), false))),
+            ParamValue::Secret(secret) => {
+                match self
+                    .secrets
+                    .get(&secret.secret)
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    Some(value) => Ok(Some((value.trim().to_string(), true))),
+                    None if secret.optional => Ok(None),
+                    None => anyhow::bail!(
+                        "secret '{}' has no value; set it in Integrations",
+                        secret.secret
+                    ),
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn request_against<'a>(
         &'a self,
         base: &str,
         base_url: &Url,
-        inherit_global_params: bool,
+        inherit_global: bool,
         path: &str,
-        capability_params: &'a [HttpParam],
+        step_headers: &'a BTreeMap<String, ParamValue>,
+        step_query: &'a BTreeMap<String, ParamValue>,
+        extra: &[(String, String)],
     ) -> anyhow::Result<PreparedRequest<'a>> {
-        let mut url = Url::parse(&format!("{}{path}", base))?;
+        let mut url = Url::parse(&format!("{base}{path}"))?;
         anyhow::ensure!(
             url.origin() == base_url.origin(),
             "path '{path}' would send the request to {} instead of {}",
@@ -712,53 +1107,67 @@ impl CustomSource {
             base_url.origin().ascii_serialization()
         );
 
-        let mut headers = Vec::new();
-        let mut redacted_pairs: Vec<(String, String)> = Vec::new();
-        let global_params = inherit_global_params
-            .then_some(self.manifest.http.params.as_slice())
-            .unwrap_or_default();
-        for param in global_params.iter().chain(capability_params) {
-            let (value, secret) = match (&param.value, &param.secret) {
-                (Some(value), None) => (value.clone(), false),
-                (None, Some(name)) => (
-                    self.secrets
-                        .get(name)
-                        .filter(|value| !value.trim().is_empty())
-                        .cloned()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("secret '{name}' has no value; set it in Integrations")
-                        })?,
-                    true,
-                ),
-                // Refused when the manifest is validated.
-                _ => anyhow::bail!(
-                    "param '{}' must set exactly one of value or secret",
-                    param.name
-                ),
-            };
-            match param.location {
-                manifest::ParamLocation::Header => headers.push((param.name.as_str(), value)),
-                manifest::ParamLocation::Query => {
-                    url.query_pairs_mut().append_pair(&param.name, &value);
-                    redacted_pairs.push((
-                        param.name.clone(),
-                        if secret { "***".to_string() } else { value },
-                    ));
+        for (name, value) in extra {
+            url.query_pairs_mut().append_pair(name, value);
+        }
+
+        let (global_headers, global_query) = match inherit_global {
+            true => (&self.manifest.http.headers, &self.manifest.http.query),
+            false => (&EMPTY_PARAMS, &EMPTY_PARAMS),
+        };
+
+        // A step's header or parameter of the same name replaces the primary
+        // one rather than being sent beside it.
+        let mut header_params: Vec<(&'a str, &'a ParamValue)> = Vec::new();
+        for (name, value) in global_headers.iter().chain(step_headers) {
+            match header_params
+                .iter_mut()
+                .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
+            {
+                Some(slot) => *slot = (name.as_str(), value),
+                None => header_params.push((name.as_str(), value)),
+            }
+        }
+        let mut headers: Vec<(&'a str, String)> = Vec::new();
+        for (name, value) in header_params {
+            if let Some((value, _)) = self.param_value(value)? {
+                headers.push((name, value));
+            }
+        }
+
+        let mut query_params: Vec<(&'a str, &'a ParamValue)> = Vec::new();
+        for (name, value) in global_query.iter().chain(step_query) {
+            match query_params
+                .iter_mut()
+                .find(|(existing, _)| *existing == name.as_str())
+            {
+                Some(slot) => slot.1 = value,
+                None => query_params.push((name.as_str(), value)),
+            }
+        }
+        let mut secret_names: Vec<&str> = Vec::new();
+        for (name, value) in query_params {
+            if let Some((value, secret)) = self.param_value(value)? {
+                url.query_pairs_mut().append_pair(name, &value);
+                if secret {
+                    secret_names.push(name);
                 }
             }
         }
 
         let mut redacted = url.clone();
-        if !redacted_pairs.is_empty() {
-            let kept: Vec<(String, String)> = url
+        if !secret_names.is_empty() {
+            let pairs: Vec<(String, String)> = url
                 .query_pairs()
-                .filter(|(name, _)| !redacted_pairs.iter().any(|(secret, _)| secret == name))
-                .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                .map(|(name, value)| {
+                    let value = match secret_names.contains(&name.as_ref()) {
+                        true => "***".to_string(),
+                        false => value.into_owned(),
+                    };
+                    (name.into_owned(), value)
+                })
                 .collect();
-            redacted.query_pairs_mut().clear();
-            for (name, value) in kept.into_iter().chain(redacted_pairs) {
-                redacted.query_pairs_mut().append_pair(&name, &value);
-            }
+            redacted.query_pairs_mut().clear().extend_pairs(pairs);
         }
 
         Ok(PreparedRequest {
@@ -767,6 +1176,133 @@ impl CustomSource {
             headers,
         })
     }
+}
+
+static EMPTY_PARAMS: BTreeMap<String, ParamValue> = BTreeMap::new();
+
+/// The records a response holds: the array `expression` selects, or the body
+/// itself when it is the array.
+fn records_in(
+    evaluator: &Evaluator,
+    expression: Option<&str>,
+    body: &Value,
+    label: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let found = match expression {
+        Some(expression) => evaluator
+            .eval(expression, body)
+            .map_err(|error| anyhow::anyhow!("{label}: {error}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("{label} expression '{expression}' matched nothing in the response")
+            })?,
+        None => body.clone(),
+    };
+    match found {
+        Value::Array(items) => Ok(items),
+        other => anyhow::bail!(
+            "{label} must select an array; found {}",
+            describe_kind(&other)
+        ),
+    }
+}
+
+/// The query pairs a browse request adds to its path: filters, sort, keyword.
+///
+/// Everything a caller may vary was declared by the manifest, so everything
+/// else is refused by name — a filter that is not declared, an option that is
+/// not one of the declared ones, a bound the filter does not offer.
+fn browse_parameters(
+    browse: &BrowseCapability,
+    request: &BrowseRequest,
+    query: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut extra = Vec::new();
+    let mut consumed: Vec<String> = Vec::new();
+
+    let mut clauses = Vec::new();
+    for (name, spec) in &browse.filters {
+        match spec {
+            FilterSpec::Choice {
+                clause, options, ..
+            } => {
+                consumed.push(name.clone());
+                if let Some(value) = request.filters.get(name).filter(|v| !v.is_empty()) {
+                    if !options.iter().any(|(option, _)| option == value) {
+                        return Err(format!("'{value}' is not an option of filter '{name}'"));
+                    }
+                    clauses.push(clause.replace("{value}", value));
+                }
+            }
+            FilterSpec::Flag { clause, .. } => {
+                consumed.push(name.clone());
+                match request.filters.get(name).map(String::as_str) {
+                    None | Some("") | Some("false") => {}
+                    Some("true") => clauses.push(clause.clone()),
+                    Some(other) => {
+                        return Err(format!("filter '{name}' is true or false; got '{other}'"))
+                    }
+                }
+            }
+            FilterSpec::Range {
+                min_clause,
+                max_clause,
+                ..
+            } => {
+                for (suffix, clause) in [("min", min_clause), ("max", max_clause)] {
+                    let key = format!("{name}.{suffix}");
+                    consumed.push(key.clone());
+                    let Some(value) = request.filters.get(&key).filter(|v| !v.is_empty()) else {
+                        continue;
+                    };
+                    let Some(clause) = clause else {
+                        return Err(format!("filter '{name}' has no {suffix} bound"));
+                    };
+                    let number: i64 = value.trim().parse().map_err(|_| {
+                        format!("filter '{key}' must be a whole number; got '{value}'")
+                    })?;
+                    clauses.push(clause.replace("{value}", &number.to_string()));
+                }
+            }
+        }
+    }
+    if let Some(unknown) = request.filters.keys().find(|key| !consumed.contains(key)) {
+        return Err(format!("'{unknown}' is not a filter this provider offers"));
+    }
+    if !clauses.is_empty() {
+        let param = browse
+            .filter_param
+            .as_deref()
+            .ok_or_else(|| "no filter_param declared".to_string())?;
+        extra.push((param.to_string(), clauses.join(&browse.filter_separator)));
+    }
+
+    match (
+        &browse.sort,
+        request.sort.as_deref().filter(|s| !s.is_empty()),
+    ) {
+        (Some(sort), chosen) => {
+            let fallback = match (query, &sort.keyword_default) {
+                (Some(_), Some(keyword_default)) => keyword_default,
+                _ => &sort.default,
+            };
+            let chosen = chosen.unwrap_or(fallback);
+            if !sort.options.iter().any(|(value, _)| value == chosen) {
+                return Err(format!("'{chosen}' is not a sort option"));
+            }
+            extra.push((sort.param.clone(), chosen.to_string()));
+        }
+        (None, Some(_)) => return Err("this provider does not offer a sort".to_string()),
+        (None, None) => {}
+    }
+
+    if let Some(query) = query {
+        let param = browse
+            .query_param
+            .as_deref()
+            .ok_or_else(|| "this provider's listing takes no keyword".to_string())?;
+        extra.push((param.to_string(), query.to_string()));
+    }
+    Ok(extra)
 }
 
 fn note_missing_id(index: usize, issues: &mut Vec<ProjectionIssue>) {
@@ -797,22 +1333,12 @@ fn capture_value(pattern: &str, group: usize, raw: &Value) -> Result<Value, Stri
     Ok(Value::String(captured))
 }
 
-fn resolver_field_type(spec: &FieldSpec) -> manifest::FieldType {
-    match spec.coercion() {
-        Some(coerce::Coercion::Int | coerce::Coercion::YearFromDate) => {
-            manifest::FieldType::Integer
-        }
-        Some(coerce::Coercion::Bool) => manifest::FieldType::Boolean,
-        Some(coerce::Coercion::AbsoluteUrl) => manifest::FieldType::Url,
-        _ => manifest::FieldType::Text,
-    }
-}
-
 fn projected_string(value: Projected) -> String {
     match value {
         Projected::Text(value) => value,
         Projected::Integer(value) => value.to_string(),
         Projected::Boolean(value) => value.to_string(),
+        Projected::Object(value) => Value::Object(value).to_string(),
     }
 }
 
@@ -921,6 +1447,40 @@ struct Projection {
     issues: Vec<ProjectionIssue>,
 }
 
+/// The projected values of one record, by field name, taken out as they are
+/// used.
+struct Fields(HashMap<String, Projected>);
+
+impl Fields {
+    fn text(&mut self, field: &str) -> Option<String> {
+        match self.0.remove(field) {
+            Some(Projected::Text(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn int(&mut self, field: &str) -> Option<i64> {
+        match self.0.remove(field) {
+            Some(Projected::Integer(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn boolean(&mut self, field: &str) -> Option<bool> {
+        match self.0.remove(field) {
+            Some(Projected::Boolean(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn object(&mut self, field: &str) -> Option<serde_json::Map<String, Value>> {
+        match self.0.remove(field) {
+            Some(Projected::Object(value)) => Some(value),
+            _ => None,
+        }
+    }
+}
+
 /// One field of one record that could not be mapped.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectionIssue {
@@ -973,60 +1533,44 @@ impl LiteratureSource for CustomSource {
         &self.display_name
     }
 
+    fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        let capabilities = &self.manifest.capabilities;
+        ProviderCapabilities {
+            browse: capabilities.browse.as_ref().map(BrowseCapability::controls),
+            lookup: capabilities.lookup.is_some(),
+            references: capabilities.references.is_some(),
+            resolve_download: capabilities.resolve_download.is_some(),
+        }
+    }
+
     async fn search(
         &self,
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<LiteratureSearchResult>> {
-        let query = query.trim();
-        anyhow::ensure!(
-            !query.is_empty(),
-            "{} search query cannot be empty",
-            self.manifest.name
-        );
-        let search = self
-            .manifest
-            .capabilities
-            .search
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("{} cannot search", self.manifest.name))?;
-        let limit = limit.clamp(1, 100);
+        self.run_search(query, limit).await
+    }
 
-        let request = self.request(
-            &substitute(
-                &search.path,
-                &[("query", query), ("limit", &limit.to_string())],
-            ),
-            &[],
-        )?;
-        let body = match self.http.get_bytes(request.url, &request.headers).await {
-            Ok(body) => body,
-            Err(error) if error.kind == ProviderHttpErrorKind::RateLimited => {
-                anyhow::bail!("{} rate limit reached", self.manifest.name)
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let projection = self.project_response(search, &body, query, limit)?;
-        // A selector that stopped matching is the service having changed shape
-        // under a manifest that was probed against the old one. It is not
-        // fatal — the other fields are still right — but it is never silent.
-        if !projection.issues.is_empty() {
-            let mut fields: Vec<&str> = projection
-                .issues
-                .iter()
-                .map(|issue| issue.field.as_str())
-                .collect();
-            fields.sort_unstable();
-            fields.dedup();
-            tracing::warn!(
-                integration = %self.id,
-                records = projection.records_seen,
-                unmapped = projection.issues.len(),
-                "custom integration could not map fields: {}",
-                fields.join(", ")
-            );
-        }
-        Ok(projection.results)
+    async fn browse(&self, request: &BrowseRequest) -> anyhow::Result<Vec<LiteratureSearchResult>> {
+        self.run_browse(request).await
+    }
+
+    async fn lookup(&self, doi: &str) -> anyhow::Result<ProviderWork> {
+        self.run_lookup(doi).await
+    }
+
+    /// The DOIs the work identified by `doi` references. **DOI in, DOIs out**:
+    /// callers identify a work by its DOI and receive normalized DOIs, so no
+    /// provider-specific identifier ever crosses this boundary and the
+    /// citation-graph storage stays decoupled from whichever provider supplies
+    /// the edges. References the provider cannot resolve to a DOI are omitted:
+    /// they can never participate in a DOI-keyed library join.
+    async fn references(&self, doi: &str) -> anyhow::Result<Vec<String>> {
+        self.run_references(doi).await
     }
 
     async fn resolve_download(
@@ -1037,57 +1581,44 @@ impl LiteratureSource for CustomSource {
     }
 
     async fn status(&self, enabled: bool) -> anyhow::Result<IntegrationStatus> {
-        if !enabled {
-            return Ok(IntegrationStatus {
-                id: self.id.clone(),
-                enabled,
-                state: IntegrationState::Disabled,
-                message: format!("{} integration is disabled.", self.manifest.name),
-                version: None,
-            });
-        }
+        let status_of = |state: IntegrationState, message: String| IntegrationStatus {
+            id: self.id.clone(),
+            enabled,
+            state,
+            message,
+            version: None,
+        };
 
         let Some(health) = &self.manifest.capabilities.health else {
-            return Ok(IntegrationStatus {
-                id: self.id.clone(),
-                enabled,
-                state: IntegrationState::Ready,
-                message: format!(
+            return Ok(status_of(
+                IntegrationState::Ready,
+                format!(
                     "{} declares no health check, so it is used without probing.",
                     self.manifest.name
                 ),
-                version: None,
-            });
+            ));
         };
 
+        // Probed whether or not the integration is enabled: the settings form
+        // asks this *before* enabling, so a short-circuit on `enabled` would
+        // answer "disabled" and the integration could never be switched on.
         let request = self.request(&health.path, &[])?;
         match self.http.get_status(request.url, &request.headers).await {
-            Ok(_) => Ok(IntegrationStatus {
-                id: self.id.clone(),
-                enabled,
-                state: IntegrationState::Ready,
-                message: format!("{} is reachable.", self.manifest.name),
-                version: None,
-            }),
-            Err(error) if error.kind == ProviderHttpErrorKind::RateLimited => {
-                Ok(IntegrationStatus {
-                    id: self.id.clone(),
-                    enabled,
-                    state: IntegrationState::RateLimited,
-                    message: format!(
-                        "{} is reachable, but the rate limit is currently reached.",
-                        self.manifest.name
-                    ),
-                    version: None,
-                })
-            }
-            Err(error) => Ok(IntegrationStatus {
-                id: self.id.clone(),
-                enabled,
-                state: IntegrationState::RemoteApiDown,
-                message: self.redact_error(error.to_string()),
-                version: None,
-            }),
+            Ok(_) => Ok(status_of(
+                IntegrationState::Ready,
+                format!("{} is reachable.", self.manifest.name),
+            )),
+            Err(error) if error.kind == ProviderHttpErrorKind::RateLimited => Ok(status_of(
+                IntegrationState::RateLimited,
+                format!(
+                    "{} is reachable, but the rate limit is currently reached.",
+                    self.manifest.name
+                ),
+            )),
+            Err(error) => Ok(status_of(
+                IntegrationState::RemoteApiDown,
+                self.redact_error(error.to_string()),
+            )),
         }
     }
 }
@@ -1104,7 +1635,7 @@ fn substitute(template: &str, values: &[(&str, &str)]) -> String {
     for (name, value) in values {
         out = out.replace(
             &format!("{{{name}}}"),
-            &urlencoding::encode(value).into_owned(),
+            &urlencoding::encode(value),
         );
     }
     out
@@ -1121,107 +1652,45 @@ fn describe_kind(value: &Value) -> &'static str {
     }
 }
 
-/// The result-field names are a compile-time list, so a name that matched one
-/// can be re-borrowed as `'static` for the projection maps.
-fn field_as_static(field: &str) -> &'static str {
-    manifest::SEARCH_FIELDS
-        .iter()
-        .find(|(name, _)| *name == field)
-        .map(|(name, _)| *name)
-        .unwrap_or("")
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::openalex::OpenAlexClient;
-    use crate::integrations::semantic_scholar::SemanticScholarClient;
+    use crate::integrations::builtin;
+    use mockito::Matcher;
 
-    /// Renaming is a label on this installation's copy, so it must not need
-    /// the manifest touched — the manifest describes the service, and editing
-    /// it to change a row's name would mean re-reading and re-probing it.
-    #[test]
-    fn a_config_name_overrides_the_manifests_own() {
-        let config = CustomIntegrationConfig {
-            id: "openalex-as-manifest".into(),
-            name: Some("My OpenAlex".into()),
-            enabled: false,
-            manifest: OPENALEX_MANIFEST.replace("BASE_URL", "https://example.test"),
-            secrets: HashMap::new(),
-        };
-        let source = CustomSource::from_config(&config).expect("loads");
-        assert_eq!(source.name(), "My OpenAlex");
-        // The id is the manifest's and is untouched by a rename: it is what
-        // every stored selection and every log line names.
-        assert_eq!(source.id(), "custom:openalex-as-manifest");
-    }
+    // ── Fixtures ─────────────────────────────────────────────────────────────
 
-    /// A cleared rename box is no override, not a nameless provider.
-    #[test]
-    fn a_blank_config_name_leaves_the_manifests_own() {
-        for name in [None, Some(String::new()), Some("   ".into())] {
-            let config = CustomIntegrationConfig {
-                id: "openalex-as-manifest".into(),
-                name,
-                enabled: false,
-                manifest: OPENALEX_MANIFEST.replace("BASE_URL", "https://example.test"),
-                secrets: HashMap::new(),
-            };
-            let source = CustomSource::from_config(&config).expect("loads");
-            assert_eq!(source.name(), "OpenAlex (manifest)");
-        }
-    }
+    /// The bodies the two native clients' own tests used, so the shipped
+    /// manifests are being asked about the same bytes the Rust clients were.
+    const OPENALEX_BODY: &str = r#"{"results":[{"id":"https://openalex.org/W1","display_name":"T","ids":{"doi":"https://doi.org/10.1/example"},"open_access":{"is_oa":true,"oa_status":"gold","oa_url":"https://example.test/article"},"best_oa_location":{"is_oa":true,"pdf_url":"https://example.test/paper.pdf","landing_page_url":"https://example.test/article","license":"cc-by"}}]}"#;
+    const SEMANTIC_SCHOLAR_BODY: &str = r#"{"data":[{"paperId":"p1","externalIds":{"DOI":"10.1/example"},"title":"T","citationCount":3,"isOpenAccess":true,"openAccessPdf":{"url":"https://example.test/paper.pdf","status":"GOLD","license":"CCBY"}}]}"#;
 
-    /// OpenAlex's search projection, said instead of written.
-    ///
-    /// Every field maps except one: `is_open_access` is `open_access.is_oa ||
-    /// best_oa_location.is_oa` in the Rust client, and `first_of` is *first
-    /// present*, not *or*. See `divergence_on_a_disjunction` — the projection
-    /// deliberately has no boolean combinator, and this is the one place the
-    /// built-in needs one.
-    const OPENALEX_MANIFEST: &str = r#"
-manifest_version = 1
-id = "openalex-as-manifest"
-name = "OpenAlex (manifest)"
+    /// A JSON service that needs a credential, shaped like Semantic Scholar's
+    /// search. The probe and error tests use it because a *required* secret is
+    /// what they are about; the shipped providers' are optional.
+    const KEYED_MANIFEST: &str = r#"
+manifest_version = 2
+id = "keyed"
+name = "Keyed"
 
 [http]
 base_url = "BASE_URL"
 
-[capabilities.search]
-path = "/works?search={query}&per-page={limit}&select=id,doi,display_name,publication_year,publication_date,cited_by_count,ids,primary_location,best_oa_location,open_access"
-items = "results[*]"
-
-[capabilities.search.fields]
-id = "id"
-title = "display_name"
-doi = { path = "ids.doi", coerce = "normalize_doi" }
-year = "publication_year"
-publication_date = "publication_date"
-venue = "primary_location.source.display_name"
-citation_count = "cited_by_count"
-is_open_access = { first_of = ["open_access.is_oa", "best_oa_location.is_oa"] }
-pdf_url = "best_oa_location.pdf_url"
-landing_page_url = { first_of = ["best_oa_location.landing_page_url", "open_access.oa_url"] }
-open_access_status = "open_access.oa_status"
-license = "best_oa_location.license"
-"#;
-
-    const SEMANTIC_SCHOLAR_MANIFEST: &str = r#"
-manifest_version = 1
-id = "s2-as-manifest"
-name = "Semantic Scholar (manifest)"
-
-[http]
-base_url = "BASE_URL"
-
-[[http.params]]
-location = "header"
-name = "x-api-key"
-secret = "api_key"
+[http.headers]
+x-api-key = { secret = "api_key" }
 
 [capabilities.search]
-path = "/graph/v1/paper/search?query={query}&limit={limit}&fields=title,citationCount,externalIds,year,venue,publicationDate,isOpenAccess,openAccessPdf"
-items = "data[*]"
+path = "/graph/v1/paper/search?query={query}&limit={limit}&fields=title,citationCount"
+items = "data"
 
 [capabilities.search.fields]
 id = "paperId"
@@ -1237,23 +1706,16 @@ open_access_status = "openAccessPdf.status"
 license = "openAccessPdf.license"
 "#;
 
-    /// The fixture bodies are the ones the built-in clients' own tests use, so
-    /// the two implementations are being asked about identical bytes.
-    const OPENALEX_BODY: &str = r#"{"results":[{"id":"https://openalex.org/W1","display_name":"T","ids":{"doi":"https://doi.org/10.1/example"},"open_access":{"is_oa":true,"oa_status":"gold","oa_url":"https://example.test/article"},"best_oa_location":{"is_oa":true,"pdf_url":"https://example.test/paper.pdf","landing_page_url":"https://example.test/article","license":"cc-by"}}]}"#;
-    const SEMANTIC_SCHOLAR_BODY: &str = r#"{"data":[{"paperId":"p1","externalIds":{"DOI":"10.1/example"},"title":"T","citationCount":3,"isOpenAccess":true,"openAccessPdf":{"url":"https://example.test/paper.pdf","status":"GOLD","license":"CCBY"}}]}"#;
-
     const ANNA_MANIFEST: &str = r#"
-manifest_version = 1
+manifest_version = 2
 id = "anna"
 name = "Anna"
 
 [http]
 base_url = "BASE_URL"
 
-[[http.params]]
-location = "header"
-name = "User-Agent"
-value = "Mozilla/5.0 Wilkes"
+[http.headers]
+User-Agent = "Mozilla/5.0 Wilkes"
 
 [capabilities.search]
 path = "/search?q={query}&content=journal"
@@ -1263,13 +1725,13 @@ items = '''div:has(> a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:o
 [capabilities.search.fields]
 id = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", capture = '''^/md5/([0-9a-f]+)$''' }
 title = '''div.max-w-full a[href^="/md5/"]'''
-authors = { path = '''div.max-w-full a[href^="/search"]:has(span[class="icon-[mdi--user-edit]"])''', coerce = "join" }
+authors = { path = '''div.max-w-full a[href^="/search"]:has(span[class="icon-[mdi--user-edit]"])''', all = true, then = "join(', ', @)" }
 publisher = '''div.max-w-full a[href^="/search"]:has(span[class="icon-[mdi--company]"])'''
 venue = '''div.max-w-full a[href^="/search"]:has(span[class="icon-[mdi--company]"])'''
 language = { path = "div.text-gray-800", capture = '''^\s*✅?\s*([^\[]+?)\s*\[''' }
 file_format = { path = "div.text-gray-800", capture = '''(?i)\b(EPUB|PDF|MOBI|AZW3|AZW|DJVU|CBZ|CBR|FB2|DOCX?|TXT)\b''' }
 file_size = { path = "div.text-gray-800", capture = '''(?i)(\d+(?:\.\d+)?\s*(?:MB|KB|GB|TB))''' }
-landing_page_url = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", coerce = "absolute_url" }
+landing_page_url = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", then = "absolute_url(@)" }
 
 [capabilities.resolve_download]
 url = "{download_url}"
@@ -1279,10 +1741,8 @@ filename = "{title}.{file_format}"
 path = "/dyn/api/fast_download.json?md5={id}"
 response_format = "json"
 
-[[capabilities.resolve_download.steps.params]]
-location = "query"
-name = "key"
-secret = "anna_key"
+[capabilities.resolve_download.steps.query]
+key = { secret = "anna_key" }
 
 [capabilities.resolve_download.steps.fields]
 download_url = "download_url"
@@ -1302,7 +1762,7 @@ download_url = "download_url"
 </body></html>"#;
 
     const ANNA_DOI_MANIFEST: &str = r#"
-manifest_version = 1
+manifest_version = 2
 id = "anna-doi"
 name = "Anna DOI"
 
@@ -1316,7 +1776,7 @@ items = '''div:has(> a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:o
 
 [capabilities.search.fields]
 id = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", capture = '''^/md5/([0-9a-f]+)$''' }
-doi = { input = "query", coerce = "normalize_doi" }
+doi = { input = "query", then = "normalize_doi(@)" }
 title = '''div.max-w-full a[href^="/md5/"]'''
 
 [capabilities.resolve_download]
@@ -1326,80 +1786,885 @@ filename = "{title}"
 
     fn source(manifest: &str, base_url: &str, secrets: &[(&str, &str)]) -> CustomSource {
         let manifest = Manifest::parse(&manifest.replace("BASE_URL", base_url)).unwrap();
-        CustomSource::new(
-            manifest,
-            secrets
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        )
-        .unwrap()
+        CustomSource::new(manifest, secret_map(secrets)).unwrap()
     }
 
-    /// The proof the design asked for: if a manifest cannot reproduce what the
-    /// Rust client makes of the same bytes, the projection vocabulary is
-    /// wrong, and it is cheaper to learn that here than after a UI exists.
+    fn secret_map(secrets: &[(&str, &str)]) -> HashMap<String, String> {
+        secrets
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// A shipped provider, pointed at a mock server in place of its own origin.
+    fn shipped(id: &str, base_url: &str, secrets: &[(&str, &str)]) -> CustomSource {
+        let mut manifest = builtin::manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == id)
+            .unwrap_or_else(|| panic!("no shipped manifest '{id}'"));
+        manifest.http.base_url = base_url.to_string();
+        CustomSource::build(manifest, secret_map(secrets), None, Standing::BuiltIn).unwrap()
+    }
+
+    // ── Identity ─────────────────────────────────────────────────────────────
+
+    /// Renaming is a label on this installation's copy, so it must not need
+    /// the manifest touched — the manifest describes the service, and editing
+    /// it to change a row's name would mean re-reading and re-probing it.
+    #[test]
+    fn a_config_name_overrides_the_manifests_own() {
+        let config = CustomIntegrationConfig {
+            id: "keyed".into(),
+            name: Some("My Keyed".into()),
+            enabled: false,
+            manifest: KEYED_MANIFEST.replace("BASE_URL", "https://example.test"),
+            secrets: HashMap::new(),
+        };
+        let source = CustomSource::from_config(&config).expect("loads");
+        assert_eq!(source.name(), "My Keyed");
+        // The id is the manifest's and is untouched by a rename: it is what
+        // every stored selection and every log line names.
+        assert_eq!(source.id(), "custom:keyed");
+    }
+
+    /// A cleared rename box is no override, not a nameless provider.
+    #[test]
+    fn a_blank_config_name_leaves_the_manifests_own() {
+        for name in [None, Some(String::new()), Some("   ".into())] {
+            let config = CustomIntegrationConfig {
+                id: "keyed".into(),
+                name,
+                enabled: false,
+                manifest: KEYED_MANIFEST.replace("BASE_URL", "https://example.test"),
+                secrets: HashMap::new(),
+            };
+            let source = CustomSource::from_config(&config).expect("loads");
+            assert_eq!(source.name(), "Keyed");
+        }
+    }
+
+    #[test]
+    fn a_built_in_is_not_namespaced_and_a_custom_provider_is() {
+        assert_eq!(
+            shipped("openalex", "https://example.test", &[]).id(),
+            "openalex"
+        );
+        assert_eq!(
+            source(KEYED_MANIFEST, "https://example.test", &[]).id(),
+            "custom:keyed"
+        );
+    }
+
+    // ── The shipped providers: search ────────────────────────────────────────
+
+    /// What the native OpenAlex client made of its own fixture, said as the
+    /// record it produced. The shipped manifest must produce the same one.
+    fn expected_openalex_record() -> LiteratureSearchResult {
+        LiteratureSearchResult {
+            id: "https://openalex.org/W1".into(),
+            doi: Some("10.1/example".into()),
+            title: Some("T".into()),
+            year: None,
+            publication_date: None,
+            venue: None,
+            citation_count: 0,
+            is_open_access: true,
+            pdf_url: Some("https://example.test/paper.pdf".into()),
+            landing_page_url: Some("https://example.test/article".into()),
+            open_access_status: Some("gold".into()),
+            license: Some("cc-by".into()),
+            authors: None,
+            publisher: None,
+            language: None,
+            file_format: None,
+            file_size: None,
+            acquisition: LiteratureAcquisition::Direct,
+        }
+    }
+
     #[tokio::test]
-    async fn manifest_reproduces_the_openalex_client_on_its_own_fixture() {
+    async fn the_openalex_manifest_sends_query_limit_and_mailto_and_reads_the_record() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/works")
-            .match_query(mockito::Matcher::Any)
-            .expect(2)
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("search".into(), "graph neural networks".into()),
+                Matcher::UrlEncoded("per-page".into(), "2".into()),
+                Matcher::UrlEncoded("mailto".into(), "team@example.com".into()),
+                Matcher::Regex("select=id".into()),
+            ]))
             .with_status(200)
             .with_body(OPENALEX_BODY)
             .create_async()
             .await;
 
-        let built_in = OpenAlexClient::new(server.url(), None)
-            .search("graph neural networks", 2)
-            .await
-            .unwrap();
-        let projected = source(OPENALEX_MANIFEST, &server.url(), &[])
-            .search("graph neural networks", 2)
-            .await
-            .unwrap();
+        let results = shipped(
+            "openalex",
+            &server.url(),
+            &[("email", " team@example.com ")],
+        )
+        .search(" graph neural networks ", 2)
+        .await
+        .unwrap();
 
-        assert_eq!(projected, built_in);
+        assert_eq!(results, vec![expected_openalex_record()]);
         mock.assert_async().await;
     }
 
     #[tokio::test]
-    async fn manifest_reproduces_the_semantic_scholar_client_on_its_own_fixture() {
+    async fn an_unset_optional_secret_is_left_off_the_request() {
+        let mut server = mockito::Server::new_async().await;
+        // Mocks match in creation order, so a request that carries `mailto`
+        // lands here and fails the `expect(0)`.
+        let with_mailto = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Regex("mailto".into()))
+            .expect(0)
+            .create_async()
+            .await;
+        let without = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(OPENALEX_BODY)
+            .expect(2)
+            .create_async()
+            .await;
+
+        // No `email` secret at all, and a blank one: both mean "not set".
+        for secrets in [vec![], vec![("email", "   ")]] {
+            let results = shipped("openalex", &server.url(), &secrets)
+                .search("graph", 1)
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+        }
+        with_mailto.assert_async().await;
+        without.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn the_semantic_scholar_manifest_sends_its_key_and_reads_the_record() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/graph/v1/paper/search")
-            .match_query(mockito::Matcher::Any)
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("query".into(), "graph neural networks".into()),
+                Matcher::UrlEncoded("limit".into(), "2".into()),
+                Matcher::Regex("fields=title".into()),
+            ]))
             .match_header("x-api-key", "secret")
-            .expect(2)
             .with_status(200)
             .with_body(SEMANTIC_SCHOLAR_BODY)
             .create_async()
             .await;
 
-        let built_in = SemanticScholarClient::new(server.url(), Some("secret".into()))
-            .search("graph neural networks", 2)
-            .await
-            .unwrap();
-        let projected = source(
-            SEMANTIC_SCHOLAR_MANIFEST,
+        let results = shipped(
+            "semantic_scholar",
             &server.url(),
-            &[("api_key", "secret")],
+            &[("api_key", " secret ")],
         )
-        .search("graph neural networks", 2)
+        .search(" graph neural networks ", 2)
         .await
         .unwrap();
 
-        assert_eq!(projected, built_in);
+        assert_eq!(results.len(), 1);
+        let paper = &results[0];
+        assert_eq!(paper.id, "p1");
+        assert_eq!(paper.doi.as_deref(), Some("10.1/example"));
+        assert_eq!(paper.citation_count, 3);
+        assert!(paper.is_open_access);
+        assert_eq!(
+            paper.pdf_url.as_deref(),
+            Some("https://example.test/paper.pdf")
+        );
+        assert_eq!(paper.open_access_status.as_deref(), Some("GOLD"));
+        assert_eq!(paper.license.as_deref(), Some("CCBY"));
+        assert_eq!(paper.acquisition, LiteratureAcquisition::Direct);
         mock.assert_async().await;
     }
+
+    #[tokio::test]
+    async fn semantic_scholar_works_without_a_key_and_sends_no_header() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/graph/v1/paper/search")
+            .match_query(Matcher::Any)
+            .match_header("x-api-key", Matcher::Missing)
+            .with_status(200)
+            .with_body(SEMANTIC_SCHOLAR_BODY)
+            .create_async()
+            .await;
+        let results = shipped("semantic_scholar", &server.url(), &[])
+            .search("graph", 1)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        mock.assert_async().await;
+    }
+
+    /// The one case the dotted-path selector could not say: `first_of` is
+    /// *first present*, not *or*, and OpenAlex's `is_open_access` is an `or`
+    /// over two fields that are both always present. It used to be the pinned
+    /// divergence between the manifest and the Rust client; the Rust client is
+    /// gone and the manifest says it.
+    #[tokio::test]
+    async fn openalex_open_access_is_a_disjunction_of_the_work_and_its_best_location() {
+        let body = r#"{"results":[{"id":"W1","display_name":"T","ids":{},"open_access":{"is_oa":false},"best_oa_location":{"is_oa":true,"pdf_url":"https://example.test/p.pdf"}}]}"#;
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+        let results = shipped("openalex", &server.url(), &[])
+            .search("q", 1)
+            .await
+            .unwrap();
+        assert!(results[0].is_open_access, "false || true is true");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn openalex_reads_authors_and_publisher_and_treats_no_authors_as_none() {
+        let body = r#"{"results":[
+            {"id":"W1","display_name":"A","ids":{},"authorships":[{"author":{"display_name":"Ada Lovelace"}},{"author":{"display_name":"Grace Hopper"}}],"primary_location":{"source":{"display_name":"J","host_organization_name":"Pub"}}},
+            {"id":"W2","display_name":"B","ids":{},"authorships":[]}
+        ]}"#;
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+        let results = shipped("openalex", &server.url(), &[])
+            .search("q", 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            results[0].authors.as_deref(),
+            Some("Ada Lovelace, Grace Hopper")
+        );
+        assert_eq!(results[0].publisher.as_deref(), Some("Pub"));
+        assert_eq!(results[1].authors, None, "an empty list is no authors");
+        mock.assert_async().await;
+    }
+
+    // ── Status ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn status_probes_whether_or_not_the_integration_is_enabled() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/graph/v1/paper/DOI:10.1145%2F3801158")
+            .match_query(Matcher::UrlEncoded("fields".into(), "paperId".into()))
+            .with_status(200)
+            .with_body(r#"{"paperId":"p1"}"#)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let source = shipped("semantic_scholar", &server.url(), &[]);
+        let disabled = source.status(false).await.unwrap();
+        assert_eq!(disabled.state, IntegrationState::Ready);
+        assert!(!disabled.enabled);
+        let enabled = source.status(true).await.unwrap();
+        assert_eq!(enabled.state, IntegrationState::Ready);
+        assert!(enabled.enabled);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn status_reports_a_down_service() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Any)
+            .with_status(400)
+            .create_async()
+            .await;
+        let status = shipped("openalex", &server.url(), &[])
+            .status(true)
+            .await
+            .unwrap();
+        assert_eq!(status.state, IntegrationState::RemoteApiDown);
+        mock.assert_async().await;
+    }
+
+    // ── Lookup ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn semantic_scholar_lookup_normalizes_the_doi_and_sends_the_key() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/graph/v1/paper/DOI:10.1145%2F3801158")
+            .match_query(Matcher::Regex("fields=title".into()))
+            .match_header("x-api-key", "secret")
+            .with_status(200)
+            .with_body(
+                r#"{"paperId":"p1","externalIds":{"DOI":"10.1145/3801158","CorpusId":7},"title":"T","year":2026,"citationCount":3}"#,
+            )
+            .create_async()
+            .await;
+
+        let work = shipped("semantic_scholar", &server.url(), &[("api_key", "secret")])
+            .lookup("https://doi.org/10.1145/3801158")
+            .await
+            .unwrap();
+
+        assert_eq!(work.doi, "10.1145/3801158");
+        assert_eq!(work.work_id, "p1");
+        assert_eq!(work.title.as_deref(), Some("T"));
+        assert_eq!(work.year, Some(2026));
+        assert_eq!(work.citation_count, 3);
+        assert_eq!(work.external_ids["CorpusId"], serde_json::json!(7));
+        assert!(work.cached_at_ms > 0);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_lookup_is_retried_once() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock("GET", "/graph/v1/paper/DOI:10.1145%2F3801158")
+            .match_query(Matcher::Any)
+            .with_status(429)
+            .with_header("Retry-After", "0")
+            .expect(1)
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/graph/v1/paper/DOI:10.1145%2F3801158")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"{"paperId":"p1","externalIds":{"DOI":"10.1145/3801158"},"citationCount":9}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let work = shipped("semantic_scholar", &server.url(), &[])
+            .lookup("10.1145/3801158")
+            .await
+            .unwrap();
+
+        assert_eq!(work.citation_count, 9);
+        first.assert_async().await;
+        second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_missing_paper_is_no_record_not_a_failure_to_read() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/graph/v1/paper/DOI:10.1145%2F3801158")
+            .match_query(Matcher::Any)
+            .with_status(404)
+            .create_async()
+            .await;
+        let error = shipped("semantic_scholar", &server.url(), &[])
+            .lookup("10.1145/3801158")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("no record for DOI 10.1145/3801158"),
+            "{error}"
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn an_invalid_doi_is_refused_before_any_request() {
+        let error = shipped("openalex", "http://127.0.0.1:1", &[])
+            .lookup("not-a-doi")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Invalid DOI"), "{error}");
+    }
+
+    const OPENALEX_RECORD: &str = r#"{"results":[{"id":"https://openalex.org/W3145166639","doi":"https://doi.org/10.1109/msr52588.2021.00074","display_name":"Sampling Projects in GitHub","publication_year":2021,"publication_date":"2021-05-01","cited_by_count":12,"ids":{"openalex":"https://openalex.org/W3145166639","doi":"https://doi.org/10.1109/msr52588.2021.00074"},"primary_location":{"source":{"display_name":"MSR"}}}]}"#;
+
+    /// The DOI index first; when it holds nothing, the landing-page index,
+    /// which knows works the first does not. This is the bounded alternative
+    /// the lookup capability exists to say.
+    #[tokio::test]
+    async fn lookup_moves_to_the_next_request_only_when_a_response_holds_no_record() {
+        let mut server = mockito::Server::new_async().await;
+        let by_doi = server
+            .mock("GET", "/works")
+            .match_query(Matcher::UrlEncoded(
+                "filter".into(),
+                "doi:https://doi.org/10.1109/msr52588.2021.00074".into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"results":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let by_landing_page = server
+            .mock("GET", "/works")
+            .match_query(Matcher::UrlEncoded(
+                "filter".into(),
+                "locations.landing_page_url:https://doi.org/10.1109/msr52588.2021.00074".into(),
+            ))
+            .with_status(200)
+            .with_body(OPENALEX_RECORD)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let work = shipped("openalex", &server.url(), &[])
+            .lookup("https://doi.org/10.1109/MSR52588.2021.00074")
+            .await
+            .unwrap();
+
+        assert_eq!(work.doi, "10.1109/msr52588.2021.00074");
+        assert_eq!(work.work_id, "https://openalex.org/W3145166639");
+        assert_eq!(work.title.as_deref(), Some("Sampling Projects in GitHub"));
+        assert_eq!(work.year, Some(2021));
+        assert_eq!(work.venue.as_deref(), Some("MSR"));
+        assert_eq!(work.citation_count, 12);
+        assert_eq!(
+            work.external_ids["openalex"],
+            serde_json::json!("https://openalex.org/W3145166639")
+        );
+        by_doi.assert_async().await;
+        by_landing_page.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn lookup_that_finds_a_record_first_does_not_ask_again() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Regex("filter=doi".into()))
+            .with_status(200)
+            .with_body(OPENALEX_RECORD)
+            .expect(1)
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Regex("landing_page_url".into()))
+            .expect(0)
+            .create_async()
+            .await;
+        shipped("openalex", &server.url(), &[])
+            .lookup("10.1109/msr52588.2021.00074")
+            .await
+            .unwrap();
+        first.assert_async().await;
+        second.assert_async().await;
+    }
+
+    /// Only "no record here" moves on. A request that *failed* says nothing
+    /// about whether the next would find one, and asking anyway would paper
+    /// over the failure.
+    #[tokio::test]
+    async fn lookup_stops_at_a_failure_instead_of_trying_the_next_request() {
+        let mut server = mockito::Server::new_async().await;
+        let failing = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Regex("filter=doi".into()))
+            .with_status(400)
+            .expect(1)
+            .create_async()
+            .await;
+        let never = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Regex("landing_page_url".into()))
+            .expect(0)
+            .create_async()
+            .await;
+        let error = shipped("openalex", &server.url(), &[])
+            .lookup("10.1109/msr52588.2021.00074")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("400"), "{error}");
+        failing.assert_async().await;
+        never.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn lookup_with_no_record_anywhere_says_so() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"results":[]}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let error = shipped("openalex", &server.url(), &[])
+            .lookup("10.1109/msr52588.2021.00074")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has no record for DOI"), "{error}");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_lookup_says_so_by_name() {
+        let error = source(KEYED_MANIFEST, "https://example.test", &[("api_key", "k")])
+            .lookup("10.1/x")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not offer lookup"), "{error}");
+    }
+
+    // ── References ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn references_resolve_a_works_identifiers_to_dois_in_one_batch() {
+        let mut server = mockito::Server::new_async().await;
+        let work = server
+            .mock("GET", "/works")
+            .match_query(Matcher::UrlEncoded(
+                "filter".into(),
+                "doi:https://doi.org/10.1/cites".into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"results":[{"id":"https://openalex.org/W1","referenced_works":["https://openalex.org/W10","https://openalex.org/W11","https://openalex.org/W12"]}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        // The separator is the service's OR operator and stays literal; the
+        // mock sees the decoded query either way, so this checks the value.
+        let resolve = server
+            .mock("GET", "/works")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("filter".into(), "openalex_id:W10|W11|W12".into()),
+                Matcher::UrlEncoded("per-page".into(), "3".into()),
+            ]))
+            .with_status(200)
+            .with_body(
+                r#"{"results":[{"id":"https://openalex.org/W12","doi":"https://doi.org/10.5/B"},{"id":"https://openalex.org/W10","doi":"https://doi.org/10.5/ref"},{"id":"https://openalex.org/W11"},{"id":"W13","doi":"https://doi.org/10.5/ref"}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let dois = shipped("openalex", &server.url(), &[])
+            .references("https://doi.org/10.1/CITES")
+            .await
+            .unwrap();
+
+        // Sorted, deduplicated, normalized; the record without a DOI is not an
+        // edge a DOI-keyed library can join.
+        assert_eq!(dois, vec!["10.5/b", "10.5/ref"]);
+        work.assert_async().await;
+        resolve.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn references_are_resolved_in_declared_chunks() {
+        const CHUNKED: &str = r#"
+manifest_version = 2
+id = "chunked"
+name = "Chunked"
+[http]
+base_url = "BASE_URL"
+[capabilities.search]
+path = "/s?q={query}"
+items = "r"
+[capabilities.search.fields]
+id = "id"
+title = "t"
+[capabilities.references]
+path = "/w/{doi}"
+ids = "refs"
+[capabilities.references.resolve]
+path = "/batch?ids={ids}&n={count}"
+join = ","
+chunk = 2
+items = "r"
+doi = "doi"
+"#;
+        let mut server = mockito::Server::new_async().await;
+        let _work = server
+            .mock("GET", "/w/10.1%2Fx")
+            .with_status(200)
+            .with_body(r#"{"refs":["a","b","c"]}"#)
+            .create_async()
+            .await;
+        let first = server
+            .mock("GET", "/batch")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("ids".into(), "a,b".into()),
+                Matcher::UrlEncoded("n".into(), "2".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"r":[{"doi":"10.9/a"}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/batch")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("ids".into(), "c".into()),
+                Matcher::UrlEncoded("n".into(), "1".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"r":[{"doi":"10.9/c"}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let dois = source(CHUNKED, &server.url(), &[])
+            .references("10.1/x")
+            .await
+            .unwrap();
+        assert_eq!(dois, vec!["10.9/a", "10.9/c"]);
+        first.assert_async().await;
+        second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_work_that_references_nothing_makes_no_second_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"results":[{"id":"W1","referenced_works":[]}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let dois = shipped("openalex", &server.url(), &[])
+            .references("10.1/x")
+            .await
+            .unwrap();
+        assert!(dois.is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_work_has_no_references_rather_than_an_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"results":[]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let dois = shipped("openalex", &server.url(), &[])
+            .references("10.1/x")
+            .await
+            .unwrap();
+        assert!(dois.is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_references_says_so_by_name() {
+        let error = shipped("semantic_scholar", "https://example.test", &[])
+            .references("10.1/x")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not offer references"), "{error}");
+    }
+
+    // ── Browse ───────────────────────────────────────────────────────────────
+
+    fn openalex_browse() -> BrowseCapability {
+        builtin::manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "openalex")
+            .unwrap()
+            .capabilities
+            .browse
+            .unwrap()
+    }
+
+    fn browse_request(filters: &[(&str, &str)]) -> BrowseRequest {
+        BrowseRequest {
+            filters: filters
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..BrowseRequest::default()
+        }
+    }
+
+    #[test]
+    fn browse_composes_the_declared_clauses_in_declaration_order() {
+        let browse = openalex_browse();
+        let request = browse_request(&[
+            // Deliberately out of order: the manifest decides the order.
+            ("open_access", "true"),
+            ("year.max", "2024"),
+            ("field", "17"),
+            ("year.min", "2020"),
+            ("cited_by.min", "100"),
+            ("not_retracted", "false"),
+        ]);
+        let extra = browse_parameters(&browse, &request, None).unwrap();
+        assert_eq!(
+            extra,
+            vec![
+                (
+                    "filter".to_string(),
+                    "from_publication_date:2020-01-01,to_publication_date:2024-12-31,\
+                     cited_by_count:>100,primary_topic.field.id:17,open_access.is_oa:true"
+                        .to_string()
+                ),
+                ("sort".to_string(), "cited_by_count:desc".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn browse_with_a_keyword_defaults_to_the_keyword_sort_and_sends_the_keyword() {
+        let browse = openalex_browse();
+        let extra = browse_parameters(&browse, &browse_request(&[]), Some("graph")).unwrap();
+        assert_eq!(
+            extra,
+            vec![
+                ("sort".to_string(), "relevance_score:desc".to_string()),
+                ("search".to_string(), "graph".to_string()),
+            ]
+        );
+        // An explicit sort beats the default of either kind.
+        let mut request = browse_request(&[]);
+        request.sort = Some("publication_date:desc".into());
+        let extra = browse_parameters(&browse, &request, Some("graph")).unwrap();
+        assert_eq!(extra[0].1, "publication_date:desc");
+    }
+
+    #[test]
+    fn browse_refuses_what_the_manifest_did_not_declare() {
+        let browse = openalex_browse();
+        for (filters, expected) in [
+            (vec![("nope", "1")], "'nope' is not a filter"),
+            (
+                vec![("type", "novel")],
+                "'novel' is not an option of filter 'type'",
+            ),
+            (vec![("open_access", "maybe")], "true or false"),
+            (vec![("year.min", "soon")], "must be a whole number"),
+            (vec![("year", "2020")], "'year' is not a filter"),
+            (
+                vec![("open_access.min", "1")],
+                "'open_access.min' is not a filter",
+            ),
+            (vec![("cited_by.max", "10")], "has no max bound"),
+        ] {
+            let error = browse_parameters(&browse, &browse_request(&filters), None).unwrap_err();
+            assert!(error.contains(expected), "{filters:?}: {error}");
+        }
+        let mut request = browse_request(&[]);
+        request.sort = Some("whatever".into());
+        let error = browse_parameters(&browse, &request, None).unwrap_err();
+        assert!(error.contains("is not a sort option"), "{error}");
+    }
+
+    #[test]
+    fn a_blank_filter_value_is_no_filter() {
+        let browse = openalex_browse();
+        let extra = browse_parameters(
+            &browse,
+            &browse_request(&[("type", ""), ("year.min", ""), ("open_access", "")]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            extra,
+            vec![("sort".to_string(), "cited_by_count:desc".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn browse_requests_the_page_the_limit_the_filters_and_the_sort() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/works")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("per-page".into(), "5".into()),
+                Matcher::UrlEncoded("page".into(), "3".into()),
+                Matcher::UrlEncoded(
+                    "filter".into(),
+                    "from_publication_date:2020-01-01,open_access.is_oa:true".into(),
+                ),
+                Matcher::UrlEncoded("sort".into(), "publication_date:desc".into()),
+                Matcher::UrlEncoded("mailto".into(), "team@example.com".into()),
+            ]))
+            .with_status(200)
+            .with_body(OPENALEX_BODY)
+            .create_async()
+            .await;
+
+        let mut request = browse_request(&[("year.min", "2020"), ("open_access", "true")]);
+        request.sort = Some("publication_date:desc".into());
+        request.page = Some(3);
+        request.limit = Some(5);
+        let results = shipped("openalex", &server.url(), &[("email", "team@example.com")])
+            .browse(&request)
+            .await
+            .unwrap();
+
+        assert_eq!(results, vec![expected_openalex_record()]);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn browse_without_a_keyword_sends_no_search_parameter() {
+        let mut server = mockito::Server::new_async().await;
+        let with_search = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Regex("search=".into()))
+            .expect(0)
+            .create_async()
+            .await;
+        let without = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(OPENALEX_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        shipped("openalex", &server.url(), &[])
+            .browse(&browse_request(&[]))
+            .await
+            .unwrap();
+        with_search.assert_async().await;
+        without.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_declares_no_browse_refuses_by_name() {
+        let error = shipped("semantic_scholar", "https://example.test", &[])
+            .browse(&BrowseRequest::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not offer browse"), "{error}");
+    }
+
+    // ── Search: HTML and download resolution ─────────────────────────────────
 
     #[tokio::test]
     async fn anna_html_search_and_credentialed_download_resolution_are_manifest_expressible() {
         let mut server = mockito::Server::new_async().await;
         let search = server
             .mock("GET", "/search")
-            .match_query(mockito::Matcher::Any)
+            .match_query(Matcher::Any)
             .match_header("user-agent", "Mozilla/5.0 Wilkes")
             .with_status(200)
             .with_body(ANNA_BODY)
@@ -1407,9 +2672,9 @@ filename = "{title}"
             .await;
         let resolve = server
             .mock("GET", "/dyn/api/fast_download.json")
-            .match_query(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::UrlEncoded("md5".into(), "deadbeef".into()),
-                mockito::Matcher::UrlEncoded("key".into(), "secret".into()),
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("md5".into(), "deadbeef".into()),
+                Matcher::UrlEncoded("key".into(), "secret".into()),
             ]))
             .with_status(200)
             .with_body(r#"{"download_url":"https://files.example.test/book"}"#)
@@ -1437,12 +2702,12 @@ filename = "{title}"
     }
 
     #[tokio::test]
-    async fn cross_origin_resolver_uses_its_own_base_and_does_not_receive_global_params() {
+    async fn cross_origin_resolver_uses_its_own_base_and_does_not_receive_global_headers() {
         let mut search_server = mockito::Server::new_async().await;
         let mut resolver_server = mockito::Server::new_async().await;
         let search = search_server
             .mock("GET", "/search")
-            .match_query(mockito::Matcher::Any)
+            .match_query(Matcher::Any)
             .match_header("user-agent", "Mozilla/5.0 Wilkes")
             .with_status(200)
             .with_body(ANNA_BODY)
@@ -1450,11 +2715,11 @@ filename = "{title}"
             .await;
         let resolve = resolver_server
             .mock("GET", "/dyn/api/fast_download.json")
-            .match_query(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::UrlEncoded("md5".into(), "deadbeef".into()),
-                mockito::Matcher::UrlEncoded("key".into(), "secret".into()),
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("md5".into(), "deadbeef".into()),
+                Matcher::UrlEncoded("key".into(), "secret".into()),
             ]))
-            .match_header("user-agent", mockito::Matcher::Missing)
+            .match_header("user-agent", Matcher::Missing)
             .with_status(200)
             .with_body(r#"{"download_url":"/files/book.pdf"}"#)
             .create_async()
@@ -1470,7 +2735,7 @@ filename = "{title}"
             )
             .replace(
                 "download_url = \"download_url\"",
-                "download_url = { path = \"download_url\", coerce = \"absolute_url\" }",
+                "download_url = \"absolute_url(download_url)\"",
             );
         let anna = source(&manifest, &search_server.url(), &[("anna_key", "secret")]);
         let book = anna.search("graph networks", 1).await.unwrap().remove(0);
@@ -1481,6 +2746,38 @@ filename = "{title}"
             format!("{}/files/book.pdf", resolver_server.url())
         );
         search.assert_async().await;
+        resolve.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_same_origin_step_inherits_global_headers_and_may_replace_one() {
+        let manifest = ANNA_MANIFEST.replace(
+            "[capabilities.resolve_download.steps.query]",
+            "[capabilities.resolve_download.steps.headers]\nuser-agent = \"Step/1\"\n\n[capabilities.resolve_download.steps.query]",
+        );
+        let mut server = mockito::Server::new_async().await;
+        let _search = server
+            .mock("GET", "/search")
+            .match_query(Matcher::Any)
+            .match_header("user-agent", "Mozilla/5.0 Wilkes")
+            .with_status(200)
+            .with_body(ANNA_BODY)
+            .create_async()
+            .await;
+        // The step's header of the same name replaces the primary one rather
+        // than being sent beside it.
+        let resolve = server
+            .mock("GET", "/dyn/api/fast_download.json")
+            .match_query(Matcher::Any)
+            .match_header("user-agent", "Step/1")
+            .with_status(200)
+            .with_body(r#"{"download_url":"https://files.example.test/book"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let anna = source(&manifest, &server.url(), &[("anna_key", "secret")]);
+        let book = anna.search("graph networks", 1).await.unwrap().remove(0);
+        anna.resolve_download(&book).await.unwrap().unwrap();
         resolve.assert_async().await;
     }
 
@@ -1507,47 +2804,11 @@ filename = "{title}"
         search.assert_async().await;
     }
 
-    /// The one thing the projection cannot say, pinned so it is not
-    /// rediscovered as a bug.
-    ///
-    /// `first_of` returns the first selector that *resolves*; OpenAlex's
-    /// `is_open_access` is a disjunction over two fields that are both always
-    /// present. Where they disagree, the manifest reports the first and the
-    /// Rust client reports their `||`. Fixing it means a boolean combinator in
-    /// the vocabulary, which is a deliberate decision and not a quiet one.
-    #[tokio::test]
-    async fn divergence_on_a_disjunction() {
-        let body = r#"{"results":[{"id":"W1","display_name":"T","ids":{},"open_access":{"is_oa":false},"best_oa_location":{"is_oa":true,"pdf_url":"https://example.test/p.pdf"}}]}"#;
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/works")
-            .match_query(mockito::Matcher::Any)
-            .expect(2)
-            .with_status(200)
-            .with_body(body)
-            .create_async()
-            .await;
-
-        let built_in = OpenAlexClient::new(server.url(), None)
-            .search("q", 1)
-            .await
-            .unwrap();
-        let projected = source(OPENALEX_MANIFEST, &server.url(), &[])
-            .search("q", 1)
-            .await
-            .unwrap();
-
-        assert!(built_in[0].is_open_access, "|| of false and true is true");
-        assert!(
-            !projected[0].is_open_access,
-            "first_of takes the first present value, which is false"
-        );
-        mock.assert_async().await;
-    }
+    // ── Secrets and the pinned origin ────────────────────────────────────────
 
     #[tokio::test]
-    async fn a_secret_is_required_before_a_request_is_made() {
-        let error = source(SEMANTIC_SCHOLAR_MANIFEST, "https://example.test", &[])
+    async fn a_required_secret_is_needed_before_a_request_is_made() {
+        let error = source(KEYED_MANIFEST, "https://example.test", &[])
             .search("q", 1)
             .await
             .unwrap_err()
@@ -1564,29 +2825,31 @@ filename = "{title}"
     /// those ever stopped holding.
     #[tokio::test]
     async fn the_host_is_pinned_against_a_path_that_tries_to_move_it() {
-        let escaping = OPENALEX_MANIFEST.replace(
-            "path = \"/works?search={query}",
-            "path = \"@evil.test/works?search={query}",
+        let escaping = KEYED_MANIFEST.replace(
+            "path = \"/graph/v1/paper/search?query={query}",
+            "path = \"@evil.test/graph/v1/paper/search?query={query}",
         );
-        let error = Manifest::parse(&escaping.replace("BASE_URL", "https://api.openalex.org"))
+        let error = Manifest::parse(&escaping.replace("BASE_URL", "https://api.example.test"))
             .unwrap_err()
             .to_string();
         assert!(error.contains("must start with '/'"), "{error}");
 
-        let doubled = OPENALEX_MANIFEST.replace(
-            "path = \"/works?search={query}",
-            "path = \"//evil.test/works?search={query}",
+        let doubled = KEYED_MANIFEST.replace(
+            "path = \"/graph/v1/paper/search?query={query}",
+            "path = \"//evil.test/graph/v1/paper/search?query={query}",
         );
-        let pinned = source(&doubled, "https://api.openalex.org", &[]);
+        let pinned = source(&doubled, "https://api.example.test", &[("api_key", "k")]);
         let request = pinned.request("//evil.test/works", &[]).unwrap();
         assert!(
             request
                 .url
-                .starts_with("https://api.openalex.org//evil.test/works"),
+                .starts_with("https://api.example.test//evil.test/works"),
             "{}",
             request.url
         );
     }
+
+    // ── Probe ────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn probe_reports_an_unmapped_field_by_name_and_refuses_to_pass() {
@@ -1596,19 +2859,15 @@ filename = "{title}"
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/graph/v1/paper/search")
-            .match_query(mockito::Matcher::Any)
+            .match_query(Matcher::Any)
             .with_status(200)
             .with_body(body)
             .create_async()
             .await;
 
-        let report = source(
-            SEMANTIC_SCHOLAR_MANIFEST,
-            &server.url(),
-            &[("api_key", "secret")],
-        )
-        .probe("graph neural networks")
-        .await;
+        let report = source(KEYED_MANIFEST, &server.url(), &[("api_key", "secret")])
+            .probe("graph neural networks")
+            .await;
 
         assert!(!report.ok, "a probe with unmapped fields is not clean");
         assert_eq!(report.issues.len(), 1);
@@ -1622,12 +2881,11 @@ filename = "{title}"
 
     #[tokio::test]
     async fn probe_redacts_a_secret_sent_as_a_query_parameter() {
-        let manifest =
-            SEMANTIC_SCHOLAR_MANIFEST.replace(r#"location = "header""#, r#"location = "query""#);
+        let manifest = KEYED_MANIFEST.replace("[http.headers]", "[http.query]");
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/graph/v1/paper/search")
-            .match_query(mockito::Matcher::Any)
+            .match_query(Matcher::Any)
             .with_status(200)
             .with_body(SEMANTIC_SCHOLAR_BODY)
             .create_async()
@@ -1653,13 +2911,9 @@ filename = "{title}"
 
     #[tokio::test]
     async fn a_blank_probe_query_is_refused_before_any_request() {
-        let report = source(
-            SEMANTIC_SCHOLAR_MANIFEST,
-            "https://example.test",
-            &[("api_key", "secret")],
-        )
-        .probe("   ")
-        .await;
+        let report = source(KEYED_MANIFEST, "https://example.test", &[("api_key", "k")])
+            .probe("   ")
+            .await;
 
         assert!(!report.ok);
         assert_eq!(report.error.as_deref(), Some("probe query cannot be empty"));
@@ -1669,7 +2923,7 @@ filename = "{title}"
     #[test]
     fn surfaced_errors_redact_every_configured_secret() {
         let source = source(
-            SEMANTIC_SCHOLAR_MANIFEST,
+            KEYED_MANIFEST,
             "https://example.test",
             &[("api_key", "hunter2"), ("shorter", "hunter")],
         );
@@ -1690,19 +2944,15 @@ filename = "{title}"
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/graph/v1/paper/search")
-            .match_query(mockito::Matcher::Any)
+            .match_query(Matcher::Any)
             .with_status(200)
             .with_body(body)
             .create_async()
             .await;
 
-        let report = source(
-            SEMANTIC_SCHOLAR_MANIFEST,
-            &server.url(),
-            &[("api_key", "secret")],
-        )
-        .probe("graph neural networks")
-        .await;
+        let report = source(KEYED_MANIFEST, &server.url(), &[("api_key", "secret")])
+            .probe("graph neural networks")
+            .await;
 
         assert_eq!(report.results.len(), 1);
         assert_eq!(report.results[0].id, "p2");
@@ -1714,27 +2964,38 @@ filename = "{title}"
     }
 
     #[tokio::test]
-    async fn an_items_selector_that_matches_nothing_names_itself() {
+    async fn an_items_expression_that_matches_nothing_names_itself() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/graph/v1/paper/search")
-            .match_query(mockito::Matcher::Any)
+            .match_query(Matcher::Any)
             .with_status(200)
             .with_body(r#"{"papers":[]}"#)
             .create_async()
             .await;
 
-        let report = source(
-            SEMANTIC_SCHOLAR_MANIFEST,
-            &server.url(),
-            &[("api_key", "secret")],
-        )
-        .probe("graph neural networks")
-        .await;
+        let report = source(KEYED_MANIFEST, &server.url(), &[("api_key", "secret")])
+            .probe("graph neural networks")
+            .await;
 
         assert!(!report.ok);
         let error = report.error.unwrap();
-        assert!(error.contains("data[*]"), "{error}");
+        assert!(error.contains("expression 'data'"), "{error}");
         mock.assert_async().await;
+    }
+
+    // ── Capabilities ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn capabilities_report_what_the_manifest_declares() {
+        let capabilities = shipped("openalex", "https://example.test", &[]).capabilities();
+        assert!(capabilities.lookup && capabilities.references);
+        assert!(!capabilities.resolve_download);
+        let controls = capabilities.browse.expect("openalex lists works");
+        assert!(controls.keyword);
+        assert!(controls.filters.iter().any(|filter| filter.name == "year"));
+
+        let capabilities = source(KEYED_MANIFEST, "https://example.test", &[]).capabilities();
+        assert!(capabilities.browse.is_none() && !capabilities.lookup && !capabilities.references);
     }
 }

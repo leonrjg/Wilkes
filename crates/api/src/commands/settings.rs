@@ -233,17 +233,38 @@ mod tests {
     use wilkes_core::types::{FileDisplayField, FileSortDirection, FileSortKey};
 
     const VALID_MANIFEST: &str = r#"
-manifest_version = 1
+manifest_version = 2
 id = "crossref"
 name = "Crossref"
 [http]
 base_url = "https://api.crossref.org"
 [capabilities.search]
 path = "/works?query.bibliographic={query}&rows={limit}"
+items = "message.items"
+[capabilities.search.fields]
+id = "DOI"
+title = "title[0]"
+"#;
+
+    /// The same service as `VALID_MANIFEST`, written the way manifests were
+    /// before version 2.
+    const VERSION_ONE_MANIFEST: &str = r#"
+manifest_version = 1
+id = "crossref"
+name = "Crossref"
+[http]
+base_url = "https://api.crossref.org"
+[[http.params]]
+location = "header"
+name = "User-Agent"
+value = "Wilkes"
+[capabilities.search]
+path = "/works?query.bibliographic={query}&rows={limit}"
 items = "message.items[*]"
 [capabilities.search.fields]
 id = "DOI"
 title = "title[0]"
+doi = { path = "DOI", coerce = "normalize_doi" }
 "#;
 
     fn custom_patch(id: &str, manifest: &str) -> serde_json::Value {
@@ -267,6 +288,53 @@ title = "title[0]"
         let reread = get_settings(&path).await.unwrap();
         assert_eq!(reread.integrations.custom[0].id, "crossref");
         assert!(reread.integrations.custom[0].enabled);
+    }
+
+    /// A manifest stored before version 2 is rewritten when the file is read,
+    /// and the next save writes only the new form.
+    #[tokio::test]
+    async fn a_stored_version_one_manifest_is_upgraded_on_read_and_written_back_as_version_two() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut stored = serde_json::to_value(Settings::default()).unwrap();
+        stored["integrations"] = serde_json::json!({
+            "openalex": {"enabled": true, "base_url": "https://api.openalex.org", "email": "me@example.org"},
+            "custom": [{"id": "crossref", "enabled": true, "manifest": VERSION_ONE_MANIFEST}]
+        });
+        tokio::fs::write(&path, serde_json::to_string(&stored).unwrap())
+            .await
+            .unwrap();
+
+        let read = get_settings(&path).await.unwrap();
+        assert!(read.integrations.custom[0]
+            .manifest
+            .contains("manifest_version = 2"));
+        assert!(read.integrations.builtin["openalex"].enabled);
+        assert_eq!(
+            read.integrations.builtin["openalex"].secrets["email"],
+            "me@example.org"
+        );
+        // Reading changed nothing on disk.
+        assert!(tokio::fs::read_to_string(&path)
+            .await
+            .unwrap()
+            .contains("\"openalex\""));
+
+        // Any save writes today's shape and only today's.
+        let saved = update_settings(&path, serde_json::json!({"context_lines": 3}))
+            .await
+            .unwrap();
+        assert_eq!(saved.context_lines, 3);
+        let written: serde_json::Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&path).await.unwrap()).unwrap();
+        assert!(written["integrations"].get("openalex").is_none());
+        assert!(written["integrations"]["builtin"]["openalex"]["enabled"]
+            .as_bool()
+            .unwrap());
+        assert!(written["integrations"]["custom"][0]["manifest"]
+            .as_str()
+            .unwrap()
+            .contains("manifest_version = 2"));
     }
 
     /// Nothing invalid may reach the file. The registry drops a manifest it

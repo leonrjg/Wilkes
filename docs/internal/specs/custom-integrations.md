@@ -1,12 +1,17 @@
 # Custom integrations — Design
 
-Status: implemented for `search`, `health`, HTML/JSON projection, bounded
-download resolution, and the UI. §9 lists the remaining exclusions.
-Two decisions changed under implementation and are marked **revised** below.
+Status: implemented. A literature provider is a manifest; there is no other
+kind. OpenAlex and Semantic Scholar are manifests embedded in the binary
+(§13), `search`, `browse`, `lookup`, `references`, `health`, HTML/JSON
+projection and bounded download resolution are capabilities of the one engine,
+and the UI is drawn from what a manifest declares. §9 lists the remaining
+exclusions. Several decisions changed under implementation and are marked
+**revised**; manifest format version 2 (§5, §13) supersedes version 1
+throughout.
 Depends on: `core/src/integrations`, `core/src/network::ProviderHttpClient`,
 `Settings.integrations`, `agent/src/mcp.rs::literature_search`
 Premise: the mapping from a service's JSON or HTML to our result types is the feature.
-The transport is secondary, and the code that exists today is almost entirely
+The transport is secondary, and the code that used to exist was almost entirely
 that mapping written by hand, once per provider.
 
 ## 1. Purpose
@@ -95,9 +100,12 @@ is never consulted for search or citations. It becomes the single owner:
   capability simply is not in the search index, so "provider not found" and
   "provider cannot search" are the same, already-handled error.
 
-Custom ids are namespaced `custom:<slug>`. A manifest can never shadow
+Custom ids are namespaced `custom:<slug>`; a provider shipped with Wilkes keeps
+its plain id (`openalex`), because that string is what stored selections, cache
+rows and agent arguments already name it by. A manifest can never shadow
 `openalex`, and every log line and error message stays unambiguous about which
-kind of provider produced it.
+kind of provider produced it. (§4 describes the registry as first built; §13
+is what it holds now: manifests, and only manifests.)
 
 ## 5. The extension mechanism: a declarative manifest
 
@@ -128,7 +136,7 @@ cheap addition rather than a competing mechanism.
 ### 5.2 Shape
 
 ```toml
-manifest_version = 1
+manifest_version = 2
 id = "crossref"
 name = "Crossref"
 
@@ -136,54 +144,74 @@ name = "Crossref"
 base_url = "https://api.crossref.org"
 
 # Identification sent to the primary origin and same-origin resolver steps.
-# `value` travels with the manifest; `secret` is only a name, whose value is
-# stored separately — see §7. Exactly one of the two per param.
-[[http.params]]
-location = "header"               # header | query
-name = "Crossref-Plus-API-Token"
-secret = "crossref_token"
+# A plain string travels with the manifest; `{ secret = "name" }` is only a
+# name, whose value is stored separately — see §7. `optional = true` leaves the
+# header or parameter off the request while the user has set no value, which is
+# what a service that works anonymously and better with a key needs.
+[http.headers]
+Crossref-Plus-API-Token = { secret = "crossref_token", optional = true, label = "Plus token" }
+
+[http.query]
+mailto = { secret = "email", optional = true, label = "Email", kind = "email" }
 
 [capabilities.health]
 path = "/works/10.1145/3801158"
 
 [capabilities.search]
 path = "/works?query.bibliographic={query}&rows={limit}"
-items = "message.items[*]"
+items = "message.items"
 
 [capabilities.search.fields]
 id             = "DOI"
-doi            = { path = "DOI", coerce = "normalize_doi" }
+doi            = "normalize_doi(DOI)"
 title          = "title[0]"
-year           = { path = "published.date-parts[0][0]", coerce = "int" }
-venue          = "container-title[0]"
-citation_count = { path = "is-referenced-by-count", coerce = "int" }
-pdf_url        = { first_of = ["link[0].URL", "resource.primary.URL"] }
+year           = "published.\"date-parts\"[0][0]"
+venue          = "\"container-title\"[0]"
+citation_count = "\"is-referenced-by-count\""
+pdf_url        = "link[?\"content-type\" == 'application/pdf'].URL | [0]"
 ```
 
 Three rules keep this a description rather than a general program:
 
 **Templates are typed substitution, never unchecked concatenation.** `{query}`
 and `{limit}` are the placeholders `search` supplies (`health` supplies none);
-download-resolution steps receive the selected result plus values declared by
-earlier steps. The engine owns percent-encoding. An unknown placeholder, or
-one the capability does not yet supply, is a save-time error. Every request
-host and scheme come from a literal `base_url`: the primary one under `http`,
-or an optional override declared on a resolver step. A resolver's final URL
-may be external because it is returned to the existing downloader rather than
-fetched by the manifest engine.
+`browse` supplies `{limit}` and `{page}`, `lookup` and `references` supply
+`{doi}`, and download-resolution steps receive the selected result plus values
+declared by earlier steps. The engine owns percent-encoding. An unknown
+placeholder, or one the capability does not yet supply, is a save-time error.
+Every request host and scheme come from a literal `base_url`: the primary one
+under `http`, or an optional override declared on a resolver step. A resolver's
+final URL may be external because it is returned to the existing downloader
+rather than fetched by the manifest engine.
 
-**The field map is a projection.** Selector grammar: dotted keys, `[n]`, `[*]`
-for the item list, and `first_of` for an ordered fallback. No filters, no
-predicates, no arithmetic. Every transformation beyond selection comes from a
-closed vocabulary of coercions — `int`, `bool`, `normalize_doi`, `year_from_date`,
-`strip_html`, `join`, `absolute_url` — each of which is a function that already
-exists in the tree or is three lines. Anything a manifest cannot say, it says
-loudly by failing to load, not by producing a plausible-looking wrong record.
+**The field map is a projection.** **Revised in version 2:** the selector
+language is JMESPath (<https://jmespath.org>) — a specified, side-effect-free
+query language for JSON with a conformance suite, no assignment, no recursion
+and no loops beyond its own projections — and not the dotted-path grammar the
+first version carried. The reason was not taste. The grammar had no predicate,
+no disjunction and no string operation, so each new need (pick the PDF link out
+of a list; `a || b`; strip a prefix from an id) was a vocabulary entry to
+design, document and defend, and `coerce` was a closed list that grew the same
+way. What JMESPath lacks is registered as *functions*, so reading an expression
+still says everything it can do: `normalize_doi`, `year_from_date`,
+`strip_html`, `absolute_url`, `to_int`, `to_bool`, `split`, `replace`, beside
+JMESPath's own. Every one maps `null` to `null`, so `normalize_doi(ids.doi)`
+describes an optional field; a value that is present and the wrong shape is an
+error naming both sides, never a guess. The final value is type-checked
+strictly against the field's type. `first_of` and `coerce` are gone for JSON
+(`not_null(a, b)` and the functions replace them); HTML keeps CSS selectors,
+`first_of`, `attribute`, `capture`, and gains `all` and `then` (a JMESPath
+expression applied to the extracted value). Anything a manifest cannot say, it
+says loudly by failing to load, not by producing a plausible-looking wrong
+record.
 
 **Sequencing is finite and purpose-specific.** Search declares one GET.
 Resolving a download after selection may declare at most four ordered GETs,
-each pinned to its statically declared origin, with scalar projection from each
-response. There are no branches, loops, arbitrary expressions, or writes.
+each pinned to its statically declared origin. A lookup may declare at most
+three alternative GETs, tried in order until one's response holds a record
+(§14). References are one GET for the work and one batched GET per
+fixed-size chunk (§14). There are no branches, loops, arbitrary expressions,
+or writes.
 
 ### 5.3 Contract per capability
 
@@ -195,13 +223,15 @@ time, not empty at query time.
 ### 5.4 HTML responses and on-demand download resolution
 
 `search.response_format = "html"` changes `items` and every field `path` or
-`first_of` entry from the JSON selector grammar to CSS. A field reads the
+`first_of` entry from JMESPath to CSS. A field reads the
 matched elements' normalized text unless its object form names `attribute`.
 `capture` plus `capture_group` is the bounded escape hatch for a service that
 puts several facts in one line: Rust's linear-time regular-expression engine
 runs it, and a missing capture is a mapping error rather than an empty value.
-For repeated elements such as author links, `coerce = "join"` joins every CSS
-match with `, `; without it a field keeps the selection's ordinary text value.
+For repeated elements such as author links, `all = true` collects every CSS
+match into an array and `then = "join(', ', @)"` joins it; `then` is a JMESPath
+expression whose `@` is the extracted value, which is how an HTML field says
+what a JSON field says in its own `path` (`then = "absolute_url(@)"`).
 `input = "query"` (or `"limit"`) projects a typed search input instead of a
 response selector. This covers DOI lookup pages whose returned HTML identifies
 the matching hash but does not repeat the DOI needed by the download endpoint.
@@ -209,11 +239,13 @@ the matching hash but does not repeat the DOI needed by the download endpoint.
 Download resolution is separate from search. A result advertises `provider`
 acquisition, and only selecting it runs `resolve_download`. Its finite list of
 GET steps is capped at four. A step inherits `http.base_url` or declares its
-own literal HTTP(S) `base_url`, may add parameters of its own, and publishes
-named scalar values for later steps. Relative values coerced with
-`absolute_url` resolve against that step's effective base. Global `http.params`
-are inherited only when the step has the primary origin; they are never copied
-to a cross-origin step. Redirects are likewise restricted to the request's
+own literal HTTP(S) `base_url`, may add `headers` and `query` of its own (a
+step's header of the same name replaces the primary one rather than being sent
+beside it), and publishes named scalar values for later steps. Relative values
+passed through `absolute_url` resolve against that step's effective base.
+Global `http.headers` and `http.query` are inherited only when the step has the
+primary origin; they are never copied to a cross-origin step, so a header both
+origins need is declared on both, explicitly. Redirects are likewise restricted to the request's
 declared origin. The final URL and optional filename are handed to the existing
 catalogue downloader. The manifest never writes a file and search never spends
 one authenticated request per displayed result.
@@ -221,17 +253,15 @@ one authenticated request per displayed result.
 An Anna-style provider is therefore expressible without code:
 
 ```toml
-manifest_version = 1
+manifest_version = 2
 id = "anna-journals"
 name = "Anna journal search"
 
 [http]
 base_url = "https://annas-archive.example"
 
-[[http.params]]
-location = "header"
-name = "User-Agent"
-value = "Mozilla/5.0"
+[http.headers]
+User-Agent = "Mozilla/5.0"
 
 [capabilities.search]
 path = "/search?q={query}&content=journal"
@@ -241,12 +271,12 @@ items = '''div:has(> a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:o
 [capabilities.search.fields]
 id = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", capture = '''^/md5/([0-9a-f]+)$''' }
 title = '''div.max-w-full a[href^="/md5/"]'''
-authors = { path = '''a[href^="/search"]:has(span[class="icon-[mdi--user-edit]"])''', coerce = "join" }
+authors = { path = '''a[href^="/search"]:has(span[class="icon-[mdi--user-edit]"])''', all = true, then = "join(', ', @)" }
 publisher = '''a[href^="/search"]:has(span[class="icon-[mdi--company]"])'''
 language = { path = "div.text-gray-800", capture = '''^\s*✅?\s*([^\[]+?)\s*\[''' }
 file_format = { path = "div.text-gray-800", capture = '''(?i)\b(EPUB|PDF|MOBI|AZW3|AZW|DJVU|CBZ|CBR|FB2|DOCX?|TXT)\b''' }
 file_size = { path = "div.text-gray-800", capture = '''(?i)(\d+(?:\.\d+)?\s*(?:MB|KB|GB|TB))''' }
-landing_page_url = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", coerce = "absolute_url" }
+landing_page_url = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", then = "absolute_url(@)" }
 
 [capabilities.resolve_download]
 url = "{download_url}"
@@ -258,10 +288,8 @@ filename = "{title}.{file_format}"
 path = "/dyn/api/fast_download.json?md5={id}"
 response_format = "json"
 
-[[capabilities.resolve_download.steps.params]]
-location = "query"
-name = "key"
-secret = "anna_key"
+[capabilities.resolve_download.steps.query]
+key = { secret = "anna_key" }
 
 [capabilities.resolve_download.steps.fields]
 download_url = "download_url"
@@ -353,16 +381,24 @@ existing scheme, size, and duplicate checks. Zotero's write surface
 ## 8. The UI stops being hand-written per provider
 
 Fixing the Rust duplication and leaving `IntegrationsPanel.tsx` with one
-bespoke form per provider would move the cost, not remove it. So a built-in
-provider is a row in `ui/src/lib/integrations/providers.ts` — its fields and
-their kinds (`url`, a nullable `password`, a `select` over citation styles),
-how to check it, what to say when it cannot be reached — and `ProviderForm`
-renders any row. The fourth provider is four lines in that table and nothing
-anywhere else.
+bespoke form per provider would move the cost, not remove it. So a provider's
+settings tab is a *row* (`ui/src/lib/integrations/providers.ts`) — its fields
+and their kinds (`url`, a nullable `password`, `email`, a `select`), how to
+read and write them in settings, how to check it, what to say when it cannot be
+reached — and `ProviderForm` renders any row.
 
-Manifest-defined providers are deliberately *not* rows in it. Their fields are
-not known until a user writes them, which is the whole point of them, so they
-are described by their manifest and rendered by `CustomIntegrations`.
+**Revised: the rows are built from the backend, not written out.** Zotero is
+the one row written by hand, because Zotero is a local library with a settings
+object of its own. Every literature provider shipped with Wilkes is a row built
+from `literature_providers` (§13): its name, its origin and the secrets its
+manifest names (`label`, `kind`, `optional`) are all read off the manifest, so
+the panel names no provider but Zotero and a provider added tomorrow is a tab
+with no change to the UI. The literature pane's browse panel (§14) and the
+metadata-source selector are drawn from the same list the same way.
+
+Providers the *user* wrote are deliberately not rows. Their fields are not
+known until a user writes them, which is the whole point of them, so they are
+described by their manifest and rendered by `CustomIntegrations`.
 
 **The panel is tabbed, not stacked.** Form-after-form made the panel's length
 the sum of how many providers exist — a shape that only got worse once a user
@@ -386,11 +422,10 @@ ids so the agent is told what it may actually name.
 
 ## 9. Deliberately excluded, and why
 
-- **`CitationSource` (`references`).** OpenAlex needs set-valued extraction,
-  batching, and a second request per batch. The scalar, at-most-four-step
-  download resolver deliberately cannot express that loop. Custom citation
-  sources wait for a real second case and then get their own bounded batch
-  shape — not a scripting engine.
+- ~~**`CitationSource` (`references`).**~~ No longer excluded: the second real
+  case (a built-in that must reach the citation graph) arrived, and it got the
+  bounded batch shape this entry promised rather than a scripting engine —
+  §14.
 - **`CatalogueSource` (`fetch_all`).** Needs pagination, a dryness heuristic,
   and progress reporting (see `catalogue/providers.rs`). Manifest-expressible
   in principle, but it is a second design, not a corollary of this one.
@@ -398,20 +433,29 @@ ids so the agent is told what it may actually name.
   remains the only writer.
 - **XML responses.** JSON and HTML have concrete cases and typed selectors;
   XML still has neither.
-- **Boolean combination**, found by §10 rather than foreseen. OpenAlex's
-  `is_open_access` is `open_access.is_oa || best_oa_location.is_oa`, and
-  `first_of` is *first present*, not *or*. The divergence is pinned by
-  `divergence_on_a_disjunction` rather than papered over: closing it means a
-  combinator in the vocabulary, which is a decision to take deliberately if a
-  second case appears.
+- ~~**Boolean combination**~~ Closed by version 2: OpenAlex's `is_open_access`
+  is `open_access.is_oa || best_oa_location.is_oa`, which JMESPath says and the
+  dotted-path grammar could not. The test that pinned the divergence
+  (`divergence_on_a_disjunction`) is now
+  `openalex_open_access_is_a_disjunction_of_the_work_and_its_best_location`.
+- **Browse paging by cursor or offset.** `browse` pages by a 1-based `{page}`
+  and `{limit}`. A service that pages by an opaque token (Semantic Scholar's
+  bulk search) or by an offset that is not a multiple of the page size cannot
+  say so, and declares no `browse`.
+- **Semantic Scholar `references`.** Its endpoint lists the cited papers'
+  external ids in one request, which the two-stage `references` shape does not
+  describe; it never fed the citation graph and still does not.
 
 ## 10. Proof that the abstraction is right
 
-Done, in `custom/mod.rs`'s tests. Both providers' search paths, re-expressed as
-manifests, are run against the same mock server as the Rust clients and asserted
-equal record for record. The vocabulary held everywhere except the one case in
-§9's last bullet, which is exactly what the exercise was for. The built-ins stay
-Rust — they do more than search — but their search path is the test case.
+First done by running both providers' search paths, re-expressed as manifests,
+against the same mock server as the Rust clients and asserting them equal
+record for record; the vocabulary held everywhere except the disjunction in
+§9. That test could not outlive its subject: the clients are gone (§13), so
+the shipped manifests are now the only implementation, tested against the same
+fixture bodies the clients used, with the expected records written out, and
+against the live services by hand (search, browse with every filter kind,
+paging, lookup including the second-request alternative, references).
 
 ## 11. Order of work
 
@@ -430,6 +474,10 @@ Rust — they do more than search — but their search path is the test case.
    halves of the duplication this feature set out to remove are now gone: a new
    provider is a row in a Rust registry and a row in a TypeScript table, and no
    new form anywhere.
+7. ~~Converge the built-ins onto the manifest.~~ Done — §13.
+8. ~~Manifest version 2: header/query maps, JMESPath, optional secrets.~~ Done.
+9. ~~`browse`, `lookup`, `references` capabilities; the browse panel.~~ Done —
+   §14.
 
 ## 12. Also changed on the way
 
@@ -438,3 +486,88 @@ response size cap. Both now exist, the cap enforced against the advertised
 `Content-Length` and again against the bytes actually streamed. The built-in
 providers wanted these anyway; a manifest that can point the client at any path
 its host serves made them required.
+
+## 13. The built-ins are manifests
+
+The decision this section records: **a literature provider is a manifest, and
+no OpenAlex-specific or Semantic Scholar-specific code is compiled in.** It
+reverses §10's earlier position that the built-ins "stay Rust — they do more
+than search". What they did beyond searching — look a DOI up for metadata
+enrichment, list a work's references for the citation graph — became
+capabilities (§14), after which nothing was left that a manifest could not say.
+
+- `core/src/integrations/builtin/{openalex,semantic_scholar}.toml` are the
+  providers, embedded with `include_str!` and parsed by `builtin::manifests()`
+  (a test asserts every shipped manifest is valid). `CustomSource` is the only
+  `LiteratureSource` implementation; `CitationSource` is a method on it.
+- **Per-installation state** is `integrations.builtin[id]` — `enabled`, a
+  `base_url` override for a mirror or proxy, and `secrets` (the values for the
+  secrets the manifest names). The manifest itself ships with the build and is
+  never stored, so it cannot go stale beside it. Custom providers stay in
+  `integrations.custom` with their manifests.
+- **Migration, once, on read.** `IntegrationsSettings` deserializes through a
+  wire type that accepts the old `openalex` / `semantic_scholar` objects (a
+  base URL equal to the shipped one is no override; the credential moves to the
+  secret the manifest names) and runs `custom::legacy::upgrade` over every
+  stored custom manifest. `Manifest::parse` reads version 2 and refuses
+  everything else; version 1 exists only inside the converter. The next save
+  writes only the new shape. A manifest that cannot be converted is left as
+  stored and reported by name — never guessed at.
+- **Metadata** is keyed by provider id: `DocumentMetadata.providers` is a map,
+  `MetadataSource::Provider(id)` is the cache's provenance, and
+  `MetadataSourcePreference` serializes as the bare string it always was. The
+  stored strings *are* the provider ids, so no row was migrated. A provider's
+  upsert writes only that provider's record. When providers disagree, shipped
+  ones are preferred in the order they are listed, then any other by id
+  (`builtin::precedence`).
+- **One settings-change rule.** `IntegrationRegistry::fingerprints` says which
+  providers a settings edit touched (enabled, secrets, origin, a custom
+  manifest — not its label); their cached records are dropped and any that can
+  look a work up are asked again. It replaced two copies of the same method,
+  one per compiled-in provider, and gave custom providers the behaviour they
+  never had.
+- **Transport.** `openalex_*`, `semantic_scholar_*` and
+  `custom_integration_status` are replaced by `literature_provider_status`,
+  `literature_provider_lookup` and `literature_browse`
+  (`/api/literature/{status,lookup,browse}`), one question for every provider.
+
+## 14. Capabilities beyond search
+
+**`browse`** is a filtered, sorted, paged listing of the records `search`
+returns (it reuses `search`'s projection: a service lists answers in the shape
+it searches in). The manifest declares what may be varied — a `path` with
+`{limit}` and `{page}`, an optional `query_param` for a keyword, a `sort`
+(options as `[value, label]` pairs, a `default`, and an optional
+`keyword_default` for when a keyword is given), and `filters`, each a `choice`,
+a `flag` or a `range` with a clause template carrying `{value}`. The engine
+composes the request from those pieces, so a control can only produce a clause
+the author wrote; anything else — an undeclared filter, a value outside the
+options, a non-integer bound — is refused by name. The interface renders its
+filter panel from `ProviderCapabilities.browse` and knows nothing about which
+service it is talking to. Filter order is declaration order (the `toml` crate
+reads maps in document order; `indexmap` keeps it).
+
+**`lookup`** is DOI in, one bibliographic record out (`id`, `title`, `year`,
+`publication_date`, `venue`, `citation_count`, `external_ids`), for metadata
+enrichment. It declares one to three request paths tried **in order**: the
+first whose response holds a record wins. A response that holds none — an empty
+result, a 404 — moves on to the next; any other failure stops the lookup,
+because a request that *failed* says nothing about whether the next would find
+one, and asking anyway would paper over the failure. That is the one branch the
+manifest has, and it is bounded by count and by what may trigger it. OpenAlex
+uses it for the DOI index, then the landing-page index.
+
+**`references`** is DOI in, the DOIs the work cites out, in two declared
+stages: one request for the work and a JMESPath expression over it yielding
+the identifiers it references, then one request per chunk of
+`chunk` (1–100) identifiers to turn them back into DOIs. `{ids}` is the
+chunk's identifiers, each percent-encoded and joined by the declared `join`,
+which stays literal because for most services it is the OR operator. A record
+whose DOI expression yields nothing, or a non-DOI, is not an edge a DOI-keyed
+library can join, and is left out — counted in the log, not silent. There is no
+loop a manifest controls.
+
+**Every capability but `health` requires `search`**, for the reason
+`resolve_download` always did: each works on what search returns or on a work a
+search result names.
+

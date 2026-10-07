@@ -22,8 +22,8 @@ use wilkes_core::types::{
     ChunkTopicsResult, CitationResult, CollectionValidation, DataPaths, DocumentMetadata,
     DocumentTagUpdate, EmbedderCapabilityManifest, EmbeddingEngine, ExternalMcpSettings,
     FileListResponse, HttpApiSettings, IndexStatus, IntegrationStatus, NewBookmark,
-    NewSmartCollection, NewTag, OpenAlexWork, RootCoverage, SearchLogEntry, SelectedEmbedder,
-    SemanticScholarPaper, Settings, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
+    NewSmartCollection, NewTag, RootCoverage, SearchLogEntry, SelectedEmbedder,
+    Settings, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::worker::manager::WorkerStatus;
 
@@ -316,32 +316,23 @@ async fn zotero_status_for_ctx(ctx: Arc<AppContext>) -> Result<IntegrationStatus
     ctx.zotero_status().await.map_err(|e| e.to_string())
 }
 
-async fn semantic_scholar_status_for_ctx(
+async fn literature_provider_status_for_ctx(
     ctx: Arc<AppContext>,
+    provider: String,
 ) -> Result<IntegrationStatus, String> {
-    ctx.semantic_scholar_status()
+    ctx.literature_provider_status(provider)
         .await
         .map_err(|e| e.to_string())
 }
 
-async fn semantic_scholar_lookup_for_ctx(
+async fn literature_provider_lookup_for_ctx(
     ctx: Arc<AppContext>,
+    provider: String,
     doi: String,
-) -> Result<SemanticScholarPaper, String> {
-    ctx.semantic_scholar_lookup(doi)
+) -> Result<wilkes_core::types::ProviderWork, String> {
+    ctx.literature_provider_lookup(provider, doi)
         .await
         .map_err(|e| e.to_string())
-}
-
-async fn openalex_status_for_ctx(ctx: Arc<AppContext>) -> Result<IntegrationStatus, String> {
-    ctx.openalex_status().await.map_err(|e| e.to_string())
-}
-
-async fn openalex_lookup_for_ctx(
-    ctx: Arc<AppContext>,
-    doi: String,
-) -> Result<OpenAlexWork, String> {
-    ctx.openalex_lookup(doi).await.map_err(|e| e.to_string())
 }
 
 fn custom_integration_summary_for_ctx(ctx: Arc<AppContext>, manifest: String) -> ManifestSummary {
@@ -355,15 +346,6 @@ async fn custom_integration_probe_for_ctx(
     query: String,
 ) -> Result<ProbeReport, String> {
     ctx.custom_integration_probe(manifest, secrets, query)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-async fn custom_integration_status_for_ctx(
-    ctx: Arc<AppContext>,
-    id: String,
-) -> Result<IntegrationStatus, String> {
-    ctx.custom_integration_status(id)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1747,29 +1729,6 @@ async fn zotero_generate_citation(path: String, app: AppHandle) -> Result<Citati
 }
 
 #[tauri::command]
-async fn semantic_scholar_status(app: AppHandle) -> Result<IntegrationStatus, String> {
-    semantic_scholar_status_for_ctx(app_context(&app)).await
-}
-
-#[tauri::command]
-async fn semantic_scholar_lookup(
-    doi: String,
-    app: AppHandle,
-) -> Result<SemanticScholarPaper, String> {
-    semantic_scholar_lookup_for_ctx(app_context(&app), doi).await
-}
-
-#[tauri::command]
-async fn openalex_status(app: AppHandle) -> Result<IntegrationStatus, String> {
-    openalex_status_for_ctx(app_context(&app)).await
-}
-
-#[tauri::command]
-async fn openalex_lookup(doi: String, app: AppHandle) -> Result<OpenAlexWork, String> {
-    openalex_lookup_for_ctx(app_context(&app), doi).await
-}
-
-#[tauri::command]
 fn custom_integration_summary(manifest: String, app: AppHandle) -> ManifestSummary {
     custom_integration_summary_for_ctx(app_context(&app), manifest)
 }
@@ -1787,14 +1746,6 @@ async fn custom_integration_probe(
     app: AppHandle,
 ) -> Result<ProbeReport, String> {
     custom_integration_probe_for_ctx(app_context(&app), manifest, secrets, query).await
-}
-
-#[tauri::command]
-async fn custom_integration_status(
-    id: String,
-    app: AppHandle,
-) -> Result<IntegrationStatus, String> {
-    custom_integration_status_for_ctx(app_context(&app), id).await
 }
 
 #[tauri::command]
@@ -1996,6 +1947,39 @@ async fn literature_resolve_download(
         .literature_resolve_download(provider, result)
         .await
         .map_err(|error| error.to_string())
+}
+
+/// One provider's listing by filter and sort. A request its manifest does not
+/// allow comes back inside the answer, beside the provider's name.
+#[tauri::command]
+async fn literature_browse(
+    app: AppHandle,
+    provider: String,
+    request: wilkes_core::types::BrowseRequest,
+) -> Result<wilkes_api::commands::integrations::literature::LiteratureProviderAnswer, String> {
+    app_context(&app)
+        .literature_browse(provider, request)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Whether one literature provider — shipped or pasted in — is reachable now.
+/// Answers whether or not it is enabled, so a form can check before enabling.
+#[tauri::command]
+async fn literature_provider_status(
+    provider: String,
+    app: AppHandle,
+) -> Result<IntegrationStatus, String> {
+    literature_provider_status_for_ctx(app_context(&app), provider).await
+}
+
+#[tauri::command]
+async fn literature_provider_lookup(
+    provider: String,
+    doi: String,
+    app: AppHandle,
+) -> Result<wilkes_core::types::ProviderWork, String> {
+    literature_provider_lookup_for_ctx(app_context(&app), provider, doi).await
 }
 
 /// Refreshes the named providers, or all of them when none is named. Minutes,
@@ -2372,14 +2356,9 @@ pub fn run() {
             refresh_file_metadata,
             zotero_add_item,
             zotero_generate_citation,
-            semantic_scholar_status,
-            semantic_scholar_lookup,
-            openalex_status,
-            openalex_lookup,
             custom_integration_summary,
             custom_integration_authoring_prompt,
             custom_integration_probe,
-            custom_integration_status,
             pick_directory,
             download_model,
             build_index,
@@ -2412,6 +2391,9 @@ pub fn run() {
             literature_providers,
             literature_search,
             literature_resolve_download,
+            literature_browse,
+            literature_provider_status,
+            literature_provider_lookup,
             catalogue_sync,
             catalogue_acquire,
             catalogue_acquire_course,

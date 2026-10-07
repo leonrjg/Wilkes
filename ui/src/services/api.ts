@@ -39,12 +39,10 @@ import type {
   CitationLinks,
   CitationLinksQuery,
   NewBookmark,
-  OpenAlexWork,
   PreviewData,
   RelatedDocument,
   RelatedDocumentsQuery,
   SelectedEmbedder,
-  SemanticScholarPaper,
   SearchQuery,
   SearchStats,
   Settings,
@@ -162,10 +160,6 @@ export interface SearchApi {
   zoteroStatus(): Promise<IntegrationStatus>;
   zoteroAddItem(path: string): Promise<AddOutcome>;
   zoteroGenerateCitation(path: string): Promise<CitationResult>;
-  semanticScholarStatus(): Promise<IntegrationStatus>;
-  semanticScholarLookup(doi: string): Promise<SemanticScholarPaper>;
-  openAlexStatus(): Promise<IntegrationStatus>;
-  openAlexLookup(doi: string): Promise<OpenAlexWork>;
   /** What a draft manifest declares, including the one host it will contact.
    *  Offline: nothing is requested and nothing is saved. */
   customIntegrationSummary(manifest: string): Promise<ManifestSummary>;
@@ -179,7 +173,6 @@ export interface SearchApi {
     secrets: Record<string, string>,
     query: string,
   ): Promise<ProbeReport>;
-  customIntegrationStatus(id: string): Promise<IntegrationStatus>;
   /** A URL this application will serve a local file at, whatever the file is:
    *  the PDF a reader loads, and the pictures an HTML document sits beside. */
   /** The pages of a book, as a PDF the reader can draw.
@@ -224,6 +217,25 @@ export interface SearchApi {
     limit?: number,
     providers?: string[],
   ): Promise<LiteratureSearchResponse>;
+  /** One provider's listing by filter and sort, with a keyword optional. What
+   *  may be asked is what the provider's `capabilities.browse` declares; a
+   *  request it does not allow comes back in the answer's `error`, beside the
+   *  provider's name, like a provider that is down. Only a provider that is
+   *  off or does not exist rejects. */
+  literatureBrowse(
+    provider: string,
+    request: import("../lib/types").BrowseRequest,
+  ): Promise<import("../lib/types").LiteratureProviderAnswer>;
+  /** Whether one literature provider — shipped or pasted in — is reachable and
+   *  usable now. Answers whether or not it is enabled, so a form can check
+   *  before switching it on. */
+  literatureProviderStatus(provider: string): Promise<IntegrationStatus>;
+  /** One provider's record of a work, from the metadata cache when it holds
+   *  one and from the provider when it does not. */
+  literatureProviderLookup(
+    provider: string,
+    doi: string,
+  ): Promise<import("../lib/types").ProviderWork>;
   /** Resolve a selected provider result to a direct file URL. No bytes are
    *  written until the returned plan is passed to catalogueAcquire. */
   literatureResolveDownload(

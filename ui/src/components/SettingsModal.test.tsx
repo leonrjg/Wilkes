@@ -23,6 +23,7 @@ describe("SettingsModal", () => {
   const mockApi = {
     getSettings: vi.fn(),
     updateSettings: vi.fn(),
+    literatureProviders: vi.fn(() => Promise.resolve([])),
     listGenerationModels: vi.fn(() => Promise.resolve([])),
     isGenerationReady: vi.fn(() => Promise.resolve(false)),
     loadGenerationModel: vi.fn(() => Promise.resolve(false)),

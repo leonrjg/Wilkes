@@ -1,6 +1,7 @@
-import { useState } from "react";
-import type { Settings } from "../lib/types";
-import { BUILT_IN_PROVIDERS } from "../lib/integrations/providers";
+import { useEffect, useMemo, useState } from "react";
+import type { LiteratureProviderInfo, Settings } from "../lib/types";
+import { ZOTERO_ROW, literatureRow } from "../lib/integrations/providers";
+import { ERROR_TEXT_CLASS } from "../lib/integrations/styles";
 import type { SearchApi } from "../services/api";
 import CustomIntegrations from "./CustomIntegrations";
 import ProviderForm from "./ProviderForm";
@@ -11,7 +12,7 @@ interface IntegrationsPanelProps {
   onUpdate: (patch: Partial<Settings>) => Promise<void> | void;
 }
 
-/** The custom tab is not a provider, so it is not a row in the provider table. */
+/** The custom tab is not a provider, so it is not a row. */
 const CUSTOM_TAB = "custom";
 
 /**
@@ -22,25 +23,53 @@ const CUSTOM_TAB = "custom";
  * worse once a user could add their own. Tabs make it the length of one
  * provider instead, and give the manifest editor, which is the tallest thing
  * here by far, somewhere to be without pushing everything else off-screen.
+ *
+ * Zotero is a row written out; every provider shipped with Wilkes is a row
+ * built from what the backend reports of it, so the panel names no provider
+ * but Zotero.
  */
 export default function IntegrationsPanel({
   api,
   settings,
   onUpdate,
 }: IntegrationsPanelProps) {
-  const [active, setActive] = useState<string>(BUILT_IN_PROVIDERS[0].key);
+  const [active, setActive] = useState<string>(ZOTERO_ROW.key);
+  const [shipped, setShipped] = useState<LiteratureProviderInfo[]>([]);
+  const [listError, setListError] = useState<string | null>(null);
   const custom = settings.integrations?.custom ?? [];
 
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .literatureProviders()
+      .then((providers) => {
+        if (cancelled) return;
+        setShipped(providers.filter((provider) => provider.builtin));
+        setListError(null);
+      })
+      .catch((error: unknown) => {
+        console.error("literature providers could not be listed:", error);
+        if (!cancelled) {
+          setListError(error instanceof Error ? error.message : String(error));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
+
+  const rows = useMemo(
+    () => [ZOTERO_ROW, ...shipped.map((provider) => literatureRow(provider))],
+    [shipped],
+  );
+
   const tabs = [
-    ...BUILT_IN_PROVIDERS.map((provider) => ({
-      id: provider.key as string,
-      label: provider.name,
+    ...rows.map((row) => ({
+      id: row.key,
+      label: row.name,
       // A provider the user has switched on is marked, so the panel says which
       // ones are live without the user opening each tab to find out.
-      on: Boolean(
-        (settings.integrations?.[provider.key] as { enabled?: boolean } | undefined)
-          ?.enabled,
-      ),
+      on: Boolean(row.read(settings.integrations).enabled),
     })),
     {
       id: CUSTOM_TAB,
@@ -49,9 +78,7 @@ export default function IntegrationsPanel({
     },
   ];
 
-  const activeProvider = BUILT_IN_PROVIDERS.find(
-    (provider) => provider.key === active,
-  );
+  const activeRow = rows.find((row) => row.key === active);
 
   return (
     <div className="space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300 p-1">
@@ -84,11 +111,17 @@ export default function IntegrationsPanel({
         ))}
       </div>
 
+      {listError !== null && (
+        <p className={ERROR_TEXT_CLASS}>
+          The literature providers could not be listed: {listError}
+        </p>
+      )}
+
       <div role="tabpanel">
-        {activeProvider ? (
+        {activeRow ? (
           <ProviderForm
-            key={activeProvider.key}
-            provider={activeProvider}
+            key={activeRow.key}
+            provider={activeRow}
             api={api}
             settings={settings}
             onUpdate={onUpdate}

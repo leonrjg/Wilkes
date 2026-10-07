@@ -29,6 +29,8 @@ import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useChatSession, useChatStore } from "../stores/useChatStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useResearchStore } from "../stores/useResearchStore";
+import { useCatalogueStore } from "../stores/useCatalogueStore";
+import { sourceLabel } from "../lib/integrations/names";
 import { useGenerationStore } from "../stores/useGenerationStore";
 import { useTopicsStore } from "../stores/useTopicsStore";
 import { FileScopeControls } from "./FileScopeControls";
@@ -38,6 +40,7 @@ import type {
   FileEntry,
   FileSortDirection,
   FileSortKey,
+  LiteratureProviderInfo,
   Match,
   MatchEvidence,
   MatchRef,
@@ -225,13 +228,6 @@ const DISPLAY_FIELD_METADATA_KEYS: Partial<Record<FileDisplayField, string>> = {
   citations: MetadataField.CitationCount,
 };
 
-const METADATA_SOURCE_LABELS: Record<string, string> = {
-  file: "File",
-  zotero: "Zotero",
-  semantic_scholar: "Semantic Scholar",
-  openalex: "OpenAlex",
-};
-
 interface MetadataConflictGroup {
   value: string;
   sources: string[];
@@ -241,18 +237,19 @@ interface MetadataConflictGroup {
 function groupMetadataConflictValues(
   values: Array<{ source: string; value: string }>,
   displayedValue: string,
+  providers: readonly LiteratureProviderInfo[],
 ): MetadataConflictGroup[] {
   const groups = new Map<string, MetadataConflictGroup>();
   for (const item of values) {
     const value = String(item.value);
-    const sourceLabel = METADATA_SOURCE_LABELS[item.source] ?? item.source;
+    const label = sourceLabel(item.source, providers);
     const group = groups.get(value);
     if (group) {
-      group.sources.push(sourceLabel);
+      group.sources.push(label);
     } else {
       groups.set(value, {
         value,
-        sources: [sourceLabel],
+        sources: [label],
         selected: value === displayedValue,
       });
     }
@@ -268,7 +265,11 @@ function metadataConflictTooltip(
   const metadataKey = DISPLAY_FIELD_METADATA_KEYS[field];
   const values = metadataKey ? entry.metadata_conflicts?.[metadataKey] : undefined;
   if (!values || values.length < 2) return undefined;
-  const groupedValues = groupMetadataConflictValues(values, displayedValue);
+  const groupedValues = groupMetadataConflictValues(
+    values,
+    displayedValue,
+    useCatalogueStore.getState().providerOptions,
+  );
 
   return (
     <div className="flex min-w-[220px] flex-col gap-1.5">

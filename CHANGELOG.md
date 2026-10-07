@@ -4,6 +4,21 @@
 
 ### Added
 
+- The literature pane can browse as well as search. Under the provider chips a
+  "Browse by filter" panel lists a provider's works by filter and sort with no
+  keyword at all — OpenAlex by year range, field and domain, type, minimum
+  citations, open access, full text and retraction, sorted by citations or
+  date — and combines a keyword with the same filters when one is typed. The
+  panel is drawn from what the provider's manifest *declares* (its `browse`
+  capability: a sort, a keyword parameter, and typed filters that are a choice,
+  a flag or an integer range), so it names no provider, and a provider added
+  tomorrow gets one by declaring it. A page is ten works with "Load more"; a
+  request the manifest does not allow is refused by name, in the answer, beside
+  the provider's name. A manifest may also declare `lookup` (a DOI to a
+  bibliographic record, with up to three requests tried in order until one
+  holds a record) and `references` (the DOIs a work cites, resolved in
+  declared, bounded batches).
+
 - Where a document was left survives a restart: a PDF's or book's page, offset
   and zoom, a text document's scroll position on each of its surfaces and its
   zoom, and whether a Markdown or HTML file was last read rendered or as
@@ -133,6 +148,43 @@
   nothing re-extracts and nothing re-embeds.
 
 ### Changed
+
+- OpenAlex and Semantic Scholar are manifests, not code. The two hand-written
+  clients, their wire models, their per-provider commands and routes, their
+  per-provider settings structs and the two copies of their metadata-cache
+  and settings-change handling are gone: each provider is a document embedded
+  in the binary and loaded through the engine that loads a manifest a user
+  pasted in, so a built-in and a custom provider enter the registry through the
+  same door and nothing downstream can tell them apart. Metadata enrichment,
+  the citation graph, the file list's citation count, the primary-metadata-source
+  choice and the cache's provenance rows are all keyed by provider id now, so a
+  custom provider that declares `lookup` enriches documents too. The rows the
+  old shape wrote are the rows the new one reads — provider ids are the
+  strings they were already stored under — so no cache was rebuilt.
+
+  Manifest format version 2 replaces the `[[http.params]]` list with
+  `[http.headers]` and `[http.query]` maps (a secret is `{ secret = "name",
+  optional = true }`, so a service that works anonymously and better with a key
+  no longer has to refuse to run), selects JSON with JMESPath instead of a
+  dotted-path grammar, and replaces the closed `coerce` list and `first_of`
+  with functions in the expression (`normalize_doi(x)`, `not_null(a, b)`,
+  `a || b`). That closes the one divergence the old manifest proved against the
+  Rust client, OpenAlex's `is_open_access`, which is a disjunction. Settings
+  and stored manifests written before this are rewritten as they load — the
+  `openalex` and `semantic_scholar` objects become `builtin` entries, a version
+  1 manifest becomes version 2 — and the next save writes only the new shape.
+  The rewrite keeps everything a manifest says and loses one thing: comments in
+  the stored text. A manifest that cannot be converted is left as it was and
+  reported by name rather than guessed at.
+
+  Visible edges: `get_file_metadata` and the file metadata events carry
+  `providers` (a map by provider id) instead of `semantic_scholar` and
+  `openalex`; the `openalex_*`, `semantic_scholar_*` and
+  `custom_integration_status` commands and routes are replaced by
+  `literature_provider_status`, `literature_provider_lookup` and
+  `literature_browse`; when two providers describe one document, the shipped
+  ones are still preferred in the order they were (Semantic Scholar, then
+  OpenAlex), then any other by id.
 
 - The extractor that reads documents is no longer named for the one format it
   used to read. `PdfExtractor` is `DocumentExtractor`, `PdfBackend` is

@@ -49,8 +49,8 @@ use wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryIn
 use wilkes_core::types::{
     AddOutcome, BookmarkClustersQuery, ChunkTopicsQuery, CitationLinksQuery, CitationResult,
     CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, IntegrationStatus,
-    MatchRef, NewBookmark, NewSmartCollection, NewTag, OpenAlexWork, RelatedDocumentsQuery,
-    SearchLogEntry, SearchQuery, SelectedEmbedder, SemanticScholarPaper, SmartCollection, Tag,
+    MatchRef, NewBookmark, NewSmartCollection, NewTag, RelatedDocumentsQuery,
+    SearchLogEntry, SearchQuery, SelectedEmbedder, SmartCollection, Tag,
     UpdateSmartCollection, UpdateTag,
 };
 #[cfg(test)]
@@ -783,6 +783,72 @@ async fn literature_resolve_download_handler(
         .await
         .map(Json)
         .map_err(|error| err(error.to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiteratureBrowseBody {
+    provider: String,
+    #[serde(default)]
+    request: wilkes_core::types::BrowseRequest,
+}
+
+/// One provider's listing by filter and sort. A request the provider's
+/// manifest does not allow is reported inside the 200, beside the provider's
+/// name, like a provider that is down; only a provider that is off or does not
+/// exist is a 400.
+async fn literature_browse_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LiteratureBrowseBody>,
+) -> Result<
+    Json<wilkes_api::commands::integrations::literature::LiteratureProviderAnswer>,
+    (StatusCode, Json<ErrorBody>),
+> {
+    state
+        .context()
+        .literature_browse(body.provider, body.request)
+        .await
+        .map(Json)
+        .map_err(|error| err(error.to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiteratureProviderBody {
+    provider: String,
+}
+
+/// Whether one literature provider — shipped or pasted in — is reachable now.
+/// Answers whether or not it is enabled, so a form can check before enabling.
+async fn literature_status_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LiteratureProviderBody>,
+) -> Result<Json<IntegrationStatus>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .literature_provider_status(body.provider)
+        .await
+        .map(Json)
+        .map_err(|e| server_err(e.to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiteratureLookupBody {
+    provider: String,
+    doi: String,
+}
+
+async fn literature_lookup_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LiteratureLookupBody>,
+) -> Result<Json<wilkes_core::types::ProviderWork>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .literature_provider_lookup(body.provider, body.doi)
+        .await
+        .map(Json)
+        .map_err(|e| server_err(e.to_string()))
 }
 
 #[derive(Deserialize)]
@@ -1842,52 +1908,6 @@ async fn zotero_status_handler(
     Ok(Json(status))
 }
 
-async fn semantic_scholar_status_handler(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<IntegrationStatus>, (StatusCode, Json<ErrorBody>)> {
-    let status = state
-        .context()
-        .semantic_scholar_status()
-        .await
-        .map_err(|e| server_err(e.to_string()))?;
-    Ok(Json(status))
-}
-
-async fn semantic_scholar_lookup_handler(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<DoiBody>,
-) -> Result<Json<SemanticScholarPaper>, (StatusCode, Json<ErrorBody>)> {
-    let paper = state
-        .context()
-        .semantic_scholar_lookup(body.doi)
-        .await
-        .map_err(|e| server_err(e.to_string()))?;
-    Ok(Json(paper))
-}
-
-async fn openalex_status_handler(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<IntegrationStatus>, (StatusCode, Json<ErrorBody>)> {
-    let status = state
-        .context()
-        .openalex_status()
-        .await
-        .map_err(|e| server_err(e.to_string()))?;
-    Ok(Json(status))
-}
-
-async fn openalex_lookup_handler(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<DoiBody>,
-) -> Result<Json<OpenAlexWork>, (StatusCode, Json<ErrorBody>)> {
-    let work = state
-        .context()
-        .openalex_lookup(body.doi)
-        .await
-        .map_err(|e| server_err(e.to_string()))?;
-    Ok(Json(work))
-}
-
 #[derive(serde::Deserialize)]
 struct ManifestBody {
     manifest: String,
@@ -1899,11 +1919,6 @@ struct ProbeBody {
     #[serde(default)]
     secrets: std::collections::HashMap<String, String>,
     query: String,
-}
-
-#[derive(serde::Deserialize)]
-struct IntegrationIdBody {
-    id: String,
 }
 
 async fn custom_integration_summary_handler(
@@ -1929,18 +1944,6 @@ async fn custom_integration_probe_handler(
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(report))
-}
-
-async fn custom_integration_status_handler(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<IntegrationIdBody>,
-) -> Result<Json<IntegrationStatus>, (StatusCode, Json<ErrorBody>)> {
-    let status = state
-        .context()
-        .custom_integration_status(body.id)
-        .await
-        .map_err(|e| server_err(e.to_string()))?;
-    Ok(Json(status))
 }
 
 async fn resolve_file_metadata_handler(
@@ -2467,6 +2470,9 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             "/api/literature/resolve-download",
             post(literature_resolve_download_handler),
         )
+        .route("/api/literature/browse", post(literature_browse_handler))
+        .route("/api/literature/status", post(literature_status_handler))
+        .route("/api/literature/lookup", post(literature_lookup_handler))
         .route("/api/catalogue/sync", post(catalogue_sync_handler))
         .route("/api/catalogue/status", get(catalogue_status_handler))
         .route("/api/catalogue/acquire", post(catalogue_acquire_handler))
@@ -2522,22 +2528,6 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             post(zotero_generate_citation_handler),
         )
         .route(
-            "/api/integrations/semantic-scholar/status",
-            get(semantic_scholar_status_handler),
-        )
-        .route(
-            "/api/integrations/semantic-scholar/lookup",
-            post(semantic_scholar_lookup_handler),
-        )
-        .route(
-            "/api/integrations/openalex/status",
-            get(openalex_status_handler),
-        )
-        .route(
-            "/api/integrations/openalex/lookup",
-            post(openalex_lookup_handler),
-        )
-        .route(
             "/api/integrations/custom/summary",
             post(custom_integration_summary_handler),
         )
@@ -2548,10 +2538,6 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/integrations/custom/probe",
             post(custom_integration_probe_handler),
-        )
-        .route(
-            "/api/integrations/custom/status",
-            post(custom_integration_status_handler),
         )
         .route("/api/embed/ready", get(is_semantic_ready_handler))
         .route("/api/embed/text", post(embed_text_handler))

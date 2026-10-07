@@ -1,8 +1,15 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, Search, X } from "react-feather";
-import type { CatalogueGrain, CatalogueHit } from "../lib/types";
+import type {
+  CatalogueGrain,
+  CatalogueHit,
+  FilterControl,
+  LiteratureProviderInfo,
+} from "../lib/types";
 import {
   ALL_GRAINS,
+  browseProviderIds,
+  type BrowseAnswer,
   enabledProviderIds,
   type LiteratureAnswer,
   type PaneSection,
@@ -54,6 +61,7 @@ export default function CataloguePane() {
   const literature = useCatalogueStore((s) => s.literature);
   const literatureError = useCatalogueStore((s) => s.literatureError);
   const acquireError = useCatalogueStore((s) => s.acquireError);
+  const browseAnswer = useCatalogueStore((s) => s.browseAnswer);
   const { readOnly, needsDirectory } = useCatalogueAdd();
   const [draft, setDraft] = useState(useCatalogueStore.getState().query);
 
@@ -190,6 +198,8 @@ export default function CataloguePane() {
               )}
             </>
           )}
+          <BrowsePanel keyword={draft} options={providerOptions} />
+          {browseAnswer !== null && <BrowseAnswerBody answer={browseAnswer} />}
         </Section>
 
         {!asked && (
@@ -345,6 +355,260 @@ function CatalogueAnswerBody({
   );
 }
 
+/**
+ * Listing a provider's works by filter and sort, for when there is no keyword
+ * to type.
+ *
+ * Shown only when an enabled provider declares a listing, and drawn entirely
+ * from that declaration: the sort, the filters and what kind each is all come
+ * from the provider's manifest, so a provider added tomorrow gets a panel with
+ * no change here. The keyword above, if there is one, is combined with the
+ * filters when the provider's listing takes one.
+ */
+function BrowsePanel({
+  keyword,
+  options,
+}: {
+  keyword: string;
+  options: LiteratureProviderInfo[];
+}) {
+  const open = useCatalogueStore((s) => s.browseOpen);
+  const setOpen = useCatalogueStore((s) => s.setBrowseOpen);
+  const chosen = useCatalogueStore((s) => s.browseProvider);
+  const selectProvider = useCatalogueStore((s) => s.selectBrowseProvider);
+  const filters = useCatalogueStore((s) => s.browseFilters);
+  const setFilter = useCatalogueStore((s) => s.setBrowseFilter);
+  const sort = useCatalogueStore((s) => s.browseSort);
+  const setSort = useCatalogueStore((s) => s.setBrowseSort);
+  const loading = useCatalogueStore((s) => s.browseLoading);
+  const error = useCatalogueStore((s) => s.browseError);
+  const browse = useCatalogueStore((s) => s.browse);
+
+  const offered = browseProviderIds(options);
+  if (offered.length === 0) return null;
+  const provider = chosen !== null && offered.includes(chosen) ? chosen : offered[0];
+  const info = options.find((option) => option.provider === provider);
+  const controls = info?.capabilities.browse ?? null;
+  if (!info || controls === null) return null;
+
+  return (
+    <div className="border-t border-[var(--border-main)] pt-1.5">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
+      >
+        {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+        Browse by filter
+      </button>
+      {open && (
+        <form
+          className="flex flex-col gap-1.5 py-1.5"
+          aria-label="Browse by filter"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void browse(keyword);
+          }}
+        >
+          {offered.length > 1 && (
+            <ControlRow label="Provider">
+              <select
+                aria-label="Provider to browse"
+                value={provider}
+                onChange={(e) => selectProvider(e.target.value)}
+                className={CONTROL_CLASS}
+              >
+                {offered.map((id) => (
+                  <option key={id} value={id}>
+                    {options.find((option) => option.provider === id)?.name ?? id}
+                  </option>
+                ))}
+              </select>
+            </ControlRow>
+          )}
+          {controls.sort !== null && (
+            <ControlRow label="Sort">
+              <select
+                aria-label="Sort"
+                value={sort ?? ""}
+                onChange={(e) => setSort(e.target.value === "" ? null : e.target.value)}
+                className={CONTROL_CLASS}
+              >
+                <option value="">
+                  {optionLabel(controls.sort.options, controls.sort.default)} (default)
+                </option>
+                {controls.sort.options
+                  .filter((option) => option.value !== controls.sort?.default)
+                  .map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+              </select>
+            </ControlRow>
+          )}
+          {controls.filters.map((filter) => (
+            <FilterInput
+              key={filter.name}
+              filter={filter}
+              values={filters}
+              onChange={setFilter}
+            />
+          ))}
+          <div className="flex items-center gap-2 pt-0.5">
+            <button
+              type="submit"
+              disabled={loading}
+              className="rounded border border-[var(--border-strong)] bg-[var(--bg-active)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)] disabled:opacity-50"
+            >
+              {loading ? "Listing" : "Show works"}
+            </button>
+            {controls.keyword && keyword.trim() !== "" && (
+              <span className="text-[10px] text-[var(--text-dim)]">
+                with “{keyword.trim()}”
+              </span>
+            )}
+          </div>
+          {error !== null && !loading && (
+            <p className="text-[10px] leading-snug text-red-400">
+              {info.name} could not list works: {error}
+            </p>
+          )}
+        </form>
+      )}
+    </div>
+  );
+}
+
+const CONTROL_CLASS =
+  "w-full rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1.5 py-1 text-[11px] text-[var(--text-main)] outline-none";
+
+function ControlRow({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <label className="flex flex-col gap-0.5">
+      <span className="text-[9px] font-bold uppercase tracking-wider text-[var(--text-dim)]">
+        {label}
+      </span>
+      {children}
+    </label>
+  );
+}
+
+function optionLabel(
+  options: readonly { value: string; label: string }[],
+  value: string,
+): string {
+  return options.find((option) => option.value === value)?.label ?? value;
+}
+
+/** One declared filter, as the control its kind calls for. */
+function FilterInput({
+  filter,
+  values,
+  onChange,
+}: {
+  filter: FilterControl;
+  values: Record<string, string>;
+  onChange: (name: string, value: string) => void;
+}) {
+  if (filter.kind === "choice") {
+    return (
+      <ControlRow label={filter.label}>
+        <select
+          aria-label={filter.label}
+          value={values[filter.name] ?? ""}
+          onChange={(e) => onChange(filter.name, e.target.value)}
+          className={CONTROL_CLASS}
+        >
+          <option value="">Any</option>
+          {filter.options.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </ControlRow>
+    );
+  }
+  if (filter.kind === "flag") {
+    return (
+      <label className="flex items-center gap-1.5 text-[11px] text-[var(--text-main)]">
+        <input
+          type="checkbox"
+          checked={values[filter.name] === "true"}
+          onChange={(e) => onChange(filter.name, e.target.checked ? "true" : "")}
+        />
+        {filter.label}
+      </label>
+    );
+  }
+  return (
+    <ControlRow label={filter.label}>
+      <span className="flex items-center gap-1.5">
+        {filter.has_min && (
+          <input
+            type="number"
+            inputMode="numeric"
+            aria-label={`${filter.label} min`}
+            placeholder={filter.has_max ? "From" : "At least"}
+            value={values[`${filter.name}.min`] ?? ""}
+            onChange={(e) => onChange(`${filter.name}.min`, e.target.value)}
+            className={CONTROL_CLASS}
+          />
+        )}
+        {filter.has_max && (
+          <input
+            type="number"
+            inputMode="numeric"
+            aria-label={`${filter.label} max`}
+            placeholder={filter.has_min ? "To" : "At most"}
+            value={values[`${filter.name}.max`] ?? ""}
+            onChange={(e) => onChange(`${filter.name}.max`, e.target.value)}
+            className={CONTROL_CLASS}
+          />
+        )}
+      </span>
+    </ControlRow>
+  );
+}
+
+/** What the listing returned, under the provider's name, with the next page
+ *  one press away. */
+function BrowseAnswerBody({ answer }: { answer: BrowseAnswer }) {
+  const loading = useCatalogueStore((s) => s.browseLoading);
+  const more = useCatalogueStore((s) => s.browseMore);
+  return (
+    <div className="flex flex-col" aria-label={`${answer.name} listing`}>
+      <h4 className="mt-2 flex items-baseline gap-1.5 border-b border-[var(--border-strong)] pb-1 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)]">
+        {answer.name}
+        <span className="font-normal normal-case tracking-normal text-[var(--text-muted)]">
+          listing · {answer.results.length}
+        </span>
+      </h4>
+      {answer.results.length === 0 ? (
+        <Note>Nothing in {answer.name} matches these filters.</Note>
+      ) : (
+        <div className="divide-y divide-[var(--border-main)]">
+          {answer.results.map((work) => (
+            <PaperCandidate key={work.id} provider={answer.provider} work={work} />
+          ))}
+        </div>
+      )}
+      {!answer.exhausted && (
+        <button
+          type="button"
+          onClick={() => void more()}
+          disabled={loading}
+          className="mt-1.5 self-start rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)] disabled:opacity-50"
+        >
+          {loading ? "Loading" : "Load more"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** An entry with neither results nor an error breaks the response contract.
  *  It is reported as a failure rather than read as "nothing found". */
 function providerAnswerMalformed(provider: string): string {
@@ -372,7 +636,7 @@ function LiteratureAnswerBody({
     return (
       <Note>
         No provider is enabled, so nothing was searched. Settings › Integrations
-        turns on OpenAlex, Semantic Scholar, or a provider you describe.
+        turns on the providers that ship with Wilkes, or one you describe.
       </Note>
     );
   }

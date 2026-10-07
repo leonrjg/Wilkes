@@ -10,11 +10,17 @@
 //! Resolution is the registry's, exactly as the MCP tool's is: the id a
 //! provider is reported under here is the id that tool accepts.
 
+use std::sync::{Arc, Mutex};
+
 use serde::Serialize;
 
-use wilkes_core::integrations::IntegrationRegistry;
+use wilkes_core::integrations::custom::manifest::SecretSlot;
+use wilkes_core::integrations::{builtin, IntegrationRegistry, ProviderCapabilities};
+use wilkes_core::metadata::cache::MetadataCache;
+use wilkes_core::metadata::doi::normalize_doi;
 use wilkes_core::types::{
-    IntegrationsSettings, LiteratureSearchResult, ResolvedLiteratureDownload,
+    BrowseRequest, IntegrationStatus, IntegrationsSettings, LiteratureSearchResult, ProviderWork,
+    ResolvedLiteratureDownload,
 };
 
 /// Works per provider when the caller does not say. The pane lists every
@@ -53,11 +59,26 @@ pub struct LiteratureSearchResponse {
 /// a user-described manifest can search at all is the registry's answer: a
 /// caller that recomputed it would be a second place that could disagree
 /// about which providers exist.
+///
+/// Everything the interface needs to render a provider — what it is called,
+/// what it can do, which secrets it asks for — is read off its manifest here,
+/// so the interface holds nothing about any particular provider.
 #[derive(Clone, Debug, Serialize)]
 pub struct LiteratureProviderInfo {
     pub provider: String,
     pub name: String,
     pub enabled: bool,
+    /// Shipped with Wilkes rather than written by the user.
+    pub builtin: bool,
+    /// The origin requests go to now.
+    pub base_url: String,
+    /// The origin the shipped manifest declares, for a built-in. A base URL
+    /// equal to it is no override.
+    pub default_base_url: Option<String>,
+    pub capabilities: ProviderCapabilities,
+    /// The values this provider asks the user for (an email address, an API
+    /// key), each optional or required.
+    pub secrets: Vec<SecretSlot>,
 }
 
 /// Every provider this installation knows, in registry order, each saying
@@ -65,12 +86,26 @@ pub struct LiteratureProviderInfo {
 /// dropped: a caller filtering by provider needs to tell *switched off* from
 /// *does not exist*, which are different mistakes with different fixes.
 pub fn providers(settings: &IntegrationsSettings) -> Vec<LiteratureProviderInfo> {
+    let shipped = builtin::manifests();
     IntegrationRegistry::from_settings(settings)
         .literature_sources()
         .map(|entry| LiteratureProviderInfo {
             provider: entry.id().to_string(),
             name: entry.name().to_string(),
             enabled: entry.enabled,
+            builtin: entry.builtin,
+            base_url: entry.manifest().http.base_url.clone(),
+            default_base_url: entry
+                .builtin
+                .then(|| {
+                    shipped
+                        .iter()
+                        .find(|manifest| manifest.id == entry.id())
+                        .map(|manifest| manifest.http.base_url.clone())
+                })
+                .flatten(),
+            capabilities: entry.source().capabilities(),
+            secrets: entry.manifest().secret_slots(),
         })
         .collect()
 }
@@ -214,9 +249,112 @@ pub async fn resolve_download(
         })
 }
 
+/// A provider's listing by filter and sort, answered in the same shape as one
+/// provider's part of a search.
+///
+/// A request the provider's manifest does not allow (an undeclared filter, a
+/// value outside its options) is an error *in the answer*, beside the
+/// provider's name, like a provider that is down: the caller has one place to
+/// look.
+pub async fn browse(
+    settings: &IntegrationsSettings,
+    provider: String,
+    request: BrowseRequest,
+) -> Result<LiteratureProviderAnswer, LiteratureRequestError> {
+    let registry = IntegrationRegistry::from_settings(settings);
+    let source = registry
+        .literature_for_search(&provider)
+        .map_err(|error| LiteratureRequestError(error.to_string()))?;
+    let name = source.name().to_string();
+    Ok(match source.browse(&request).await {
+        Ok(results) => LiteratureProviderAnswer {
+            provider,
+            name,
+            results: Some(results),
+            error: None,
+        },
+        Err(error) => {
+            tracing::warn!(provider = %provider, "literature browse failed: {error:#}");
+            LiteratureProviderAnswer {
+                provider,
+                name,
+                results: None,
+                error: Some(format!("{error:#}")),
+            }
+        }
+    })
+}
+
+/// Whether a provider is reachable and usable now.
+///
+/// Answers for a provider whether or not it is enabled: the settings form asks
+/// before switching it on. One question for every provider, shipped or
+/// pasted in, so there is one place that says how it is asked.
+pub async fn status(
+    settings: &IntegrationsSettings,
+    provider: &str,
+) -> anyhow::Result<IntegrationStatus> {
+    let registry = IntegrationRegistry::from_settings(settings);
+    let entry = registry.literature(provider).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unknown literature provider '{provider}'; known providers are {}",
+            registry.literature_ids().join(", ")
+        )
+    })?;
+    entry.source().status(entry.enabled).await
+}
+
+/// One provider's record of a work, from the metadata cache when it holds one
+/// and from the provider when it does not.
+pub async fn lookup(
+    settings: &IntegrationsSettings,
+    cache: Option<Arc<Mutex<MetadataCache>>>,
+    provider: &str,
+    doi: &str,
+) -> anyhow::Result<ProviderWork> {
+    let registry = IntegrationRegistry::from_settings(settings);
+    let source = registry.literature_for_search(provider)?;
+    let doi = normalize_doi(doi).ok_or_else(|| anyhow::anyhow!("Invalid DOI: {doi}"))?;
+
+    let cache = cache.ok_or_else(|| anyhow::anyhow!("The metadata cache is unavailable"))?;
+    {
+        let guard = cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("The metadata cache lock failed"))?;
+        if let Some(cached) = guard.get_provider_by_doi(provider, &doi)? {
+            return Ok(cached);
+        }
+    }
+
+    let work = source.lookup(&doi).await?;
+
+    {
+        let guard = cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("The metadata cache lock failed"))?;
+        guard.upsert_provider_by_doi(provider, &work)?;
+    }
+    Ok(work)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wilkes_core::types::BuiltinProviderState;
+
+    fn enabled(ids: &[&str]) -> IntegrationsSettings {
+        let mut settings = IntegrationsSettings::default();
+        for id in ids {
+            settings.builtin.insert(
+                id.to_string(),
+                BuiltinProviderState {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+        }
+        settings
+    }
 
     fn direct_result() -> LiteratureSearchResult {
         LiteratureSearchResult {
@@ -266,9 +404,14 @@ mod tests {
     #[tokio::test]
     async fn an_out_of_range_limit_is_refused_rather_than_clamped() {
         for limit in [0, MAX_LIMIT + 1] {
-            let error = search_all(&IntegrationsSettings::default(), "q".into(), Some(limit), None)
-                .await
-                .expect_err("out of range limit");
+            let error = search_all(
+                &IntegrationsSettings::default(),
+                "q".into(),
+                Some(limit),
+                None,
+            )
+            .await
+            .expect_err("out of range limit");
             assert!(error.0.contains(&limit.to_string()), "{error}");
         }
     }
@@ -290,9 +433,14 @@ mod tests {
     /// Asking nobody is the caller deciding not to search, not a search.
     #[tokio::test]
     async fn an_empty_filter_is_refused_rather_than_read_as_every_provider() {
-        let error = search_all(&IntegrationsSettings::default(), "q".into(), None, Some(vec![]))
-            .await
-            .expect_err("empty filter");
+        let error = search_all(
+            &IntegrationsSettings::default(),
+            "q".into(),
+            None,
+            Some(vec![]),
+        )
+        .await
+        .expect_err("empty filter");
         assert!(error.0.contains("no providers"), "{error}");
     }
 
@@ -301,15 +449,18 @@ mod tests {
     /// the answer.
     #[tokio::test]
     async fn an_unselected_provider_is_not_asked() {
-        let mut settings = IntegrationsSettings::default();
-        settings.openalex.enabled = true;
-        settings.semantic_scholar.enabled = true;
+        let mut settings = enabled(&["openalex", "semantic_scholar"]);
         // Both point nowhere: what is asserted is which providers were asked,
         // and a test that reached the real services to find that out would be
         // egress this crate's tests do not perform. Whichever is asked fails
         // to connect and is reported as an entry, which is what is counted.
-        settings.openalex.base_url = "http://127.0.0.1:1/openalex".into();
-        settings.semantic_scholar.base_url = "http://127.0.0.1:1/s2".into();
+        settings.builtin.get_mut("openalex").unwrap().base_url =
+            Some("http://127.0.0.1:1/openalex".into());
+        settings
+            .builtin
+            .get_mut("semantic_scholar")
+            .unwrap()
+            .base_url = Some("http://127.0.0.1:1/s2".into());
         let response = search_all(
             &settings,
             "graph theory".into(),
@@ -330,13 +481,12 @@ mod tests {
     /// one must read as "switched off", not as "does not exist".
     #[test]
     fn the_provider_list_names_disabled_providers_too() {
-        let mut settings = IntegrationsSettings::default();
-        settings.openalex.enabled = true;
+        let settings = enabled(&["openalex"]);
         let listed = providers(&settings);
         let openalex = listed
             .iter()
             .find(|entry| entry.provider == "openalex")
-            .expect("openalex is compiled in");
+            .expect("openalex is shipped");
         assert!(openalex.enabled);
         let semantic = listed
             .iter()
@@ -348,12 +498,138 @@ mod tests {
 
     #[tokio::test]
     async fn resolving_a_builtin_result_returns_its_direct_url_without_downloading() {
-        let mut settings = IntegrationsSettings::default();
-        settings.openalex.enabled = true;
+        let settings = enabled(&["openalex"]);
         let resolved = resolve_download(&settings, "openalex".to_string(), direct_result())
             .await
             .unwrap();
         assert_eq!(resolved.url, "https://example.test/paper.pdf");
         assert!(resolved.filename.is_none());
+    }
+
+    #[test]
+    fn the_provider_list_carries_what_the_interface_renders() {
+        let listed = providers(&IntegrationsSettings::default());
+        let openalex = listed.iter().find(|p| p.provider == "openalex").unwrap();
+        assert!(openalex.builtin);
+        assert_eq!(openalex.base_url, "https://api.openalex.org");
+        assert_eq!(
+            openalex.default_base_url.as_deref(),
+            Some("https://api.openalex.org")
+        );
+        assert!(openalex.capabilities.browse.is_some());
+        assert_eq!(openalex.secrets.len(), 1);
+        assert_eq!(openalex.secrets[0].name, "email");
+        assert!(openalex.secrets[0].optional);
+
+        let semantic = listed
+            .iter()
+            .find(|p| p.provider == "semantic_scholar")
+            .unwrap();
+        assert_eq!(semantic.secrets[0].name, "api_key");
+        assert!(semantic.capabilities.browse.is_none());
+    }
+
+    #[test]
+    fn a_base_url_override_is_what_the_list_reports_and_the_default_stays_the_shipped_one() {
+        let mut settings = enabled(&["openalex"]);
+        settings.builtin.get_mut("openalex").unwrap().base_url =
+            Some("https://mirror.example.test".into());
+        let listed = providers(&settings);
+        let openalex = listed.iter().find(|p| p.provider == "openalex").unwrap();
+        assert_eq!(openalex.base_url, "https://mirror.example.test");
+        assert_eq!(
+            openalex.default_base_url.as_deref(),
+            Some("https://api.openalex.org")
+        );
+    }
+
+    #[tokio::test]
+    async fn status_names_an_unknown_provider() {
+        let error = status(&IntegrationsSettings::default(), "crossref")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Unknown literature provider 'crossref'"),
+            "{error}"
+        );
+        assert!(error.contains("openalex"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn status_probes_a_disabled_provider_so_it_can_be_checked_before_enabling() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/works")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+        let mut settings = IntegrationsSettings::default();
+        settings.builtin.insert(
+            "openalex".into(),
+            BuiltinProviderState {
+                enabled: false,
+                base_url: Some(server.url()),
+                ..Default::default()
+            },
+        );
+        let status = status(&settings, "openalex").await.unwrap();
+        assert_eq!(status.state, wilkes_core::types::IntegrationState::Ready);
+        assert!(!status.enabled);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn lookup_rejects_a_disabled_provider() {
+        let error = lookup(
+            &IntegrationsSettings::default(),
+            None,
+            "openalex",
+            "10.1145/3801158",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("disabled"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn browse_reports_a_refused_request_in_the_answer_beside_the_providers_name() {
+        let settings = enabled(&["openalex"]);
+        let answer = browse(
+            &settings,
+            "openalex".into(),
+            BrowseRequest {
+                filters: [("nope".to_string(), "1".to_string())].into(),
+                ..BrowseRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer.provider, "openalex");
+        assert_eq!(answer.name, "OpenAlex");
+        assert!(answer.results.is_none());
+        assert!(answer.error.unwrap().contains("'nope' is not a filter"));
+    }
+
+    #[tokio::test]
+    async fn browse_names_a_provider_that_is_off_or_unknown() {
+        let error = browse(
+            &IntegrationsSettings::default(),
+            "openalex".into(),
+            BrowseRequest::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.0.contains("disabled"), "{error}");
+        let error = browse(
+            &IntegrationsSettings::default(),
+            "nowhere".into(),
+            BrowseRequest::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.0.contains("Unknown literature provider"), "{error}");
     }
 }

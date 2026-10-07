@@ -65,7 +65,11 @@ impl SearchHandle {
                 .ok()
                 .and_then(|cache| {
                     cache
-                        .get_valid_with_primary(&result.path, identity, metadata.primary_source)
+                        .get_valid_with_primary(
+                            &result.path,
+                            identity,
+                            metadata.primary_source.clone(),
+                        )
                         .ok()
                 })
                 .flatten()

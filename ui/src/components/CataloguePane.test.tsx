@@ -1,6 +1,11 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { CatalogueHit, LiteratureSearchResult } from "../lib/types";
+import type {
+  BrowseControls,
+  CatalogueHit,
+  LiteratureProviderInfo,
+  LiteratureSearchResult,
+} from "../lib/types";
 
 vi.mock("../services", () => ({
   isTauri: true,
@@ -9,6 +14,7 @@ vi.mock("../services", () => ({
     catalogueAcquire: vi.fn(),
     literatureProviders: vi.fn(),
     literatureSearch: vi.fn(),
+    literatureBrowse: vi.fn(),
     literatureResolveDownload: vi.fn(),
     listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
   },
@@ -63,9 +69,70 @@ const WORK: LiteratureSearchResult = {
   acquisition: "direct",
 };
 
+/** What OpenAlex's manifest declares, said the way the backend reports it. */
+const OPENALEX_BROWSE: BrowseControls = {
+  keyword: true,
+  sort: {
+    default: "cited_by_count:desc",
+    keyword_default: "relevance_score:desc",
+    options: [
+      { value: "cited_by_count:desc", label: "Most cited" },
+      { value: "publication_date:desc", label: "Newest first" },
+    ],
+  },
+  filters: [
+    {
+      name: "year",
+      label: "Year",
+      kind: "range",
+      options: [],
+      has_min: true,
+      has_max: true,
+    },
+    {
+      name: "type",
+      label: "Type",
+      kind: "choice",
+      options: [
+        { value: "article", label: "Article" },
+        { value: "book", label: "Book" },
+      ],
+      has_min: false,
+      has_max: false,
+    },
+    {
+      name: "open_access",
+      label: "Open access only",
+      kind: "flag",
+      options: [],
+      has_min: false,
+      has_max: false,
+    },
+  ],
+};
+
+function provider(
+  id: string,
+  name: string,
+  browse: BrowseControls | null = null,
+  enabled = true,
+): LiteratureProviderInfo {
+  return {
+    provider: id,
+    name,
+    enabled,
+    builtin: true,
+    base_url: `https://api.${id}.example`,
+    default_base_url: `https://api.${id}.example`,
+    capabilities: { browse, lookup: true, references: false, resolve_download: false },
+    secrets: [],
+  };
+}
+
 const search = api.catalogueSearch as unknown as ReturnType<typeof vi.fn>;
 const providers = api.literatureProviders as unknown as ReturnType<typeof vi.fn>;
 const literature = api.literatureSearch as unknown as ReturnType<typeof vi.fn>;
+const browse = api.literatureBrowse as unknown as ReturnType<typeof vi.fn>;
 const resolveDownload = api.literatureResolveDownload as unknown as ReturnType<typeof vi.fn>;
 const acquire = api.catalogueAcquire as unknown as ReturnType<typeof vi.fn>;
 const importFiles = (source as unknown as { importFiles: ReturnType<typeof vi.fn> }).importFiles;
@@ -84,12 +151,18 @@ describe("CataloguePane", () => {
       collapsed: [],
       providerOptions: [],
       providerOptionsError: null,
+      browseOpen: false,
+      browseProvider: null,
+      browseFilters: {},
+      browseSort: null,
+      browseAnswer: null,
+      browseError: null,
     });
     useSettingsStore.setState({ directory: "/library", refreshFileList: vi.fn() as never });
     useWorkspaceStore.setState({ workspaces: [], activeWorkspaceId: null } as never);
     providers.mockResolvedValue([
-      { provider: "semantic_scholar", name: "Semantic Scholar", enabled: true },
-      { provider: "openalex", name: "OpenAlex", enabled: true },
+      provider("semantic_scholar", "Semantic Scholar"),
+      provider("openalex", "OpenAlex", OPENALEX_BROWSE),
     ]);
     search.mockResolvedValue({
       results: [{ key: "pane", terms: ["python", "lists"], hits: [HIT] }],
@@ -329,6 +402,184 @@ describe("CataloguePane", () => {
     render(<CataloguePane />);
     submit("python lists");
     expect(await screen.findByText(/No provider is enabled/)).toBeTruthy();
+  });
+
+  // ── Browse ───────────────────────────────────────────────────────────────
+
+  const works = (count: number, from = 0): LiteratureSearchResult[] =>
+    Array.from({ length: count }, (_, i) => ({
+      ...WORK,
+      id: `W${from + i}`,
+      title: `Browsed work ${from + i}`,
+    }));
+
+  const openBrowse = async () => {
+    fireEvent.click(await screen.findByRole("button", { name: "Browse by filter" }));
+    return screen.getByRole("form", { name: "Browse by filter" });
+  };
+
+  /// What a provider can be listed by is its manifest's declaration. A pane
+  /// that offered a panel for a provider that declares none would be asking a
+  /// question the provider cannot answer.
+  it("offers browsing only when an enabled provider declares a listing", async () => {
+    providers.mockResolvedValue([provider("semantic_scholar", "Semantic Scholar")]);
+    render(<CataloguePane />);
+    await screen.findByRole("button", { name: "Semantic Scholar" });
+    expect(screen.queryByRole("button", { name: "Browse by filter" })).toBeNull();
+  });
+
+  it("does not offer a listing from a provider that is switched off", async () => {
+    providers.mockResolvedValue([provider("openalex", "OpenAlex", OPENALEX_BROWSE, false)]);
+    render(<CataloguePane />);
+    await waitFor(() => expect(providers).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Browse by filter" })).toBeNull();
+  });
+
+  it("draws the panel from the provider's declaration and asks for exactly what was set", async () => {
+    browse.mockResolvedValue({
+      provider: "openalex",
+      name: "OpenAlex",
+      results: works(3),
+      error: null,
+    });
+    render(<CataloguePane />);
+    const panel = await openBrowse();
+
+    // One control per declared filter, of the kind it declares.
+    fireEvent.change(within(panel).getByLabelText("Year min"), { target: { value: "2020" } });
+    fireEvent.change(within(panel).getByLabelText("Year max"), { target: { value: "2024" } });
+    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
+    fireEvent.click(within(panel).getByLabelText("Open access only"));
+    fireEvent.change(within(panel).getByLabelText("Sort"), {
+      target: { value: "publication_date:desc" },
+    });
+    fireEvent.click(within(panel).getByRole("button", { name: "Show works" }));
+
+    expect(await screen.findByText("Browsed work 0")).toBeTruthy();
+    expect(browse).toHaveBeenCalledWith("openalex", {
+      // No keyword was typed.
+      query: null,
+      filters: {
+        "year.min": "2020",
+        "year.max": "2024",
+        type: "article",
+        open_access: "true",
+      },
+      sort: "publication_date:desc",
+      page: 1,
+      limit: 10,
+    });
+    expect(
+      within(screen.getByRole("region", { name: "Literature" })).getByLabelText(
+        "OpenAlex listing",
+      ),
+    ).toBeTruthy();
+    // A listing is not a search: nothing was asked of the keyword search.
+    expect(literature).not.toHaveBeenCalled();
+  });
+
+  it("clears a filter when its value is emptied, rather than sending a blank", async () => {
+    browse.mockResolvedValue({ provider: "openalex", name: "OpenAlex", results: [], error: null });
+    render(<CataloguePane />);
+    const panel = await openBrowse();
+    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "book" } });
+    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "" } });
+    fireEvent.click(within(panel).getByRole("button", { name: "Show works" }));
+    await waitFor(() => expect(browse).toHaveBeenCalled());
+    expect(browse.mock.calls[0][1].filters).toEqual({});
+    expect(await screen.findByText(/Nothing in OpenAlex matches these filters/)).toBeTruthy();
+  });
+
+  /// The keyword in the search box is combined with the filters when the
+  /// provider's listing takes one, and is not a filter a provider that takes
+  /// none was asked to apply.
+  it("combines the typed keyword with the filters", async () => {
+    browse.mockResolvedValue({ provider: "openalex", name: "OpenAlex", results: works(1), error: null });
+    render(<CataloguePane />);
+    const panel = await openBrowse();
+    fireEvent.change(screen.getByLabelText("Search catalogues and literature"), {
+      target: { value: "persistent lists" },
+    });
+    fireEvent.click(within(panel).getByRole("button", { name: "Show works" }));
+    await waitFor(() => expect(browse).toHaveBeenCalled());
+    expect(browse.mock.calls[0][1].query).toBe("persistent lists");
+  });
+
+  it("reads on: the next page extends the listing and the last short page ends it", async () => {
+    browse
+      .mockResolvedValueOnce({ provider: "openalex", name: "OpenAlex", results: works(10), error: null })
+      .mockResolvedValueOnce({ provider: "openalex", name: "OpenAlex", results: works(3, 10), error: null });
+    render(<CataloguePane />);
+    const panel = await openBrowse();
+    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
+    fireEvent.click(within(panel).getByRole("button", { name: "Show works" }));
+    expect(await screen.findByText("Browsed work 9")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    expect(await screen.findByText("Browsed work 12")).toBeTruthy();
+    // The same request, one page on; and what was read stays.
+    expect(browse.mock.calls[1][1]).toMatchObject({
+      filters: { type: "article" },
+      page: 2,
+      limit: 10,
+    });
+    expect(screen.getByText("Browsed work 0")).toBeTruthy();
+    // A short page is the last one.
+    expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+  });
+
+  it("says what a provider refused, beside its name, and keeps what was already read", async () => {
+    browse
+      .mockResolvedValueOnce({ provider: "openalex", name: "OpenAlex", results: works(10), error: null })
+      .mockResolvedValueOnce({
+        provider: "openalex",
+        name: "OpenAlex",
+        results: null,
+        error: "OpenAlex rate limit reached",
+      });
+    render(<CataloguePane />);
+    const panel = await openBrowse();
+    fireEvent.click(within(panel).getByRole("button", { name: "Show works" }));
+    await screen.findByText("Browsed work 0");
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    expect(await screen.findByText(/OpenAlex could not list works: OpenAlex rate limit reached/)).toBeTruthy();
+    expect(screen.getByText("Browsed work 9")).toBeTruthy();
+  });
+
+  it("says what a request the manifest refused was", async () => {
+    browse.mockRejectedValue(new Error("OpenAlex integration is disabled."));
+    render(<CataloguePane />);
+    const panel = await openBrowse();
+    fireEvent.click(within(panel).getByRole("button", { name: "Show works" }));
+    expect(await screen.findByText(/could not list works: Error: OpenAlex integration is disabled/)).toBeTruthy();
+  });
+
+  it("lets the user choose among providers that each declare a listing", async () => {
+    providers.mockResolvedValue([
+      provider("semantic_scholar", "Semantic Scholar"),
+      provider("openalex", "OpenAlex", OPENALEX_BROWSE),
+      provider("custom:crossref", "Crossref", {
+        keyword: false,
+        sort: null,
+        filters: [],
+      }),
+    ]);
+    browse.mockResolvedValue({ provider: "custom:crossref", name: "Crossref", results: works(1), error: null });
+    render(<CataloguePane />);
+    const panel = await openBrowse();
+    fireEvent.change(within(panel).getByLabelText("Provider to browse"), {
+      target: { value: "custom:crossref" },
+    });
+    // Crossref declares no filters and no sort: the panel is just the button.
+    expect(within(panel).queryByLabelText("Sort")).toBeNull();
+    expect(within(panel).queryByLabelText("Type")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Search catalogues and literature"), {
+      target: { value: "ignored" },
+    });
+    fireEvent.click(within(panel).getByRole("button", { name: "Show works" }));
+    await waitFor(() => expect(browse).toHaveBeenCalled());
+    // And its listing takes no keyword, so none is sent.
+    expect(browse).toHaveBeenCalledWith("custom:crossref", expect.objectContaining({ query: null }));
   });
 
   it("adds a paper through uploads and into the library", async () => {

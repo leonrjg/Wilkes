@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { api } from "../services";
 import type {
+  BrowseRequest,
   CatalogueCourse,
   CatalogueCourseProgress,
   CatalogueDownloadProgress,
@@ -161,6 +162,31 @@ export interface LiteratureAnswer {
   providers: LiteratureProviderAnswer[];
 }
 
+/** Works per page of a browse. A page is a list of things to consider, like
+ *  the rest of this pane, so it is short; the next is one press away. */
+export const BROWSE_LIMIT = 10;
+
+/**
+ * What one provider's listing returned, kept apart from the search answers.
+ *
+ * A browse is a different question from a search — filters and a sort rather
+ * than a query — asked of one provider at a time, and its pages accumulate as
+ * the user reads on. Folding it into `LiteratureAnswer` would have meant a
+ * search that held some other question's results.
+ */
+export interface BrowseAnswer {
+  provider: string;
+  name: string;
+  /** Every page so far, in the order the provider returned them. */
+  results: LiteratureSearchResult[];
+  /** The last page fetched, 1-based. */
+  page: number;
+  /** The last page was short, so there is no next one. */
+  exhausted: boolean;
+  /** The request this answer belongs to, so the next page asks the same one. */
+  request: BrowseRequest;
+}
+
 /**
  * How far one row's add has got.
  *
@@ -210,6 +236,21 @@ interface CatalogueStore {
   /** The request as a whole failed. A single provider failing is not this:
    *  it is reported in that provider's own entry. */
   literatureError: string | null;
+  /** Whether the browse panel is open. A display choice: closing it hides the
+   *  controls and keeps what they were set to. */
+  browseOpen: boolean;
+  /** The provider being browsed, by id. */
+  browseProvider: string | null;
+  /** Filter values by the names the provider's manifest gives them. A blank
+   *  value is no filter and is never stored. */
+  browseFilters: Record<string, string>;
+  /** The sort chosen, or null for the provider's own default. */
+  browseSort: string | null;
+  browseLoading: boolean;
+  browseAnswer: BrowseAnswer | null;
+  /** Why the last browse failed. A failed *next page* leaves the pages already
+   *  read where they are. */
+  browseError: string | null;
   /** Why the last add failed, whichever of its three calls failed. Kept apart
    *  from the search errors so a failed download does not replace the results
    *  the user was choosing from. */
@@ -251,6 +292,17 @@ interface CatalogueStore {
   toggleGrain: (grain: CatalogueGrain) => void;
   toggleProvider: (provider: string) => void;
   toggleSection: (section: PaneSection) => void;
+  setBrowseOpen: (open: boolean) => void;
+  /** Switches the provider being browsed. Filters belong to a provider's
+   *  manifest, so a different provider starts from none. */
+  selectBrowseProvider: (provider: string) => void;
+  setBrowseFilter: (name: string, value: string) => void;
+  setBrowseSort: (sort: string | null) => void;
+  /** Lists the chosen provider's works by the filters set, with `keyword`
+   *  beside them when the provider takes one. Replaces what was listed. */
+  browse: (keyword: string) => Promise<void>;
+  /** The next page of the listing already held. */
+  browseMore: () => Promise<void>;
   /** Reads the provider list and prunes any stored selection against it, so a
    *  filter that outlived the provider it named does not refuse every search. */
   loadProviders: () => Promise<void>;
@@ -418,6 +470,70 @@ function unasked(
   return wanted.filter((id) => !literature.asked.includes(id));
 }
 
+let browseRequest = 0;
+
+/** The provider the panel is browsing: the one chosen, else the first enabled
+ *  one that offers a listing. Null when none does. */
+function browseProviderOf(state: CatalogueStore): string | null {
+  const offered = browseProviderIds(state.providerOptions);
+  if (state.browseProvider !== null && offered.includes(state.browseProvider)) {
+    return state.browseProvider;
+  }
+  return offered[0] ?? null;
+}
+
+/** The ids of the enabled providers that offer a listing, in registry order. */
+export function browseProviderIds(options: LiteratureProviderInfo[]): string[] {
+  return options
+    .filter((option) => option.enabled && option.capabilities.browse !== null)
+    .map((option) => option.provider);
+}
+
+/** Asks for one page. `held` is the answer to extend, or null for a fresh
+ *  listing that replaces whatever was shown. */
+async function runBrowse(
+  set: (partial: Partial<CatalogueStore>) => void,
+  provider: string,
+  name: string,
+  request: BrowseRequest,
+  held: BrowseAnswer | null,
+): Promise<void> {
+  const token = ++browseRequest;
+  set({ browseLoading: true, browseError: null });
+  try {
+    const answer = await api.literatureBrowse(provider, request);
+    if (token !== browseRequest) return;
+    if (answer.error !== null || answer.results === null) {
+      // The provider answered, and refused: a request its manifest does not
+      // allow, or a service that is down. Pages already read stay.
+      set({
+        browseLoading: false,
+        browseError: answer.error ?? "the answer carried neither results nor an error",
+        browseAnswer: held,
+      });
+      return;
+    }
+    set({
+      browseLoading: false,
+      browseAnswer: {
+        provider,
+        name,
+        results: [...(held?.results ?? []), ...answer.results],
+        page: request.page ?? 1,
+        exhausted: answer.results.length < (request.limit ?? BROWSE_LIMIT),
+        request,
+      },
+    });
+  } catch (e: any) {
+    if (token !== browseRequest) return;
+    set({
+      browseLoading: false,
+      browseError: e?.toString?.() ?? "Browse failed",
+      browseAnswer: held,
+    });
+  }
+}
+
 export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
   paneOpen: false,
   query: "",
@@ -430,6 +546,13 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
   literatureLoading: false,
   literature: null,
   literatureError: null,
+  browseOpen: false,
+  browseProvider: null,
+  browseFilters: {},
+  browseSort: null,
+  browseLoading: false,
+  browseAnswer: null,
+  browseError: null,
   acquireError: null,
   acquired: {},
   adding: {},
@@ -506,6 +629,60 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       : [...collapsed, section];
     set({ collapsed: next });
     persistPreferences({ ...preferences(get()), collapsed: next });
+  },
+
+  setBrowseOpen: (open) => set({ browseOpen: open }),
+
+  selectBrowseProvider: (provider) => {
+    if (provider === get().browseProvider) return;
+    browseRequest++;
+    set({
+      browseProvider: provider,
+      browseFilters: {},
+      browseSort: null,
+      browseAnswer: null,
+      browseError: null,
+      browseLoading: false,
+    });
+  },
+
+  setBrowseFilter: (name, value) =>
+    set((state) => {
+      const { [name]: _removed, ...rest } = state.browseFilters;
+      return { browseFilters: value === "" ? rest : { ...rest, [name]: value } };
+    }),
+
+  setBrowseSort: (sort) => set({ browseSort: sort }),
+
+  browse: async (keyword) => {
+    const { providerOptions } = get();
+    const provider = browseProviderOf(get());
+    if (provider === null) return;
+    const info = providerOptions.find((option) => option.provider === provider);
+    const trimmed = keyword.trim();
+    const request: BrowseRequest = {
+      // A keyword only goes to a provider whose listing takes one; sending it
+      // to another would be refused by name, and what the user typed in the
+      // search box above is not a filter they asked this provider to apply.
+      query: info?.capabilities.browse?.keyword && trimmed ? trimmed : null,
+      filters: get().browseFilters,
+      sort: get().browseSort,
+      page: 1,
+      limit: BROWSE_LIMIT,
+    };
+    await runBrowse(set, provider, info?.name ?? provider, request, null);
+  },
+
+  browseMore: async () => {
+    const held = get().browseAnswer;
+    if (held === null || held.exhausted) return;
+    await runBrowse(
+      set,
+      held.provider,
+      held.name,
+      { ...held.request, page: held.page + 1 },
+      held,
+    );
   },
 
   loadProviders: async () => {
@@ -621,6 +798,7 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
   reset: () => {
     catalogueRequest++;
     literatureRequest++;
+    browseRequest++;
     set({
       query: "",
       answer: null,
@@ -629,6 +807,9 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       literature: null,
       literatureError: null,
       literatureLoading: false,
+      browseAnswer: null,
+      browseError: null,
+      browseLoading: false,
       acquireError: null,
       acquired: {},
       adding: {},

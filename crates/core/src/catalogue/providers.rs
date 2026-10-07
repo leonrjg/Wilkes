@@ -53,7 +53,7 @@ impl FetchReporter {
 
 /// A catalogue of acquirable teaching resources.
 ///
-/// Modelled on [`crate::integrations::citations::CitationSource`]: the
+/// Modelled on [`crate::integrations::LiteratureSource`]: the
 /// provider-specific identifiers and wire shapes stay behind the trait, and
 /// only [`CatalogueRecord`] crosses it. Adding a fifth catalogue means writing
 /// a fifth implementation and registering it, and touching nothing else.
