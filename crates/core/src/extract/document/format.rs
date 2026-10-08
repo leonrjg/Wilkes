@@ -337,7 +337,10 @@ mod tests {
                 "{extension} is listed in EXTENSIONS but not admitted by for_path"
             );
         }
-        for name in ["a.pdf", "b.epub", "c.mobi", "d.prc", "e.pdb", "f.azw3", "f.azw", "g.fb2", "h.cbz", "i.cbt"] {
+        for name in [
+            "a.pdf", "b.epub", "c.mobi", "d.prc", "e.pdb", "f.azw3", "f.azw", "g.fb2", "h.cbz",
+            "i.cbt",
+        ] {
             let extension = name.split('.').next_back().unwrap();
             assert!(
                 PagedFormat::EXTENSIONS.contains(&extension),

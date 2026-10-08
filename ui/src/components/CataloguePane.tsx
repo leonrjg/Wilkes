@@ -1,6 +1,7 @@
-import { useEffect, useState, type ReactNode } from "react";
-import { ChevronDown, ChevronRight, Search, X } from "react-feather";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { ChevronDown, ChevronRight, Search, Sliders, X } from "react-feather";
 import type {
+  BrowseControls,
   CatalogueGrain,
   CatalogueHit,
   FilterControl,
@@ -13,6 +14,8 @@ import {
   enabledProviderIds,
   type LiteratureAnswer,
   type PaneSection,
+  refinedProvider,
+  refinementCount,
   type Selection,
   selects,
   selectsAny,
@@ -62,6 +65,10 @@ export default function CataloguePane() {
   const literatureError = useCatalogueStore((s) => s.literatureError);
   const acquireError = useCatalogueStore((s) => s.acquireError);
   const browseAnswer = useCatalogueStore((s) => s.browseAnswer);
+  const browseLoading = useCatalogueStore((s) => s.browseLoading);
+  const browseError = useCatalogueStore((s) => s.browseError);
+  const listed = useCatalogueStore(refinedProvider);
+  const setBrowseOpen = useCatalogueStore((s) => s.setBrowseOpen);
   const { readOnly, needsDirectory } = useCatalogueAdd();
   const [draft, setDraft] = useState(useCatalogueStore.getState().query);
 
@@ -75,16 +82,21 @@ export default function CataloguePane() {
   // What a collapsed section is hiding. A rolled-up heading that said only its
   // name would be a place results could land unseen.
   const catalogueCount = answer === null ? null : answer.hits.length;
+  // A provider shown as a filtered listing is counted once, as the listing.
+  const listing = listed !== null && selectsAny(providers) ? browseAnswer : null;
   const literatureCount =
-    literature === null
+    literature === null && listing === null
       ? null
-      : literature.providers
-          .filter((entry) => selects(providers, entry.provider))
-          .reduce((total, entry) => total + (entry.results?.length ?? 0), 0);
+      : (literature?.providers ?? [])
+          .filter((entry) => selects(providers, entry.provider) && entry.provider !== listed)
+          .reduce((total, entry) => total + (entry.results?.length ?? 0), 0) +
+        (listing?.results.length ?? 0);
   const asked =
     (selectsAny(grains) && (loading || error !== null || answer !== null)) ||
     (selectsAny(providers) &&
-      (literatureLoading || literatureError !== null || literature !== null));
+      (literatureLoading || literatureError !== null || literature !== null)) ||
+    (listed !== null && (browseLoading || browseError !== null || browseAnswer !== null));
+  const browsable = browseProviderIds(providerOptions);
 
   return (
     <div className="flex h-full flex-col border-l border-[var(--border-main)] bg-[var(--bg-sidebar)]">
@@ -103,23 +115,27 @@ export default function CataloguePane() {
       </div>
 
       <form
-        className="border-b border-[var(--border-main)] px-3 py-1.5"
+        className="px-3 py-1.5"
         onSubmit={(e) => {
           e.preventDefault();
           void runSearch(draft);
         }}
       >
-        <div className="flex items-center gap-1.5 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2">
-          <Search size={12} className="shrink-0 text-[var(--text-dim)]" />
-          <input
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            placeholder="What do you want to learn or read?"
-            aria-label="Search catalogues and literature"
-            className="w-full bg-transparent py-1.5 text-[11px] text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
-          />
+        <div className="flex items-stretch gap-1.5">
+          <div className="flex min-w-0 flex-1 items-center gap-1.5 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2">
+            <Search size={12} className="shrink-0 text-[var(--text-dim)]" />
+            <input
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              placeholder="What do you want to learn or read?"
+              aria-label="Search catalogues and literature"
+              className="w-full bg-transparent py-1.5 text-[11px] text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
+            />
+          </div>
+          <FiltersButton />
         </div>
       </form>
+      <RefineBar keyword={draft} options={providerOptions} />
 
       {(readOnly || needsDirectory) && (
         <p className="border-b border-[var(--border-main)] px-3 py-1.5 text-[10px] leading-snug text-[var(--text-dim)]">
@@ -129,7 +145,7 @@ export default function CataloguePane() {
         </p>
       )}
 
-      <div className="flex-1 overflow-y-auto px-3 pb-2">
+      <div className="flex-1 overflow-y-auto border-t border-[var(--border-main)] px-3 pb-2">
         {acquireError !== null && (
           <p className="py-1.5 text-[10px] leading-snug text-red-400">{acquireError}</p>
         )}
@@ -185,6 +201,9 @@ export default function CataloguePane() {
             <Note>No provider selected, so nothing was searched.</Note>
           ) : (
             <>
+              {listing !== null || (listed !== null && (browseLoading || browseError !== null)) ? (
+                <ListingBody answer={listing} />
+              ) : null}
               {literatureLoading && <Spinner />}
               {/* The error and the answer are shown together when both exist.
                   A failed request for a provider the user has just re-selected
@@ -194,20 +213,41 @@ export default function CataloguePane() {
                 <p className="py-2 text-[10px] leading-snug text-red-400">{literatureError}</p>
               )}
               {!literatureLoading && literature !== null && (
-                <LiteratureAnswerBody answer={literature} selection={providers} />
+                <LiteratureAnswerBody
+                  answer={literature}
+                  selection={providers}
+                  omit={listed}
+                />
               )}
             </>
           )}
-          <BrowsePanel keyword={draft} options={providerOptions} />
-          {browseAnswer !== null && <BrowseAnswerBody answer={browseAnswer} />}
         </Section>
 
         {!asked && (
-          <Note>
-            Describe what you are trying to understand. The catalogues are open
-            textbooks, courses and documentation sets; the providers are the
-            live sources enabled in Settings › Integrations.
-          </Note>
+          <>
+            <Note>
+              Describe what you are trying to understand. The catalogues are open
+              textbooks, courses and documentation sets; the providers are the
+              live sources enabled in Settings › Integrations.
+            </Note>
+            {browsable.length > 0 && (
+              <Note>
+                No keyword needed to explore:{" "}
+                <button
+                  type="button"
+                  onClick={() => setBrowseOpen(true)}
+                  className="font-bold text-[var(--accent-blue)] hover:underline"
+                >
+                  open Filters
+                </button>{" "}
+                to list{" "}
+                {browsable
+                  .map((id) => providerOptions.find((o) => o.provider === id)?.name ?? id)
+                  .join(", ")}{" "}
+                works by year, type, citations and more.
+              </Note>
+            )}
+          </>
         )}
       </div>
     </div>
@@ -290,7 +330,13 @@ function FilterChips<T extends string>({
 }) {
   if (all.length === 0) return null;
   return (
-    <div className="flex flex-wrap gap-1 pb-1">
+    // Named for what it decides. These chips choose which sources are asked;
+    // the Filters button beside the search box narrows what one of them
+    // returns, and both being called "filters" sent people to the wrong one.
+    <div role="group" aria-label="Search in" className="flex flex-wrap items-center gap-1 pb-1">
+      <span className="pr-0.5 text-[9px] uppercase tracking-wider text-[var(--text-muted)]">
+        Search in
+      </span>
       {all.map((item) => {
         const on = selects(selection, item);
         return (
@@ -356,16 +402,54 @@ function CatalogueAnswerBody({
 }
 
 /**
- * Listing a provider's works by filter and sort, for when there is no keyword
- * to type.
- *
- * Shown only when an enabled provider declares a listing, and drawn entirely
- * from that declaration: the sort, the filters and what kind each is all come
- * from the provider's manifest, so a provider added tomorrow gets a panel with
- * no change here. The keyword above, if there is one, is combined with the
- * filters when the provider's listing takes one.
+ * The control that opens the filters, beside the search box rather than under
+ * a section: what a provider can be filtered by is a property of the whole
+ * search, and a control hidden at the foot of the results was one nobody found.
+ * It shows how many filters are set, so a closed panel still says the results
+ * below are narrowed.
  */
-function BrowsePanel({
+function FiltersButton() {
+  const open = useCatalogueStore((s) => s.browseOpen);
+  const setOpen = useCatalogueStore((s) => s.setBrowseOpen);
+  const count = useCatalogueStore(refinementCount);
+  const options = useCatalogueStore((s) => s.providerOptions);
+  if (browseProviderIds(options).length === 0) return null;
+  return (
+    <button
+      type="button"
+      onClick={() => setOpen(!open)}
+      aria-expanded={open}
+      aria-label={count > 0 ? `Filters, ${count} set` : "Filters"}
+      title="Filter and sort a provider's works, with or without a keyword"
+      className={`flex shrink-0 items-center gap-1 rounded border px-2 text-[10px] font-bold uppercase tracking-wider transition-colors ${
+        open || count > 0
+          ? "border-[var(--border-strong)] bg-[var(--bg-active)] text-[var(--text-main)]"
+          : "border-[var(--border-main)] bg-[var(--bg-app)] text-[var(--text-dim)] hover:text-[var(--text-main)]"
+      }`}
+    >
+      <Sliders size={11} />
+      Filters
+      {count > 0 && (
+        <span className="rounded-full bg-[var(--accent-blue)] px-1 text-[9px] leading-[14px] text-white">
+          {count}
+        </span>
+      )}
+    </button>
+  );
+}
+
+/**
+ * Refining a provider's works, drawn entirely from its manifest's declaration:
+ * the sort, the filters and what kind each is all come from the provider, so a
+ * provider added tomorrow gets controls with no change here.
+ *
+ * Changes apply as they are made. A filter is a narrowing of what is already
+ * on screen, and a separate "apply" button between the choice and its effect
+ * made the pane look inert. Ranges apply when the field is left, since a
+ * request per keystroke would ask a rate-limited service about "2", "20" and
+ * "202". The keyword in the search box rides along when the listing takes one.
+ */
+function RefineBar({
   keyword,
   options,
 }: {
@@ -373,16 +457,17 @@ function BrowsePanel({
   options: LiteratureProviderInfo[];
 }) {
   const open = useCatalogueStore((s) => s.browseOpen);
-  const setOpen = useCatalogueStore((s) => s.setBrowseOpen);
   const chosen = useCatalogueStore((s) => s.browseProvider);
   const selectProvider = useCatalogueStore((s) => s.selectBrowseProvider);
   const filters = useCatalogueStore((s) => s.browseFilters);
   const setFilter = useCatalogueStore((s) => s.setBrowseFilter);
+  const clearFilter = useCatalogueStore((s) => s.clearBrowseFilter);
   const sort = useCatalogueStore((s) => s.browseSort);
   const setSort = useCatalogueStore((s) => s.setBrowseSort);
-  const loading = useCatalogueStore((s) => s.browseLoading);
-  const error = useCatalogueStore((s) => s.browseError);
-  const browse = useCatalogueStore((s) => s.browse);
+  const reset = useCatalogueStore((s) => s.resetRefinement);
+  const refine = useCatalogueStore((s) => s.refine);
+  const count = useCatalogueStore(refinementCount);
+  const selected = useCatalogueStore((s) => s.providers);
 
   const offered = browseProviderIds(options);
   if (offered.length === 0) return null;
@@ -391,33 +476,47 @@ function BrowsePanel({
   const controls = info?.capabilities.browse ?? null;
   if (!info || controls === null) return null;
 
+  const apply = () => void refine(keyword);
+  const typed = keyword.trim() !== "";
+  const switchedOff = !selects(selected, provider);
+
   return (
-    <div className="border-t border-[var(--border-main)] pt-1.5">
-      <button
-        type="button"
-        onClick={() => setOpen(!open)}
-        aria-expanded={open}
-        className="flex w-full items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
-      >
-        {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-        Browse by filter
-      </button>
-      {open && (
-        <form
-          className="flex flex-col gap-1.5 py-1.5"
-          aria-label="Browse by filter"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void browse(keyword);
+    <div className="px-3 pb-1.5">
+      {count > 0 && !open && (
+        <ActiveFilters
+          controls={controls}
+          filters={filters}
+          sort={sort}
+          onClearFilter={(name) => {
+            clearFilter(name);
+            apply();
           }}
+          onClearSort={() => {
+            setSort(null);
+            apply();
+          }}
+          onReset={() => {
+            reset();
+            apply();
+          }}
+        />
+      )}
+      {open && (
+        <div
+          role="group"
+          aria-label="Filters"
+          className="flex max-h-[45vh] flex-col gap-1.5 overflow-y-auto rounded border border-[var(--border-main)] bg-[var(--bg-app)] p-2"
         >
-          {offered.length > 1 && (
-            <ControlRow label="Provider">
+          <div className="flex items-center justify-between gap-2">
+            {offered.length > 1 ? (
               <select
-                aria-label="Provider to browse"
+                aria-label="Provider to filter"
                 value={provider}
-                onChange={(e) => selectProvider(e.target.value)}
-                className={CONTROL_CLASS}
+                onChange={(e) => {
+                  selectProvider(e.target.value);
+                  apply();
+                }}
+                className="rounded border border-[var(--border-main)] bg-[var(--bg-sidebar)] px-1 py-0.5 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)] outline-none"
               >
                 {offered.map((id) => (
                   <option key={id} value={id}>
@@ -425,68 +524,182 @@ function BrowsePanel({
                   </option>
                 ))}
               </select>
-            </ControlRow>
-          )}
-          {controls.sort !== null && (
-            <ControlRow label="Sort">
-              <select
-                aria-label="Sort"
-                value={sort ?? ""}
-                onChange={(e) => setSort(e.target.value === "" ? null : e.target.value)}
-                className={CONTROL_CLASS}
-              >
-                <option value="">
-                  {optionLabel(controls.sort.options, controls.sort.default)} (default)
-                </option>
-                {controls.sort.options
-                  .filter((option) => option.value !== controls.sort?.default)
-                  .map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-              </select>
-            </ControlRow>
-          )}
-          {controls.filters.map((filter) => (
-            <FilterInput
-              key={filter.name}
-              filter={filter}
-              values={filters}
-              onChange={setFilter}
-            />
-          ))}
-          <div className="flex items-center gap-2 pt-0.5">
-            <button
-              type="submit"
-              disabled={loading}
-              className="rounded border border-[var(--border-strong)] bg-[var(--bg-active)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)] disabled:opacity-50"
-            >
-              {loading ? "Listing" : "Show works"}
-            </button>
-            {controls.keyword && keyword.trim() !== "" && (
-              <span className="text-[10px] text-[var(--text-dim)]">
-                with “{keyword.trim()}”
+            ) : (
+              <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)]">
+                {info.name}
               </span>
             )}
+            {count > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  reset();
+                  apply();
+                }}
+                className="text-[10px] text-[var(--text-dim)] underline-offset-2 hover:text-[var(--text-main)] hover:underline"
+              >
+                Reset
+              </button>
+            )}
           </div>
-          {error !== null && !loading && (
-            <p className="text-[10px] leading-snug text-red-400">
-              {info.name} could not list works: {error}
+          {switchedOff && (
+            <p className="text-[10px] leading-snug text-[var(--text-muted)]">
+              {info.name} is switched off in the Literature section, so these filters are
+              not applied.
             </p>
           )}
-        </form>
+          <div className="grid grid-cols-2 gap-1.5">
+            {controls.sort !== null && (
+              <ControlRow label="Sort by" wide={controls.filters.length === 0}>
+                <select
+                  aria-label="Sort"
+                  value={sort ?? ""}
+                  onChange={(e) => {
+                    setSort(e.target.value === "" ? null : e.target.value);
+                    apply();
+                  }}
+                  className={CONTROL_CLASS}
+                >
+                  <option value="">{defaultSortLabel(controls, typed)}</option>
+                  {controls.sort.options
+                    .filter((option) => option.value !== controls.sort?.default)
+                    .map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                </select>
+              </ControlRow>
+            )}
+            {controls.filters.map((filter) => (
+              <FilterInput
+                key={filter.name}
+                filter={filter}
+                values={filters}
+                onChange={setFilter}
+                onApply={apply}
+              />
+            ))}
+          </div>
+          {typed && !controls.keyword && (
+            <p className="text-[10px] leading-snug text-[var(--text-muted)]">
+              {info.name}'s listing does not take a keyword, so “{keyword.trim()}” only
+              searches the other sources.
+            </p>
+          )}
+          {count === 0 && (
+            <p className="text-[10px] leading-snug text-[var(--text-muted)]">
+              Set a filter or a sort to list {info.name} works
+              {controls.keyword ? ", with or without a keyword" : ""}.
+            </p>
+          )}
+        </div>
       )}
     </div>
   );
 }
 
-const CONTROL_CLASS =
-  "w-full rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1.5 py-1 text-[11px] text-[var(--text-main)] outline-none";
+/** What the unset sort means right now: with a keyword typed, the provider
+ *  ranks by relevance; without one, by its own default. */
+function defaultSortLabel(controls: BrowseControls, keywordTyped: boolean): string {
+  const sort = controls.sort;
+  if (sort === null) return "";
+  if (keywordTyped && controls.keyword && sort.keyword_default) {
+    return `${optionLabel(sort.options, sort.keyword_default, "Relevance")} (default)`;
+  }
+  return `${optionLabel(sort.options, sort.default, sort.default)} (default)`;
+}
 
-function ControlRow({ label, children }: { label: string; children: ReactNode }) {
+/** The filters that are set, one removable chip each, for when the panel is
+ *  closed and the results would otherwise look unexplained. */
+function ActiveFilters({
+  controls,
+  filters,
+  sort,
+  onClearFilter,
+  onClearSort,
+  onReset,
+}: {
+  controls: BrowseControls;
+  filters: Record<string, string>;
+  sort: string | null;
+  onClearFilter: (name: string) => void;
+  onClearSort: () => void;
+  onReset: () => void;
+}) {
+  const chips: { key: string; text: string; clear: () => void }[] = [];
+  for (const filter of controls.filters) {
+    const text = filterSummary(filter, filters);
+    if (text !== null) {
+      chips.push({ key: filter.name, text, clear: () => onClearFilter(filter.name) });
+    }
+  }
+  if (sort !== null && controls.sort !== null) {
+    chips.push({
+      key: "sort",
+      text: `Sort: ${optionLabel(controls.sort.options, sort, sort)}`,
+      clear: onClearSort,
+    });
+  }
   return (
-    <label className="flex flex-col gap-0.5">
+    <div className="flex flex-wrap items-center gap-1" aria-label="Active filters">
+      {chips.map((chip) => (
+        <button
+          key={chip.key}
+          type="button"
+          onClick={chip.clear}
+          aria-label={`Remove ${chip.text}`}
+          title="Remove"
+          className="flex items-center gap-1 rounded-full border border-[var(--border-strong)] bg-[var(--bg-active)] px-2 py-0.5 text-[10px] text-[var(--text-main)] transition-colors hover:border-red-400"
+        >
+          {chip.text}
+          <X size={9} />
+        </button>
+      ))}
+      {chips.length > 1 && (
+        <button
+          type="button"
+          onClick={onReset}
+          className="px-1 text-[10px] text-[var(--text-dim)] underline-offset-2 hover:text-[var(--text-main)] hover:underline"
+        >
+          Clear all
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** How one filter's value reads in a chip, or null when it is not set. */
+function filterSummary(filter: FilterControl, values: Record<string, string>): string | null {
+  if (filter.kind === "choice") {
+    const value = values[filter.name];
+    return value === undefined
+      ? null
+      : `${filter.label}: ${optionLabel(filter.options, value, value)}`;
+  }
+  if (filter.kind === "flag") return values[filter.name] === "true" ? filter.label : null;
+  const min = values[`${filter.name}.min`];
+  const max = values[`${filter.name}.max`];
+  if (min !== undefined && max !== undefined) return `${filter.label}: ${min}–${max}`;
+  if (min !== undefined) return `${filter.label} ≥ ${min}`;
+  if (max !== undefined) return `${filter.label} ≤ ${max}`;
+  return null;
+}
+
+const CONTROL_CLASS =
+  "w-full rounded border border-[var(--border-main)] bg-[var(--bg-sidebar)] px-1.5 py-1 text-[11px] text-[var(--text-main)] outline-none focus:border-[var(--border-strong)]";
+
+function ControlRow({
+  label,
+  wide = false,
+  children,
+}: {
+  label: string;
+  wide?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <label className={`flex flex-col gap-0.5 ${wide ? "col-span-2" : ""}`}>
       <span className="text-[9px] font-bold uppercase tracking-wider text-[var(--text-dim)]">
         {label}
       </span>
@@ -498,8 +711,9 @@ function ControlRow({ label, children }: { label: string; children: ReactNode })
 function optionLabel(
   options: readonly { value: string; label: string }[],
   value: string,
+  fallback: string,
 ): string {
-  return options.find((option) => option.value === value)?.label ?? value;
+  return options.find((option) => option.value === value)?.label ?? fallback;
 }
 
 /** One declared filter, as the control its kind calls for. */
@@ -507,10 +721,12 @@ function FilterInput({
   filter,
   values,
   onChange,
+  onApply,
 }: {
   filter: FilterControl;
   values: Record<string, string>;
   onChange: (name: string, value: string) => void;
+  onApply: () => void;
 }) {
   if (filter.kind === "choice") {
     return (
@@ -518,7 +734,10 @@ function FilterInput({
         <select
           aria-label={filter.label}
           value={values[filter.name] ?? ""}
-          onChange={(e) => onChange(filter.name, e.target.value)}
+          onChange={(e) => {
+            onChange(filter.name, e.target.value);
+            onApply();
+          }}
           className={CONTROL_CLASS}
         >
           <option value="">Any</option>
@@ -533,39 +752,38 @@ function FilterInput({
   }
   if (filter.kind === "flag") {
     return (
-      <label className="flex items-center gap-1.5 text-[11px] text-[var(--text-main)]">
+      <label className="col-span-2 flex items-center gap-1.5 text-[11px] text-[var(--text-main)]">
         <input
           type="checkbox"
           checked={values[filter.name] === "true"}
-          onChange={(e) => onChange(filter.name, e.target.checked ? "true" : "")}
+          onChange={(e) => {
+            onChange(filter.name, e.target.checked ? "true" : "");
+            onApply();
+          }}
         />
         {filter.label}
       </label>
     );
   }
   return (
-    <ControlRow label={filter.label}>
+    <ControlRow label={filter.label} wide>
       <span className="flex items-center gap-1.5">
         {filter.has_min && (
-          <input
-            type="number"
-            inputMode="numeric"
-            aria-label={`${filter.label} min`}
+          <RangeEnd
+            label={`${filter.label} min`}
             placeholder={filter.has_max ? "From" : "At least"}
             value={values[`${filter.name}.min`] ?? ""}
-            onChange={(e) => onChange(`${filter.name}.min`, e.target.value)}
-            className={CONTROL_CLASS}
+            onChange={(v) => onChange(`${filter.name}.min`, v)}
+            onApply={onApply}
           />
         )}
         {filter.has_max && (
-          <input
-            type="number"
-            inputMode="numeric"
-            aria-label={`${filter.label} max`}
+          <RangeEnd
+            label={`${filter.label} max`}
             placeholder={filter.has_min ? "To" : "At most"}
             value={values[`${filter.name}.max`] ?? ""}
-            onChange={(e) => onChange(`${filter.name}.max`, e.target.value)}
-            className={CONTROL_CLASS}
+            onChange={(v) => onChange(`${filter.name}.max`, v)}
+            onApply={onApply}
           />
         )}
       </span>
@@ -573,29 +791,90 @@ function FilterInput({
   );
 }
 
-/** What the listing returned, under the provider's name, with the next page
- *  one press away. */
-function BrowseAnswerBody({ answer }: { answer: BrowseAnswer }) {
-  const loading = useCatalogueStore((s) => s.browseLoading);
-  const more = useCatalogueStore((s) => s.browseMore);
+/** One end of a range. Applies when left, and only if it changed while it held
+ *  focus; Enter leaves it, so the two ways of finishing are one request. */
+function RangeEnd({
+  label,
+  placeholder,
+  value,
+  onChange,
+  onApply,
+}: {
+  label: string;
+  placeholder: string;
+  value: string;
+  onChange: (value: string) => void;
+  onApply: () => void;
+}) {
+  const atFocus = useRef(value);
   return (
-    <div className="flex flex-col" aria-label={`${answer.name} listing`}>
+    <input
+      type="number"
+      inputMode="numeric"
+      aria-label={label}
+      placeholder={placeholder}
+      value={value}
+      onFocus={() => {
+        atFocus.current = value;
+      }}
+      onChange={(e) => onChange(e.target.value)}
+      onBlur={() => {
+        if (value !== atFocus.current) onApply();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          e.currentTarget.blur();
+        }
+      }}
+      className={CONTROL_CLASS}
+    />
+  );
+}
+
+/**
+ * The provider's filtered works, in the Literature section under its name like
+ * any other provider's answer, with the next page one press away.
+ *
+ * `answer` is null while the first page is on its way or has failed; the
+ * heading and the reason are shown either way, so a refinement that is asking
+ * does not look like one that was ignored.
+ */
+function ListingBody({ answer }: { answer: BrowseAnswer | null }) {
+  const loading = useCatalogueStore((s) => s.browseLoading);
+  const error = useCatalogueStore((s) => s.browseError);
+  const more = useCatalogueStore((s) => s.browseMore);
+  const options = useCatalogueStore((s) => s.providerOptions);
+  const chosen = useCatalogueStore((s) => s.browseProvider);
+  const name =
+    answer?.name ??
+    options.find((o) => o.provider === (chosen ?? browseProviderIds(options)[0]))?.name ??
+    "Provider";
+  return (
+    <div className="flex flex-col" aria-label={`${name} listing`}>
       <h4 className="mt-2 flex items-baseline gap-1.5 border-b border-[var(--border-strong)] pb-1 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)]">
-        {answer.name}
+        {name}
         <span className="font-normal normal-case tracking-normal text-[var(--text-muted)]">
-          listing · {answer.results.length}
+          filtered{answer !== null ? ` · ${answer.results.length}` : ""}
         </span>
       </h4>
-      {answer.results.length === 0 ? (
-        <Note>Nothing in {answer.name} matches these filters.</Note>
-      ) : (
-        <div className="divide-y divide-[var(--border-main)]">
-          {answer.results.map((work) => (
-            <PaperCandidate key={work.id} provider={answer.provider} work={work} />
-          ))}
-        </div>
+      {answer === null && loading && <Spinner />}
+      {error !== null && !loading && (
+        <p className="py-1.5 text-[10px] leading-snug text-red-400">
+          {name} could not list works: {error}
+        </p>
       )}
-      {!answer.exhausted && (
+      {answer !== null &&
+        (answer.results.length === 0 ? (
+          <Note>Nothing in {answer.name} matches these filters.</Note>
+        ) : (
+          <div className="divide-y divide-[var(--border-main)]">
+            {answer.results.map((work) => (
+              <PaperCandidate key={work.id} provider={answer.provider} work={work} />
+            ))}
+          </div>
+        ))}
+      {answer !== null && !answer.exhausted && (
         <button
           type="button"
           onClick={() => void more()}
@@ -626,9 +905,12 @@ function providerAnswerMalformed(provider: string): string {
 function LiteratureAnswerBody({
   answer,
   selection,
+  omit,
 }: {
   answer: LiteratureAnswer;
   selection: Selection<string>;
+  /** A provider shown elsewhere as a filtered listing, and not listed twice. */
+  omit: string | null;
 }) {
   // No provider enabled is a setting, not a search result: saying "nothing
   // found" would send someone rephrasing a query no index ever saw.
@@ -640,7 +922,13 @@ function LiteratureAnswerBody({
       </Note>
     );
   }
-  const shown = answer.providers.filter((entry) => selects(selection, entry.provider));
+  const options = useCatalogueStore((s) => s.providerOptions);
+  const moreLoading = useCatalogueStore((s) => s.literatureMore);
+  const moreError = useCatalogueStore((s) => s.literatureMoreError);
+  const loadMore = useCatalogueStore((s) => s.loadMoreLiterature);
+  const shown = answer.providers.filter(
+    (entry) => selects(selection, entry.provider) && entry.provider !== omit,
+  );
   return (
     <div className="flex flex-col">
       {shown.map((entry) => (
@@ -673,6 +961,26 @@ function LiteratureAnswerBody({
               ))}
             </div>
           )}
+          {moreError[entry.provider] !== undefined && (
+            <p className="py-1 text-[10px] leading-snug text-red-400">
+              {entry.name} could not read the next page: {moreError[entry.provider]}
+            </p>
+          )}
+          {entry.results !== null &&
+            entry.results.length > 0 &&
+            answer.pages[entry.provider]?.exhausted === false &&
+            options.find((o) => o.provider === entry.provider)?.capabilities.paged_search ===
+              true && (
+              <button
+                type="button"
+                onClick={() => void loadMore(entry.provider)}
+                disabled={moreLoading.includes(entry.provider)}
+                aria-label={`Load more from ${entry.name}`}
+                className="mt-1.5 self-start rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)] disabled:opacity-50"
+              >
+                {moreLoading.includes(entry.provider) ? "Loading" : "Load more"}
+              </button>
+            )}
         </div>
       ))}
     </div>

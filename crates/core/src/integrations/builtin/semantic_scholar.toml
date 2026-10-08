@@ -19,7 +19,7 @@ x-api-key = { secret = "api_key", optional = true, label = "API key", kind = "pa
 path = "/graph/v1/paper/DOI:10.1145%2F3801158?fields=paperId"
 
 [capabilities.search]
-path = "/graph/v1/paper/search?query={query}&limit={limit}&fields=title,citationCount,externalIds,year,venue,publicationDate,isOpenAccess,openAccessPdf,authors"
+path = "/graph/v1/paper/search?query={query}&limit={limit}&offset={offset}&fields=title,citationCount,externalIds,year,venue,publicationDate,isOpenAccess,openAccessPdf,authors"
 items = "data"
 
 [capabilities.search.fields]

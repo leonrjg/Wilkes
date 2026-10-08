@@ -124,7 +124,7 @@ function provider(
     builtin: true,
     base_url: `https://api.${id}.example`,
     default_base_url: `https://api.${id}.example`,
-    capabilities: { browse, lookup: true, references: false, resolve_download: false },
+    capabilities: { paged_search: true, browse, lookup: true, references: false, resolve_download: false },
     secrets: [],
   };
 }
@@ -191,7 +191,7 @@ describe("CataloguePane", () => {
     // Ten records, not the backend's own default: the pane is a shortlist to
     // consider, not a second page of search results.
     expect(search.mock.calls[0][1]).toBe(10);
-    expect(literature).toHaveBeenCalledWith("python lists", undefined, undefined);
+    expect(literature).toHaveBeenCalledWith("python lists", 10, undefined);
     // Listed apart, under headings, because they are different answers. The
     // live sources are "Literature", not "Papers": a provider may index a
     // monograph or a standard, and several do.
@@ -248,7 +248,7 @@ describe("CataloguePane", () => {
     fireEvent.click(screen.getByRole("button", { name: "Semantic Scholar" }));
     submit("python lists");
     await screen.findByText("Persistent Lists Revisited");
-    expect(literature).toHaveBeenCalledWith("python lists", undefined, ["openalex"]);
+    expect(literature).toHaveBeenCalledWith("python lists", 10, ["openalex"]);
     expect(JSON.parse(localStorage.getItem("wilkes.catalogue.filters") ?? "null")).toEqual({
       grains: null,
       providers: ["openalex"],
@@ -291,7 +291,7 @@ describe("CataloguePane", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Semantic Scholar" }));
     await waitFor(() => {
-      expect(literature).toHaveBeenLastCalledWith("python lists", undefined, [
+      expect(literature).toHaveBeenLastCalledWith("python lists", 10, [
         "semantic_scholar",
       ]);
     });
@@ -404,7 +404,128 @@ describe("CataloguePane", () => {
     expect(await screen.findByText(/No provider is enabled/)).toBeTruthy();
   });
 
-  // ── Browse ───────────────────────────────────────────────────────────────
+  // ── Reading on in a keyword search ───────────────────────────────────────
+
+  const hits = (count: number, from = 0): LiteratureSearchResult[] =>
+    Array.from({ length: count }, (_, i) => ({
+      ...WORK,
+      id: `S${from + i}`,
+      title: `Searched work ${from + i}`,
+    }));
+  const answerOf = (id: string, name: string, results: LiteratureSearchResult[]) => ({
+    query: "python lists",
+    providers: [{ provider: id, name, results, error: null }],
+  });
+
+  it("reads on in a keyword search, one provider at a time, appending to what it said", async () => {
+    literature
+      .mockResolvedValueOnce({
+        query: "python lists",
+        providers: [
+          { provider: "semantic_scholar", name: "Semantic Scholar", results: hits(2), error: null },
+          { provider: "openalex", name: "OpenAlex", results: hits(10), error: null },
+        ],
+      })
+      .mockResolvedValueOnce(answerOf("openalex", "OpenAlex", hits(4, 10)));
+    render(<CataloguePane />);
+    submit("python lists");
+    await screen.findByText("Searched work 9");
+
+    // Semantic Scholar's page was short, so it has no next one; OpenAlex's was
+    // full, so it has.
+    expect(screen.queryByRole("button", { name: "Load more from Semantic Scholar" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Load more from OpenAlex" }));
+    expect(await screen.findByText("Searched work 13")).toBeTruthy();
+    // Only that provider was asked, for the next page of the same question.
+    expect(literature).toHaveBeenLastCalledWith("python lists", 10, ["openalex"], 2);
+    // And a short page was the last.
+    expect(screen.queryByRole("button", { name: "Load more from OpenAlex" })).toBeNull();
+  });
+
+  /// A provider whose manifest names no page would answer its first again.
+  it("lists a work once when two pages both return it", async () => {
+    literature
+      .mockResolvedValueOnce(answerOf("openalex", "OpenAlex", hits(10)))
+      .mockResolvedValueOnce(answerOf("openalex", "OpenAlex", [...hits(1, 9), ...hits(2, 10)]));
+    render(<CataloguePane />);
+    submit("python lists");
+    await screen.findByText("Searched work 9");
+    fireEvent.click(screen.getByRole("button", { name: "Load more from OpenAlex" }));
+    await screen.findByText("Searched work 11");
+    expect(screen.getAllByText("Searched work 9")).toHaveLength(1);
+  });
+
+  it("offers no next page for a provider whose search cannot be read past its first", async () => {
+    providers.mockResolvedValue([
+      { ...provider("openalex", "OpenAlex", OPENALEX_BROWSE), capabilities: {
+        ...provider("openalex", "OpenAlex", OPENALEX_BROWSE).capabilities,
+        paged_search: false,
+      } },
+    ]);
+    literature.mockResolvedValue(answerOf("openalex", "OpenAlex", hits(10)));
+    render(<CataloguePane />);
+    submit("python lists");
+    await screen.findByText("Searched work 9");
+    expect(screen.queryByRole("button", { name: /Load more from/ })).toBeNull();
+  });
+
+  it("says why the next page failed and keeps what was read", async () => {
+    literature
+      .mockResolvedValueOnce(answerOf("openalex", "OpenAlex", hits(10)))
+      .mockResolvedValueOnce({
+        query: "python lists",
+        providers: [
+          { provider: "openalex", name: "OpenAlex", results: null, error: "rate limit reached" },
+        ],
+      });
+    render(<CataloguePane />);
+    submit("python lists");
+    await screen.findByText("Searched work 9");
+    fireEvent.click(screen.getByRole("button", { name: "Load more from OpenAlex" }));
+    expect(
+      await screen.findByText(/OpenAlex could not read the next page: rate limit reached/),
+    ).toBeTruthy();
+    expect(screen.getByText("Searched work 0")).toBeTruthy();
+    // The button is still there to try again.
+    expect(screen.getByRole("button", { name: "Load more from OpenAlex" })).toBeTruthy();
+  });
+
+  it("names the source chips for what they decide, apart from the Filters button", async () => {
+    render(<CataloguePane />);
+    await screen.findByRole("button", { name: "OpenAlex" });
+    expect(screen.getAllByRole("group", { name: "Search in" })).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "Filters" })).toBeTruthy();
+  });
+
+  // ── Paper rows ───────────────────────────────────────────────────────────
+
+  /// The line is clamped, so what comes first is what survives: a long author
+  /// list must not push the citations and the access out of view.
+  it("leads a paper's facts with year, citations and access, before its authors", async () => {
+    literature.mockResolvedValue(
+      answerOf("openalex", "OpenAlex", [
+        { ...WORK, authors: "Ada Lovelace, Alan Turing, Grace Hopper" },
+      ]),
+    );
+    render(<CataloguePane />);
+    submit("python lists");
+    const facts = await screen.findByTitle(/^2021 · 12 citations · Open access · Ada Lovelace/);
+    expect(facts).toBeTruthy();
+  });
+
+  /// A provider that reported no count has not reported zero.
+  it("shows no citation count for a work whose provider reported none", async () => {
+    literature.mockResolvedValue(
+      answerOf("openalex", "OpenAlex", [{ ...WORK, citation_count: null }]),
+    );
+    render(<CataloguePane />);
+    submit("python lists");
+    await screen.findByText("Persistent Lists Revisited");
+    expect(screen.queryByText(/citation/)).toBeNull();
+    expect(screen.queryByTitle(/0 citations/)).toBeNull();
+  });
+
+  // ── Filters ──────────────────────────────────────────────────────────────
 
   const works = (count: number, from = 0): LiteratureSearchResult[] =>
     Array.from({ length: count }, (_, i) => ({
@@ -412,107 +533,179 @@ describe("CataloguePane", () => {
       id: `W${from + i}`,
       title: `Browsed work ${from + i}`,
     }));
+  const listing = (results: LiteratureSearchResult[]) => ({
+    provider: "openalex",
+    name: "OpenAlex",
+    results,
+    error: null,
+  });
 
-  const openBrowse = async () => {
-    fireEvent.click(await screen.findByRole("button", { name: "Browse by filter" }));
-    return screen.getByRole("form", { name: "Browse by filter" });
+  const openFilters = async () => {
+    fireEvent.click(await screen.findByRole("button", { name: "Filters" }));
+    return screen.getByRole("group", { name: "Filters" });
   };
+  const searchBox = () => screen.getByLabelText("Search catalogues and literature");
 
-  /// What a provider can be listed by is its manifest's declaration. A pane
-  /// that offered a panel for a provider that declares none would be asking a
+  /// What a provider can be filtered by is its manifest's declaration. A pane
+  /// that offered filters for a provider that declares none would be asking a
   /// question the provider cannot answer.
-  it("offers browsing only when an enabled provider declares a listing", async () => {
+  it("offers filters only when an enabled provider declares something to refine", async () => {
     providers.mockResolvedValue([provider("semantic_scholar", "Semantic Scholar")]);
     render(<CataloguePane />);
     await screen.findByRole("button", { name: "Semantic Scholar" });
-    expect(screen.queryByRole("button", { name: "Browse by filter" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Filters/ })).toBeNull();
   });
 
-  it("does not offer a listing from a provider that is switched off", async () => {
+  it("does not offer filters from a provider that is switched off", async () => {
     providers.mockResolvedValue([provider("openalex", "OpenAlex", OPENALEX_BROWSE, false)]);
     render(<CataloguePane />);
     await waitFor(() => expect(providers).toHaveBeenCalled());
-    expect(screen.queryByRole("button", { name: "Browse by filter" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Filters/ })).toBeNull();
   });
 
-  it("draws the panel from the provider's declaration and asks for exactly what was set", async () => {
-    browse.mockResolvedValue({
-      provider: "openalex",
-      name: "OpenAlex",
-      results: works(3),
-      error: null,
-    });
+  it("puts the filters beside the search box, and says so before anything is asked", async () => {
     render(<CataloguePane />);
-    const panel = await openBrowse();
+    expect(await screen.findByRole("button", { name: "Filters" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "open Filters" }));
+    expect(screen.getByRole("group", { name: "Filters" })).toBeTruthy();
+  });
 
-    // One control per declared filter, of the kind it declares.
-    fireEvent.change(within(panel).getByLabelText("Year min"), { target: { value: "2020" } });
-    fireEvent.change(within(panel).getByLabelText("Year max"), { target: { value: "2024" } });
+  it("applies each change as it is made, asking for exactly what was set", async () => {
+    browse.mockResolvedValue(listing(works(3)));
+    render(<CataloguePane />);
+    const panel = await openFilters();
+
     fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
+    expect(await screen.findByText("Browsed work 0")).toBeTruthy();
+    expect(browse).toHaveBeenLastCalledWith("openalex", {
+      // No keyword was typed.
+      query: null,
+      filters: { type: "article" },
+      sort: null,
+      page: 1,
+      limit: 10,
+    });
+
     fireEvent.click(within(panel).getByLabelText("Open access only"));
     fireEvent.change(within(panel).getByLabelText("Sort"), {
       target: { value: "publication_date:desc" },
     });
-    fireEvent.click(within(panel).getByRole("button", { name: "Show works" }));
-
-    expect(await screen.findByText("Browsed work 0")).toBeTruthy();
-    expect(browse).toHaveBeenCalledWith("openalex", {
-      // No keyword was typed.
-      query: null,
-      filters: {
-        "year.min": "2020",
-        "year.max": "2024",
-        type: "article",
-        open_access: "true",
-      },
-      sort: "publication_date:desc",
-      page: 1,
-      limit: 10,
-    });
+    await waitFor(() =>
+      expect(browse).toHaveBeenLastCalledWith("openalex", {
+        query: null,
+        filters: { type: "article", open_access: "true" },
+        sort: "publication_date:desc",
+        page: 1,
+        limit: 10,
+      }),
+    );
+    // The listing sits in the Literature section under the provider's name,
+    // and nothing was asked of the keyword search.
     expect(
       within(screen.getByRole("region", { name: "Literature" })).getByLabelText(
         "OpenAlex listing",
       ),
     ).toBeTruthy();
-    // A listing is not a search: nothing was asked of the keyword search.
     expect(literature).not.toHaveBeenCalled();
   });
 
-  it("clears a filter when its value is emptied, rather than sending a blank", async () => {
-    browse.mockResolvedValue({ provider: "openalex", name: "OpenAlex", results: [], error: null });
+  /// A range is typed a digit at a time. Asking the provider about "2", "20"
+  /// and "202" on the way to 2024 would be three requests nobody wanted.
+  it("applies a range when the field is left, once, and not per keystroke", async () => {
+    browse.mockResolvedValue(listing(works(1)));
     render(<CataloguePane />);
-    const panel = await openBrowse();
-    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "book" } });
-    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "" } });
-    fireEvent.click(within(panel).getByRole("button", { name: "Show works" }));
-    await waitFor(() => expect(browse).toHaveBeenCalled());
-    expect(browse.mock.calls[0][1].filters).toEqual({});
-    expect(await screen.findByText(/Nothing in OpenAlex matches these filters/)).toBeTruthy();
+    const panel = await openFilters();
+    const min = within(panel).getByLabelText("Year min");
+    fireEvent.focus(min);
+    fireEvent.change(min, { target: { value: "2" } });
+    fireEvent.change(min, { target: { value: "2020" } });
+    expect(browse).not.toHaveBeenCalled();
+    fireEvent.blur(min);
+    await waitFor(() => expect(browse).toHaveBeenCalledTimes(1));
+    expect(browse.mock.calls[0][1].filters).toEqual({ "year.min": "2020" });
+    // Leaving it again without a change asks nothing.
+    fireEvent.focus(min);
+    fireEvent.blur(min);
+    expect(browse).toHaveBeenCalledTimes(1);
   });
 
-  /// The keyword in the search box is combined with the filters when the
-  /// provider's listing takes one, and is not a filter a provider that takes
-  /// none was asked to apply.
-  it("combines the typed keyword with the filters", async () => {
-    browse.mockResolvedValue({ provider: "openalex", name: "OpenAlex", results: works(1), error: null });
+  it("counts what is set on the button and shows it as removable chips when closed", async () => {
+    browse.mockResolvedValue(listing(works(2)));
     render(<CataloguePane />);
-    const panel = await openBrowse();
-    fireEvent.change(screen.getByLabelText("Search catalogues and literature"), {
-      target: { value: "persistent lists" },
+    const panel = await openFilters();
+    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "book" } });
+    fireEvent.click(within(panel).getByLabelText("Open access only"));
+    await screen.findByText("Browsed work 0");
+
+    fireEvent.click(screen.getByRole("button", { name: "Filters, 2 set" }));
+    expect(screen.queryByRole("group", { name: "Filters" })).toBeNull();
+    const chips = screen.getByLabelText("Active filters");
+    expect(within(chips).getByText("Type: Book")).toBeTruthy();
+
+    // Removing a chip clears that filter and re-asks.
+    fireEvent.click(within(chips).getByRole("button", { name: "Remove Type: Book" }));
+    await waitFor(() =>
+      expect(browse).toHaveBeenLastCalledWith(
+        "openalex",
+        expect.objectContaining({ filters: { open_access: "true" } }),
+      ),
+    );
+  });
+
+  it("goes back to keyword search when the last filter is cleared", async () => {
+    browse.mockResolvedValue(listing(works(2)));
+    render(<CataloguePane />);
+    fireEvent.change(searchBox(), { target: { value: "python lists" } });
+    const panel = await openFilters();
+    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "book" } });
+    await screen.findByText("Browsed work 0");
+    expect(literature).not.toHaveBeenCalled();
+
+    fireEvent.click(within(panel).getByRole("button", { name: "Reset" }));
+    // OpenAlex was left out of the keyword search while it was a listing, so
+    // it is asked now, and the listing is gone.
+    await waitFor(() => expect(literature).toHaveBeenCalled());
+    expect(literature.mock.calls[0][0]).toBe("python lists");
+    expect(await screen.findByText("Persistent Lists Revisited")).toBeTruthy();
+    expect(screen.queryByText("Browsed work 0")).toBeNull();
+  });
+
+  /// The keyword is combined with the filters when the provider's listing
+  /// takes one, and the provider is then not searched a second time.
+  it("combines the typed keyword with the filters on submit and lists the provider once", async () => {
+    browse.mockResolvedValue(listing(works(1)));
+    literature.mockResolvedValue({
+      query: "persistent lists",
+      providers: [
+        { provider: "semantic_scholar", name: "Semantic Scholar", results: [], error: null },
+      ],
     });
-    fireEvent.click(within(panel).getByRole("button", { name: "Show works" }));
-    await waitFor(() => expect(browse).toHaveBeenCalled());
-    expect(browse.mock.calls[0][1].query).toBe("persistent lists");
+    render(<CataloguePane />);
+    const panel = await openFilters();
+    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "book" } });
+    await screen.findByText("Browsed work 0");
+
+    fireEvent.change(searchBox(), { target: { value: "persistent lists" } });
+    submit("persistent lists");
+    await waitFor(() =>
+      expect(browse).toHaveBeenLastCalledWith(
+        "openalex",
+        expect.objectContaining({ query: "persistent lists", filters: { type: "book" } }),
+      ),
+    );
+    // The other provider is still searched; the filtered one is left out of it.
+    await waitFor(() => expect(literature).toHaveBeenCalled());
+    expect(literature).toHaveBeenCalledWith("persistent lists", 10, ["semantic_scholar"]);
+    expect(screen.getAllByLabelText("OpenAlex listing")).toHaveLength(1);
   });
 
   it("reads on: the next page extends the listing and the last short page ends it", async () => {
     browse
-      .mockResolvedValueOnce({ provider: "openalex", name: "OpenAlex", results: works(10), error: null })
-      .mockResolvedValueOnce({ provider: "openalex", name: "OpenAlex", results: works(3, 10), error: null });
+      .mockResolvedValueOnce(listing(works(10)))
+      .mockResolvedValueOnce(listing(works(3, 10)));
     render(<CataloguePane />);
-    const panel = await openBrowse();
+    const panel = await openFilters();
     fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
-    fireEvent.click(within(panel).getByRole("button", { name: "Show works" }));
     expect(await screen.findByText("Browsed work 9")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Load more" }));
@@ -528,9 +721,9 @@ describe("CataloguePane", () => {
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
   });
 
-  it("says what a provider refused, beside its name, and keeps what was already read", async () => {
+  it("says what a provider refused, under its name, and keeps what was already read", async () => {
     browse
-      .mockResolvedValueOnce({ provider: "openalex", name: "OpenAlex", results: works(10), error: null })
+      .mockResolvedValueOnce(listing(works(10)))
       .mockResolvedValueOnce({
         provider: "openalex",
         name: "OpenAlex",
@@ -538,8 +731,8 @@ describe("CataloguePane", () => {
         error: "OpenAlex rate limit reached",
       });
     render(<CataloguePane />);
-    const panel = await openBrowse();
-    fireEvent.click(within(panel).getByRole("button", { name: "Show works" }));
+    const panel = await openFilters();
+    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
     await screen.findByText("Browsed work 0");
     fireEvent.click(screen.getByRole("button", { name: "Load more" }));
     expect(await screen.findByText(/OpenAlex could not list works: OpenAlex rate limit reached/)).toBeTruthy();
@@ -549,37 +742,51 @@ describe("CataloguePane", () => {
   it("says what a request the manifest refused was", async () => {
     browse.mockRejectedValue(new Error("OpenAlex integration is disabled."));
     render(<CataloguePane />);
-    const panel = await openBrowse();
-    fireEvent.click(within(panel).getByRole("button", { name: "Show works" }));
+    const panel = await openFilters();
+    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
     expect(await screen.findByText(/could not list works: Error: OpenAlex integration is disabled/)).toBeTruthy();
   });
 
-  it("lets the user choose among providers that each declare a listing", async () => {
+  it("does not apply filters to a provider the user has switched off", async () => {
+    render(<CataloguePane />);
+    const panel = await openFilters();
+    fireEvent.click(await screen.findByRole("button", { name: "OpenAlex" }));
+    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
+    expect(browse).not.toHaveBeenCalled();
+    expect(within(panel).getByText(/is switched off in the Literature section/)).toBeTruthy();
+  });
+
+  it("lets the user choose among providers that each declare something to refine", async () => {
     providers.mockResolvedValue([
       provider("semantic_scholar", "Semantic Scholar"),
       provider("openalex", "OpenAlex", OPENALEX_BROWSE),
       provider("custom:crossref", "Crossref", {
         keyword: false,
-        sort: null,
+        sort: {
+          default: "issued",
+          keyword_default: null,
+          options: [{ value: "issued", label: "Issued" }],
+        },
         filters: [],
       }),
     ]);
-    browse.mockResolvedValue({ provider: "custom:crossref", name: "Crossref", results: works(1), error: null });
+    browse.mockResolvedValue({
+      provider: "custom:crossref",
+      name: "Crossref",
+      results: works(1),
+      error: null,
+    });
     render(<CataloguePane />);
-    const panel = await openBrowse();
-    fireEvent.change(within(panel).getByLabelText("Provider to browse"), {
+    const panel = await openFilters();
+    fireEvent.change(within(panel).getByLabelText("Provider to filter"), {
       target: { value: "custom:crossref" },
     });
-    // Crossref declares no filters and no sort: the panel is just the button.
-    expect(within(panel).queryByLabelText("Sort")).toBeNull();
+    // A different provider starts from its own declaration.
     expect(within(panel).queryByLabelText("Type")).toBeNull();
-    fireEvent.change(screen.getByLabelText("Search catalogues and literature"), {
-      target: { value: "ignored" },
-    });
-    fireEvent.click(within(panel).getByRole("button", { name: "Show works" }));
-    await waitFor(() => expect(browse).toHaveBeenCalled());
-    // And its listing takes no keyword, so none is sent.
-    expect(browse).toHaveBeenCalledWith("custom:crossref", expect.objectContaining({ query: null }));
+    fireEvent.change(searchBox(), { target: { value: "ignored" } });
+    expect(
+      within(panel).getByText(/Crossref's listing does not take a keyword/),
+    ).toBeTruthy();
   });
 
   it("adds a paper through uploads and into the library", async () => {

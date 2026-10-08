@@ -499,10 +499,19 @@ impl MetadataCache {
                 .and_then(|value| value.parse::<i64>().ok()),
             publication_date: self.metadata_value(file_id, FIELD_PUBLICATION_DATE, source)?,
             venue: self.metadata_value(file_id, FIELD_VENUE, source)?,
+            // Absent is "the provider reported none". A stored value that is
+            // not a number is a damaged row, and says so rather than reading
+            // as a count of zero.
             citation_count: self
                 .metadata_value(file_id, FIELD_CITATION_COUNT, source)?
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or_default(),
+                .map(|value| {
+                    value.parse::<i64>().map_err(|error| {
+                        anyhow::anyhow!(
+                            "stored citation count {value:?} for file {file_id} is not a number: {error}"
+                        )
+                    })
+                })
+                .transpose()?,
             external_ids: self
                 .metadata_value(file_id, FIELD_EXTERNAL_IDS_JSON, source)?
                 .and_then(|json| serde_json::from_str(&json).ok())
@@ -759,12 +768,7 @@ impl MetadataCache {
             source,
         )?;
         self.upsert_metadata_value(file_id, FIELD_VENUE, work.venue.as_deref(), source)?;
-        self.upsert_metadata_i64(
-            file_id,
-            FIELD_CITATION_COUNT,
-            Some(work.citation_count),
-            source,
-        )?;
+        self.upsert_metadata_i64(file_id, FIELD_CITATION_COUNT, work.citation_count, source)?;
         self.upsert_metadata_value(
             file_id,
             FIELD_EXTERNAL_IDS_JSON,
@@ -1525,7 +1529,7 @@ mod tests {
                             year: None,
                             publication_date: None,
                             venue: None,
-                            citation_count: 3,
+                            citation_count: Some(3),
                             external_ids: Default::default(),
                             cached_at_ms: 42,
                         },
@@ -1768,7 +1772,7 @@ mod tests {
             year: None,
             publication_date: None,
             venue: None,
-            citation_count: citations,
+            citation_count: Some(citations),
             external_ids: Default::default(),
             cached_at_ms: 42,
         }
@@ -1787,7 +1791,7 @@ mod tests {
             year: Some(2026),
             publication_date: Some("2026-07-06".into()),
             venue: Some("Venue".into()),
-            citation_count: 7,
+            citation_count: Some(7),
             external_ids,
             cached_at_ms: 42,
         };
@@ -1852,6 +1856,76 @@ mod tests {
         );
     }
 
+    /// A provider that reported no count has no count: not zero, which would
+    /// rank its works as uncited, and not an error, since many services never
+    /// report one.
+    #[test]
+    fn a_provider_that_reported_no_count_is_cached_as_having_none() {
+        let dir = tempdir().unwrap();
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        let identity = FileIdentity {
+            size_bytes: 1,
+            modified_at_ms: 2,
+        };
+        let path = Path::new("/a.pdf");
+        cache
+            .upsert(
+                path,
+                identity,
+                &DocumentMetadata {
+                    doi: Some("10.1145/1".into()),
+                    ..DocumentMetadata::default()
+                },
+                MetadataSource::File,
+            )
+            .unwrap();
+        let mut uncounted = work("10.1145/1", "abc", 0);
+        uncounted.citation_count = None;
+        cache
+            .upsert_provider_by_doi("custom:index", &uncounted)
+            .unwrap();
+
+        let metadata = cache.get_valid(path, identity).unwrap().unwrap();
+        assert_eq!(metadata.providers["custom:index"].citation_count, None);
+        assert_eq!(metadata.citation_count(), None);
+    }
+
+    /// Absent is not the same as damaged: a stored value that is not a number
+    /// is reported, not read as zero.
+    #[test]
+    fn a_stored_count_that_is_not_a_number_is_an_error() {
+        let dir = tempdir().unwrap();
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        let identity = FileIdentity {
+            size_bytes: 1,
+            modified_at_ms: 2,
+        };
+        let path = Path::new("/a.pdf");
+        cache
+            .upsert(
+                path,
+                identity,
+                &DocumentMetadata {
+                    doi: Some("10.1145/1".into()),
+                    ..DocumentMetadata::default()
+                },
+                MetadataSource::File,
+            )
+            .unwrap();
+        cache
+            .upsert_provider_by_doi("openalex", &work("10.1145/1", "abc", 5))
+            .unwrap();
+        cache
+            .conn
+            .execute(
+                "UPDATE file_metadata SET value = 'many' WHERE key = ?1",
+                params![FIELD_CITATION_COUNT],
+            )
+            .unwrap();
+        let error = cache.get_valid(path, identity).unwrap_err().to_string();
+        assert!(error.contains("not a number"), "{error}");
+    }
+
     #[test]
     fn test_provider_upsert_updates_all_cached_rows_for_doi() {
         let dir = tempdir().unwrap();
@@ -1884,7 +1958,7 @@ mod tests {
             cache
                 .get_valid(Path::new("/a.pdf"), identity)
                 .unwrap()
-                .and_then(|m| m.providers.get("openalex").map(|p| p.citation_count)),
+                .and_then(|m| m.providers.get("openalex").and_then(|p| p.citation_count)),
             Some(11)
         );
     }
@@ -1921,7 +1995,10 @@ mod tests {
         let metadata = cache.get_valid(path, identity).unwrap().unwrap();
         assert_eq!(metadata.providers.len(), 2);
         assert_eq!(metadata.providers["openalex"].work_id, "W1");
-        assert_eq!(metadata.providers["custom:crossref"].citation_count, 9);
+        assert_eq!(
+            metadata.providers["custom:crossref"].citation_count,
+            Some(9)
+        );
 
         assert_eq!(cache.invalidate_provider("openalex").unwrap(), 1);
         let metadata = cache.get_valid(path, identity).unwrap().unwrap();

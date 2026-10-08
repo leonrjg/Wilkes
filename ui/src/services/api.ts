@@ -211,11 +211,12 @@ export interface SearchApi {
    *  `providers`. A provider that fails is reported in its own entry beside
    *  those that answered; only a query that could not be run at all — an empty
    *  query, an unknown provider, an empty filter — rejects. `limit` is per
-   *  provider. */
+   *  provider, and `page` (1-based, the first when absent) is of each. */
   literatureSearch(
     query: string,
     limit?: number,
     providers?: string[],
+    page?: number,
   ): Promise<LiteratureSearchResponse>;
   /** One provider's listing by filter and sort, with a keyword optional. What
    *  may be asked is what the provider's `capabilities.browse` declares; a

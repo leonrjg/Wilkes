@@ -136,6 +136,7 @@ pub async fn search_all(
     query: String,
     limit: Option<usize>,
     providers: Option<Vec<String>>,
+    page: Option<usize>,
 ) -> Result<LiteratureSearchResponse, LiteratureRequestError> {
     let query = query.trim().to_string();
     if query.is_empty() {
@@ -151,6 +152,16 @@ pub async fn search_all(
                 "Literature search limit {limit} is outside 1-{MAX_LIMIT}"
             )))
         }
+    };
+
+    let page = match page {
+        None => 1,
+        Some(0) => {
+            return Err(LiteratureRequestError(
+                "Literature search page is 1-based; 0 is not a page".into(),
+            ))
+        }
+        Some(page) => page,
     };
 
     let registry = IntegrationRegistry::from_settings(settings);
@@ -191,7 +202,7 @@ pub async fn search_all(
             (
                 entry.id().to_string(),
                 entry.name().to_string(),
-                tokio::spawn(async move { source.search(&query, limit).await }),
+                tokio::spawn(async move { source.search(&query, limit, page).await }),
             )
         })
         .collect();
@@ -364,7 +375,7 @@ mod tests {
             year: None,
             publication_date: None,
             venue: None,
-            citation_count: 0,
+            citation_count: None,
             is_open_access: true,
             pdf_url: Some("https://example.test/paper.pdf".to_string()),
             landing_page_url: None,
@@ -386,6 +397,7 @@ mod tests {
             "graph theory".into(),
             None,
             None,
+            None,
         )
         .await
         .expect("nothing enabled is a state the pane presents, not a failure");
@@ -395,9 +407,15 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_query_is_refused() {
-        let error = search_all(&IntegrationsSettings::default(), "   ".into(), None, None)
-            .await
-            .expect_err("empty query");
+        let error = search_all(
+            &IntegrationsSettings::default(),
+            "   ".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("empty query");
         assert!(error.0.contains("empty"), "{error}");
     }
 
@@ -408,6 +426,7 @@ mod tests {
                 &IntegrationsSettings::default(),
                 "q".into(),
                 Some(limit),
+                None,
                 None,
             )
             .await
@@ -423,6 +442,7 @@ mod tests {
             "q".into(),
             None,
             Some(vec!["openalex".into(), "custom:gone".into()]),
+            None,
         )
         .await
         .expect_err("unknown provider");
@@ -438,6 +458,7 @@ mod tests {
             "q".into(),
             None,
             Some(vec![]),
+            None,
         )
         .await
         .expect_err("empty filter");
@@ -466,6 +487,7 @@ mod tests {
             "graph theory".into(),
             None,
             Some(vec!["openalex".into()]),
+            None,
         )
         .await
         .expect("a filtered search still runs");

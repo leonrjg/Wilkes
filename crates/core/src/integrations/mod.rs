@@ -39,6 +39,9 @@ use custom::{CustomSource, Standing};
 /// it before it has asked anything.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ProviderCapabilities {
+    /// Whether keyword search can be read past its first page. A provider that
+    /// cannot is asked for one page, and a second would repeat the first.
+    pub paged_search: bool,
     /// The filter panel the provider declares, if it offers a listing.
     pub browse: Option<BrowseControls>,
     /// Whether a DOI can be looked up (metadata enrichment).
@@ -62,10 +65,13 @@ pub trait LiteratureSource: Send + Sync {
 
     fn capabilities(&self) -> ProviderCapabilities;
 
+    /// `page` is 1-based. A page past the first is refused by a provider whose
+    /// [`ProviderCapabilities::paged_search`] is false.
     async fn search(
         &self,
         query: &str,
         limit: usize,
+        page: usize,
     ) -> anyhow::Result<Vec<LiteratureSearchResult>>;
 
     /// A listing by filter and sort, with the keyword optional. What may be

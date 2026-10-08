@@ -1351,13 +1351,25 @@ mod tests {
             .begin(&root, &paths(&["/corpus/a", "/corpus/b"]))
             .unwrap();
         journal
-            .note_outcome(first, &PathBuf::from("/corpus/a"), DocumentOutcome::Empty, None, Some(0))
+            .note_outcome(
+                first,
+                &PathBuf::from("/corpus/a"),
+                DocumentOutcome::Empty,
+                None,
+                Some(0),
+            )
             .unwrap();
         journal.finish(first, JobState::Cancelled, None).unwrap();
 
         let second = journal.begin(&root, &paths(&["/corpus/b"])).unwrap();
         journal
-            .note_outcome(second, &PathBuf::from("/corpus/b"), DocumentOutcome::Empty, None, Some(0))
+            .note_outcome(
+                second,
+                &PathBuf::from("/corpus/b"),
+                DocumentOutcome::Empty,
+                None,
+                Some(0),
+            )
             .unwrap();
         journal.finish(second, JobState::Completed, None).unwrap();
 

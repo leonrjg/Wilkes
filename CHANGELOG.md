@@ -4,9 +4,27 @@
 
 ### Added
 
-- The literature pane can browse as well as search. Under the provider chips a
-  "Browse by filter" panel lists a provider's works by filter and sort with no
-  keyword at all — OpenAlex by year range, field and domain, type, minimum
+- A provider that reports no citation count no longer shows "0 citations". The
+  count is absent rather than zero in a search result and in the metadata
+  cache, the document's own count comes from the first provider *that reported
+  one*, and a cached value that is not a number is an error rather than a zero.
+  Counts already cached as 0 for a provider that never reported one cannot be
+  told apart from a real zero and stay until that document is refreshed.
+- A paper's facts now lead with year, citations and open access, then authors
+  and venue, so a long author list can no longer push them out of the two lines
+  the row shows.
+- Keyword search in the literature pane can be read past its first page: each
+  provider has its own "Load more", and a manifest's `search.path` may name
+  `{page}` (1-based) or `{offset}` for a service that pages. OpenAlex pages by
+  page and Semantic Scholar by offset. A provider whose search path names
+  neither is asked for one page, and a second is refused rather than repeating
+  the first. The two rows of source chips are now labelled "Search in", apart
+  from the Filters button.
+- The literature pane can browse as well as search. A "Filters" button beside
+  the search box opens controls that list a provider's works by filter and sort
+  with no keyword at all, applying each change as it is made, showing what is
+  set as removable chips when the panel is closed, and listing the filtered
+  provider once, in the Literature section, in place of its keyword answer — OpenAlex by year range, field and domain, type, minimum
   citations, open access, full text and retraction, sorted by citations or
   date — and combines a keyword with the same filters when one is typed. The
   panel is drawn from what the provider's manifest *declares* (its `browse`

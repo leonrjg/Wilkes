@@ -104,12 +104,7 @@ fn extension_for_mime(mime: &str) -> Option<&'static str> {
 /// Written in the form comparison sees: lowercase, and with the typographic
 /// apostrophe folded to the ASCII one, because a name carries whichever of the
 /// two the mirror happened to use.
-const STRIPPED_NAME_MARKERS: [&str; 4] = [
-    "anna's archive",
-    "z-library.sk",
-    "1lib.sk",
-    "z-lib.sk",
-];
+const STRIPPED_NAME_MARKERS: [&str; 4] = ["anna's archive", "z-library.sk", "1lib.sk", "z-lib.sk"];
 
 /// The comparison form of a character: one character in, one character out, so
 /// an offset into the normalized name is an offset into the name itself.
@@ -178,7 +173,10 @@ fn tidy_separators(value: &str) -> String {
         .join(" ")
         .trim_matches(|character: char| {
             character.is_whitespace()
-                || matches!(character, '-' | '_' | '\u{2013}' | '\u{2014}' | ',' | ';' | '.')
+                || matches!(
+                    character,
+                    '-' | '_' | '\u{2013}' | '\u{2014}' | ',' | ';' | '.'
+                )
         })
         .to_string()
 }
@@ -328,12 +326,11 @@ pub async fn download_to_root(
     // Sanitized before the join, not after: a name decoded out of a URL can
     // hold a separator of its own (`%2F` in a doi), and joining that to the
     // root would make the last component the whole name Wilkes thinks it saved.
-    let named = wilkes_path::sanitize_file_name(&strip_source_markers(&filename)).map_err(
-        |error| {
+    let named =
+        wilkes_path::sanitize_file_name(&strip_source_markers(&filename)).map_err(|error| {
             tracing::warn!(filename, "download refused: {error}");
             format!("Download filename is unusable: {error}")
-        },
-    )?;
+        })?;
     let target = root.join(&named);
 
     tracing::info!(url = %url, root = %root.display(), "download started");
@@ -865,7 +862,10 @@ mod tests {
             strip_source_markers("Wilkes 1992 (z-library.sk).pdf"),
             "Wilkes 1992 ().pdf"
         );
-        assert_eq!(strip_source_markers("paper 1lib.sk copy.epub"), "paper copy.epub");
+        assert_eq!(
+            strip_source_markers("paper 1lib.sk copy.epub"),
+            "paper copy.epub"
+        );
         assert_eq!(strip_source_markers("z-lib.sk - paper.pdf"), "paper.pdf");
         // Nothing to strip, nothing touched — including the separators.
         assert_eq!(
@@ -874,7 +874,10 @@ mod tests {
         );
         // A name that is only a marker keeps it: there is nothing else to
         // call the file.
-        assert_eq!(strip_source_markers("Anna\u{2019}s Archive.pdf"), "Anna\u{2019}s Archive.pdf");
+        assert_eq!(
+            strip_source_markers("Anna\u{2019}s Archive.pdf"),
+            "Anna\u{2019}s Archive.pdf"
+        );
     }
 
     /// The reported failure, end to end: a percent-encoded shadow-library
@@ -916,7 +919,10 @@ mod tests {
             .to_string();
         assert!(name.len() <= wilkes_path::MAX_FILE_NAME_BYTES, "{name}");
         assert!(name.ends_with(".pdf"), "{name}");
-        assert!(name.starts_with("Artificial Intelligence as the year 2000"), "{name}");
+        assert!(
+            name.starts_with("Artificial Intelligence as the year 2000"),
+            "{name}"
+        );
         assert!(!name.to_lowercase().contains("anna"), "{name}");
         assert!(!name.contains('%'), "{name}");
         assert!(Path::new(&saved.path).exists());
@@ -953,7 +959,11 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        assert!(name.len() <= wilkes_path::MAX_FILE_NAME_BYTES, "{}", name.len());
+        assert!(
+            name.len() <= wilkes_path::MAX_FILE_NAME_BYTES,
+            "{}",
+            name.len()
+        );
         assert!(name.ends_with(".pdf"), "{name}");
         assert!(!name.to_lowercase().contains("anna"), "{name}");
         assert!(Path::new(&saved.path).exists());

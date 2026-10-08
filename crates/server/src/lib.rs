@@ -737,6 +737,9 @@ struct LiteratureSearchBody {
     /// unknown provider, or none at all, is a 400.
     #[serde(default)]
     providers: Option<Vec<String>>,
+    /// Which page of each provider's results, 1-based. Absent is the first.
+    #[serde(default)]
+    page: Option<usize>,
 }
 
 /// Every literature provider this installation knows, switched on or not.
@@ -760,7 +763,7 @@ async fn literature_search_handler(
 > {
     state
         .context()
-        .literature_search(body.query, body.limit, body.providers)
+        .literature_search(body.query, body.limit, body.providers, body.page)
         .await
         .map(Json)
         .map_err(|error| err(error.to_string()))

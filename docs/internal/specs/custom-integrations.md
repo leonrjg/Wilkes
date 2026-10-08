@@ -174,7 +174,10 @@ pdf_url        = "link[?\"content-type\" == 'application/pdf'].URL | [0]"
 Three rules keep this a description rather than a general program:
 
 **Templates are typed substitution, never unchecked concatenation.** `{query}`
-and `{limit}` are the placeholders `search` supplies (`health` supplies none);
+and `{limit}` are the placeholders `search` supplies, with `{page}` (1-based)
+or `{offset}` (`(page - 1) * limit`) when the service can be read past its
+first page — a search path naming neither is asked for one page, and a second
+is refused (`health` supplies none);
 `browse` supplies `{limit}` and `{page}`, `lookup` and `references` supply
 `{doi}`, and download-resolution steps receive the selected result plus values
 declared by earlier steps. The engine owns percent-encoding. An unknown
@@ -438,10 +441,11 @@ ids so the agent is told what it may actually name.
   dotted-path grammar could not. The test that pinned the divergence
   (`divergence_on_a_disjunction`) is now
   `openalex_open_access_is_a_disjunction_of_the_work_and_its_best_location`.
-- **Browse paging by cursor or offset.** `browse` pages by a 1-based `{page}`
-  and `{limit}`. A service that pages by an opaque token (Semantic Scholar's
-  bulk search) or by an offset that is not a multiple of the page size cannot
-  say so, and declares no `browse`.
+- **Browse paging by cursor.** `browse` pages by a 1-based `{page}` and
+  `{limit}`. A service that pages by an opaque token (Semantic Scholar's bulk
+  search) cannot say so, and declares no `browse`. Keyword `search` pages by
+  `{page}` or `{offset}`, which is how Semantic Scholar's relevance search is
+  read on.
 - **Semantic Scholar `references`.** Its endpoint lists the cited papers'
   external ids in one request, which the two-stage `references` shape does not
   describe; it never fed the citation graph and still does not.

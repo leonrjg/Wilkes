@@ -436,7 +436,8 @@ export interface ProviderWork {
   year: number | null;
   publication_date: string | null;
   venue: string | null;
-  citation_count: number;
+  /** Null when the provider reported none, which is not a count of zero. */
+  citation_count: number | null;
   external_ids: Record<string, unknown>;
   cached_at_ms: number;
 }
@@ -1031,7 +1032,8 @@ export interface LiteratureSearchResult {
   year: number | null;
   publication_date: string | null;
   venue: string | null;
-  citation_count: number;
+  /** Null when the provider reported none, which is not a count of zero. */
+  citation_count: number | null;
   is_open_access: boolean;
   pdf_url: string | null;
   landing_page_url: string | null;
@@ -1102,6 +1104,9 @@ export interface BrowseControls {
 }
 
 export interface ProviderCapabilities {
+  /** Keyword search can be read past its first page. Without it a second page
+   *  would repeat the first. */
+  paged_search: boolean;
   browse: BrowseControls | null;
   lookup: boolean;
   references: boolean;

@@ -206,7 +206,12 @@ impl CustomSource {
         let request = match self.request(
             &substitute(
                 &search.path,
-                &[("query", query), ("limit", &PROBE_LIMIT.to_string())],
+                &[
+                    ("query", query),
+                    ("limit", &PROBE_LIMIT.to_string()),
+                    ("page", "1"),
+                    ("offset", "0"),
+                ],
             ),
             &[],
         ) {
@@ -474,7 +479,7 @@ impl CustomSource {
             year: fields.int("year"),
             publication_date: fields.text("publication_date"),
             venue: fields.text("venue"),
-            citation_count: fields.int("citation_count").unwrap_or(0),
+            citation_count: fields.int("citation_count"),
             is_open_access: fields.boolean("is_open_access").unwrap_or(false),
             pdf_url,
             landing_page_url: fields.text("landing_page_url"),
@@ -658,6 +663,7 @@ impl CustomSource {
         &self,
         query: &str,
         limit: usize,
+        page: usize,
     ) -> anyhow::Result<Vec<LiteratureSearchResult>> {
         let query = query.trim();
         anyhow::ensure!(
@@ -672,11 +678,23 @@ impl CustomSource {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("{} cannot search", self.manifest.name))?;
         let limit = limit.clamp(1, MAX_LIMIT);
+        let page = page.max(1);
+        anyhow::ensure!(
+            page == 1 || search.paged(),
+            "{} search has one page: its path names neither {{page}} nor {{offset}}",
+            self.manifest.name
+        );
+        let offset = (page - 1) * limit;
 
         let request = self.request(
             &substitute(
                 &search.path,
-                &[("query", query), ("limit", &limit.to_string())],
+                &[
+                    ("query", query),
+                    ("limit", &limit.to_string()),
+                    ("page", &page.to_string()),
+                    ("offset", &offset.to_string()),
+                ],
             ),
             &[],
         )?;
@@ -797,7 +815,7 @@ impl CustomSource {
             year: fields.int("year"),
             publication_date: fields.text("publication_date"),
             venue: fields.text("venue"),
-            citation_count: fields.int("citation_count").unwrap_or(0),
+            citation_count: fields.int("citation_count"),
             external_ids: fields
                 .object("external_ids")
                 .unwrap_or_default()
@@ -1346,10 +1364,6 @@ fn result_values(result: &LiteratureSearchResult) -> HashMap<String, String> {
     let mut values = HashMap::from([
         ("id".to_string(), result.id.clone()),
         (
-            "citation_count".to_string(),
-            result.citation_count.to_string(),
-        ),
-        (
             "is_open_access".to_string(),
             result.is_open_access.to_string(),
         ),
@@ -1375,6 +1389,11 @@ fn result_values(result: &LiteratureSearchResult) -> HashMap<String, String> {
     }
     if let Some(year) = result.year {
         values.insert("year".to_string(), year.to_string());
+    }
+    // A count the provider did not report is left out, so a step that asks
+    // for it is told it is missing rather than that it is zero.
+    if let Some(count) = result.citation_count {
+        values.insert("citation_count".to_string(), count.to_string());
     }
     values
 }
@@ -1540,6 +1559,10 @@ impl LiteratureSource for CustomSource {
     fn capabilities(&self) -> ProviderCapabilities {
         let capabilities = &self.manifest.capabilities;
         ProviderCapabilities {
+            paged_search: capabilities
+                .search
+                .as_ref()
+                .is_some_and(SearchCapability::paged),
             browse: capabilities.browse.as_ref().map(BrowseCapability::controls),
             lookup: capabilities.lookup.is_some(),
             references: capabilities.references.is_some(),
@@ -1551,8 +1574,9 @@ impl LiteratureSource for CustomSource {
         &self,
         query: &str,
         limit: usize,
+        page: usize,
     ) -> anyhow::Result<Vec<LiteratureSearchResult>> {
-        self.run_search(query, limit).await
+        self.run_search(query, limit, page).await
     }
 
     async fn browse(&self, request: &BrowseRequest) -> anyhow::Result<Vec<LiteratureSearchResult>> {
@@ -1633,10 +1657,7 @@ impl LiteratureSource for CustomSource {
 fn substitute(template: &str, values: &[(&str, &str)]) -> String {
     let mut out = template.to_string();
     for (name, value) in values {
-        out = out.replace(
-            &format!("{{{name}}}"),
-            &urlencoding::encode(value),
-        );
+        out = out.replace(&format!("{{{name}}}"), &urlencoding::encode(value));
     }
     out
 }
@@ -1867,7 +1888,7 @@ filename = "{title}"
             year: None,
             publication_date: None,
             venue: None,
-            citation_count: 0,
+            citation_count: None,
             is_open_access: true,
             pdf_url: Some("https://example.test/paper.pdf".into()),
             landing_page_url: Some("https://example.test/article".into()),
@@ -1903,12 +1924,83 @@ filename = "{title}"
             &server.url(),
             &[("email", " team@example.com ")],
         )
-        .search(" graph neural networks ", 2)
+        .search(" graph neural networks ", 2, 1)
         .await
         .unwrap();
 
         assert_eq!(results, vec![expected_openalex_record()]);
         mock.assert_async().await;
+    }
+
+    /// Reading on is one declared placeholder, and each service says where to
+    /// start in its own terms: OpenAlex by page, Semantic Scholar by offset.
+    #[tokio::test]
+    async fn a_later_page_of_a_search_starts_where_the_service_expects() {
+        let mut server = mockito::Server::new_async().await;
+        let openalex = server
+            .mock("GET", "/works")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("per-page".into(), "10".into()),
+                Matcher::UrlEncoded("page".into(), "3".into()),
+            ]))
+            .with_status(200)
+            .with_body(OPENALEX_BODY)
+            .create_async()
+            .await;
+        let scholar = server
+            .mock("GET", "/graph/v1/paper/search")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("limit".into(), "10".into()),
+                Matcher::UrlEncoded("offset".into(), "20".into()),
+            ]))
+            .with_status(200)
+            .with_body(SEMANTIC_SCHOLAR_BODY)
+            .create_async()
+            .await;
+
+        shipped("openalex", &server.url(), &[])
+            .search("graph", 10, 3)
+            .await
+            .unwrap();
+        shipped("semantic_scholar", &server.url(), &[])
+            .search("graph", 10, 3)
+            .await
+            .unwrap();
+        openalex.assert_async().await;
+        scholar.assert_async().await;
+    }
+
+    /// A service whose path names no page would answer its first again, and
+    /// the pane would list the same works twice as if they were more.
+    #[tokio::test]
+    async fn a_second_page_of_a_search_that_has_one_is_refused() {
+        let source = source(
+            r#"manifest_version = 2
+id = "onepage"
+name = "One page"
+
+[http]
+base_url = "BASE_URL"
+
+[capabilities.search]
+path = "/search?q={query}&limit={limit}"
+items = "results"
+
+[capabilities.search.fields]
+id = "id"
+title = "title"
+"#,
+            "https://one.test",
+            &[],
+        );
+        assert!(!source.capabilities().paged_search);
+        let error = source.search("graph", 10, 2).await.unwrap_err().to_string();
+        assert!(error.contains("one page"), "{error}");
+        assert!(
+            shipped("openalex", "https://api.example.test", &[])
+                .capabilities()
+                .paged_search
+        );
     }
 
     #[tokio::test]
@@ -1934,7 +2026,7 @@ filename = "{title}"
         // No `email` secret at all, and a blank one: both mean "not set".
         for secrets in [vec![], vec![("email", "   ")]] {
             let results = shipped("openalex", &server.url(), &secrets)
-                .search("graph", 1)
+                .search("graph", 1, 1)
                 .await
                 .unwrap();
             assert_eq!(results.len(), 1);
@@ -1964,7 +2056,7 @@ filename = "{title}"
             &server.url(),
             &[("api_key", " secret ")],
         )
-        .search(" graph neural networks ", 2)
+        .search(" graph neural networks ", 2, 1)
         .await
         .unwrap();
 
@@ -1972,7 +2064,7 @@ filename = "{title}"
         let paper = &results[0];
         assert_eq!(paper.id, "p1");
         assert_eq!(paper.doi.as_deref(), Some("10.1/example"));
-        assert_eq!(paper.citation_count, 3);
+        assert_eq!(paper.citation_count, Some(3));
         assert!(paper.is_open_access);
         assert_eq!(
             paper.pdf_url.as_deref(),
@@ -1996,7 +2088,7 @@ filename = "{title}"
             .create_async()
             .await;
         let results = shipped("semantic_scholar", &server.url(), &[])
-            .search("graph", 1)
+            .search("graph", 1, 1)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -2020,7 +2112,7 @@ filename = "{title}"
             .create_async()
             .await;
         let results = shipped("openalex", &server.url(), &[])
-            .search("q", 1)
+            .search("q", 1, 1)
             .await
             .unwrap();
         assert!(results[0].is_open_access, "false || true is true");
@@ -2042,7 +2134,7 @@ filename = "{title}"
             .create_async()
             .await;
         let results = shipped("openalex", &server.url(), &[])
-            .search("q", 2)
+            .search("q", 2, 1)
             .await
             .unwrap();
         assert_eq!(
@@ -2120,7 +2212,7 @@ filename = "{title}"
         assert_eq!(work.work_id, "p1");
         assert_eq!(work.title.as_deref(), Some("T"));
         assert_eq!(work.year, Some(2026));
-        assert_eq!(work.citation_count, 3);
+        assert_eq!(work.citation_count, Some(3));
         assert_eq!(work.external_ids["CorpusId"], serde_json::json!(7));
         assert!(work.cached_at_ms > 0);
         mock.assert_async().await;
@@ -2153,7 +2245,7 @@ filename = "{title}"
             .await
             .unwrap();
 
-        assert_eq!(work.citation_count, 9);
+        assert_eq!(work.citation_count, Some(9));
         first.assert_async().await;
         second.assert_async().await;
     }
@@ -2230,7 +2322,7 @@ filename = "{title}"
         assert_eq!(work.title.as_deref(), Some("Sampling Projects in GitHub"));
         assert_eq!(work.year, Some(2021));
         assert_eq!(work.venue.as_deref(), Some("MSR"));
-        assert_eq!(work.citation_count, 12);
+        assert_eq!(work.citation_count, Some(12));
         assert_eq!(
             work.external_ids["openalex"],
             serde_json::json!("https://openalex.org/W3145166639")
@@ -2682,7 +2774,7 @@ doi = "doi"
             .await;
 
         let anna = source(ANNA_MANIFEST, &server.url(), &[("anna_key", "secret")]);
-        let results = anna.search("graph networks", 1).await.unwrap();
+        let results = anna.search("graph networks", 1, 1).await.unwrap();
         assert_eq!(results.len(), 1);
         let book = &results[0];
         assert_eq!(book.id, "deadbeef");
@@ -2738,7 +2830,7 @@ doi = "doi"
                 "download_url = \"absolute_url(download_url)\"",
             );
         let anna = source(&manifest, &search_server.url(), &[("anna_key", "secret")]);
-        let book = anna.search("graph networks", 1).await.unwrap().remove(0);
+        let book = anna.search("graph networks", 1, 1).await.unwrap().remove(0);
         let download = anna.resolve_download(&book).await.unwrap().unwrap();
 
         assert_eq!(
@@ -2776,7 +2868,7 @@ doi = "doi"
             .create_async()
             .await;
         let anna = source(&manifest, &server.url(), &[("anna_key", "secret")]);
-        let book = anna.search("graph networks", 1).await.unwrap().remove(0);
+        let book = anna.search("graph networks", 1, 1).await.unwrap().remove(0);
         anna.resolve_download(&book).await.unwrap().unwrap();
         resolve.assert_async().await;
     }
@@ -2792,7 +2884,11 @@ doi = "doi"
             .await;
 
         let anna = source(ANNA_DOI_MANIFEST, &server.url(), &[]);
-        let result = anna.search("10.1234/example", 1).await.unwrap().remove(0);
+        let result = anna
+            .search("10.1234/example", 1, 1)
+            .await
+            .unwrap()
+            .remove(0);
         assert_eq!(result.doi.as_deref(), Some("10.1234/example"));
 
         let download = anna.resolve_download(&result).await.unwrap().unwrap();
@@ -2809,7 +2905,7 @@ doi = "doi"
     #[tokio::test]
     async fn a_required_secret_is_needed_before_a_request_is_made() {
         let error = source(KEYED_MANIFEST, "https://example.test", &[])
-            .search("q", 1)
+            .search("q", 1, 1)
             .await
             .unwrap_err()
             .to_string();

@@ -1353,7 +1353,7 @@ impl WilkesMcp {
                 return CallToolResult::error(vec![ContentBlock::text(error.to_string())])
             }
         };
-        match source.search(&query, limit).await {
+        match source.search(&query, limit, 1).await {
             Ok(results) => structured(LiteratureSearchResponse {
                 query,
                 provider: params.provider,

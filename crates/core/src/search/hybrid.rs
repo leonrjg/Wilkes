@@ -373,10 +373,16 @@ mod tests {
 
     #[test]
     fn a_document_both_lanes_returned_carries_both_explanations_and_all_matches() {
-        let exact = vec![file("a.txt", vec![content_match("weak identification", None)])];
+        let exact = vec![file(
+            "a.txt",
+            vec![content_match("weak identification", None)],
+        )];
         let semantic = vec![file(
             "a.txt",
-            vec![content_match("the instruments are only weakly correlated", Some(0.8))],
+            vec![content_match(
+                "the instruments are only weakly correlated",
+                Some(0.8),
+            )],
         )];
 
         let fused = fuse(exact, semantic);
@@ -396,7 +402,10 @@ mod tests {
     #[test]
     fn single_lane_documents_carry_only_that_lane_explanation() {
         let exact = vec![file("exact.txt", vec![content_match("phrase", None)])];
-        let semantic = vec![file("related.txt", vec![content_match("passage", Some(0.5))])];
+        let semantic = vec![file(
+            "related.txt",
+            vec![content_match("passage", Some(0.5))],
+        )];
 
         let fused = fuse(exact, semantic);
 
@@ -406,7 +415,10 @@ mod tests {
                 .find(|result| result.path == path(name))
                 .expect("document present")
         };
-        assert_eq!(by_path("exact.txt").evidence, vec![MatchEvidence::ExactPhrase]);
+        assert_eq!(
+            by_path("exact.txt").evidence,
+            vec![MatchEvidence::ExactPhrase]
+        );
         assert_eq!(
             by_path("related.txt").evidence,
             vec![MatchEvidence::RelatedPassage]
@@ -440,7 +452,10 @@ mod tests {
             file("both.txt", vec![content_match("phrase", None)]),
         ];
         let semantic = vec![
-            file("semantic_only.txt", vec![content_match("passage", Some(0.9))]),
+            file(
+                "semantic_only.txt",
+                vec![content_match("passage", Some(0.9))],
+            ),
             file("both.txt", vec![content_match("passage", Some(0.7))]),
         ];
 

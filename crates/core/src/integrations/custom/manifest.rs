@@ -201,7 +201,10 @@ pub struct HealthCapability {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SearchCapability {
-    /// Path and query, relative to `base_url`. May use `{query}` and `{limit}`.
+    /// Path and query, relative to `base_url`. May use `{query}` and `{limit}`,
+    /// and `{page}` (1-based) or `{offset}` (`(page - 1) * limit`) when the
+    /// service can be read past its first page. A path using neither is a
+    /// search that has one page.
     pub path: String,
     /// How selectors in this capability are interpreted. Omitted means JSON.
     #[serde(default)]
@@ -213,6 +216,15 @@ pub struct SearchCapability {
     pub items: Option<String>,
     /// Result field name → where to find it in one record.
     pub fields: BTreeMap<String, FieldSpec>,
+}
+
+impl SearchCapability {
+    /// Whether the search can be read past its first page: its path says where
+    /// to start. A caller must not ask for a second page of one that cannot,
+    /// because the service would answer the first again.
+    pub fn paged(&self) -> bool {
+        self.path.contains("{page}") || self.path.contains("{offset}")
+    }
 }
 
 /// A filtered, sorted, paged listing.
@@ -670,7 +682,10 @@ pub fn lookup_field_type(field: &str) -> Option<FieldType> {
 }
 
 /// Placeholders a capability may use, by capability.
+/// What a search field may take as its input.
 const SEARCH_PLACEHOLDERS: &[&str] = &["query", "limit"];
+/// What a search path may name: the inputs, and where in the results to start.
+const SEARCH_PATH_PLACEHOLDERS: &[&str] = &["query", "limit", "page", "offset"];
 const BROWSE_PLACEHOLDERS: &[&str] = &["limit", "page"];
 const HEALTH_PLACEHOLDERS: &[&str] = &[];
 const LOOKUP_PLACEHOLDERS: &[&str] = &["doi"];
@@ -756,7 +771,7 @@ x-api-key = { secret = "api_key", optional = true, label = "API key" }
 path = "/ping"
 
 [capabilities.search]
-path = "/works?search={query}&per-page={limit}"
+path = "/works?search={query}&per-page={limit}&page={page}"
 items = "results"
 
 [capabilities.search.fields]
@@ -910,7 +925,7 @@ other_param = { secret = "symbolic_secret_name", optional = true }
 path = "/health"                      # no placeholders
 
 [capabilities.search]                 # required for every capability but health
-path = "/search?q={query}&limit={limit}"
+path = "/search?q={query}&limit={limit}"   # also {page} (1-based) or {offset} where the service pages, so the pane can read on
 response_format = "json"              # optional; "json" or "html"; defaults to json
 items = "expression"                  # JMESPath yielding an array, or a CSS selector for HTML; optional for JSON when the body is the array
 
@@ -1091,7 +1106,7 @@ impl Manifest {
             problems.extend(template_problems(
                 "search.path",
                 &search.path,
-                SEARCH_PLACEHOLDERS,
+                SEARCH_PATH_PLACEHOLDERS,
             ));
             match (&search.response_format, &search.items) {
                 (ResponseFormat::Html, None) => {

@@ -469,8 +469,14 @@ export class TauriSearchApi implements SearchApi {
     query: string,
     limit?: number,
     providers?: string[],
+    page?: number,
   ): Promise<LiteratureSearchResponse> {
-    return invoke<LiteratureSearchResponse>("literature_search", { query, limit, providers });
+    return invoke<LiteratureSearchResponse>("literature_search", {
+      query,
+      limit,
+      providers,
+      page,
+    });
   }
 
   async literatureBrowse(

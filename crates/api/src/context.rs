@@ -40,9 +40,9 @@ use wilkes_core::generate::tasks::search_results_summary::{
     summarize_search_results as generate_search_results_summary, SearchResultsSummaryInput,
 };
 use wilkes_core::generate::{Generated, GenerationEngine, Generator};
-use wilkes_core::integrations::{IntegrationRegistry, LiteratureSource};
 use wilkes_core::integrations::zotero::model::ZoteroItem;
 use wilkes_core::integrations::zotero::ZoteroClient;
+use wilkes_core::integrations::{IntegrationRegistry, LiteratureSource};
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::metadata::doi::find_dois;
 use wilkes_core::models::progress::EmbedProgress;
@@ -4639,7 +4639,11 @@ impl AppContext {
                     let Some(identity) = FileIdentity::from_entry(entry) else {
                         continue;
                     };
-                    match guard.get_valid_with_primary(&entry.path, identity, primary_source.clone()) {
+                    match guard.get_valid_with_primary(
+                        &entry.path,
+                        identity,
+                        primary_source.clone(),
+                    ) {
                         Ok(Some(cached)) => {
                             let meta = cached.metadata;
                             let citation_count = meta.citation_count();
@@ -5246,6 +5250,7 @@ impl AppContext {
         query: String,
         limit: Option<usize>,
         providers: Option<Vec<String>>,
+        page: Option<usize>,
     ) -> Result<
         crate::commands::integrations::literature::LiteratureSearchResponse,
         crate::commands::integrations::literature::LiteratureRequestError,
@@ -5256,6 +5261,7 @@ impl AppContext {
             query,
             limit,
             providers,
+            page,
         )
         .await
     }
@@ -5289,12 +5295,8 @@ impl AppContext {
         crate::commands::integrations::literature::LiteratureRequestError,
     > {
         let settings = self.get_settings().await;
-        crate::commands::integrations::literature::browse(
-            &settings.integrations,
-            provider,
-            request,
-        )
-        .await
+        crate::commands::integrations::literature::browse(&settings.integrations, provider, request)
+            .await
     }
 
     /// Authoritative document metadata: file-based extraction overridden by the

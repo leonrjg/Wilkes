@@ -2129,13 +2129,11 @@ mod tests {
             })
             .await
             .unwrap();
-        let parent_semantic = read_manifest(&workspace_manifest_path(
-            dir.path(),
-            &corpus.corpus_id,
-        ))
-        .unwrap()
-        .semantic
-        .unwrap();
+        let parent_semantic =
+            read_manifest(&workspace_manifest_path(dir.path(), &corpus.corpus_id))
+                .unwrap()
+                .semantic
+                .unwrap();
         let projection = manager
             .ensure_projection_workspace(
                 &corpus.corpus_id,

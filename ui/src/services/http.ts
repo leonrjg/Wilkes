@@ -821,12 +821,14 @@ export class HttpSearchApi implements SearchApi {
     query: string,
     limit?: number,
     providers?: string[],
+    page?: number,
   ): Promise<LiteratureSearchResponse> {
     // The route refuses unknown fields, so an absent filter is omitted rather
     // than sent as null.
     const body: Record<string, unknown> = { query };
     if (limit !== undefined) body.limit = limit;
     if (providers !== undefined) body.providers = providers;
+    if (page !== undefined) body.page = page;
     const res = await fetch("/api/literature/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

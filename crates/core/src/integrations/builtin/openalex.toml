@@ -22,7 +22,7 @@ path = "/works?filter=doi:https://doi.org/10.1145/3801158&select=id&per-page=1"
 # ── Search: keyword in, works out ─────────────────────────────────────────────
 
 [capabilities.search]
-path = "/works?search={query}&per-page={limit}&select=id,doi,display_name,publication_year,publication_date,cited_by_count,ids,primary_location,best_oa_location,open_access,authorships"
+path = "/works?search={query}&per-page={limit}&page={page}&select=id,doi,display_name,publication_year,publication_date,cited_by_count,ids,primary_location,best_oa_location,open_access,authorships"
 items = "results"
 
 [capabilities.search.fields]

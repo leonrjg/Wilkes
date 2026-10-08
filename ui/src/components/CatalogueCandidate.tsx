@@ -462,17 +462,23 @@ export function PaperCandidate({ provider, work }: PaperProps) {
         </div>
       </div>
 
+      {/* What a person chooses by comes first — when, how cited, whether it
+          can be had — because the line is clamped at two lines and a long
+          author list used to push the citations and the access out of view. A
+          count the provider did not report is left out rather than shown as
+          zero. */}
       <MetaLine
         parts={[
           work.year !== null && `${work.year}`,
+          work.citation_count !== null &&
+            `${work.citation_count.toLocaleString()} citation${work.citation_count === 1 ? "" : "s"}`,
+          work.is_open_access && "Open access",
           work.authors,
           work.venue,
           work.publisher !== work.venue && work.publisher,
           work.language,
           work.file_format,
           work.file_size,
-          `${work.citation_count.toLocaleString()} citation${work.citation_count === 1 ? "" : "s"}`,
-          work.is_open_access && "Open access",
           work.license,
         ]}
       />

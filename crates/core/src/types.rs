@@ -1468,14 +1468,16 @@ pub struct DocumentMetadata {
 
 impl DocumentMetadata {
     /// How often the document is cited, by the provider that comes first in
-    /// [`crate::integrations::builtin::precedence`] among those that recorded
-    /// a work. Providers count differently, so one is chosen rather than the
-    /// counts being mixed.
+    /// [`crate::integrations::builtin::precedence`] among those that reported
+    /// a count. Providers count differently, so one is chosen rather than the
+    /// counts being mixed; a provider that reported none is not one of them,
+    /// and is not read as having counted zero.
     pub fn citation_count(&self) -> Option<i64> {
         self.providers
             .iter()
+            .filter_map(|(id, work)| work.citation_count.map(|count| (id, count)))
             .min_by_key(|(id, _)| crate::integrations::builtin::precedence(id))
-            .map(|(_, work)| work.citation_count)
+            .map(|(_, count)| count)
     }
 }
 
@@ -3205,7 +3207,8 @@ pub struct ProviderWork {
     pub year: Option<i64>,
     pub publication_date: Option<String>,
     pub venue: Option<String>,
-    pub citation_count: i64,
+    /// None when the provider reported no count, which is not a count of zero.
+    pub citation_count: Option<i64>,
     pub external_ids: HashMap<String, serde_json::Value>,
     pub cached_at_ms: i64,
 }
@@ -3242,7 +3245,8 @@ pub struct LiteratureSearchResult {
     pub year: Option<i64>,
     pub publication_date: Option<String>,
     pub venue: Option<String>,
-    pub citation_count: i64,
+    /// None when the provider reported no count, which is not a count of zero.
+    pub citation_count: Option<i64>,
     pub is_open_access: bool,
     pub pdf_url: Option<String>,
     pub landing_page_url: Option<String>,
@@ -3600,6 +3604,42 @@ pub struct SearchStats {
 
 #[cfg(test)]
 mod tests {
+    fn counted(count: Option<i64>) -> ProviderWork {
+        ProviderWork {
+            doi: "10.1/x".into(),
+            work_id: "w".into(),
+            title: None,
+            year: None,
+            publication_date: None,
+            venue: None,
+            citation_count: count,
+            external_ids: Default::default(),
+            cached_at_ms: 0,
+        }
+    }
+
+    /// The count comes from the first provider in precedence *that reported
+    /// one*. One that did not is skipped, not read as zero, and none reporting
+    /// means no count at all.
+    #[test]
+    fn the_citation_count_is_the_first_reported_not_the_first_recorded() {
+        let metadata = DocumentMetadata {
+            providers: [
+                ("semantic_scholar".to_string(), counted(None)),
+                ("openalex".to_string(), counted(Some(12))),
+            ]
+            .into(),
+            ..DocumentMetadata::default()
+        };
+        assert_eq!(metadata.citation_count(), Some(12));
+
+        let none = DocumentMetadata {
+            providers: [("semantic_scholar".to_string(), counted(None))].into(),
+            ..DocumentMetadata::default()
+        };
+        assert_eq!(none.citation_count(), None);
+    }
+
     use super::*;
     use std::path::Path;
 

@@ -1930,9 +1930,10 @@ async fn literature_search(
     query: String,
     limit: Option<usize>,
     providers: Option<Vec<String>>,
+    page: Option<usize>,
 ) -> Result<wilkes_api::commands::integrations::literature::LiteratureSearchResponse, String> {
     app_context(&app)
-        .literature_search(query, limit, providers)
+        .literature_search(query, limit, providers, page)
         .await
         .map_err(|error| error.to_string())
 }

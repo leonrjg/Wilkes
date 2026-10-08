@@ -486,7 +486,10 @@ mod tests {
     #[test]
     fn separators_and_traversal_do_not_survive() {
         assert_eq!(sanitize_file_name("../a/b.pdf").unwrap(), "__a_b.pdf");
-        assert_eq!(sanitize_file_name("Graph: Networks.PDF").unwrap(), "Graph_ Networks.PDF");
+        assert_eq!(
+            sanitize_file_name("Graph: Networks.PDF").unwrap(),
+            "Graph_ Networks.PDF"
+        );
     }
 
     #[test]
