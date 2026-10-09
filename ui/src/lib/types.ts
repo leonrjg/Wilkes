@@ -461,7 +461,8 @@ export interface FileEntry {
   /** Document publication date ("YYYY-MM") from cached extracted metadata.
    *  Absent until the metadata cache has processed this file. */
   publication_date?: string | null;
-  /** Semantic Scholar citation count from cached extracted metadata. */
+  /** Citation count from cached provider metadata, taken from the first provider
+   *  that reported one. */
   citation_count?: number | null;
   metadata_conflicts?: Record<string, MetadataConflictValue[]>;
   tags?: Tag[];

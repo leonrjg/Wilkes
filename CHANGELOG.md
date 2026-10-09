@@ -23,8 +23,11 @@
 - The literature pane can browse as well as search. A "Filters" button beside
   the search box opens controls that list a provider's works by filter and sort
   with no keyword at all, applying each change as it is made, showing what is
-  set as removable chips when the panel is closed, and listing the filtered
-  provider once, in the Literature section, in place of its keyword answer — OpenAlex by year range, field and domain, type, minimum
+  set as removable chips when the panel is closed, and listing each filtered
+  provider once, in the Literature section, in place of its keyword answer.
+  Filters belong to the provider that declares them: every selected provider
+  with a sort or filters gets its own set, several can be filtered at once, and
+  a provider that is switched off simply has none — OpenAlex by year range, field and domain, type, minimum
   citations, open access, full text and retraction, sorted by citations or
   date — and combines a keyword with the same filters when one is typed. The
   panel is drawn from what the provider's manifest *declares* (its `browse`

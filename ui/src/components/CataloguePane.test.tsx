@@ -152,11 +152,8 @@ describe("CataloguePane", () => {
       providerOptions: [],
       providerOptionsError: null,
       browseOpen: false,
-      browseProvider: null,
-      browseFilters: {},
-      browseSort: null,
-      browseAnswer: null,
-      browseError: null,
+      refinements: {},
+      listings: {},
     });
     useSettingsStore.setState({ directory: "/library", refreshFileList: vi.fn() as never });
     useWorkspaceStore.setState({ workspaces: [], activeWorkspaceId: null } as never);
@@ -661,7 +658,7 @@ describe("CataloguePane", () => {
     await screen.findByText("Browsed work 0");
     expect(literature).not.toHaveBeenCalled();
 
-    fireEvent.click(within(panel).getByRole("button", { name: "Reset" }));
+    fireEvent.click(within(panel).getByRole("button", { name: "Reset OpenAlex filters" }));
     // OpenAlex was left out of the keyword search while it was a listing, so
     // it is asked now, and the listing is gone.
     await waitFor(() => expect(literature).toHaveBeenCalled());
@@ -708,7 +705,7 @@ describe("CataloguePane", () => {
     fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
     expect(await screen.findByText("Browsed work 9")).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load more filtered OpenAlex" }));
     expect(await screen.findByText("Browsed work 12")).toBeTruthy();
     // The same request, one page on; and what was read stays.
     expect(browse.mock.calls[1][1]).toMatchObject({
@@ -718,7 +715,7 @@ describe("CataloguePane", () => {
     });
     expect(screen.getByText("Browsed work 0")).toBeTruthy();
     // A short page is the last one.
-    expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Load more filtered OpenAlex" })).toBeNull();
   });
 
   it("says what a provider refused, under its name, and keeps what was already read", async () => {
@@ -734,7 +731,7 @@ describe("CataloguePane", () => {
     const panel = await openFilters();
     fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
     await screen.findByText("Browsed work 0");
-    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load more filtered OpenAlex" }));
     expect(await screen.findByText(/OpenAlex could not list works: OpenAlex rate limit reached/)).toBeTruthy();
     expect(screen.getByText("Browsed work 9")).toBeTruthy();
   });
@@ -747,19 +744,86 @@ describe("CataloguePane", () => {
     expect(await screen.findByText(/could not list works: Error: OpenAlex integration is disabled/)).toBeTruthy();
   });
 
-  it("does not apply filters to a provider the user has switched off", async () => {
+  /// A provider that is off has no filters and no listing. Nothing about it is
+  /// said, because nothing about it is shown.
+  it("shows no filters for a provider the user has switched off, and asks it nothing", async () => {
+    browse.mockResolvedValue(listing(works(2)));
     render(<CataloguePane />);
     const panel = await openFilters();
-    fireEvent.click(await screen.findByRole("button", { name: "OpenAlex" }));
     fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
-    expect(browse).not.toHaveBeenCalled();
-    expect(within(panel).getByText(/is switched off in the Literature section/)).toBeTruthy();
+    await screen.findByText("Browsed work 0");
+    expect(browse).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(await screen.findByRole("button", { name: "OpenAlex" }));
+    expect(screen.queryByRole("group", { name: "OpenAlex filters" })).toBeNull();
+    expect(screen.queryByLabelText("OpenAlex listing")).toBeNull();
+    expect(within(panel).getByText(/None of the sources selected above can be filtered/)).toBeTruthy();
+
+    // Switching it back on asks for the listing again, with its filters kept.
+    fireEvent.click(screen.getByRole("button", { name: "OpenAlex" }));
+    await waitFor(() => expect(browse).toHaveBeenCalledTimes(2));
+    expect(browse.mock.calls[1][1].filters).toEqual({ type: "article" });
   });
 
-  it("lets the user choose among providers that each declare something to refine", async () => {
+  /// Filters belong to the provider that declared them. Two providers that
+  /// declare some each get a set, and each is filtered on its own.
+  it("gives every filterable provider its own filters, applied independently", async () => {
     providers.mockResolvedValue([
       provider("semantic_scholar", "Semantic Scholar"),
       provider("openalex", "OpenAlex", OPENALEX_BROWSE),
+      provider("custom:crossref", "Crossref", {
+        keyword: false,
+        sort: {
+          default: "issued",
+          keyword_default: null,
+          options: [
+            { value: "issued", label: "Issued" },
+            { value: "cited", label: "Most cited" },
+          ],
+        },
+        filters: [],
+      }),
+    ]);
+    browse.mockImplementation(async (id: string) => ({
+      provider: id,
+      name: id === "openalex" ? "OpenAlex" : "Crossref",
+      results: works(1).map((w) => ({ ...w, id: `${id}-1`, title: `${id} work` })),
+      error: null,
+    }));
+    render(<CataloguePane />);
+    const panel = await openFilters();
+    const openalex = within(panel).getByRole("group", { name: "OpenAlex filters" });
+    const crossref = within(panel).getByRole("group", { name: "Crossref filters" });
+    // A provider that declares nothing has no set.
+    expect(within(panel).queryByRole("group", { name: "Semantic Scholar filters" })).toBeNull();
+
+    fireEvent.change(within(openalex).getByLabelText("Type"), { target: { value: "book" } });
+    await screen.findByText("openalex work");
+    expect(browse).toHaveBeenCalledTimes(1);
+    expect(browse).toHaveBeenLastCalledWith("openalex", expect.objectContaining({ filters: { type: "book" } }));
+    // Crossref was not asked: nothing was set on it.
+    expect(screen.queryByLabelText("Crossref listing")).toBeNull();
+
+    fireEvent.change(within(crossref).getByLabelText("Sort"), { target: { value: "cited" } });
+    await screen.findByText("custom:crossref work");
+    expect(browse).toHaveBeenLastCalledWith(
+      "custom:crossref",
+      expect.objectContaining({ sort: "cited", filters: {} }),
+    );
+    // Both are listings now, in the registry's order, and each only once.
+    expect(screen.getAllByLabelText(/listing$/).map((el) => el.getAttribute("aria-label"))).toEqual([
+      "OpenAlex listing",
+      "Crossref listing",
+    ]);
+
+    // Resetting one leaves the other.
+    fireEvent.click(within(openalex).getByRole("button", { name: "Reset OpenAlex filters" }));
+    await waitFor(() => expect(screen.queryByLabelText("OpenAlex listing")).toBeNull());
+    expect(screen.getByLabelText("Crossref listing")).toBeTruthy();
+  });
+
+  it("tells a keyword-less listing that the keyword searches the other sources", async () => {
+    providers.mockResolvedValue([
       provider("custom:crossref", "Crossref", {
         keyword: false,
         sort: {
@@ -770,23 +834,10 @@ describe("CataloguePane", () => {
         filters: [],
       }),
     ]);
-    browse.mockResolvedValue({
-      provider: "custom:crossref",
-      name: "Crossref",
-      results: works(1),
-      error: null,
-    });
     render(<CataloguePane />);
     const panel = await openFilters();
-    fireEvent.change(within(panel).getByLabelText("Provider to filter"), {
-      target: { value: "custom:crossref" },
-    });
-    // A different provider starts from its own declaration.
-    expect(within(panel).queryByLabelText("Type")).toBeNull();
     fireEvent.change(searchBox(), { target: { value: "ignored" } });
-    expect(
-      within(panel).getByText(/Crossref's listing does not take a keyword/),
-    ).toBeTruthy();
+    expect(within(panel).getByText(/Crossref's listing does not take a keyword/)).toBeTruthy();
   });
 
   it("adds a paper through uploads and into the library", async () => {

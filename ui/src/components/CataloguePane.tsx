@@ -1,21 +1,23 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, Search, Sliders, X } from "react-feather";
 import type {
   BrowseControls,
   CatalogueGrain,
   CatalogueHit,
   FilterControl,
+  LiteratureProviderAnswer,
   LiteratureProviderInfo,
 } from "../lib/types";
 import {
   ALL_GRAINS,
   browseProviderIds,
-  type BrowseAnswer,
   enabledProviderIds,
   type LiteratureAnswer,
+  type Refinement,
   type PaneSection,
-  refinedProvider,
+  refinedProviderIds,
   refinementCount,
+  totalRefinements,
   type Selection,
   selects,
   selectsAny,
@@ -64,10 +66,12 @@ export default function CataloguePane() {
   const literature = useCatalogueStore((s) => s.literature);
   const literatureError = useCatalogueStore((s) => s.literatureError);
   const acquireError = useCatalogueStore((s) => s.acquireError);
-  const browseAnswer = useCatalogueStore((s) => s.browseAnswer);
-  const browseLoading = useCatalogueStore((s) => s.browseLoading);
-  const browseError = useCatalogueStore((s) => s.browseError);
-  const listed = useCatalogueStore(refinedProvider);
+  const refinements = useCatalogueStore((s) => s.refinements);
+  const listings = useCatalogueStore((s) => s.listings);
+  const listed = useMemo(
+    () => refinedProviderIds({ refinements, providerOptions, providers }),
+    [refinements, providerOptions, providers],
+  );
   const setBrowseOpen = useCatalogueStore((s) => s.setBrowseOpen);
   const { readOnly, needsDirectory } = useCatalogueAdd();
   const [draft, setDraft] = useState(useCatalogueStore.getState().query);
@@ -83,19 +87,25 @@ export default function CataloguePane() {
   // name would be a place results could land unseen.
   const catalogueCount = answer === null ? null : answer.hits.length;
   // A provider shown as a filtered listing is counted once, as the listing.
-  const listing = listed !== null && selectsAny(providers) ? browseAnswer : null;
+  const listedCount = listed.reduce(
+    (total, id) => total + (listings[id]?.answer?.results.length ?? 0),
+    0,
+  );
+  const listedAsked = listed.some((id) => {
+    const listing = listings[id];
+    return listing !== undefined && (listing.loading || listing.error !== null || listing.answer !== null);
+  });
   const literatureCount =
-    literature === null && listing === null
+    literature === null && !listedAsked
       ? null
       : (literature?.providers ?? [])
-          .filter((entry) => selects(providers, entry.provider) && entry.provider !== listed)
-          .reduce((total, entry) => total + (entry.results?.length ?? 0), 0) +
-        (listing?.results.length ?? 0);
+          .filter((entry) => selects(providers, entry.provider) && !listed.includes(entry.provider))
+          .reduce((total, entry) => total + (entry.results?.length ?? 0), 0) + listedCount;
   const asked =
     (selectsAny(grains) && (loading || error !== null || answer !== null)) ||
     (selectsAny(providers) &&
       (literatureLoading || literatureError !== null || literature !== null)) ||
-    (listed !== null && (browseLoading || browseError !== null || browseAnswer !== null));
+    listedAsked;
   const browsable = browseProviderIds(providerOptions);
 
   return (
@@ -201,9 +211,6 @@ export default function CataloguePane() {
             <Note>No provider selected, so nothing was searched.</Note>
           ) : (
             <>
-              {listing !== null || (listed !== null && (browseLoading || browseError !== null)) ? (
-                <ListingBody answer={listing} />
-              ) : null}
               {literatureLoading && <Spinner />}
               {/* The error and the answer are shown together when both exist.
                   A failed request for a provider the user has just re-selected
@@ -212,13 +219,12 @@ export default function CataloguePane() {
               {literatureError !== null && !literatureLoading && (
                 <p className="py-2 text-[10px] leading-snug text-red-400">{literatureError}</p>
               )}
-              {!literatureLoading && literature !== null && (
-                <LiteratureAnswerBody
-                  answer={literature}
-                  selection={providers}
-                  omit={listed}
-                />
-              )}
+              <ProviderResults
+                answer={literatureLoading ? null : literature}
+                listed={listed}
+                providerOptions={providerOptions}
+                selection={providers}
+              />
             </>
           )}
         </Section>
@@ -411,7 +417,7 @@ function CatalogueAnswerBody({
 function FiltersButton() {
   const open = useCatalogueStore((s) => s.browseOpen);
   const setOpen = useCatalogueStore((s) => s.setBrowseOpen);
-  const count = useCatalogueStore(refinementCount);
+  const count = useCatalogueStore(totalRefinements);
   const options = useCatalogueStore((s) => s.providerOptions);
   if (browseProviderIds(options).length === 0) return null;
   return (
@@ -439,15 +445,20 @@ function FiltersButton() {
 }
 
 /**
- * Refining a provider's works, drawn entirely from its manifest's declaration:
- * the sort, the filters and what kind each is all come from the provider, so a
- * provider added tomorrow gets controls with no change here.
+ * Filtering and sorting, drawn entirely from what each provider's manifest
+ * declares: the sort, the filters and what kind each is all come from the
+ * provider, so a provider added tomorrow gets controls with no change here.
+ *
+ * Every selected provider that declares something to refine gets its own set,
+ * and several can be filtered at once; a provider that is off, or declares
+ * nothing, has no set. Filters belong to the provider that declared them, not
+ * to the pane, so nothing here chooses "the" provider to filter.
  *
  * Changes apply as they are made. A filter is a narrowing of what is already
  * on screen, and a separate "apply" button between the choice and its effect
  * made the pane look inert. Ranges apply when the field is left, since a
  * request per keystroke would ask a rate-limited service about "2", "20" and
- * "202". The keyword in the search box rides along when the listing takes one.
+ * "202". The keyword in the search box rides along wherever a listing takes one.
  */
 function RefineBar({
   keyword,
@@ -457,47 +468,37 @@ function RefineBar({
   options: LiteratureProviderInfo[];
 }) {
   const open = useCatalogueStore((s) => s.browseOpen);
-  const chosen = useCatalogueStore((s) => s.browseProvider);
-  const selectProvider = useCatalogueStore((s) => s.selectBrowseProvider);
-  const filters = useCatalogueStore((s) => s.browseFilters);
-  const setFilter = useCatalogueStore((s) => s.setBrowseFilter);
+  const refinements = useCatalogueStore((s) => s.refinements);
+  const selected = useCatalogueStore((s) => s.providers);
   const clearFilter = useCatalogueStore((s) => s.clearBrowseFilter);
-  const sort = useCatalogueStore((s) => s.browseSort);
   const setSort = useCatalogueStore((s) => s.setBrowseSort);
   const reset = useCatalogueStore((s) => s.resetRefinement);
   const refine = useCatalogueStore((s) => s.refine);
-  const count = useCatalogueStore(refinementCount);
-  const selected = useCatalogueStore((s) => s.providers);
 
   const offered = browseProviderIds(options);
   if (offered.length === 0) return null;
-  const provider = chosen !== null && offered.includes(chosen) ? chosen : offered[0];
-  const info = options.find((option) => option.provider === provider);
-  const controls = info?.capabilities.browse ?? null;
-  if (!info || controls === null) return null;
-
-  const apply = () => void refine(keyword);
+  const shown = offered.filter((id) => selects(selected, id));
+  const listed = refinedProviderIds({ refinements, providerOptions: options, providers: selected });
   const typed = keyword.trim() !== "";
-  const switchedOff = !selects(selected, provider);
 
   return (
     <div className="px-3 pb-1.5">
-      {count > 0 && !open && (
+      {listed.length > 0 && !open && (
         <ActiveFilters
-          controls={controls}
-          filters={filters}
-          sort={sort}
-          onClearFilter={(name) => {
-            clearFilter(name);
-            apply();
+          options={options}
+          refinements={refinements}
+          listed={listed}
+          onClearFilter={(provider, name) => {
+            clearFilter(provider, name);
+            void refine(keyword, provider);
           }}
-          onClearSort={() => {
-            setSort(null);
-            apply();
+          onClearSort={(provider) => {
+            setSort(provider, null);
+            void refine(keyword, provider);
           }}
           onReset={() => {
             reset();
-            apply();
+            void refine(keyword);
           }}
         />
       )}
@@ -505,95 +506,115 @@ function RefineBar({
         <div
           role="group"
           aria-label="Filters"
-          className="flex max-h-[45vh] flex-col gap-1.5 overflow-y-auto rounded border border-[var(--border-main)] bg-[var(--bg-app)] p-2"
+          className="flex max-h-[45vh] flex-col gap-2 overflow-y-auto rounded border border-[var(--border-main)] bg-[var(--bg-app)] p-2"
         >
-          <div className="flex items-center justify-between gap-2">
-            {offered.length > 1 ? (
-              <select
-                aria-label="Provider to filter"
-                value={provider}
-                onChange={(e) => {
-                  selectProvider(e.target.value);
-                  apply();
-                }}
-                className="rounded border border-[var(--border-main)] bg-[var(--bg-sidebar)] px-1 py-0.5 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)] outline-none"
-              >
-                {offered.map((id) => (
-                  <option key={id} value={id}>
-                    {options.find((option) => option.provider === id)?.name ?? id}
+          {shown.length === 0 && (
+            <p className="text-[10px] leading-snug text-[var(--text-muted)]">
+              None of the sources selected above can be filtered. Select one that can to
+              set filters.
+            </p>
+          )}
+          {shown.map((id) => (
+            <ProviderFilters
+              key={id}
+              info={options.find((option) => option.provider === id)}
+              typed={typed}
+              keyword={keyword}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** One provider's filters and sort, under its name. */
+function ProviderFilters({
+  info,
+  typed,
+  keyword,
+}: {
+  info: LiteratureProviderInfo | undefined;
+  typed: boolean;
+  keyword: string;
+}) {
+  const refinement = useCatalogueStore((s) => (info ? s.refinements[info.provider] : undefined));
+  const setFilter = useCatalogueStore((s) => s.setBrowseFilter);
+  const setSort = useCatalogueStore((s) => s.setBrowseSort);
+  const reset = useCatalogueStore((s) => s.resetRefinement);
+  const refine = useCatalogueStore((s) => s.refine);
+  const controls = info?.capabilities.browse ?? null;
+  if (!info || controls === null) return null;
+  const provider = info.provider;
+  const filters = refinement?.filters ?? {};
+  const sort = refinement?.sort ?? null;
+  const count = refinementCount(refinement);
+  const apply = () => void refine(keyword, provider);
+
+  return (
+    <div role="group" aria-label={`${info.name} filters`} className="flex flex-col gap-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)]">
+          {info.name}
+        </span>
+        {count > 0 && (
+          <button
+            type="button"
+            onClick={() => {
+              reset(provider);
+              apply();
+            }}
+            aria-label={`Reset ${info.name} filters`}
+            className="text-[10px] text-[var(--text-dim)] underline-offset-2 hover:text-[var(--text-main)] hover:underline"
+          >
+            Reset
+          </button>
+        )}
+      </div>
+      <div className="grid grid-cols-2 gap-1.5">
+        {controls.sort !== null && (
+          <ControlRow label="Sort by" wide={controls.filters.length === 0}>
+            <select
+              aria-label="Sort"
+              value={sort ?? ""}
+              onChange={(e) => {
+                setSort(provider, e.target.value === "" ? null : e.target.value);
+                apply();
+              }}
+              className={CONTROL_CLASS}
+            >
+              <option value="">{defaultSortLabel(controls, typed)}</option>
+              {controls.sort.options
+                .filter((option) => option.value !== controls.sort?.default)
+                .map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
                   </option>
                 ))}
-              </select>
-            ) : (
-              <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)]">
-                {info.name}
-              </span>
-            )}
-            {count > 0 && (
-              <button
-                type="button"
-                onClick={() => {
-                  reset();
-                  apply();
-                }}
-                className="text-[10px] text-[var(--text-dim)] underline-offset-2 hover:text-[var(--text-main)] hover:underline"
-              >
-                Reset
-              </button>
-            )}
-          </div>
-          {switchedOff && (
-            <p className="text-[10px] leading-snug text-[var(--text-muted)]">
-              {info.name} is switched off in the Literature section, so these filters are
-              not applied.
-            </p>
-          )}
-          <div className="grid grid-cols-2 gap-1.5">
-            {controls.sort !== null && (
-              <ControlRow label="Sort by" wide={controls.filters.length === 0}>
-                <select
-                  aria-label="Sort"
-                  value={sort ?? ""}
-                  onChange={(e) => {
-                    setSort(e.target.value === "" ? null : e.target.value);
-                    apply();
-                  }}
-                  className={CONTROL_CLASS}
-                >
-                  <option value="">{defaultSortLabel(controls, typed)}</option>
-                  {controls.sort.options
-                    .filter((option) => option.value !== controls.sort?.default)
-                    .map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                </select>
-              </ControlRow>
-            )}
-            {controls.filters.map((filter) => (
-              <FilterInput
-                key={filter.name}
-                filter={filter}
-                values={filters}
-                onChange={setFilter}
-                onApply={apply}
-              />
-            ))}
-          </div>
-          {typed && !controls.keyword && (
-            <p className="text-[10px] leading-snug text-[var(--text-muted)]">
-              {info.name}'s listing does not take a keyword, so “{keyword.trim()}” only
-              searches the other sources.
-            </p>
-          )}
-          {count === 0 && (
-            <p className="text-[10px] leading-snug text-[var(--text-muted)]">
-              Set a filter or a sort to list {info.name} works
-              {controls.keyword ? ", with or without a keyword" : ""}.
-            </p>
-          )}
-        </div>
+            </select>
+          </ControlRow>
+        )}
+        {controls.filters.map((filter) => (
+          <FilterInput
+            key={filter.name}
+            filter={filter}
+            values={filters}
+            onChange={(name, value) => setFilter(provider, name, value)}
+            onApply={apply}
+          />
+        ))}
+      </div>
+      {typed && !controls.keyword && (
+        <p className="text-[10px] leading-snug text-[var(--text-muted)]">
+          {info.name}'s listing does not take a keyword, so “{keyword.trim()}” only
+          searches the other sources.
+        </p>
+      )}
+      {count === 0 && (
+        <p className="text-[10px] leading-snug text-[var(--text-muted)]">
+          Set a filter or a sort to list {info.name} works
+          {controls.keyword ? ", with or without a keyword" : ""}.
+        </p>
       )}
     </div>
   );
@@ -611,35 +632,47 @@ function defaultSortLabel(controls: BrowseControls, keywordTyped: boolean): stri
 }
 
 /** The filters that are set, one removable chip each, for when the panel is
- *  closed and the results would otherwise look unexplained. */
+ *  closed and the results would otherwise look unexplained. With more than one
+ *  provider filtered, each chip is prefixed with the provider it belongs to. */
 function ActiveFilters({
-  controls,
-  filters,
-  sort,
+  options,
+  refinements,
+  listed,
   onClearFilter,
   onClearSort,
   onReset,
 }: {
-  controls: BrowseControls;
-  filters: Record<string, string>;
-  sort: string | null;
-  onClearFilter: (name: string) => void;
-  onClearSort: () => void;
+  options: LiteratureProviderInfo[];
+  refinements: Record<string, Refinement>;
+  listed: string[];
+  onClearFilter: (provider: string, name: string) => void;
+  onClearSort: (provider: string) => void;
   onReset: () => void;
 }) {
   const chips: { key: string; text: string; clear: () => void }[] = [];
-  for (const filter of controls.filters) {
-    const text = filterSummary(filter, filters);
-    if (text !== null) {
-      chips.push({ key: filter.name, text, clear: () => onClearFilter(filter.name) });
+  for (const provider of listed) {
+    const info = options.find((option) => option.provider === provider);
+    const controls = info?.capabilities.browse ?? null;
+    if (!info || controls === null) continue;
+    const prefix = listed.length > 1 ? `${info.name} · ` : "";
+    const refinement = refinements[provider];
+    for (const filter of controls.filters) {
+      const text = filterSummary(filter, refinement?.filters ?? {});
+      if (text !== null) {
+        chips.push({
+          key: `${provider}:${filter.name}`,
+          text: prefix + text,
+          clear: () => onClearFilter(provider, filter.name),
+        });
+      }
     }
-  }
-  if (sort !== null && controls.sort !== null) {
-    chips.push({
-      key: "sort",
-      text: `Sort: ${optionLabel(controls.sort.options, sort, sort)}`,
-      clear: onClearSort,
-    });
+    if (refinement?.sort != null && controls.sort !== null) {
+      chips.push({
+        key: `${provider}:sort`,
+        text: `${prefix}Sort: ${optionLabel(controls.sort.options, refinement.sort, refinement.sort)}`,
+        clear: () => onClearSort(provider),
+      });
+    }
   }
   return (
     <div className="flex flex-wrap items-center gap-1" aria-label="Active filters">
@@ -833,23 +866,19 @@ function RangeEnd({
 }
 
 /**
- * The provider's filtered works, in the Literature section under its name like
- * any other provider's answer, with the next page one press away.
+ * A provider's filtered works, under its name like any other provider's
+ * answer, with the next page one press away.
  *
- * `answer` is null while the first page is on its way or has failed; the
+ * While the first page is on its way or has failed there is no answer yet; the
  * heading and the reason are shown either way, so a refinement that is asking
  * does not look like one that was ignored.
  */
-function ListingBody({ answer }: { answer: BrowseAnswer | null }) {
-  const loading = useCatalogueStore((s) => s.browseLoading);
-  const error = useCatalogueStore((s) => s.browseError);
+function ListingBody({ provider, name }: { provider: string; name: string }) {
+  const listing = useCatalogueStore((s) => s.listings[provider]);
   const more = useCatalogueStore((s) => s.browseMore);
-  const options = useCatalogueStore((s) => s.providerOptions);
-  const chosen = useCatalogueStore((s) => s.browseProvider);
-  const name =
-    answer?.name ??
-    options.find((o) => o.provider === (chosen ?? browseProviderIds(options)[0]))?.name ??
-    "Provider";
+  const answer = listing?.answer ?? null;
+  const loading = listing?.loading ?? false;
+  const error = listing?.error ?? null;
   return (
     <div className="flex flex-col" aria-label={`${name} listing`}>
       <h4 className="mt-2 flex items-baseline gap-1.5 border-b border-[var(--border-strong)] pb-1 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)]">
@@ -866,19 +895,20 @@ function ListingBody({ answer }: { answer: BrowseAnswer | null }) {
       )}
       {answer !== null &&
         (answer.results.length === 0 ? (
-          <Note>Nothing in {answer.name} matches these filters.</Note>
+          <Note>Nothing in {name} matches these filters.</Note>
         ) : (
           <div className="divide-y divide-[var(--border-main)]">
             {answer.results.map((work) => (
-              <PaperCandidate key={work.id} provider={answer.provider} work={work} />
+              <PaperCandidate key={work.id} provider={provider} work={work} />
             ))}
           </div>
         ))}
       {answer !== null && !answer.exhausted && (
         <button
           type="button"
-          onClick={() => void more()}
+          onClick={() => void more(provider)}
           disabled={loading}
+          aria-label={`Load more filtered ${name}`}
           className="mt-1.5 self-start rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)] disabled:opacity-50"
         >
           {loading ? "Loading" : "Load more"}
@@ -896,25 +926,28 @@ function providerAnswerMalformed(provider: string): string {
 }
 
 /**
- * Every selected provider's answer, each under its own name.
+ * Every selected provider's part of the Literature section, in the registry's
+ * order and each under its own name: a filtered listing for a provider with
+ * filters set, otherwise its answer to the keyword.
  *
- * The held answers can cover more providers than the filter admits — narrowing
- * a filter hides a provider rather than re-asking the rest — so what is listed
- * is the intersection, not everything that replied.
+ * The held answers can cover more providers than the selection admits —
+ * narrowing the selection hides a provider rather than re-asking the rest — so
+ * what is listed is the intersection, not everything that replied.
  */
-function LiteratureAnswerBody({
+function ProviderResults({
   answer,
+  listed,
+  providerOptions,
   selection,
-  omit,
 }: {
-  answer: LiteratureAnswer;
+  answer: LiteratureAnswer | null;
+  listed: string[];
+  providerOptions: LiteratureProviderInfo[];
   selection: Selection<string>;
-  /** A provider shown elsewhere as a filtered listing, and not listed twice. */
-  omit: string | null;
 }) {
   // No provider enabled is a setting, not a search result: saying "nothing
   // found" would send someone rephrasing a query no index ever saw.
-  if (answer.providers.length === 0) {
+  if (answer !== null && answer.providers.length === 0 && listed.length === 0) {
     return (
       <Note>
         No provider is enabled, so nothing was searched. Settings › Integrations
@@ -922,67 +955,101 @@ function LiteratureAnswerBody({
       </Note>
     );
   }
-  const options = useCatalogueStore((s) => s.providerOptions);
+  const known = enabledProviderIds(providerOptions).filter((id) => selects(selection, id));
+  // An answer from a provider the list does not know is kept, at the end,
+  // rather than dropped: the answer is what the backend said, and the list may
+  // be older than it.
+  const order = [
+    ...known,
+    ...(answer?.providers ?? [])
+      .map((entry) => entry.provider)
+      .filter((id) => !known.includes(id) && selects(selection, id)),
+  ];
+  return (
+    <div className="flex flex-col">
+      {order.map((id) => {
+        const info = providerOptions.find((option) => option.provider === id);
+        if (listed.includes(id)) {
+          return <ListingBody key={id} provider={id} name={info?.name ?? id} />;
+        }
+        const entry = answer?.providers.find((candidate) => candidate.provider === id);
+        if (answer === null || entry === undefined) return null;
+        return (
+          <ProviderEntry
+            key={id}
+            answer={answer}
+            entry={entry}
+            paged={info?.capabilities.paged_search === true}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+/** One provider's answer to the keyword, with its next page one press away
+ *  where the provider can be read on. */
+function ProviderEntry({
+  answer,
+  entry,
+  paged,
+}: {
+  answer: LiteratureAnswer;
+  entry: LiteratureProviderAnswer;
+  paged: boolean;
+}) {
   const moreLoading = useCatalogueStore((s) => s.literatureMore);
   const moreError = useCatalogueStore((s) => s.literatureMoreError);
   const loadMore = useCatalogueStore((s) => s.loadMoreLiterature);
-  const shown = answer.providers.filter(
-    (entry) => selects(selection, entry.provider) && entry.provider !== omit,
-  );
   return (
     <div className="flex flex-col">
-      {shown.map((entry) => (
-        <div key={entry.provider} className="flex flex-col">
-          {/* The provider is the strongest label in this half: it says whose
-              index a row came from, and it is the only thing that does now
-              that no row carries a kind badge. So it reads brighter than the
-              section heading above it and sits on a rule of its own, rather
-              than as a dim line that scanned as part of the row beneath. */}
-          <h4 className="mt-2 flex items-baseline gap-1.5 border-b border-[var(--border-strong)] pb-1 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)]">
-            {entry.name}
-            {entry.results !== null && (
-              <span className="font-normal normal-case tracking-normal text-[var(--text-muted)]">
-                {entry.results.length}
-              </span>
-            )}
-          </h4>
-          {entry.error !== null || entry.results === null ? (
-            <p className="py-1.5 text-[10px] leading-snug text-red-400">
-              {entry.name} could not answer: {entry.error ?? providerAnswerMalformed(entry.provider)}
-            </p>
-          ) : entry.results.length === 0 ? (
-            <Note>
-              {entry.name} returned nothing for “{answer.query}”.
-            </Note>
-          ) : (
-            <div className="divide-y divide-[var(--border-main)]">
-              {entry.results.map((work) => (
-                <PaperCandidate key={work.id} provider={entry.provider} work={work} />
-              ))}
-            </div>
-          )}
-          {moreError[entry.provider] !== undefined && (
-            <p className="py-1 text-[10px] leading-snug text-red-400">
-              {entry.name} could not read the next page: {moreError[entry.provider]}
-            </p>
-          )}
-          {entry.results !== null &&
-            entry.results.length > 0 &&
-            answer.pages[entry.provider]?.exhausted === false &&
-            options.find((o) => o.provider === entry.provider)?.capabilities.paged_search ===
-              true && (
-              <button
-                type="button"
-                onClick={() => void loadMore(entry.provider)}
-                disabled={moreLoading.includes(entry.provider)}
-                aria-label={`Load more from ${entry.name}`}
-                className="mt-1.5 self-start rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)] disabled:opacity-50"
-              >
-                {moreLoading.includes(entry.provider) ? "Loading" : "Load more"}
-              </button>
-            )}
+      {/* The provider is the strongest label in this half: it says whose
+          index a row came from, and it is the only thing that does now
+          that no row carries a kind badge. So it reads brighter than the
+          section heading above it and sits on a rule of its own, rather
+          than as a dim line that scanned as part of the row beneath. */}
+      <h4 className="mt-2 flex items-baseline gap-1.5 border-b border-[var(--border-strong)] pb-1 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)]">
+        {entry.name}
+        {entry.results !== null && (
+          <span className="font-normal normal-case tracking-normal text-[var(--text-muted)]">
+            {entry.results.length}
+          </span>
+        )}
+      </h4>
+      {entry.error !== null || entry.results === null ? (
+        <p className="py-1.5 text-[10px] leading-snug text-red-400">
+          {entry.name} could not answer: {entry.error ?? providerAnswerMalformed(entry.provider)}
+        </p>
+      ) : entry.results.length === 0 ? (
+        <Note>
+          {entry.name} returned nothing for “{answer.query}”.
+        </Note>
+      ) : (
+        <div className="divide-y divide-[var(--border-main)]">
+          {entry.results.map((work) => (
+            <PaperCandidate key={work.id} provider={entry.provider} work={work} />
+          ))}
         </div>
-      ))}
+      )}
+      {moreError[entry.provider] !== undefined && (
+        <p className="py-1 text-[10px] leading-snug text-red-400">
+          {entry.name} could not read the next page: {moreError[entry.provider]}
+        </p>
+      )}
+      {entry.results !== null &&
+        entry.results.length > 0 &&
+        paged &&
+        answer.pages[entry.provider]?.exhausted === false && (
+          <button
+            type="button"
+            onClick={() => void loadMore(entry.provider)}
+            disabled={moreLoading.includes(entry.provider)}
+            aria-label={`Load more from ${entry.name}`}
+            className="mt-1.5 self-start rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)] disabled:opacity-50"
+          >
+            {moreLoading.includes(entry.provider) ? "Loading" : "Load more"}
+          </button>
+        )}
     </div>
   );
 }

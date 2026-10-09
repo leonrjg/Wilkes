@@ -199,6 +199,23 @@ export interface BrowseAnswer {
   request: BrowseRequest;
 }
 
+/** What one provider is being filtered and sorted by. Filter values are keyed
+ *  by the names the provider's manifest gives them, and a blank value is no
+ *  filter and is never stored. The sort is null for the provider's default. */
+export interface Refinement {
+  filters: Record<string, string>;
+  sort: string | null;
+}
+
+/** A provider's listing: what it returned so far, whether a page is on its
+ *  way, and why the last request failed. A failed *next page* leaves the pages
+ *  already read where they are. */
+export interface Listing {
+  answer: BrowseAnswer | null;
+  loading: boolean;
+  error: string | null;
+}
+
 /**
  * How far one row's add has got.
  *
@@ -256,18 +273,14 @@ interface CatalogueStore {
   /** Whether the browse panel is open. A display choice: closing it hides the
    *  controls and keeps what they were set to. */
   browseOpen: boolean;
-  /** The provider being browsed, by id. */
-  browseProvider: string | null;
-  /** Filter values by the names the provider's manifest gives them. A blank
-   *  value is no filter and is never stored. */
-  browseFilters: Record<string, string>;
-  /** The sort chosen, or null for the provider's own default. */
-  browseSort: string | null;
-  browseLoading: boolean;
-  browseAnswer: BrowseAnswer | null;
-  /** Why the last browse failed. A failed *next page* leaves the pages already
-   *  read where they are. */
-  browseError: string | null;
+  /** What each provider is being filtered and sorted by, keyed by provider id.
+   *  Held per provider because what can be filtered is that provider's own
+   *  declaration, and several can be filtered at once. A provider with no
+   *  entry, or an empty one, is searched by keyword like any other. */
+  refinements: Record<string, Refinement>;
+  /** What each filtered provider's listing returned, and how its request is
+   *  going, keyed by provider id. */
+  listings: Record<string, Listing>;
   /** Why the last add failed, whichever of its three calls failed. Kept apart
    *  from the search errors so a failed download does not replace the results
    *  the user was choosing from. */
@@ -310,21 +323,20 @@ interface CatalogueStore {
   toggleProvider: (provider: string) => void;
   toggleSection: (section: PaneSection) => void;
   setBrowseOpen: (open: boolean) => void;
-  /** Switches the provider being browsed. Filters belong to a provider's
-   *  manifest, so a different provider starts from none. */
-  selectBrowseProvider: (provider: string) => void;
-  setBrowseFilter: (name: string, value: string) => void;
-  /** Drops one declared filter, both ends of a range included. */
-  clearBrowseFilter: (name: string) => void;
-  setBrowseSort: (sort: string | null) => void;
-  /** Drops every filter and the sort, back to plain search. */
-  resetRefinement: () => void;
-  /** Brings the provider's listing in line with the filters and sort now set,
-   *  with `keyword` beside them when its listing takes one. With none set the
-   *  listing goes and the provider is searched by keyword like the others. */
-  refine: (keyword: string) => Promise<void>;
-  /** The next page of the listing already held. */
-  browseMore: () => Promise<void>;
+  /** Sets one filter of one provider; an empty value is no filter. */
+  setBrowseFilter: (provider: string, name: string, value: string) => void;
+  /** Drops one declared filter of a provider, both ends of a range included. */
+  clearBrowseFilter: (provider: string, name: string) => void;
+  setBrowseSort: (provider: string, sort: string | null) => void;
+  /** Drops the filters and sort of one provider, or of every provider. */
+  resetRefinement: (provider?: string) => void;
+  /** Brings listings in line with the filters now set — one provider's, or all
+   *  of them — with `keyword` beside the filters wherever a listing takes one.
+   *  A provider left with none stops being a listing and is searched by
+   *  keyword like the others. */
+  refine: (keyword: string, provider?: string) => Promise<void>;
+  /** The next page of one provider's listing. */
+  browseMore: (provider: string) => Promise<void>;
   /** Reads the provider list and prunes any stored selection against it, so a
    *  filter that outlived the provider it named does not refuse every search. */
   loadProviders: () => Promise<void>;
@@ -523,17 +535,12 @@ function omitKey<T>(record: Record<string, T>, key: string): Record<string, T> {
   return rest;
 }
 
-let browseRequest = 0;
+/** In-flight listing requests per provider, so a stale answer is recognised. */
+const browseRequests: Record<string, number> = {};
 
-/** The provider the panel is browsing: the one chosen, else the first enabled
- *  one that offers a listing. Null when none does. */
-function browseProviderOf(state: CatalogueStore): string | null {
-  const offered = browseProviderIds(state.providerOptions);
-  if (state.browseProvider !== null && offered.includes(state.browseProvider)) {
-    return state.browseProvider;
-  }
-  return offered[0] ?? null;
-}
+type StoreSet = (
+  partial: Partial<CatalogueStore> | ((state: CatalogueStore) => Partial<CatalogueStore>),
+) => void;
 
 /** The ids of the enabled providers whose listing can be refined — one that
  *  declares at least a sort or a filter — in registry order. A listing with
@@ -558,45 +565,77 @@ function filterNameOf(key: string): string {
   return key.replace(/\.(min|max)$/, "");
 }
 
-/** How many refinements are set: filters by declared name, plus a chosen sort.
- *  A range with both ends is one. */
-export function refinementCount(state: {
-  browseFilters: Record<string, string>;
-  browseSort: string | null;
-}): number {
-  const names = new Set(Object.keys(state.browseFilters).map(filterNameOf));
-  return names.size + (state.browseSort !== null ? 1 : 0);
+export const NO_REFINEMENT: Refinement = { filters: {}, sort: null };
+const IDLE_LISTING: Listing = { answer: null, loading: false, error: null };
+
+/** How many refinements one provider has set: filters by declared name, plus a
+ *  chosen sort. A range with both ends is one. */
+export function refinementCount(refinement: Refinement | undefined): number {
+  if (refinement === undefined) return 0;
+  const names = new Set(Object.keys(refinement.filters).map(filterNameOf));
+  return names.size + (refinement.sort !== null ? 1 : 0);
 }
 
 /**
- * The provider whose results are currently a filtered listing, or null when
- * the pane is in plain search.
+ * The providers whose results are currently a filtered listing, in registry
+ * order.
  *
  * A listing replaces that provider's keyword answer rather than sitting beside
  * it: both are the same provider's works for the same keyword, and two lists
  * of them would be two answers to one question. It applies only while the
- * provider is one the user has selected above.
+ * provider is enabled and one the user has selected above, so a provider that
+ * is off simply has no listing and nothing needs saying about it.
  */
-export function refinedProvider(state: CatalogueStore): string | null {
-  if (refinementCount(state) === 0) return null;
-  const provider = browseProviderOf(state);
-  if (provider === null || !selects(state.providers, provider)) return null;
-  return provider;
+export function refinedProviderIds(state: {
+  refinements: Record<string, Refinement>;
+  providerOptions: LiteratureProviderInfo[];
+  providers: Selection<string>;
+}): string[] {
+  return browseProviderIds(state.providerOptions).filter(
+    (id) => selects(state.providers, id) && refinementCount(state.refinements[id]) > 0,
+  );
 }
 
-/** The first page of the listing for what is set now. A keyword only goes to a
- *  provider whose listing takes one: sending it to another would be refused by
- *  name, and what was typed in the search box is not a filter that provider was
- *  asked to apply. */
+/** How many refinements are in force across every listed provider. */
+export function totalRefinements(state: {
+  refinements: Record<string, Refinement>;
+  providerOptions: LiteratureProviderInfo[];
+  providers: Selection<string>;
+}): number {
+  return refinedProviderIds(state).reduce(
+    (total, id) => total + refinementCount(state.refinements[id]),
+    0,
+  );
+}
+
+function patchListing(set: StoreSet, provider: string, patch: Partial<Listing>): void {
+  set((state) => ({
+    listings: {
+      ...state.listings,
+      [provider]: { ...(state.listings[provider] ?? IDLE_LISTING), ...patch },
+    },
+  }));
+}
+
+/** Forgets a provider's listing and ignores any request still out for it. */
+function dropListing(set: StoreSet, provider: string): void {
+  browseRequests[provider] = (browseRequests[provider] ?? 0) + 1;
+  set((state) => ({ listings: omitKey(state.listings, provider) }));
+}
+
+/** The first page of a provider's listing for what is set now. A keyword only
+ *  goes to a provider whose listing takes one: sending it to another would be
+ *  refused by name, and what was typed in the search box is not a filter that
+ *  provider was asked to apply. */
 function browseRequestFor(
-  state: CatalogueStore,
+  refinement: Refinement,
   info: LiteratureProviderInfo | undefined,
   keyword: string,
 ): BrowseRequest {
   return {
     query: info?.capabilities.browse?.keyword && keyword ? keyword : null,
-    filters: state.browseFilters,
-    sort: state.browseSort,
+    filters: refinement.filters,
+    sort: refinement.sort,
     page: 1,
     limit: BROWSE_LIMIT,
   };
@@ -605,30 +644,30 @@ function browseRequestFor(
 /** Asks for one page. `held` is the answer to extend, or null for a fresh
  *  listing that replaces whatever was shown. */
 async function runBrowse(
-  set: (partial: Partial<CatalogueStore>) => void,
+  set: StoreSet,
   provider: string,
   name: string,
   request: BrowseRequest,
   held: BrowseAnswer | null,
 ): Promise<void> {
-  const token = ++browseRequest;
-  set({ browseLoading: true, browseError: null });
+  const token = (browseRequests[provider] = (browseRequests[provider] ?? 0) + 1);
+  patchListing(set, provider, { loading: true, error: null });
   try {
     const answer = await api.literatureBrowse(provider, request);
-    if (token !== browseRequest) return;
+    if (token !== browseRequests[provider]) return;
     if (answer.error !== null || answer.results === null) {
       // The provider answered, and refused: a request its manifest does not
       // allow, or a service that is down. Pages already read stay.
-      set({
-        browseLoading: false,
-        browseError: answer.error ?? "the answer carried neither results nor an error",
-        browseAnswer: held,
+      patchListing(set, provider, {
+        loading: false,
+        error: answer.error ?? "the answer carried neither results nor an error",
+        answer: held,
       });
       return;
     }
-    set({
-      browseLoading: false,
-      browseAnswer: {
+    patchListing(set, provider, {
+      loading: false,
+      answer: {
         provider,
         name,
         results: [...(held?.results ?? []), ...unseen(held?.results ?? [], answer.results)],
@@ -638,13 +677,54 @@ async function runBrowse(
       },
     });
   } catch (e: any) {
-    if (token !== browseRequest) return;
-    set({
-      browseLoading: false,
-      browseError: e?.toString?.() ?? "Browse failed",
-      browseAnswer: held,
+    if (token !== browseRequests[provider]) return;
+    patchListing(set, provider, {
+      loading: false,
+      error: e?.toString?.() ?? "Browse failed",
+      answer: held,
     });
   }
+}
+
+/**
+ * Puts each named provider in the state its filters call for: asked for its
+ * listing if it has filters set and is selected, otherwise with no listing.
+ * Returns the requests started and the providers that are not listings.
+ */
+function applyListings(
+  set: StoreSet,
+  get: () => CatalogueStore,
+  keyword: string,
+  ids: string[],
+): { requests: Promise<void>[]; stopped: string[] } {
+  const listed = refinedProviderIds(get());
+  const requests: Promise<void>[] = [];
+  const stopped: string[] = [];
+  for (const id of ids) {
+    if (listed.includes(id)) requests.push(listProvider(set, get(), id, keyword));
+    else {
+      dropListing(set, id);
+      stopped.push(id);
+    }
+  }
+  return { requests, stopped };
+}
+
+/** Asks one provider for its listing under what is set now. */
+function listProvider(
+  set: StoreSet,
+  state: CatalogueStore,
+  provider: string,
+  keyword: string,
+): Promise<void> {
+  const info = state.providerOptions.find((option) => option.provider === provider);
+  return runBrowse(
+    set,
+    provider,
+    info?.name ?? provider,
+    browseRequestFor(state.refinements[provider] ?? NO_REFINEMENT, info, keyword),
+    null,
+  );
 }
 
 export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
@@ -662,12 +742,8 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
   literature: null,
   literatureError: null,
   browseOpen: false,
-  browseProvider: null,
-  browseFilters: {},
-  browseSort: null,
-  browseLoading: false,
-  browseAnswer: null,
-  browseError: null,
+  refinements: {},
+  listings: {},
   acquireError: null,
   acquired: {},
   adding: {},
@@ -723,9 +799,11 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
     const next = toggled(get().providers, enabled, provider);
     set({ providers: next });
     persistPreferences({ ...preferences(get()), providers: next });
-    // The listing follows its provider's chip: switching the provider off
-    // hides it and switching it on asks for it, as it would a search.
-    if (provider === browseProviderOf(get())) void get().refine(get().query);
+    // A filtered listing follows its provider's chip: switching the provider
+    // off removes it and switching it on asks for it, as it would a search.
+    if (browseProviderIds(get().providerOptions).includes(provider)) {
+      void get().refine(get().query, provider);
+    }
     const query = get().query.trim();
     if (!query) return;
     if (!selectsAny(next)) {
@@ -737,9 +815,9 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
     // shows the subset. Only a provider that has not been asked this query
     // costs a request, and then only that provider is asked. A provider shown
     // as a filtered listing is not one of them.
-    const listed = refinedProvider(get());
+    const listed = refinedProviderIds(get());
     const missing = unasked(get().literature, query, next, enabled).filter(
-      (id) => id !== listed,
+      (id) => !listed.includes(id),
     );
     if (missing.length > 0) void searchLiterature(set, get, query, missing, true);
   },
@@ -755,56 +833,69 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
 
   setBrowseOpen: (open) => set({ browseOpen: open }),
 
-  selectBrowseProvider: (provider) => {
-    if (provider === get().browseProvider) return;
-    browseRequest++;
-    set({
-      browseProvider: provider,
-      browseFilters: {},
-      browseSort: null,
-      browseAnswer: null,
-      browseError: null,
-      browseLoading: false,
-    });
-  },
-
-  setBrowseFilter: (name, value) =>
+  setBrowseFilter: (provider, name, value) =>
     set((state) => {
-      const { [name]: _removed, ...rest } = state.browseFilters;
-      return { browseFilters: value === "" ? rest : { ...rest, [name]: value } };
+      const current = state.refinements[provider] ?? NO_REFINEMENT;
+      const { [name]: _removed, ...rest } = current.filters;
+      return {
+        refinements: {
+          ...state.refinements,
+          [provider]: { ...current, filters: value === "" ? rest : { ...rest, [name]: value } },
+        },
+      };
     }),
 
-  clearBrowseFilter: (name) =>
+  clearBrowseFilter: (provider, name) =>
+    set((state) => {
+      const current = state.refinements[provider] ?? NO_REFINEMENT;
+      return {
+        refinements: {
+          ...state.refinements,
+          [provider]: {
+            ...current,
+            filters: Object.fromEntries(
+              Object.entries(current.filters).filter(([key]) => filterNameOf(key) !== name),
+            ),
+          },
+        },
+      };
+    }),
+
+  setBrowseSort: (provider, sort) =>
     set((state) => ({
-      browseFilters: Object.fromEntries(
-        Object.entries(state.browseFilters).filter(([key]) => filterNameOf(key) !== name),
-      ),
+      refinements: {
+        ...state.refinements,
+        [provider]: { ...(state.refinements[provider] ?? NO_REFINEMENT), sort },
+      },
     })),
 
-  setBrowseSort: (sort) => set({ browseSort: sort }),
+  resetRefinement: (provider) =>
+    set((state) => ({
+      refinements:
+        provider === undefined ? {} : omitKey(state.refinements, provider),
+    })),
 
-  resetRefinement: () => set({ browseFilters: {}, browseSort: null }),
-
-  refine: async (keyword) => {
+  refine: async (keyword, provider) => {
     const trimmed = keyword.trim();
     set({ query: keyword });
-    const provider = refinedProvider(get());
-    if (provider === null) {
-      browseRequest++;
-      set({ browseAnswer: null, browseError: null, browseLoading: false });
-      // The provider goes back to the keyword search it was left out of.
-      if (!trimmed) return;
+    const considered =
+      provider === undefined ? browseProviderIds(get().providerOptions) : [provider];
+    const { requests, stopped } = applyListings(set, get, trimmed, considered);
+    const asked = [...requests];
+    // A provider that stopped being a listing goes back to the keyword search
+    // it was left out of; the others' answers to it are already held.
+    if (trimmed && stopped.length > 0) {
       const enabled = enabledProviderIds(get().providerOptions);
-      const missing = unasked(get().literature, trimmed, get().providers, enabled);
-      if (missing.length > 0) await searchLiterature(set, get, trimmed, missing, true);
-      return;
+      const missing = unasked(get().literature, trimmed, get().providers, enabled).filter(
+        (id) => stopped.includes(id),
+      );
+      if (missing.length > 0) asked.push(searchLiterature(set, get, trimmed, missing, true));
     }
-    const info = get().providerOptions.find((option) => option.provider === provider);
-    await runBrowse(set, provider, info?.name ?? provider, browseRequestFor(get(), info, trimmed), null);
+    await Promise.all(asked);
   },
 
-  browseMore: async () => {
-    const held = get().browseAnswer;
+  browseMore: async (provider) => {
+    const held = get().listings[provider]?.answer ?? null;
     if (held === null || held.exhausted) return;
     await runBrowse(
       set,
@@ -897,7 +988,7 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
 
   search: async (query) => {
     const trimmed = query.trim();
-    const listed = refinedProvider(get());
+    const listed = refinedProviderIds(get());
     if (!trimmed) {
       catalogueRequest++;
       literatureRequest++;
@@ -910,21 +1001,20 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
         literatureLoading: false,
       });
       // Filters need no keyword: that is what browsing is.
-      if (listed !== null) await get().refine(query);
-      else {
-        browseRequest++;
-        set({ browseAnswer: null, browseError: null, browseLoading: false });
-      }
+      set({ query });
+      await Promise.all(applyListings(set, get, "", browseProviderIds(get().providerOptions)).requests);
       return;
     }
     set({ query, acquireError: null });
     const { grains, providers, providerOptions } = get();
-    // The provider shown as a filtered listing is asked by the listing, with
-    // the keyword beside the filters, and left out of the keyword search.
+    // A provider shown as a filtered listing is asked by the listing, with the
+    // keyword beside its filters, and left out of the keyword search.
     const searched =
-      listed === null
+      listed.length === 0
         ? providers
-        : (providers ?? enabledProviderIds(providerOptions)).filter((id) => id !== listed);
+        : (providers ?? enabledProviderIds(providerOptions)).filter(
+            (id) => !listed.includes(id),
+          );
     const searchesLiterature = selectsAny(searched);
     // Both halves run at once and land independently: the mirror is local and
     // answers in milliseconds, and it should not wait on a remote index. A
@@ -933,12 +1023,8 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
     await Promise.all([
       selectsAny(grains) ? searchCatalogue(set, trimmed, grains) : null,
       searchesLiterature ? searchLiterature(set, get, trimmed, searched, false) : null,
-      listed !== null ? get().refine(query) : null,
+      ...applyListings(set, get, trimmed, browseProviderIds(providerOptions)).requests,
     ]);
-    if (listed === null) {
-      browseRequest++;
-      set({ browseAnswer: null, browseError: null, browseLoading: false });
-    }
     if (!selectsAny(grains)) set({ answer: null, error: null, loading: false });
     if (!searchesLiterature) {
       set({ literature: null, literatureError: null, literatureLoading: false });
@@ -1006,7 +1092,7 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
   reset: () => {
     catalogueRequest++;
     literatureRequest++;
-    browseRequest++;
+    for (const provider of Object.keys(browseRequests)) browseRequests[provider]++;
     set({
       query: "",
       answer: null,
@@ -1017,9 +1103,7 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       literatureLoading: false,
       literatureMore: [],
       literatureMoreError: {},
-      browseAnswer: null,
-      browseError: null,
-      browseLoading: false,
+      listings: {},
       acquireError: null,
       acquired: {},
       adding: {},
