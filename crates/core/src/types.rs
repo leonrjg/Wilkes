@@ -3213,6 +3213,46 @@ pub struct ProviderWork {
     pub cached_at_ms: i64,
 }
 
+/// One filter's value in a [`BrowseRequest`]: one string, or several.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum FilterValue {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl FilterValue {
+    /// The values given, blanks dropped: a blank is "not set", never a value.
+    pub fn values(&self) -> Vec<&str> {
+        let all: Vec<&str> = match self {
+            Self::One(value) => vec![value.as_str()],
+            Self::Many(values) => values.iter().map(String::as_str).collect(),
+        };
+        all.into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .collect()
+    }
+}
+
+/// One entry a provider suggested for a filter, as the user typed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FilterSuggestion {
+    /// What the filter is set to if this is chosen.
+    pub value: String,
+    pub label: String,
+    /// Tells two entries of one name apart: an author's institution, a
+    /// journal's publisher.
+    pub hint: Option<String>,
+}
+
+/// One page of a provider's listing.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BrowsePage {
+    pub results: Vec<LiteratureSearchResult>,
+    /// How many records match in all, when the provider says.
+    pub total: Option<u64>,
+}
+
 /// A request to list a provider's works by filter and sort rather than by
 /// keyword alone. What may be asked is declared by the provider's `browse`
 /// capability; anything else is refused by name.
@@ -3221,11 +3261,15 @@ pub struct BrowseRequest {
     /// A keyword to combine with the filters. Empty means none.
     #[serde(default)]
     pub query: Option<String>,
-    /// Filter name → value. A `choice` takes one of its option values, a
-    /// `flag` takes `"true"`, and a `range` is two keys, `<name>.min` and
-    /// `<name>.max`, each an integer.
+    /// Filter name → value, or values. An on/off filter takes `"true"`; any
+    /// other takes what its declaration admits. Several values need a filter
+    /// that declares modes.
     #[serde(default)]
-    pub filters: std::collections::BTreeMap<String, String>,
+    pub filters: std::collections::BTreeMap<String, FilterValue>,
+    /// Filter name → how its values are combined, one of the modes that
+    /// filter declares. Absent means the filter's first.
+    #[serde(default)]
+    pub modes: std::collections::BTreeMap<String, String>,
     /// One of the provider's sort option values. Empty means its default.
     #[serde(default)]
     pub sort: Option<String>,

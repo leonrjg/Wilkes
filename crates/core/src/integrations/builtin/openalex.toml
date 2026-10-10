@@ -50,6 +50,7 @@ path = "/works?per-page={limit}&page={page}&select=id,doi,display_name,publicati
 query_param = "search"
 filter_param = "filter"
 filter_separator = ","
+total = "meta.count"
 
 [capabilities.browse.sort]
 param = "sort"
@@ -62,33 +63,85 @@ options = [
   ["relevance_score:desc", "Most relevant (needs a keyword)"],
 ]
 
-[capabilities.browse.filters.year]
-kind = "range"
-label = "Year"
-min_clause = "from_publication_date:{value}-01-01"
-max_clause = "to_publication_date:{value}-12-31"
+# Every autocomplete endpoint answers in this one shape.
+[capabilities.browse.suggest]
+items = "results"
+value = "id"
+label = "display_name"
+hint = "hint"
 
-[capabilities.browse.filters.cited_by]
-kind = "range"
-label = "Cited more than"
-min_clause = "cited_by_count:>{value}"
+# How OpenAlex writes several values of one attribute. "All of" and "None of"
+# repeat the clause, which the filter separator ANDs.
+[capabilities.browse.modes]
+any  = { label = "Any of",  join = "|" }
+all  = { label = "All of",  repeat = true }
+none = { label = "None of", repeat = true, value = "!{value}" }
 
-[capabilities.browse.filters.domain]
-kind = "choice"
-label = "Domain"
-clause = "primary_topic.domain.id:{value}"
-options = [
-  ["1", "Life Sciences"],
-  ["2", "Social Sciences"],
-  ["3", "Physical Sciences"],
-  ["4", "Health Sciences"],
-]
+# One line per filter, in the order the pane offers them. A clause with no
+# {value} is on or off; a range is two filters sharing a group.
+[capabilities.browse.filters]
+year_from      = { label = "From", group = "Year", clause = "from_publication_date:{value}-01-01", value = "integer" }
+year_to        = { label = "To", group = "Year", clause = "to_publication_date:{value}-12-31", value = "integer" }
+published_from = { label = "From", group = "Published", clause = "from_publication_date:{value}", value = "date" }
+published_to   = { label = "To", group = "Published", clause = "to_publication_date:{value}", value = "date" }
+type           = { label = "Type", clause = "type:{value}", modes = ["any", "none"], options = [
+  ["article", "Article"],
+  ["review", "Review"],
+  ["preprint", "Preprint"],
+  ["book", "Book"],
+  ["book-chapter", "Book chapter"],
+  ["dissertation", "Dissertation"],
+  ["conference-paper", "Conference paper"],
+  ["conference-abstract", "Conference abstract"],
+  ["report", "Report"],
+  ["dataset", "Dataset"],
+  ["software", "Software"],
+  ["editorial", "Editorial"],
+  ["letter", "Letter"],
+  ["book-review", "Book review"],
+  ["peer-review", "Peer review"],
+  ["reference-entry", "Reference entry"],
+  ["standard", "Standard"],
+  ["erratum", "Erratum"],
+  ["retraction", "Retraction notice"],
+  ["other", "Other"],
+] }
+language       = { label = "Language", clause = "language:{value}", modes = ["any", "none"], options = [
+  ["en", "English"],
+  ["es", "Spanish"],
+  ["de", "German"],
+  ["fr", "French"],
+  ["pt", "Portuguese"],
+  ["zh", "Chinese"],
+  ["ja", "Japanese"],
+  ["ru", "Russian"],
+  ["it", "Italian"],
+  ["ko", "Korean"],
+  ["id", "Indonesian"],
+  ["pl", "Polish"],
+  ["tr", "Turkish"],
+  ["nl", "Dutch"],
+  ["uk", "Ukrainian"],
+  ["ar", "Arabic"],
+  ["cs", "Czech"],
+  ["sv", "Swedish"],
+  ["fa", "Persian"],
+  ["ca", "Catalan"],
+] }
 
-[capabilities.browse.filters.field]
-kind = "choice"
-label = "Field"
-clause = "primary_topic.field.id:{value}"
-options = [
+open_access    = { label = "Open access only", group = "Access", clause = "open_access.is_oa:true" }
+fulltext       = { label = "Full text available", group = "Access", clause = "has_fulltext:true" }
+oa_status      = { label = "Open-access status", clause = "open_access.oa_status:{value}", modes = ["any", "none"], options = [["gold", "Gold"], ["diamond", "Diamond"], ["green", "Green"], ["hybrid", "Hybrid"], ["bronze", "Bronze"], ["closed", "Closed"]] }
+license        = { label = "Licence", clause = "best_oa_location.license:{value}", modes = ["any", "none"], options = [["cc-by", "CC BY"], ["cc-by-sa", "CC BY-SA"], ["cc-by-nc", "CC BY-NC"], ["cc-by-nc-sa", "CC BY-NC-SA"], ["cc-by-nd", "CC BY-ND"], ["cc-by-nc-nd", "CC BY-NC-ND"], ["public-domain", "Public domain"], ["other-oa", "Other open licence"]] }
+
+cited_min      = { label = "More than", group = "Citations", clause = "cited_by_count:>{value}", value = "integer" }
+cited_max      = { label = "Fewer than", group = "Citations", clause = "cited_by_count:<{value}", value = "integer" }
+impact_min     = { label = "Field-weighted impact above", clause = "fwci:>{value}", value = "number" }
+top_10_percent = { label = "Top 10% cited in its field and year", group = "Standing", clause = "citation_normalized_percentile.is_in_top_10_percent:true" }
+top_1_percent  = { label = "Top 1% cited in its field and year", group = "Standing", clause = "citation_normalized_percentile.is_in_top_1_percent:true" }
+
+domain         = { label = "Domain", clause = "primary_topic.domain.id:{value}", modes = ["any", "none"], options = [["1", "Life Sciences"], ["2", "Social Sciences"], ["3", "Physical Sciences"], ["4", "Health Sciences"]] }
+field          = { label = "Field", clause = "primary_topic.field.id:{value}", modes = ["any", "none"], options = [
   ["11", "Agricultural and Biological Sciences"],
   ["12", "Arts and Humanities"],
   ["13", "Biochemistry, Genetics and Molecular Biology"],
@@ -115,39 +168,85 @@ options = [
   ["34", "Veterinary"],
   ["35", "Dentistry"],
   ["36", "Health Professions"],
-]
+] }
+topic          = { label = "Topic", clause = "topics.id:{value}", modes = ["any", "all", "none"], suggest = "/autocomplete/topics?q={query}" }
+keyword        = { label = "Keyword", clause = "keywords.id:{value}", modes = ["any", "all", "none"], suggest = "/autocomplete/keywords?q={query}" }
 
-[capabilities.browse.filters.type]
-kind = "choice"
-label = "Type"
-clause = "type:{value}"
-options = [
-  ["article", "Article"],
-  ["review", "Review"],
-  ["preprint", "Preprint"],
-  ["book", "Book"],
-  ["book-chapter", "Book chapter"],
-  ["dissertation", "Dissertation"],
-  ["conference-paper", "Conference paper"],
-  ["report", "Report"],
-  ["dataset", "Dataset"],
-  ["editorial", "Editorial"],
-]
+author         = { label = "Author", clause = "authorships.author.id:{value}", modes = ["any", "all", "none"], suggest = "/autocomplete/authors?q={query}" }
+institution    = { label = "Institution", clause = "authorships.institutions.lineage:{value}", modes = ["any", "all", "none"], suggest = "/autocomplete/institutions?q={query}" }
+institution_type = { label = "Institution type", clause = "authorships.institutions.type:{value}", modes = ["any", "none"], options = [["education", "Education"], ["healthcare", "Healthcare"], ["company", "Company"], ["government", "Government"], ["nonprofit", "Nonprofit"], ["facility", "Facility"], ["archive", "Archive"], ["other", "Other"]] }
+continent      = { label = "Continent", clause = "authorships.institutions.continent:{value}", modes = ["any", "all", "none"], options = [["Q15", "Africa"], ["Q48", "Asia"], ["Q46", "Europe"], ["Q49", "North America"], ["Q55643", "Oceania"], ["Q18", "South America"]] }
+country        = { label = "Country", clause = "authorships.countries:{value}", modes = ["any", "all", "none"], options = [
+  ["AR", "Argentina"],
+  ["AU", "Australia"],
+  ["AT", "Austria"],
+  ["BE", "Belgium"],
+  ["BR", "Brazil"],
+  ["CA", "Canada"],
+  ["CL", "Chile"],
+  ["CN", "China"],
+  ["CO", "Colombia"],
+  ["CZ", "Czechia"],
+  ["DK", "Denmark"],
+  ["EG", "Egypt"],
+  ["FI", "Finland"],
+  ["FR", "France"],
+  ["DE", "Germany"],
+  ["GR", "Greece"],
+  ["IN", "India"],
+  ["ID", "Indonesia"],
+  ["IR", "Iran"],
+  ["IE", "Ireland"],
+  ["IL", "Israel"],
+  ["IT", "Italy"],
+  ["JP", "Japan"],
+  ["MX", "Mexico"],
+  ["NL", "Netherlands"],
+  ["NZ", "New Zealand"],
+  ["NG", "Nigeria"],
+  ["NO", "Norway"],
+  ["PK", "Pakistan"],
+  ["PL", "Poland"],
+  ["PT", "Portugal"],
+  ["RU", "Russia"],
+  ["SA", "Saudi Arabia"],
+  ["SG", "Singapore"],
+  ["ZA", "South Africa"],
+  ["KR", "South Korea"],
+  ["ES", "Spain"],
+  ["SE", "Sweden"],
+  ["CH", "Switzerland"],
+  ["TW", "Taiwan"],
+  ["TR", "Turkey"],
+  ["UA", "Ukraine"],
+  ["GB", "United Kingdom"],
+  ["US", "United States"],
+] }
+global_south   = { label = "From the Global South", clause = "authorships.institutions.is_global_south:true" }
+authors_min    = { label = "More than", group = "Number of authors", clause = "authors_count:>{value}", value = "integer" }
+authors_max    = { label = "Fewer than", group = "Number of authors", clause = "authors_count:<{value}", value = "integer" }
+affiliation    = { label = "Affiliation mentions", clause = "raw_affiliation_strings.search:{value}", value = "text" }
 
-[capabilities.browse.filters.open_access]
-kind = "flag"
-label = "Open access only"
-clause = "open_access.is_oa:true"
+journal        = { label = "Journal or source", clause = "primary_location.source.id:{value}", modes = ["any", "none"], suggest = "/autocomplete/sources?q={query}" }
+publisher      = { label = "Publisher", clause = "primary_location.source.host_organization_lineage:{value}", modes = ["any", "none"], suggest = "/autocomplete/publishers?q={query}" }
+source_type    = { label = "Published in a", clause = "primary_location.source.type:{value}", modes = ["any", "none"], options = [["journal", "Journal"], ["repository", "Repository"], ["conference", "Conference"]] }
+in_doaj        = { label = "In an open-access journal directory (DOAJ)", clause = "primary_location.source.is_in_doaj:true" }
+indexed_in     = { label = "Indexed in", clause = "indexed_in:{value}", modes = ["any", "all", "none"], options = [["crossref", "Crossref"], ["pubmed", "PubMed"], ["arxiv", "arXiv"], ["doaj", "DOAJ"], ["datacite", "DataCite"]] }
+funder         = { label = "Funder", clause = "funders.id:{value}", modes = ["any", "all", "none"], suggest = "/autocomplete/funders?q={query}" }
 
-[capabilities.browse.filters.fulltext]
-kind = "flag"
-label = "Full text available"
-clause = "has_fulltext:true"
+title          = { label = "Title mentions", clause = "title.search:{value}", value = "text" }
+abstract       = { label = "Abstract mentions", clause = "abstract.search:{value}", value = "text" }
+full_text      = { label = "Full text mentions", clause = "fulltext.search:{value}", value = "text" }
 
-[capabilities.browse.filters.not_retracted]
-kind = "flag"
-label = "Hide retracted works"
-clause = "is_retracted:false"
+has_abstract   = { label = "Has an abstract", group = "Record", clause = "has_abstract:true" }
+has_doi        = { label = "Has a DOI", group = "Record", clause = "has_doi:true" }
+has_references = { label = "Lists its references", group = "Record", clause = "has_references:true" }
+not_retracted  = { label = "Hide retracted works", group = "Record", clause = "is_retracted:false" }
+not_paratext   = { label = "Hide covers, indexes and front matter", group = "Record", clause = "is_paratext:false" }
+
+cites          = { label = "Works citing", clause = "cites:{value}", from_result = "id", suggest = "/autocomplete/works?q={query}" }
+cited_by       = { label = "Works cited by", clause = "cited_by:{value}", from_result = "id", suggest = "/autocomplete/works?q={query}" }
+related_to     = { label = "Works related to", clause = "related_to:{value}", from_result = "id", suggest = "/autocomplete/works?q={query}" }
 
 # ── Lookup: DOI in, one record out (metadata enrichment) ──────────────────────
 

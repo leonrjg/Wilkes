@@ -482,6 +482,7 @@ export function PaperCandidate({ provider, work }: PaperProps) {
           work.license,
         ]}
       />
+      <ResultFilters provider={provider} work={work} title={title} />
       {stage !== undefined && (
         <AddProgress stage={stage} title={title} download={download} />
       )}
@@ -493,5 +494,56 @@ export function PaperCandidate({ provider, work }: PaperProps) {
         </span>
       )}
     </div>
+  );
+}
+
+/**
+ * The filters a provider can set from this row: "works citing this one".
+ *
+ * A provider declares them (`from_result` names the result field that supplies
+ * the value), so the row knows nothing about citations or about any provider;
+ * it offers whatever was declared, for a row that holds the field. Using one
+ * sets that filter to this row and lists the provider by it, keeping the
+ * row's title as what the filter's chip says.
+ */
+function ResultFilters({
+  provider,
+  work,
+  title,
+}: {
+  provider: string;
+  work: LiteratureSearchResult;
+  title: string;
+}) {
+  const filters = useCatalogueStore(
+    (s) =>
+      s.providerOptions.find((option) => option.provider === provider)?.capabilities.browse
+        ?.filters,
+  );
+  const setFilter = useCatalogueStore((s) => s.setBrowseFilter);
+  const refine = useCatalogueStore((s) => s.refine);
+  const offers = (filters ?? []).flatMap((filter) => {
+    if (filter.from_result === null) return [];
+    const value = (work as unknown as Record<string, unknown>)[filter.from_result];
+    return typeof value === "string" && value !== "" ? [{ filter, value }] : [];
+  });
+  if (offers.length === 0) return null;
+  return (
+    <p className="flex flex-wrap gap-x-2 text-[10px] leading-snug">
+      {offers.map(({ filter, value }) => (
+        <button
+          key={filter.name}
+          type="button"
+          onClick={() => {
+            setFilter(provider, filter.name, [value], { [value]: title });
+            void refine(useCatalogueStore.getState().query, provider);
+          }}
+          aria-label={`${filter.label} ${title}`}
+          className="text-[var(--text-dim)] underline-offset-2 transition-colors hover:text-[var(--accent-blue)] hover:underline"
+        >
+          {filter.label}
+        </button>
+      ))}
+    </p>
   );
 }

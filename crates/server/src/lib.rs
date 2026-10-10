@@ -49,9 +49,8 @@ use wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryIn
 use wilkes_core::types::{
     AddOutcome, BookmarkClustersQuery, ChunkTopicsQuery, CitationLinksQuery, CitationResult,
     CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, IntegrationStatus,
-    MatchRef, NewBookmark, NewSmartCollection, NewTag, RelatedDocumentsQuery,
-    SearchLogEntry, SearchQuery, SelectedEmbedder, SmartCollection, Tag,
-    UpdateSmartCollection, UpdateTag,
+    MatchRef, NewBookmark, NewSmartCollection, NewTag, RelatedDocumentsQuery, SearchLogEntry,
+    SearchQuery, SelectedEmbedder, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 #[cfg(test)]
 use wilkes_core::worker::manager::WorkerPaths;
@@ -810,6 +809,29 @@ async fn literature_browse_handler(
     state
         .context()
         .literature_browse(body.provider, body.request)
+        .await
+        .map(Json)
+        .map_err(|error| err(error.to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiteratureSuggestBody {
+    provider: String,
+    filter: String,
+    text: String,
+}
+
+/// What a provider suggests for one of its filters as the user types. A
+/// filter with no suggestions, text too short to ask about, or a provider that
+/// could not answer is a 400 with the reason.
+async fn literature_suggest_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LiteratureSuggestBody>,
+) -> Result<Json<Vec<wilkes_core::types::FilterSuggestion>>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .literature_filter_suggest(body.provider, body.filter, body.text)
         .await
         .map(Json)
         .map_err(|error| err(error.to_string()))
@@ -1931,9 +1953,7 @@ async fn custom_integration_summary_handler(
     Json(state.context().custom_integration_summary(body.manifest))
 }
 
-async fn custom_integration_authoring_prompt_handler(
-    State(state): State<Arc<AppState>>,
-) -> String {
+async fn custom_integration_authoring_prompt_handler(State(state): State<Arc<AppState>>) -> String {
     state.context().custom_integration_authoring_prompt()
 }
 
@@ -2415,8 +2435,10 @@ async fn set_worker_timeout_handler(
 pub fn api_router(state: Arc<AppState>) -> Router {
     // Both the headless server and the desktop's shared API serve the same
     // workspace-aware MCP. Test-only contexts without a registry expose no MCP.
-    let mcp = state.workspaces.as_ref().map(|manager|
-        wilkes_agent::mcp::api_router(manager.clone()));
+    let mcp = state
+        .workspaces
+        .as_ref()
+        .map(|manager| wilkes_agent::mcp::api_router(manager.clone()));
     let router = Router::new()
         .route("/health", get(health_handler))
         // Core
@@ -2467,13 +2489,17 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             post(chunks_search_handler).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route("/api/catalogue/search", post(catalogue_search_handler))
-        .route("/api/literature/providers", get(literature_providers_handler))
+        .route(
+            "/api/literature/providers",
+            get(literature_providers_handler),
+        )
         .route("/api/literature/search", post(literature_search_handler))
         .route(
             "/api/literature/resolve-download",
             post(literature_resolve_download_handler),
         )
         .route("/api/literature/browse", post(literature_browse_handler))
+        .route("/api/literature/suggest", post(literature_suggest_handler))
         .route("/api/literature/status", post(literature_status_handler))
         .route("/api/literature/lookup", post(literature_lookup_handler))
         .route("/api/catalogue/sync", post(catalogue_sync_handler))
@@ -2651,7 +2677,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/worker/timeout", patch(set_worker_timeout_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
-    match mcp { Some(mcp) => router.merge(mcp), None => router }
+    match mcp {
+        Some(mcp) => router.merge(mcp),
+        None => router,
+    }
 }
 
 // ── Serving ───────────────────────────────────────────────────────────────────

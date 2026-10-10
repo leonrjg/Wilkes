@@ -227,6 +227,14 @@ export interface SearchApi {
     provider: string,
     request: import("../lib/types").BrowseRequest,
   ): Promise<import("../lib/types").LiteratureProviderAnswer>;
+  /** What a provider suggests for one of its filters as the user types. Only
+   *  a filter whose control is `suggest` can be asked, and not for fewer than
+   *  two characters; either rejects. */
+  literatureFilterSuggest(
+    provider: string,
+    filter: string,
+    text: string,
+  ): Promise<import("../lib/types").FilterSuggestion[]>;
   /** Whether one literature provider — shipped or pasted in — is reachable and
    *  usable now. Answers whether or not it is enabled, so a form can check
    *  before switching it on. */

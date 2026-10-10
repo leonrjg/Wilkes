@@ -9,6 +9,7 @@ import type {
   CatalogueStatus,
   CatalogueSyncResponse,
   BrowseRequest,
+  FilterSuggestion,
   LiteratureProviderAnswer,
   LiteratureProviderInfo,
   ProviderWork,
@@ -849,6 +850,20 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw await responseError(res, "literatureBrowse");
     return res.json() as Promise<LiteratureProviderAnswer>;
+  }
+
+  async literatureFilterSuggest(
+    provider: string,
+    filter: string,
+    text: string,
+  ): Promise<FilterSuggestion[]> {
+    const res = await fetch("/api/literature/suggest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, filter, text }),
+    });
+    if (!res.ok) throw await responseError(res, "literatureFilterSuggest");
+    return res.json() as Promise<FilterSuggestion[]>;
   }
 
   async literatureProviderStatus(provider: string): Promise<IntegrationStatus> {

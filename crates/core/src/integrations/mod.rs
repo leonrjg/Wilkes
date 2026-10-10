@@ -24,8 +24,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    BrowseRequest, IntegrationStatus, IntegrationsSettings, LiteratureSearchResult, ProviderWork,
-    ResolvedLiteratureDownload,
+    BrowsePage, BrowseRequest, FilterSuggestion, IntegrationStatus, IntegrationsSettings,
+    LiteratureSearchResult, ProviderWork, ResolvedLiteratureDownload,
 };
 
 pub mod builtin;
@@ -76,11 +76,14 @@ pub trait LiteratureSource: Send + Sync {
 
     /// A listing by filter and sort, with the keyword optional. What may be
     /// asked is what [`ProviderCapabilities::browse`] declares.
-    async fn browse(
-        &self,
-        _request: &BrowseRequest,
-    ) -> anyhow::Result<Vec<LiteratureSearchResult>> {
+    async fn browse(&self, _request: &BrowseRequest) -> anyhow::Result<BrowsePage> {
         anyhow::bail!("{} does not offer browse", self.name())
+    }
+
+    /// What the provider suggests for one of its filters as the user types.
+    /// Only a filter that declares `suggest` can be asked.
+    async fn suggest(&self, _filter: &str, _text: &str) -> anyhow::Result<Vec<FilterSuggestion>> {
+        anyhow::bail!("{} does not offer suggestions", self.name())
     }
 
     /// One bibliographic record for a DOI, for the metadata cache.

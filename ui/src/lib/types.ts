@@ -1062,6 +1062,8 @@ export interface LiteratureProviderAnswer {
   name: string;
   results: LiteratureSearchResult[] | null;
   error: string | null;
+  /** How many records match in all, for a listing whose provider says. */
+  total?: number | null;
 }
 
 /** A value a provider asks the user for. */
@@ -1077,16 +1079,40 @@ export interface ControlOption {
   label: string;
 }
 
-/** One filter a provider's listing offers. A `choice` takes one of its
- *  options, a `flag` is on or off, and a `range` is an integer lower and/or
- *  upper bound. */
+/** Which control sets a filter's value. `result` has none of its own: its
+ *  value only ever comes from a row. */
+export type FilterInput =
+  | "toggle"
+  | "options"
+  | "integer"
+  | "number"
+  | "date"
+  | "text"
+  | "suggest"
+  | "result";
+
+/** One filter a provider's listing offers: a label, and where its value comes
+ *  from. There are no kinds of filter; a range is two filters sharing a
+ *  `group`. */
 export interface FilterControl {
   name: string;
   label: string;
-  kind: "choice" | "flag" | "range";
+  /** Filters sharing a group are drawn together under its name. */
+  group: string | null;
+  input: FilterInput;
   options: ControlOption[];
-  has_min: boolean;
-  has_max: boolean;
+  /** The modes several values may be combined by, the first being the
+   *  default. Empty means the filter takes one value. */
+  modes: string[];
+  /** The result field a row offers this filter with, if any. */
+  from_result: string | null;
+}
+
+/** One entry a provider suggested for a filter, as the user typed. */
+export interface FilterSuggestion {
+  value: string;
+  label: string;
+  hint: string | null;
 }
 
 /** What a provider's browse capability offers, declared by its manifest. The
@@ -1095,12 +1121,17 @@ export interface FilterControl {
 export interface BrowseControls {
   /** Whether the listing takes a keyword beside the filters. */
   keyword: boolean;
+  /** Whether a listing says how many records match in all. */
+  total: boolean;
   sort: {
     default: string;
     /** Used instead of `default` when a keyword is given. */
     keyword_default: string | null;
     options: ControlOption[];
   } | null;
+  /** The ways several values of one filter combine ("Any of", "None of"), in
+   *  the order they are offered. */
+  modes: ControlOption[];
   filters: FilterControl[];
 }
 
@@ -1114,11 +1145,13 @@ export interface ProviderCapabilities {
   resolve_download: boolean;
 }
 
-/** A request to list a provider's works by filter and sort. A `range` filter
- *  is two keys, `<name>.min` and `<name>.max`. */
+/** A request to list a provider's works by filter and sort. A filter's values
+ *  are a list; an on/off filter's is `["true"]`. `modes` names how a filter's
+ *  values are combined, where it is not the filter's first mode. */
 export interface BrowseRequest {
   query?: string | null;
-  filters?: Record<string, string>;
+  filters?: Record<string, string[]>;
+  modes?: Record<string, string>;
   sort?: string | null;
   /** 1-based. */
   page?: number | null;

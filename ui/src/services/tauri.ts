@@ -13,6 +13,7 @@ import type {
   CatalogueStatus,
   CatalogueSyncResponse,
   BrowseRequest,
+  FilterSuggestion,
   LiteratureProviderAnswer,
   LiteratureProviderInfo,
   ProviderWork,
@@ -484,6 +485,14 @@ export class TauriSearchApi implements SearchApi {
     request: BrowseRequest,
   ): Promise<LiteratureProviderAnswer> {
     return invoke<LiteratureProviderAnswer>("literature_browse", { provider, request });
+  }
+
+  async literatureFilterSuggest(
+    provider: string,
+    filter: string,
+    text: string,
+  ): Promise<FilterSuggestion[]> {
+    return invoke<FilterSuggestion[]>("literature_filter_suggest", { provider, filter, text });
   }
 
   async literatureProviderStatus(provider: string): Promise<IntegrationStatus> {

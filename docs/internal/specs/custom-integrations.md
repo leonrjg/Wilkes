@@ -285,17 +285,11 @@ landing_page_url = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr
 url = "{download_url}"
 filename = "{title}.{file_format}"
 
-[[capabilities.resolve_download.steps]]
-# Optional when an intermediate API is on another declared origin:
-# base_url = "https://annas-archive.example"
-path = "/dyn/api/fast_download.json?md5={id}"
-response_format = "json"
-
-[capabilities.resolve_download.steps.query]
-key = { secret = "anna_key" }
-
-[capabilities.resolve_download.steps.fields]
-download_url = "download_url"
+# One inline table per step. Add base_url = "https://annas-archive.example" to
+# a step when an intermediate API is on another declared origin.
+steps = [
+  { path = "/dyn/api/fast_download.json?md5={id}", response_format = "json", query = { key = { secret = "anna_key" } }, fields = { download_url = "download_url" } },
+]
 ```
 
 ## 6. Validation is a probe, and it is evidence
@@ -575,3 +569,167 @@ loop a manifest controls.
 `resolve_download` always did: each works on what search returns or on a work a
 search result names.
 
+
+## 15. Layout: one header per map, one line per entry
+
+A manifest Wilkes ships, generates or teaches writes each entry of a map — a
+filter, a field, a header — as one line under one header, and a list of steps
+as one inline table per step. A header per entry
+(`[capabilities.browse.filters.year]`), or a header per list item followed by a
+header per part of it (`[[capabilities.resolve_download.steps]]`, then
+`[…steps.query]`), restates the whole path for every entry. It was removed
+once, from the header and step parameters, and came back in the browse filters.
+
+Both layouts are valid TOML and parse to the same manifest, so the parser does
+not refuse a user's own manifest over it. `manifest::layout_problems` is the
+rule — no `[[…]]` header, none deeper than three segments — and tests hold the
+shipped manifests, the whole authoring prompt and the interface's starter
+manifest to it. A long value stays inline: a TOML array may span lines inside
+an inline table, which is how a 26-entry option list fits on one entry.
+
+A design that seems to need a sub-table per entry is a sign the schema is
+wrong, not that the rule needs an exception.
+
+## 16. Filters, generalised
+
+**The invariant.** A filter can only produce a clause its manifest author
+wrote, with a value whose shape the manifest declared. §14's three kinds held
+that by enumerating shapes — a closed list, an on/off, two integer bounds — and
+each kind was an arm in four places: validation, request building, the control
+description, and the interface. Covering OpenAlex that way would have been a
+new arm in all four for entities, dates, decimals, free text, multi-select and
+negation.
+
+**The change.** A filter is not a *kind*. It is two independent facts — **one
+clause** and **what a value may be** — and everything else is the same for
+every filter.
+
+```toml
+[capabilities.browse.filters]
+open_access = { label = "Open access only", clause = "open_access.is_oa:true" }
+type        = { label = "Type", clause = "type:{value}", modes = ["any", "none"], options = [["article", "Article"], ["review", "Review"]] }
+year_from   = { label = "From", group = "Year", clause = "from_publication_date:{value}-01-01", value = "integer" }
+year_to     = { label = "To",   group = "Year", clause = "to_publication_date:{value}-12-31",   value = "integer" }
+impact_min  = { label = "Field-weighted impact above", clause = "fwci:>{value}", value = "number" }
+title       = { label = "Title mentions", clause = "title.search:{value}", value = "text" }
+author      = { label = "Author", clause = "authorships.author.id:{value}", modes = ["any", "all", "none"], suggest = "/autocomplete/authors?q={query}" }
+cites       = { label = "Works citing", clause = "cites:{value}", from_result = "id", suggest = "/autocomplete/works?q={query}" }
+```
+
+| Key | Meaning |
+| --- | --- |
+| `label` | Shown to the user. |
+| `clause` | Added when the filter is set. With no `{value}` the filter is on/off. |
+| `options` | The value is one of a closed list. |
+| `value` | The value is typed: `integer`, `number`, `date` (`YYYY-MM-DD`) or `text`. |
+| `suggest` | The value is chosen from the service's own suggestions for what was typed. |
+| `from_result` | The value is a field of a search result the user is looking at. |
+| `modes` | Several values are allowed, combined by one of these `browse.modes`; the first is the default. |
+| `group` | Filters sharing a group are drawn together under its name. |
+
+When the clause has `{value}`, exactly one of `options`, `value` and `suggest`
+says where it comes from, or `from_result` does, alone or beside `suggest`.
+That is the whole vocabulary; `kind` is gone and a manifest that still writes
+it is refused by name.
+
+**A range is two filters.** `year_from` and `year_to` are two clauses with two
+values; `group` puts them on one row.
+
+**Modes are declared once.** How several values of one attribute are written is
+the service's filter syntax, not a filter's:
+
+```toml
+[capabilities.browse.modes]
+any  = { label = "Any of",  join = "|" }
+all  = { label = "All of",  repeat = true }
+none = { label = "None of", repeat = true, value = "!{value}" }
+```
+
+Every mode is the same three steps: rewrite each value by `value`, then either
+put them all in one clause joined by `join`, or `repeat` the clause once per
+value and let the filter separator AND them. `type:article|review`,
+`institutions.id:I1,institutions.id:I2` and `type:!article,type:!review` are
+those three rows. Negation and intersection are therefore data, and a service
+that writes them differently declares different rows.
+
+**Suggestions are declared once.** How a suggestion response is read is a
+property of the service:
+
+```toml
+[capabilities.browse.suggest]
+items = "results"
+value = "id"
+label = "display_name"
+hint  = "hint"
+```
+
+One GET on the provider's own origin, `{query}` and `{limit}` as placeholders,
+the same headers and query parameters as every other request, at most ten
+results, refused under two characters. A filter names only its path. A
+suggestion with no value or label, or whose value the filter would refuse, is
+left out and counted in the log.
+
+**A value from a row.** `from_result = "id"` makes the filter an action on
+every result that holds that field: "works citing this one" sets `cites` to the
+row's id and lists the provider by it. The row knows nothing about citations.
+
+**`total`** is one expression over the listing response (`meta.count`), so a
+page of ten says it is ten of twelve thousand. Absent from a response, it is
+absent and logged; present and not a count, it is an error.
+
+**What keeps the invariant.** `ValueRule::admit`, the same call for every
+filter:
+
+- an `options` value is one of the options; an `integer`, `number` or `date`
+  parses as one;
+- a `text`, suggested or row value is free data, so it may not contain the
+  filter separator or any mode's `join`, may not start with what a mode writes
+  before a value (`!`), may not hold a control character, and is at most 200
+  characters — refused by name rather than escaped, because a silently
+  rewritten search is a different search;
+- several values need a mode the filter declares, and at most ten are accepted;
+- a filter the manifest does not declare is refused by name.
+
+The engine does not check that a suggested value was really suggested: that
+needs state, and the value cannot add a clause either way.
+
+**Why this is not a switch chain.** The value rule is the only thing that
+varies, so `admit` is the only match on it. Request building is one loop —
+admit each value, combine by the mode, write the clause — in declaration order.
+Validation and the control description are one path each. The interface holds
+one table from value source to control, and every control has the same props:
+the filter, its values as a list, a change handler. A new value type is one
+`admit` arm and one table row.
+
+**The request.** `filters` maps a name to a list of strings (a single string is
+accepted for one value) and `modes` maps a name to the mode chosen, where it is
+not the filter's first.
+
+**The interface.** A provider with more than eight filters shows the ones in
+use and offers the rest from an "Add a filter" menu. A chip says a value as it
+was called when it was chosen, which the pane keeps beside the value because
+the request carries only the value.
+
+**What OpenAlex declares.** Forty-eight filters, each checked against the live
+API in every mode it declares: year and exact dates; type, language,
+open-access status and licence; citations, field-weighted impact and top-cited
+standing; domain, field, topic and keyword; author, institution, institution
+type, country, continent and number of authors; journal, publisher, source
+type, funder and index; text in the title, abstract, full text or affiliation;
+presence of an abstract, DOI or references; and the citation graph (citing,
+cited by, related to). Two were dropped on the way: OpenAlex's created-date and
+updated-date filters need a paid plan.
+
+**Not covered, deliberately.**
+
+- **Nested boolean logic.** A filter panel is a conjunction of filters.
+- **Paired constraints** ("this author while at this institution").
+- **Facets** — counts per value, and options read from the service rather than
+  listed in the manifest. One more request per filter opened; a follow-up.
+- **Countries beyond the forty-four listed**, and subfields: OpenAlex has no
+  suggestion endpoint for either, so they would be long closed lists.
+- **The MCP tool**, which still searches by keyword only.
+
+**Migration.** There is none: `kind` is refused, with no fallback. `browse`
+shipped one commit earlier, so this reached the shipped OpenAlex manifest and
+whatever a user had written since.

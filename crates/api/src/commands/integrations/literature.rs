@@ -41,6 +41,9 @@ pub struct LiteratureProviderAnswer {
     pub name: String,
     pub results: Option<Vec<LiteratureSearchResult>>,
     pub error: Option<String>,
+    /// How many records match in all, for a listing whose provider says. A
+    /// keyword search does not carry one.
+    pub total: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -220,6 +223,7 @@ pub async fn search_all(
                 name,
                 results: Some(results),
                 error: None,
+                total: None,
             }),
             Err(error) => {
                 tracing::warn!(provider = %provider, "literature search failed: {error}");
@@ -228,6 +232,7 @@ pub async fn search_all(
                     name,
                     results: None,
                     error: Some(error),
+                    total: None,
                 });
             }
         }
@@ -278,11 +283,12 @@ pub async fn browse(
         .map_err(|error| LiteratureRequestError(error.to_string()))?;
     let name = source.name().to_string();
     Ok(match source.browse(&request).await {
-        Ok(results) => LiteratureProviderAnswer {
+        Ok(page) => LiteratureProviderAnswer {
             provider,
             name,
-            results: Some(results),
+            results: Some(page.results),
             error: None,
+            total: page.total,
         },
         Err(error) => {
             tracing::warn!(provider = %provider, "literature browse failed: {error:#}");
@@ -291,8 +297,29 @@ pub async fn browse(
                 name,
                 results: None,
                 error: Some(format!("{error:#}")),
+                total: None,
             }
         }
+    })
+}
+
+/// What a provider suggests for one of its filters as the user types.
+///
+/// Unlike a listing, a failure here is the request's own: there is one
+/// provider and one filter, and nothing else in the answer to keep.
+pub async fn suggest(
+    settings: &IntegrationsSettings,
+    provider: String,
+    filter: String,
+    text: String,
+) -> Result<Vec<wilkes_core::types::FilterSuggestion>, LiteratureRequestError> {
+    let registry = IntegrationRegistry::from_settings(settings);
+    let source = registry
+        .literature_for_search(&provider)
+        .map_err(|error| LiteratureRequestError(error.to_string()))?;
+    source.suggest(&filter, &text).await.map_err(|error| {
+        tracing::warn!(provider = %provider, filter = %filter, "filter suggestion failed: {error:#}");
+        LiteratureRequestError(format!("{error:#}"))
     })
 }
 
@@ -623,7 +650,11 @@ mod tests {
             &settings,
             "openalex".into(),
             BrowseRequest {
-                filters: [("nope".to_string(), "1".to_string())].into(),
+                filters: [(
+                    "nope".to_string(),
+                    wilkes_core::types::FilterValue::One("1".to_string()),
+                )]
+                .into(),
                 ..BrowseRequest::default()
             },
         )

@@ -55,18 +55,12 @@ landing_page_url = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr
 url = "{download_url}"
 filename = "{title}.{file_format}"
 
-[[capabilities.resolve_download.steps]]
-## Optional: uncomment to resolve on a different Anna origin. Primary-origin
-## headers and query parameters are not forwarded across this boundary.
-## base_url = "https://annas-archive.example"
-path = "/dyn/api/fast_download.json?md5={id}"
-response_format = "json"
-
-[capabilities.resolve_download.steps.query]
-key = { secret = "anna_key" }
-
-[capabilities.resolve_download.steps.fields]
-download_url = "download_url"
+## One inline table per step. To resolve on a different Anna origin, add
+## base_url = "https://annas-archive.example" to the step. Primary-origin
+## headers and query parameters are not forwarded across that boundary.
+steps = [
+  { path = "/dyn/api/fast_download.json?md5={id}", response_format = "json", query = { key = { secret = "anna_key" } }, fields = { download_url = "download_url" } },
+]
 
 ## For a DOI-specific provider, a field may carry the search input:
 ## doi = { input = "query", then = "normalize_doi(@)" }

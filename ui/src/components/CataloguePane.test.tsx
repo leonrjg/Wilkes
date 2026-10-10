@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   BrowseControls,
+  FilterControl,
   CatalogueHit,
   LiteratureProviderInfo,
   LiteratureSearchResult,
@@ -15,6 +16,7 @@ vi.mock("../services", () => ({
     literatureProviders: vi.fn(),
     literatureSearch: vi.fn(),
     literatureBrowse: vi.fn(),
+    literatureFilterSuggest: vi.fn(),
     literatureResolveDownload: vi.fn(),
     listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
   },
@@ -69,9 +71,27 @@ const WORK: LiteratureSearchResult = {
   acquisition: "direct",
 };
 
-/** What OpenAlex's manifest declares, said the way the backend reports it. */
+const control = (
+  name: string,
+  label: string,
+  input: FilterControl["input"],
+  rest: Partial<FilterControl> = {},
+): FilterControl => ({
+  name,
+  label,
+  group: null,
+  input,
+  options: [],
+  modes: [],
+  from_result: null,
+  ...rest,
+});
+
+/** A small declaration with one filter of each plain kind, said the way the
+ *  backend reports it. */
 const OPENALEX_BROWSE: BrowseControls = {
   keyword: true,
+  total: true,
   sort: {
     default: "cited_by_count:desc",
     keyword_default: "relevance_score:desc",
@@ -80,34 +100,38 @@ const OPENALEX_BROWSE: BrowseControls = {
       { value: "publication_date:desc", label: "Newest first" },
     ],
   },
+  modes: [
+    { value: "any", label: "Any of" },
+    { value: "none", label: "None of" },
+  ],
   filters: [
-    {
-      name: "year",
-      label: "Year",
-      kind: "range",
-      options: [],
-      has_min: true,
-      has_max: true,
-    },
-    {
-      name: "type",
-      label: "Type",
-      kind: "choice",
+    control("year_from", "From", "integer", { group: "Year" }),
+    control("year_to", "To", "integer", { group: "Year" }),
+    control("type", "Type", "options", {
       options: [
         { value: "article", label: "Article" },
         { value: "book", label: "Book" },
       ],
-      has_min: false,
-      has_max: false,
-    },
-    {
-      name: "open_access",
-      label: "Open access only",
-      kind: "flag",
-      options: [],
-      has_min: false,
-      has_max: false,
-    },
+    }),
+    control("open_access", "Open access only", "toggle"),
+  ],
+};
+
+/** A declaration with the richer value sources: several values combined by a
+ *  mode, values the provider suggests, and a value taken from a row. */
+const RICH_BROWSE: BrowseControls = {
+  ...OPENALEX_BROWSE,
+  filters: [
+    control("language", "Language", "options", {
+      modes: ["any", "none"],
+      options: [
+        { value: "en", label: "English" },
+        { value: "fr", label: "French" },
+      ],
+    }),
+    control("author", "Author", "suggest", { modes: ["any", "none"] }),
+    control("title", "Title mentions", "text"),
+    control("cites", "Works citing", "result", { from_result: "id" }),
   ],
 };
 
@@ -577,7 +601,8 @@ describe("CataloguePane", () => {
     expect(browse).toHaveBeenLastCalledWith("openalex", {
       // No keyword was typed.
       query: null,
-      filters: { type: "article" },
+      filters: { type: ["article"] },
+      modes: {},
       sort: null,
       page: 1,
       limit: 10,
@@ -590,7 +615,8 @@ describe("CataloguePane", () => {
     await waitFor(() =>
       expect(browse).toHaveBeenLastCalledWith("openalex", {
         query: null,
-        filters: { type: "article", open_access: "true" },
+        filters: { type: ["article"], open_access: ["true"] },
+        modes: {},
         sort: "publication_date:desc",
         page: 1,
         limit: 10,
@@ -612,14 +638,14 @@ describe("CataloguePane", () => {
     browse.mockResolvedValue(listing(works(1)));
     render(<CataloguePane />);
     const panel = await openFilters();
-    const min = within(panel).getByLabelText("Year min");
+    const min = within(panel).getByLabelText("Year from");
     fireEvent.focus(min);
     fireEvent.change(min, { target: { value: "2" } });
     fireEvent.change(min, { target: { value: "2020" } });
     expect(browse).not.toHaveBeenCalled();
     fireEvent.blur(min);
     await waitFor(() => expect(browse).toHaveBeenCalledTimes(1));
-    expect(browse.mock.calls[0][1].filters).toEqual({ "year.min": "2020" });
+    expect(browse.mock.calls[0][1].filters).toEqual({ year_from: ["2020"] });
     // Leaving it again without a change asks nothing.
     fireEvent.focus(min);
     fireEvent.blur(min);
@@ -644,7 +670,7 @@ describe("CataloguePane", () => {
     await waitFor(() =>
       expect(browse).toHaveBeenLastCalledWith(
         "openalex",
-        expect.objectContaining({ filters: { open_access: "true" } }),
+        expect.objectContaining({ filters: { open_access: ["true"] } }),
       ),
     );
   });
@@ -687,7 +713,7 @@ describe("CataloguePane", () => {
     await waitFor(() =>
       expect(browse).toHaveBeenLastCalledWith(
         "openalex",
-        expect.objectContaining({ query: "persistent lists", filters: { type: "book" } }),
+        expect.objectContaining({ query: "persistent lists", filters: { type: ["book"] } }),
       ),
     );
     // The other provider is still searched; the filtered one is left out of it.
@@ -709,7 +735,7 @@ describe("CataloguePane", () => {
     expect(await screen.findByText("Browsed work 12")).toBeTruthy();
     // The same request, one page on; and what was read stays.
     expect(browse.mock.calls[1][1]).toMatchObject({
-      filters: { type: "article" },
+      filters: { type: ["article"] },
       page: 2,
       limit: 10,
     });
@@ -762,7 +788,7 @@ describe("CataloguePane", () => {
     // Switching it back on asks for the listing again, with its filters kept.
     fireEvent.click(screen.getByRole("button", { name: "OpenAlex" }));
     await waitFor(() => expect(browse).toHaveBeenCalledTimes(2));
-    expect(browse.mock.calls[1][1].filters).toEqual({ type: "article" });
+    expect(browse.mock.calls[1][1].filters).toEqual({ type: ["article"] });
   });
 
   /// Filters belong to the provider that declared them. Two providers that
@@ -800,7 +826,7 @@ describe("CataloguePane", () => {
     fireEvent.change(within(openalex).getByLabelText("Type"), { target: { value: "book" } });
     await screen.findByText("openalex work");
     expect(browse).toHaveBeenCalledTimes(1);
-    expect(browse).toHaveBeenLastCalledWith("openalex", expect.objectContaining({ filters: { type: "book" } }));
+    expect(browse).toHaveBeenLastCalledWith("openalex", expect.objectContaining({ filters: { type: ["book"] } }));
     // Crossref was not asked: nothing was set on it.
     expect(screen.queryByLabelText("Crossref listing")).toBeNull();
 
@@ -838,6 +864,168 @@ describe("CataloguePane", () => {
     const panel = await openFilters();
     fireEvent.change(searchBox(), { target: { value: "ignored" } });
     expect(within(panel).getByText(/Crossref's listing does not take a keyword/)).toBeTruthy();
+  });
+
+  // ── Value sources: several values, suggestions, rows, totals ─────────────
+
+  const suggest = api.literatureFilterSuggest as unknown as ReturnType<typeof vi.fn>;
+  const rich = () =>
+    providers.mockResolvedValue([provider("openalex", "OpenAlex", RICH_BROWSE)]);
+
+  /// A filter that combines values is a checklist, and how they combine is
+  /// the provider's declared modes, sent only when it is not the first.
+  it("sets several values of one filter and says how they are combined", async () => {
+    rich();
+    browse.mockResolvedValue(listing(works(1)));
+    render(<CataloguePane />);
+    const panel = await openFilters();
+    const language = within(panel).getByRole("group", { name: "Language" });
+    fireEvent.click(within(language).getByLabelText("English"));
+    fireEvent.click(within(language).getByLabelText("French"));
+    await waitFor(() =>
+      expect(browse).toHaveBeenLastCalledWith(
+        "openalex",
+        expect.objectContaining({ filters: { language: ["en", "fr"] }, modes: {} }),
+      ),
+    );
+
+    fireEvent.change(within(panel).getByLabelText("Language matches"), {
+      target: { value: "none" },
+    });
+    await waitFor(() =>
+      expect(browse).toHaveBeenLastCalledWith(
+        "openalex",
+        expect.objectContaining({
+          filters: { language: ["en", "fr"] },
+          modes: { language: "none" },
+        }),
+      ),
+    );
+    // Closed, the chip says the values as a person would and how they combine.
+    fireEvent.click(screen.getByRole("button", { name: "Filters, 1 set" }));
+    expect(
+      within(screen.getByLabelText("Active filters")).getByText(
+        "Language (none of): English, French",
+      ),
+    ).toBeTruthy();
+  });
+
+  /// The provider is asked once typing pauses, not per keystroke, and a chosen
+  /// suggestion is remembered by its name because the request carries its id.
+  it("offers what the provider suggests and filters by the one chosen", async () => {
+    rich();
+    browse.mockResolvedValue(listing(works(1)));
+    suggest.mockResolvedValue([
+      { value: "https://openalex.org/A1", label: "Geoffrey Hinton", hint: "University of Toronto" },
+      { value: "https://openalex.org/A2", label: "G. Hinton", hint: null },
+    ]);
+    render(<CataloguePane />);
+    const panel = await openFilters();
+    const box = within(panel).getByLabelText("Author");
+    fireEvent.change(box, { target: { value: "h" } });
+    fireEvent.change(box, { target: { value: "hin" } });
+    fireEvent.change(box, { target: { value: "hinton" } });
+    const choices = await within(panel).findByRole("list", { name: "Author suggestions" });
+    expect(suggest).toHaveBeenCalledTimes(1);
+    expect(suggest).toHaveBeenCalledWith("openalex", "author", "hinton");
+    expect(within(choices).getByText("University of Toronto")).toBeTruthy();
+
+    fireEvent.click(within(choices).getByText("Geoffrey Hinton"));
+    await waitFor(() =>
+      expect(browse).toHaveBeenLastCalledWith(
+        "openalex",
+        expect.objectContaining({ filters: { author: ["https://openalex.org/A1"] } }),
+      ),
+    );
+    // The chosen value reads as its name, in the panel and on the chip.
+    expect(
+      within(panel).getByRole("button", { name: "Remove Geoffrey Hinton from Author" }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Filters, 1 set" }));
+    expect(
+      within(screen.getByLabelText("Active filters")).getByText("Author: Geoffrey Hinton"),
+    ).toBeTruthy();
+  });
+
+  it("says why suggestions could not be read", async () => {
+    rich();
+    suggest.mockRejectedValue(new Error("OpenAlex rate limit reached"));
+    render(<CataloguePane />);
+    const panel = await openFilters();
+    fireEvent.change(within(panel).getByLabelText("Author"), { target: { value: "hinton" } });
+    expect(await within(panel).findByText(/OpenAlex rate limit reached/)).toBeTruthy();
+  });
+
+  /// "Works citing this one": the value is a row, not something typed. The
+  /// row offers whatever the provider declared, and knows nothing more.
+  it("sets a filter from a result row and lists by it", async () => {
+    rich();
+    literature.mockResolvedValue(answerOf("openalex", "OpenAlex", [WORK]));
+    browse.mockResolvedValue(listing(works(2)));
+    render(<CataloguePane />);
+    submit("python lists");
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Works citing Persistent Lists Revisited" }),
+    );
+    await screen.findByText("Browsed work 0");
+    expect(browse).toHaveBeenCalledWith(
+      "openalex",
+      expect.objectContaining({ query: "python lists", filters: { cites: ["W1"] } }),
+    );
+    // It has no control of its own; set, it shows as what it was set to.
+    fireEvent.click(screen.getByRole("button", { name: "Filters, 1 set" }));
+    const panel = screen.getByRole("group", { name: "Filters" });
+    expect(
+      within(panel).getByRole("button", {
+        name: "Remove Persistent Lists Revisited from Works citing",
+      }),
+    ).toBeTruthy();
+  });
+
+  it("offers no row filters from a provider that declares none", async () => {
+    literature.mockResolvedValue(answerOf("openalex", "OpenAlex", [WORK]));
+    render(<CataloguePane />);
+    submit("python lists");
+    await screen.findByText("Persistent Lists Revisited");
+    expect(screen.queryByRole("button", { name: /^Works citing/ })).toBeNull();
+  });
+
+  /// Ten of twelve thousand is a different thing from ten in all.
+  it("says how many works match in all when the provider says", async () => {
+    browse.mockResolvedValue({ ...listing(works(10)), total: 12430 });
+    render(<CataloguePane />);
+    const panel = await openFilters();
+    fireEvent.click(within(panel).getByLabelText("Open access only"));
+    await screen.findByText("Browsed work 9");
+    expect(screen.getByLabelText("OpenAlex listing").textContent).toContain("10 of 12,430");
+  });
+
+  /// Forty controls is not a panel: past a handful, only the filters in use
+  /// are drawn and the rest are one menu away.
+  it("shows the filters in use and offers the rest from a menu when there are many", async () => {
+    const many: BrowseControls = {
+      ...OPENALEX_BROWSE,
+      filters: Array.from({ length: 12 }, (_, i) => control(`flag_${i}`, `Flag ${i}`, "toggle")),
+    };
+    providers.mockResolvedValue([provider("openalex", "OpenAlex", many)]);
+    browse.mockResolvedValue(listing(works(1)));
+    render(<CataloguePane />);
+    const panel = await openFilters();
+    expect(within(panel).queryByLabelText("Flag 3")).toBeNull();
+
+    fireEvent.change(within(panel).getByLabelText("Add a OpenAlex filter"), {
+      target: { value: "flag_3" },
+    });
+    fireEvent.click(within(panel).getByLabelText("Flag 3"));
+    await waitFor(() =>
+      expect(browse).toHaveBeenLastCalledWith(
+        "openalex",
+        expect.objectContaining({ filters: { flag_3: ["true"] } }),
+      ),
+    );
+    // Now in use, it is no longer on the menu.
+    const menu = within(panel).getByLabelText("Add a OpenAlex filter") as HTMLSelectElement;
+    expect(Array.from(menu.options).map((option) => option.value)).not.toContain("flag_3");
   });
 
   it("adds a paper through uploads and into the library", async () => {

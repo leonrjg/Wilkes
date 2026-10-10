@@ -22,8 +22,8 @@ use wilkes_core::types::{
     ChunkTopicsResult, CitationResult, CollectionValidation, DataPaths, DocumentMetadata,
     DocumentTagUpdate, EmbedderCapabilityManifest, EmbeddingEngine, ExternalMcpSettings,
     FileListResponse, HttpApiSettings, IndexStatus, IntegrationStatus, NewBookmark,
-    NewSmartCollection, NewTag, RootCoverage, SearchLogEntry, SelectedEmbedder,
-    Settings, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
+    NewSmartCollection, NewTag, RootCoverage, SearchLogEntry, SelectedEmbedder, Settings,
+    SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::worker::manager::WorkerStatus;
 
@@ -1964,6 +1964,20 @@ async fn literature_browse(
         .map_err(|error| error.to_string())
 }
 
+/// What a provider suggests for one of its filters as the user types.
+#[tauri::command]
+async fn literature_filter_suggest(
+    app: AppHandle,
+    provider: String,
+    filter: String,
+    text: String,
+) -> Result<Vec<wilkes_core::types::FilterSuggestion>, String> {
+    app_context(&app)
+        .literature_filter_suggest(provider, filter, text)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Whether one literature provider — shipped or pasted in — is reachable now.
 /// Answers whether or not it is enabled, so a form can check before enabling.
 #[tauri::command]
@@ -2393,6 +2407,7 @@ pub fn run() {
             literature_search,
             literature_resolve_download,
             literature_browse,
+            literature_filter_suggest,
             literature_provider_status,
             literature_provider_lookup,
             catalogue_sync,

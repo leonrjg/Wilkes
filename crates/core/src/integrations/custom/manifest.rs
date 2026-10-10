@@ -229,11 +229,11 @@ impl SearchCapability {
 
 /// A filtered, sorted, paged listing.
 ///
-/// What the user may vary is declared here, as typed controls, rather than as
-/// a template the user fills: the engine composes the request from the
-/// declared pieces, so a control can only produce a clause the manifest author
-/// wrote, and the interface renders its filter panel from this declaration
-/// without knowing which service it is talking to.
+/// What the user may vary is declared here rather than as a template the user
+/// fills: the engine composes the request from the declared pieces, so a
+/// filter can only produce a clause the manifest author wrote, with a value
+/// whose shape the manifest declared, and the interface renders its filter
+/// panel from this declaration without knowing which service it is talking to.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BrowseCapability {
@@ -252,6 +252,19 @@ pub struct BrowseCapability {
     pub filter_param: Option<String>,
     #[serde(default = "default_filter_separator")]
     pub filter_separator: String,
+    /// JMESPath over the response body yielding how many records match in
+    /// all, so a page of ten can say it is ten of twelve thousand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<String>,
+    /// How this service's suggestion responses are read. Declared once: it is
+    /// a property of the service, not of each filter that asks for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggest: Option<SuggestSpec>,
+    /// The ways several values of one filter may be combined, in the order
+    /// the interface offers them. Declared once, because how "any of" and
+    /// "none of" are written is this service's filter syntax, not a filter's.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub modes: IndexMap<String, ModeSpec>,
     /// Filters in the order the interface shows them.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub filters: IndexMap<String, FilterSpec>,
@@ -276,44 +289,256 @@ pub struct SortSpec {
     pub options: Vec<(String, String)>,
 }
 
+/// Where a suggestion response holds its entries and what each one says.
+/// JMESPath, like every other JSON selection in a manifest.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum FilterSpec {
-    /// One of a fixed set. `clause` carries `{value}`.
-    Choice {
-        label: String,
-        clause: String,
-        /// `[value, label]` pairs.
-        options: Vec<(String, String)>,
-    },
-    /// On or off. `clause` is added when on.
-    Flag { label: String, clause: String },
-    /// An integer lower and/or upper bound, each with its own clause carrying
-    /// `{value}`. A bound with no clause is not offered.
-    Range {
-        label: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        min_clause: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        max_clause: Option<String>,
-    },
+#[serde(deny_unknown_fields)]
+pub struct SuggestSpec {
+    /// Where the entries are. Omitted when the body is itself the array.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<String>,
+    /// The value a filter is set to when the entry is chosen.
+    pub value: String,
+    /// What the user sees.
+    pub label: String,
+    /// A second line that tells two entries of one name apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
-impl FilterSpec {
-    pub fn label(&self) -> &str {
-        match self {
-            Self::Choice { label, .. } | Self::Flag { label, .. } | Self::Range { label, .. } => {
-                label
-            }
+/// One way of combining several values of a filter.
+///
+/// Every mode is the same three steps — rewrite each value, then either put
+/// them all in one clause or write the clause once per value — so a mode is a
+/// row of data and a service with a different syntax declares different rows.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModeSpec {
+    /// What the interface calls it: "Any of", "None of".
+    pub label: String,
+    /// The values go in one clause, joined by this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
+    /// The clause is written once per value; the filter separator joins them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repeat: bool,
+    /// How each value is written before it is combined. Carries `{value}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+impl ModeSpec {
+    /// One value as this mode writes it.
+    pub fn write(&self, value: &str) -> String {
+        match &self.value {
+            Some(template) => template.replace("{value}", value),
+            None => value.to_string(),
         }
     }
+}
+
+/// A value the user types rather than picks.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueType {
+    Integer,
+    Number,
+    /// `YYYY-MM-DD`.
+    Date,
+    Text,
+}
+
+/// One filter: a clause, and what its value may be.
+///
+/// There are no kinds. A clause with no `{value}` is on or off; otherwise
+/// exactly one of `options`, `value`, `suggest` and `from_result` says where
+/// the value comes from (`suggest` and `from_result` may stand together: the
+/// same filter can be typed into or set from a result). A range is two filters
+/// sharing a `group`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FilterSpec {
+    pub label: String,
+    /// Added to the request when the filter is set. `{value}` is the value,
+    /// or several combined as the chosen mode says.
+    pub clause: String,
+    /// Filters sharing a group are drawn together under its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// The value is one of these `[value, label]` pairs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<(String, String)>>,
+    /// The value is typed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<ValueType>,
+    /// The value is chosen from the service's suggestions for what was typed.
+    /// A path relative to `base_url`, using `{query}` and optionally `{limit}`;
+    /// the response is read as `browse.suggest` says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggest: Option<String>,
+    /// The value is taken from a search result: the named result field of a
+    /// row the user is looking at ("works citing this one").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_result: Option<String>,
+    /// The `browse.modes` this filter may combine several values by, the
+    /// first being the default. Empty means it takes one value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modes: Vec<String>,
+}
+
+/// What a filter's value may be: the one thing that differs between filters,
+/// and so the one place the engine tells them apart.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ValueRule<'a> {
+    /// No value: the filter is on or off.
+    Toggle,
+    Options(&'a [(String, String)]),
+    Typed(ValueType),
+    /// Free data the service supplied: a suggestion's value, a result's field.
+    Free,
+}
+
+/// The longest free value a filter accepts.
+pub const MAX_FILTER_VALUE_CHARS: usize = 200;
+/// The most values one filter accepts.
+pub const MAX_FILTER_VALUES: usize = 10;
+/// The most suggestions asked for and returned.
+pub const MAX_SUGGESTIONS: usize = 10;
+/// The fewest characters a suggestion is asked for.
+pub const MIN_SUGGEST_CHARS: usize = 2;
+
+impl FilterSpec {
+    pub fn rule(&self) -> ValueRule<'_> {
+        if let Some(options) = &self.options {
+            ValueRule::Options(options)
+        } else if let Some(value) = self.value {
+            ValueRule::Typed(value)
+        } else if self.suggest.is_some() || self.from_result.is_some() {
+            ValueRule::Free
+        } else {
+            ValueRule::Toggle
+        }
+    }
+
+    /// The control the interface draws, by name. `result` has none of its
+    /// own: its value only ever comes from a row.
+    pub fn input(&self) -> &'static str {
+        match self.rule() {
+            ValueRule::Toggle => "toggle",
+            ValueRule::Options(_) => "options",
+            ValueRule::Typed(ValueType::Integer) => "integer",
+            ValueRule::Typed(ValueType::Number) => "number",
+            ValueRule::Typed(ValueType::Date) => "date",
+            ValueRule::Typed(ValueType::Text) => "text",
+            ValueRule::Free if self.suggest.is_some() => "suggest",
+            ValueRule::Free => "result",
+        }
+    }
+}
+
+/// Strings a free value may not carry, because they are this service's filter
+/// syntax: a value holding one would write a clause, or a combination, that no
+/// manifest author declared.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Reserved {
+    /// May not appear anywhere in a value.
+    pub within: Vec<String>,
+    /// May not start a value.
+    pub leading: Vec<String>,
+}
+
+impl ValueRule<'_> {
+    /// The value as it goes into a clause, or why it may not.
+    ///
+    /// The only place filters differ. Everything after it — combining values,
+    /// writing the clause — is the same for every filter.
+    pub fn admit(&self, raw: &str, reserved: &Reserved) -> Result<String, String> {
+        let value = raw.trim();
+        match self {
+            Self::Toggle => match value {
+                "true" => Ok(String::new()),
+                other => Err(format!("is on or off; got '{other}'")),
+            },
+            Self::Options(options) => options
+                .iter()
+                .any(|(option, _)| option == value)
+                .then(|| value.to_string())
+                .ok_or_else(|| format!("'{value}' is not one of its options")),
+            Self::Typed(ValueType::Integer) => value
+                .parse::<i64>()
+                .map(|number| number.to_string())
+                .map_err(|_| format!("must be a whole number; got '{value}'")),
+            Self::Typed(ValueType::Number) => match value.parse::<f64>() {
+                Ok(number) if number.is_finite() => Ok(number.to_string()),
+                _ => Err(format!("must be a number; got '{value}'")),
+            },
+            Self::Typed(ValueType::Date) => is_iso_date(value)
+                .then(|| value.to_string())
+                .ok_or_else(|| format!("must be a date written YYYY-MM-DD; got '{value}'")),
+            Self::Typed(ValueType::Text) | Self::Free => free_value(value, reserved),
+        }
+    }
+}
+
+fn is_iso_date(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('-').collect();
+    let [year, month, day] = parts.as_slice() else {
+        return false;
+    };
+    let digits = |part: &str, len: usize| {
+        part.chars().count() == len && part.chars().all(|c| c.is_ascii_digit())
+    };
+    digits(year, 4)
+        && digits(month, 2)
+        && digits(day, 2)
+        && (1..=12).contains(&month.parse::<u32>().unwrap_or(0))
+        && (1..=31).contains(&day.parse::<u32>().unwrap_or(0))
+}
+
+/// A value nobody declared in advance. It is refused, by what is wrong with
+/// it, rather than escaped: a search silently rewritten is a different search.
+fn free_value(value: &str, reserved: &Reserved) -> Result<String, String> {
+    if value.is_empty() {
+        return Err("cannot be empty".to_string());
+    }
+    if value.chars().count() > MAX_FILTER_VALUE_CHARS {
+        return Err(format!(
+            "is longer than {MAX_FILTER_VALUE_CHARS} characters"
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err("contains a control character".to_string());
+    }
+    if let Some(found) = reserved
+        .within
+        .iter()
+        .find(|part| value.contains(part.as_str()))
+    {
+        return Err(format!(
+            "cannot contain '{found}', which this service reads as filter syntax"
+        ));
+    }
+    if let Some(found) = reserved
+        .leading
+        .iter()
+        .find(|part| value.starts_with(part.as_str()))
+    {
+        return Err(format!(
+            "cannot start with '{found}', which this service reads as filter syntax"
+        ));
+    }
+    Ok(value.to_string())
 }
 
 /// What a manifest's browse capability offers, for the interface to render.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BrowseControls {
     pub keyword: bool,
+    /// Whether a listing says how many records match in all.
+    pub total: bool,
     pub sort: Option<SortControl>,
+    /// The combination modes, in the order they are offered.
+    pub modes: Vec<ControlOption>,
     pub filters: Vec<FilterControl>,
 }
 
@@ -334,57 +559,73 @@ pub struct ControlOption {
 pub struct FilterControl {
     pub name: String,
     pub label: String,
-    /// `choice`, `flag` or `range`.
-    pub kind: String,
+    pub group: Option<String>,
+    /// `toggle`, `options`, `integer`, `number`, `date`, `text`, `suggest` or
+    /// `result`: which control sets the value.
+    pub input: String,
     pub options: Vec<ControlOption>,
-    pub has_min: bool,
-    pub has_max: bool,
+    /// The modes several values may be combined by; empty means one value.
+    pub modes: Vec<String>,
+    /// The result field a row offers this filter with, if any.
+    pub from_result: Option<String>,
 }
 
 impl BrowseCapability {
     pub fn controls(&self) -> BrowseControls {
         BrowseControls {
             keyword: self.query_param.is_some(),
+            total: self.total.is_some(),
             sort: self.sort.as_ref().map(|sort| SortControl {
                 default: sort.default.clone(),
                 keyword_default: sort.keyword_default.clone(),
                 options: options_view(&sort.options),
             }),
+            modes: self
+                .modes
+                .iter()
+                .map(|(id, mode)| ControlOption {
+                    value: id.clone(),
+                    label: mode.label.clone(),
+                })
+                .collect(),
             filters: self
                 .filters
                 .iter()
-                .map(|(name, spec)| match spec {
-                    FilterSpec::Choice { label, options, .. } => FilterControl {
-                        name: name.clone(),
-                        label: label.clone(),
-                        kind: "choice".to_string(),
-                        options: options_view(options),
-                        has_min: false,
-                        has_max: false,
-                    },
-                    FilterSpec::Flag { label, .. } => FilterControl {
-                        name: name.clone(),
-                        label: label.clone(),
-                        kind: "flag".to_string(),
-                        options: Vec::new(),
-                        has_min: false,
-                        has_max: false,
-                    },
-                    FilterSpec::Range {
-                        label,
-                        min_clause,
-                        max_clause,
-                    } => FilterControl {
-                        name: name.clone(),
-                        label: label.clone(),
-                        kind: "range".to_string(),
-                        options: Vec::new(),
-                        has_min: min_clause.is_some(),
-                        has_max: max_clause.is_some(),
-                    },
+                .map(|(name, spec)| FilterControl {
+                    name: name.clone(),
+                    label: spec.label.clone(),
+                    group: spec.group.clone(),
+                    input: spec.input().to_string(),
+                    options: options_view(spec.options.as_deref().unwrap_or(&[])),
+                    modes: spec.modes.clone(),
+                    from_result: spec.from_result.clone(),
                 })
                 .collect(),
         }
+    }
+
+    /// The strings this service's filter syntax is made of.
+    pub fn reserved(&self) -> Reserved {
+        let mut reserved = Reserved {
+            within: vec![self.filter_separator.clone()],
+            leading: Vec::new(),
+        };
+        for mode in self.modes.values() {
+            if let Some(join) = &mode.join {
+                reserved.within.push(join.clone());
+            }
+            // What a mode writes before a value is how it marks one: a value
+            // that began with it would be read as marked.
+            if let Some(before) = mode
+                .value
+                .as_deref()
+                .and_then(|template| template.split("{value}").next())
+                .filter(|before| !before.is_empty())
+            {
+                reserved.leading.push(before.to_string());
+            }
+        }
+        reserved
     }
 }
 
@@ -687,6 +928,7 @@ const SEARCH_PLACEHOLDERS: &[&str] = &["query", "limit"];
 /// What a search path may name: the inputs, and where in the results to start.
 const SEARCH_PATH_PLACEHOLDERS: &[&str] = &["query", "limit", "page", "offset"];
 const BROWSE_PLACEHOLDERS: &[&str] = &["limit", "page"];
+const SUGGEST_PLACEHOLDERS: &[&str] = &["query", "limit"];
 const HEALTH_PLACEHOLDERS: &[&str] = &[];
 const LOOKUP_PLACEHOLDERS: &[&str] = &["doi"];
 const REFERENCES_PLACEHOLDERS: &[&str] = &["doi"];
@@ -694,6 +936,60 @@ const REFERENCES_RESOLVE_PLACEHOLDERS: &[&str] = &["ids", "count"];
 const MAX_RESOLVER_STEPS: usize = 4;
 pub const MAX_LOOKUP_PATHS: usize = 3;
 pub const MAX_REFERENCE_CHUNK: usize = 100;
+
+/// The deepest table header a manifest we ship or teach may use:
+/// `[capabilities.browse.filters]`, and nothing below it.
+pub const MAX_HEADER_DEPTH: usize = 3;
+
+/// Where a manifest's text departs from the layout Wilkes ships and teaches:
+/// every entry of a map (a filter, a field, a header) is one line under one
+/// header, and a list of steps is one inline table per step.
+///
+/// The verbose alternative is a header per entry, then a header per part of
+/// an entry (`[capabilities.browse.filters.year]`, or
+/// `[[capabilities.resolve_download.steps]]` followed by
+/// `[capabilities.resolve_download.steps.query]`), which restates the whole
+/// path for every entry and was removed once already. Both layouts are valid
+/// TOML and parse to the same manifest, so the parser cannot tell them apart
+/// and does not refuse a user's own manifest over it; this is a rule for what
+/// Wilkes writes, and the tests hold the shipped manifests and the authoring
+/// prompt to it.
+pub fn layout_problems(source: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        // A header starts in the first column with a bare key; an array value
+        // on a line of its own starts with a quote, a bracket or a space.
+        let Some(rest) = line.strip_prefix('[') else {
+            continue;
+        };
+        let array = rest.starts_with('[');
+        let rest = rest.trim_start_matches('[');
+        let Some(end) = rest.find(']') else {
+            continue;
+        };
+        let path = &rest[..end];
+        if path.is_empty()
+            || !path
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        {
+            continue;
+        }
+        let depth = path.split('.').count();
+        if array {
+            problems.push(format!(
+                "line {}: [[{path}]] is a header per list item; write the list as one inline table per item",
+                index + 1
+            ));
+        } else if depth > MAX_HEADER_DEPTH {
+            problems.push(format!(
+                "line {}: [{path}] is a header per entry; write the entry as one line under its parent header",
+                index + 1
+            ));
+        }
+    }
+    problems
+}
 
 const AUTHORING_JSON_EXAMPLE: &str = r#"manifest_version = 2
 id = "example-json"
@@ -745,16 +1041,9 @@ landing_page_url = { path = "a.details", attribute = "href", then = "absolute_ur
 url = "{download_url}"
 filename = "{title}.{file_format}"
 
-[[capabilities.resolve_download.steps]]
-base_url = "https://downloads.example.test"
-path = "/api/download?id={id}"
-response_format = "json"
-
-[capabilities.resolve_download.steps.query]
-key = { secret = "member_key" }
-
-[capabilities.resolve_download.steps.fields]
-download_url = "absolute_url(url)"
+steps = [
+  { base_url = "https://downloads.example.test", path = "/api/download?id={id}", response_format = "json", query = { key = { secret = "member_key" } }, fields = { download_url = "absolute_url(url)" } },
+]
 "#;
 
 const AUTHORING_FULL_EXAMPLE: &str = r#"manifest_version = 2
@@ -786,6 +1075,7 @@ path = "/works?per-page={limit}&page={page}"
 query_param = "search"
 filter_param = "filter"
 filter_separator = ","
+total = "meta.count"
 
 [capabilities.browse.sort]
 param = "sort"
@@ -793,22 +1083,24 @@ default = "cited_by_count:desc"
 keyword_default = "relevance_score:desc"
 options = [["cited_by_count:desc", "Most cited"], ["publication_date:desc", "Newest"], ["relevance_score:desc", "Most relevant"]]
 
-[capabilities.browse.filters.year]
-kind = "range"
-label = "Year"
-min_clause = "from_publication_date:{value}-01-01"
-max_clause = "to_publication_date:{value}-12-31"
+[capabilities.browse.suggest]
+items = "results"
+value = "id"
+label = "name"
+hint = "affiliation"
 
-[capabilities.browse.filters.type]
-kind = "choice"
-label = "Type"
-clause = "type:{value}"
-options = [["article", "Article"], ["book", "Book"]]
+[capabilities.browse.modes]
+any  = { label = "Any of", join = "|" }
+none = { label = "None of", repeat = true, value = "!{value}" }
 
-[capabilities.browse.filters.open_access]
-kind = "flag"
-label = "Open access only"
-clause = "is_oa:true"
+[capabilities.browse.filters]
+year_from   = { label = "From", group = "Year", clause = "from_publication_date:{value}-01-01", value = "integer" }
+year_to     = { label = "To", group = "Year", clause = "to_publication_date:{value}-12-31", value = "integer" }
+type        = { label = "Type", clause = "type:{value}", modes = ["any", "none"], options = [["article", "Article"], ["book", "Book"]] }
+open_access = { label = "Open access only", clause = "is_oa:true" }
+title       = { label = "Title mentions", clause = "title.search:{value}", value = "text" }
+author      = { label = "Author", clause = "author.id:{value}", modes = ["any", "none"], suggest = "/suggest/authors?q={query}" }
+cites       = { label = "Works citing", clause = "cites:{value}", from_result = "id" }
 
 # Lookup: tried in order; the first request whose response holds a record wins.
 [capabilities.lookup]
@@ -943,6 +1235,7 @@ path = "/list?limit={limit}&page={page}"   # {limit}, {page} (1-based)
 query_param = "q"                     # optional; appended only when the caller gave a keyword
 filter_param = "filter"               # required when there are filters; one parameter carries every active clause
 filter_separator = ","                # optional, defaults to ","
+total = "expression"                  # optional; JMESPath over the response yielding how many records match in all
 
 [capabilities.browse.sort]            # optional
 param = "sort"
@@ -950,12 +1243,29 @@ default = "value-of-the-default-option"
 keyword_default = "value-used-instead-when-a-keyword-is-given"   # optional
 options = [["value", "Label"], ["value2", "Label 2"]]
 
-[capabilities.browse.filters.name]    # one table per filter, shown in this order; name is a-z, 0-9, _
-kind = "choice"                       # choice | flag | range
-label = "Shown to the user"
-clause = "field:{value}"              # choice: {value} is one option value. flag: no {value}, added when on
-options = [["value", "Label"]]        # choice only
-# kind = "range": min_clause = "field:>{value}" and/or max_clause = "field:<{value}" (integers)
+[capabilities.browse.suggest]         # optional; how every suggestion response of this service is read (JMESPath)
+items = "expression"                  # optional; where the entries are
+value = "expression"                  # what a filter is set to when the entry is chosen
+label = "expression"                  # what the user sees
+hint = "expression"                   # optional; a second line that tells two entries apart
+
+[capabilities.browse.modes]           # optional; the ways several values of one filter combine, in the order offered
+any = { label = "Any of", join = "|" }                         # join: the values go in one clause, joined by this
+all = { label = "All of", repeat = true }                      # repeat: the clause is written once per value
+none = { label = "None of", repeat = true, value = "!{value}" } # value: how each value is written first
+
+[capabilities.browse.filters]         # one line per filter, shown in this order; a name is a-z, 0-9, _
+# A filter is a label, a clause, and where its value comes from. Write each as one inline table under this one
+# header; never a header per filter. A long options array may span lines. There are no kinds:
+on_off = { label = "Shown to the user", clause = "field:true" }                                                  # no {value}: on or off
+choice = { label = "Shown to the user", clause = "field:{value}", options = [["value", "Label"]] }             # one of a closed list
+typed = { label = "Shown to the user", clause = "field:>{value}", value = "integer" }                          # integer | number | date (YYYY-MM-DD) | text
+picked = { label = "Shown to the user", clause = "field.id:{value}", suggest = "/suggest/things?q={query}" }  # chosen from the service's suggestions; also {limit}
+from_row = { label = "Works citing", clause = "cites:{value}", from_result = "id" }                             # set from a search result field of a row; may stand with suggest
+# Exactly one of options, value and suggest, or from_result, when the clause has {value}. Optional on any filter:
+#   group = "Year"            filters sharing a group are drawn together, which is how a range is written (two filters)
+#   modes = ["any", "none"]   which browse.modes may combine several values, the first being the default; omitted means one value
+# Text and suggested values are refused if they contain the filter separator or a mode's join, so they cannot add a clause.
 
 [capabilities.lookup]                 # optional; DOI to one bibliographic record, for metadata enrichment
 paths = ["/work?doi={doi}"]           # 1 to 3 requests tried in order; the first whose response holds a record wins. A response with no record (empty, 404) moves on; any other failure stops
@@ -979,16 +1289,12 @@ doi = "expression"                    # JMESPath over one record yielding its DO
 url = "{result_or_step_value}"        # required; HTTP(S) or relative to http.base_url
 filename = "{title}.{file_format}"   # optional; sanitized before download
 
-[[capabilities.resolve_download.steps]]
-base_url = "https://other-origin.test" # optional literal HTTP(S) base; defaults to http.base_url
-path = "/resolve?id={id}"             # result values plus outputs from earlier steps
-response_format = "json"              # optional; "json" or "html"; defaults to json
-
-[capabilities.resolve_download.steps.query]   # and/or .headers; this step only
-param = { secret = "symbolic_secret_name" }
-
-[capabilities.resolve_download.steps.fields]
-new_value = "expression"              # required scalar string; the full field-spec object form is also allowed
+steps = [                             # optional; one inline table per step, in order; never a header per step
+  # base_url: optional literal HTTP(S) base, defaults to http.base_url. path: result values plus outputs from earlier steps.
+  # response_format: optional, "json" or "html". query and/or headers: this step only. fields: each a required scalar string
+  # (the full field-spec object form is also allowed).
+  { base_url = "https://other-origin.test", path = "/resolve?id={id}", response_format = "json", query = { param = { secret = "symbolic_secret_name" } }, fields = { new_value = "expression" } },
+]
 
 JMESPath selects keys (`a.b`), indices (`a[0]`, `a[-1]`), projections (`a[*].b`), filters (`a[?k == 'v']`), alternatives (`not_null(a, b)`) and disjunctions (`a || b`). Quote keys that are not plain identifiers: `published."date-parts"[0][0]`. Standard JMESPath functions are available, plus these:
 "#,
@@ -1523,6 +1829,52 @@ fn browse_problems(browse: &BrowseCapability) -> Vec<String> {
         problems.push("browse.filter_separator cannot be empty".to_string());
     }
 
+    if let Some(total) = &browse.total {
+        if let Err(error) = expr::check(total) {
+            problems.push(format!("browse.total is not a valid expression: {error}"));
+        }
+    }
+
+    if let Some(suggest) = &browse.suggest {
+        for (field, expression) in [
+            ("items", suggest.items.as_deref()),
+            ("value", Some(suggest.value.as_str())),
+            ("label", Some(suggest.label.as_str())),
+            ("hint", suggest.hint.as_deref()),
+        ] {
+            if let Some(Err(error)) = expression.map(expr::check) {
+                problems.push(format!(
+                    "browse.suggest.{field} is not a valid expression: {error}"
+                ));
+            }
+        }
+    }
+
+    for (name, mode) in &browse.modes {
+        let label = format!("browse.modes.{name}");
+        if !is_variable(name) {
+            problems.push(format!(
+                "{label}: the mode name must be a-z, 0-9 or '_', starting with a letter"
+            ));
+        }
+        if mode.label.trim().is_empty() {
+            problems.push(format!("{label}.label cannot be empty"));
+        }
+        match (&mode.join, mode.repeat) {
+            (Some(join), false) if join.is_empty() => {
+                problems.push(format!("{label}.join cannot be empty"))
+            }
+            (Some(_), false) | (None, true) => {}
+            (Some(_), true) => problems.push(format!("{label} sets both join and repeat")),
+            (None, false) => problems.push(format!(
+                "{label} says neither how its values are joined nor to repeat the clause"
+            )),
+        }
+        if let Some(template) = &mode.value {
+            problems.extend(clause_problems(&label, "value", template, true));
+        }
+    }
+
     for (name, spec) in &browse.filters {
         let label = format!("browse.filters.{name}");
         if !is_variable(name) {
@@ -1530,37 +1882,83 @@ fn browse_problems(browse: &BrowseCapability) -> Vec<String> {
                 "{label}: the filter name must be a-z, 0-9 or '_', starting with a letter"
             ));
         }
-        if spec.label().trim().is_empty() {
+        if spec.label.trim().is_empty() {
             problems.push(format!("{label}.label cannot be empty"));
         }
-        match spec {
-            FilterSpec::Choice {
-                clause, options, ..
-            } => {
-                problems.extend(clause_problems(&label, "clause", clause, true));
-                if options.is_empty() {
-                    problems.push(format!("{label}.options cannot be empty"));
-                }
-                problems.extend(option_problems(&label, options));
+        if spec
+            .group
+            .as_deref()
+            .is_some_and(|group| group.trim().is_empty())
+        {
+            problems.push(format!("{label}.group cannot be empty"));
+        }
+
+        let sources = [
+            spec.options.is_some(),
+            spec.value.is_some(),
+            spec.suggest.is_some(),
+        ]
+        .iter()
+        .filter(|set| **set)
+        .count();
+        if sources > 1 {
+            problems.push(format!(
+                "{label} sets more than one of options, value and suggest"
+            ));
+        }
+        if spec.from_result.is_some() && (spec.options.is_some() || spec.value.is_some()) {
+            problems.push(format!(
+                "{label}.from_result stands alone or with suggest, not with options or value"
+            ));
+        }
+        let takes_value = sources > 0 || spec.from_result.is_some();
+        if !takes_value && spec.clause.contains("{value}") {
+            problems.push(format!(
+                "{label}.clause takes a {{value}} but the filter declares none of options, value, suggest and from_result"
+            ));
+        } else {
+            problems.extend(clause_problems(&label, "clause", &spec.clause, takes_value));
+        }
+
+        if let Some(options) = &spec.options {
+            if options.is_empty() {
+                problems.push(format!("{label}.options cannot be empty"));
             }
-            FilterSpec::Flag { clause, .. } => {
-                problems.extend(clause_problems(&label, "clause", clause, false));
+            problems.extend(option_problems(&label, options));
+        }
+        if let Some(path) = &spec.suggest {
+            problems.extend(template_problems(
+                &format!("{label}.suggest"),
+                path,
+                SUGGEST_PLACEHOLDERS,
+            ));
+            if !path.contains("{query}") {
+                problems.push(format!("{label}.suggest must contain {{query}}"));
             }
-            FilterSpec::Range {
-                min_clause,
-                max_clause,
-                ..
-            } => {
-                if min_clause.is_none() && max_clause.is_none() {
-                    problems.push(format!(
-                        "{label} declares neither min_clause nor max_clause"
-                    ));
-                }
-                for (field, clause) in [("min_clause", min_clause), ("max_clause", max_clause)] {
-                    if let Some(clause) = clause {
-                        problems.extend(clause_problems(&label, field, clause, true));
-                    }
-                }
+            if browse.suggest.is_none() {
+                problems.push(format!(
+                    "{label}.suggest needs browse.suggest to say how the response is read"
+                ));
+            }
+        }
+        if let Some(field) = &spec.from_result {
+            if !SEARCH_FIELDS.iter().any(|(known, _)| known == field) {
+                problems.push(format!(
+                    "{label}.from_result '{field}' is not a search result field"
+                ));
+            }
+        }
+        if !spec.modes.is_empty() && !takes_value {
+            problems.push(format!("{label}.modes needs a filter that takes a value"));
+        }
+        for (index, mode) in spec.modes.iter().enumerate() {
+            if !browse.modes.contains_key(mode) {
+                problems.push(format!(
+                    "{label}.modes names '{mode}', which browse.modes does not declare"
+                ));
+            }
+            if spec.modes[..index].contains(mode) {
+                problems.push(format!("{label}.modes repeats '{mode}'"));
             }
         }
     }
@@ -2082,18 +2480,48 @@ url = "{id}"
     }
 
     #[test]
-    fn browse_declares_typed_controls_the_interface_can_render() {
+    fn browse_declares_controls_the_interface_can_render() {
         let manifest = Manifest::parse(AUTHORING_FULL_EXAMPLE).unwrap();
         let controls = manifest.capabilities.browse.unwrap().controls();
         assert!(controls.keyword);
+        assert!(controls.total);
         assert_eq!(controls.sort.as_ref().unwrap().options.len(), 3);
-        // Declaration order, not alphabetical: `year` precedes `type`.
-        let names: Vec<_> = controls.filters.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec!["year", "type", "open_access"]);
-        assert_eq!(controls.filters[0].kind, "range");
-        assert!(controls.filters[0].has_min && controls.filters[0].has_max);
-        assert_eq!(controls.filters[1].options.len(), 2);
-        assert_eq!(controls.filters[2].kind, "flag");
+        assert_eq!(
+            controls.modes,
+            vec![
+                ControlOption {
+                    value: "any".into(),
+                    label: "Any of".into()
+                },
+                ControlOption {
+                    value: "none".into(),
+                    label: "None of".into()
+                },
+            ]
+        );
+        // Declaration order, not alphabetical, and each filter's control is
+        // what its value source calls for.
+        let inputs: Vec<_> = controls
+            .filters
+            .iter()
+            .map(|f| (f.name.as_str(), f.input.as_str()))
+            .collect();
+        assert_eq!(
+            inputs,
+            vec![
+                ("year_from", "integer"),
+                ("year_to", "integer"),
+                ("type", "options"),
+                ("open_access", "toggle"),
+                ("title", "text"),
+                ("author", "suggest"),
+                ("cites", "result"),
+            ]
+        );
+        assert_eq!(controls.filters[0].group.as_deref(), Some("Year"));
+        assert_eq!(controls.filters[2].options.len(), 2);
+        assert_eq!(controls.filters[2].modes, vec!["any", "none"]);
+        assert_eq!(controls.filters[6].from_result.as_deref(), Some("id"));
     }
 
     #[test]
@@ -2104,13 +2532,122 @@ url = "{id}"
     }
 
     #[test]
-    fn a_browse_clause_must_carry_its_value() {
+    fn a_browse_clause_carries_a_value_exactly_when_the_filter_has_one() {
         let source = AUTHORING_FULL_EXAMPLE.replace("type:{value}", "type:fixed");
         let error = Manifest::parse(&source).unwrap_err().to_string();
         assert!(error.contains("must contain {value}"), "{error}");
         let source = AUTHORING_FULL_EXAMPLE.replace("is_oa:true", "is_oa:{value}");
         let error = Manifest::parse(&source).unwrap_err().to_string();
-        assert!(error.contains("not available here"), "{error}");
+        assert!(
+            error.contains("declares none of options, value, suggest"),
+            "{error}"
+        );
+    }
+
+    /// The filter kinds are gone, and a manifest still written with them is
+    /// told so by name rather than read as something else.
+    #[test]
+    fn a_filter_written_with_a_kind_is_refused_by_name() {
+        let source = AUTHORING_FULL_EXAMPLE.replace(
+            r#"open_access = { label"#,
+            r#"open_access = { kind = "flag", label"#,
+        );
+        let error = format!("{:#}", Manifest::parse(&source).unwrap_err());
+        assert!(error.contains("kind"), "{error}");
+    }
+
+    #[test]
+    fn a_filter_says_where_its_value_comes_from_once() {
+        for (from, to, expected) in [
+            (
+                r#"value = "text" }"#,
+                r#"value = "text", options = [["a", "A"]] }"#,
+                "more than one of options, value and suggest",
+            ),
+            (
+                r#"from_result = "id" }"#,
+                r#"from_result = "id", value = "text" }"#,
+                "from_result stands alone or with suggest",
+            ),
+            (
+                r#"from_result = "id" }"#,
+                r#"from_result = "nope" }"#,
+                "is not a search result field",
+            ),
+            (
+                r#"suggest = "/suggest/authors?q={query}" }"#,
+                r#"suggest = "/suggest/authors" }"#,
+                "suggest must contain {query}",
+            ),
+            (
+                r#"open_access = { label = "Open access only""#,
+                r#"open_access = { modes = ["any"], label = "Open access only""#,
+                "modes needs a filter that takes a value",
+            ),
+            (
+                r#"modes = ["any", "none"], options"#,
+                r#"modes = ["any", "every"], options"#,
+                "names 'every', which browse.modes does not declare",
+            ),
+        ] {
+            assert!(AUTHORING_FULL_EXAMPLE.contains(from), "{from}");
+            let source = AUTHORING_FULL_EXAMPLE.replace(from, to);
+            let error = Manifest::parse(&source).unwrap_err().to_string();
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_suggesting_filter_needs_the_response_described() {
+        let start = AUTHORING_FULL_EXAMPLE
+            .find("[capabilities.browse.suggest]")
+            .unwrap();
+        let end = AUTHORING_FULL_EXAMPLE
+            .find("[capabilities.browse.modes]")
+            .unwrap();
+        let source = format!(
+            "{}{}",
+            &AUTHORING_FULL_EXAMPLE[..start],
+            &AUTHORING_FULL_EXAMPLE[end..]
+        );
+        let error = Manifest::parse(&source).unwrap_err().to_string();
+        assert!(error.contains("needs browse.suggest"), "{error}");
+    }
+
+    #[test]
+    fn a_mode_says_one_way_of_combining_values() {
+        for (from, to, expected) in [
+            (
+                r#"any  = { label = "Any of", join = "|" }"#,
+                r#"any  = { label = "Any of" }"#,
+                "neither how its values are joined nor to repeat",
+            ),
+            (
+                r#"any  = { label = "Any of", join = "|" }"#,
+                r#"any  = { label = "Any of", join = "|", repeat = true }"#,
+                "sets both join and repeat",
+            ),
+            (
+                r#"value = "!{value}" }"#,
+                r#"value = "!" }"#,
+                "must contain {value}",
+            ),
+        ] {
+            assert!(AUTHORING_FULL_EXAMPLE.contains(from), "{from}");
+            let source = AUTHORING_FULL_EXAMPLE.replace(from, to);
+            let error = Manifest::parse(&source).unwrap_err().to_string();
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+    }
+
+    /// What a free value may not carry is the service's own filter syntax,
+    /// read off its declaration.
+    #[test]
+    fn the_reserved_strings_are_the_declared_syntax() {
+        let manifest = Manifest::parse(AUTHORING_FULL_EXAMPLE).unwrap();
+        let reserved = manifest.capabilities.browse.unwrap().reserved();
+        assert_eq!(reserved.within, vec![",", "|"]);
+        assert_eq!(reserved.leading, vec!["!"]);
     }
 
     #[test]
@@ -2147,6 +2684,26 @@ url = "{id}"
         assert!(error.contains("outside 1-100"), "{error}");
         let source = AUTHORING_FULL_EXAMPLE.replace("chunk = 50", "chunk = 0");
         assert!(Manifest::parse(&source).is_err());
+    }
+
+    /// What the prompt teaches is what gets written. It shows one line per
+    /// entry, and says so, because a model copies the layout it is shown.
+    #[test]
+    fn the_authoring_prompt_teaches_one_line_per_entry() {
+        assert_eq!(layout_problems(&authoring_prompt()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_header_per_entry_and_a_header_per_list_item_are_both_named() {
+        let verbose = "[capabilities.browse.filters]\nyear = { kind = \"flag\" }\n\n\
+                       [capabilities.browse.filters.year]\nkind = \"range\"\n\n\
+                       [[capabilities.resolve_download.steps]]\npath = \"/a\"\n\
+                       options = [\n  [\"a\", \"A\"],\n[\"b\", \"B\"],\n]\n";
+        let problems = layout_problems(verbose);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("line 4"), "{problems:?}");
+        assert!(problems[0].contains("capabilities.browse.filters.year"));
+        assert!(problems[1].contains("[[capabilities.resolve_download.steps]]"));
     }
 
     #[test]

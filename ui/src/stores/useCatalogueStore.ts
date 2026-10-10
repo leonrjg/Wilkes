@@ -195,15 +195,26 @@ export interface BrowseAnswer {
   page: number;
   /** The last page was short, so there is no next one. */
   exhausted: boolean;
+  /** How many works match in all, when the provider says. */
+  total: number | null;
   /** The request this answer belongs to, so the next page asks the same one. */
   request: BrowseRequest;
 }
 
-/** What one provider is being filtered and sorted by. Filter values are keyed
- *  by the names the provider's manifest gives them, and a blank value is no
- *  filter and is never stored. The sort is null for the provider's default. */
+/** What one provider is being filtered and sorted by.
+ *
+ *  Every filter's value is a list, whatever sets it: an on/off filter's is
+ *  `["true"]`, a typed one's is what was typed, a multi-valued one's is each
+ *  value chosen. An empty list is no filter and is never stored. `modes` is how
+ *  a filter's values are combined where that is not the filter's first mode.
+ *  `labels` is what a chosen value was called when it was chosen — an author's
+ *  name for an author's id — kept because the request carries only the value
+ *  and the chip has to say something a person can read. The sort is null for
+ *  the provider's default. */
 export interface Refinement {
-  filters: Record<string, string>;
+  filters: Record<string, string[]>;
+  modes: Record<string, string>;
+  labels: Record<string, Record<string, string>>;
   sort: string | null;
 }
 
@@ -323,9 +334,18 @@ interface CatalogueStore {
   toggleProvider: (provider: string) => void;
   toggleSection: (section: PaneSection) => void;
   setBrowseOpen: (open: boolean) => void;
-  /** Sets one filter of one provider; an empty value is no filter. */
-  setBrowseFilter: (provider: string, name: string, value: string) => void;
-  /** Drops one declared filter of a provider, both ends of a range included. */
+  /** Sets one filter of one provider to these values; none is no filter.
+   *  `labels` says what the values are called, for values a person cannot
+   *  read. */
+  setBrowseFilter: (
+    provider: string,
+    name: string,
+    values: string[],
+    labels?: Record<string, string>,
+  ) => void;
+  /** Chooses how one filter's values are combined. */
+  setBrowseMode: (provider: string, name: string, mode: string) => void;
+  /** Drops one filter of a provider, with its mode and its labels. */
   clearBrowseFilter: (provider: string, name: string) => void;
   setBrowseSort: (provider: string, sort: string | null) => void;
   /** Drops the filters and sort of one provider, or of every provider. */
@@ -530,6 +550,16 @@ function unseen(
   return fetched.filter((work) => !known.has(work.id));
 }
 
+/** A refinement with one filter gone: its values, its mode and its labels. */
+function withoutFilter(refinement: Refinement, name: string): Refinement {
+  return {
+    ...refinement,
+    filters: omitKey(refinement.filters, name),
+    modes: omitKey(refinement.modes, name),
+    labels: omitKey(refinement.labels, name),
+  };
+}
+
 function omitKey<T>(record: Record<string, T>, key: string): Record<string, T> {
   const { [key]: _removed, ...rest } = record;
   return rest;
@@ -559,21 +589,14 @@ export function browseProviderIds(options: LiteratureProviderInfo[]): string[] {
     .map((option) => option.provider);
 }
 
-/** The declared filter a stored value belongs to: a range stores its two ends
- *  as `name.min` and `name.max`. */
-function filterNameOf(key: string): string {
-  return key.replace(/\.(min|max)$/, "");
-}
-
-export const NO_REFINEMENT: Refinement = { filters: {}, sort: null };
+export const NO_REFINEMENT: Refinement = { filters: {}, modes: {}, labels: {}, sort: null };
 const IDLE_LISTING: Listing = { answer: null, loading: false, error: null };
 
-/** How many refinements one provider has set: filters by declared name, plus a
- *  chosen sort. A range with both ends is one. */
+/** How many refinements one provider has set: its filters, plus a chosen
+ *  sort. A filter with several values is one. */
 export function refinementCount(refinement: Refinement | undefined): number {
   if (refinement === undefined) return 0;
-  const names = new Set(Object.keys(refinement.filters).map(filterNameOf));
-  return names.size + (refinement.sort !== null ? 1 : 0);
+  return Object.keys(refinement.filters).length + (refinement.sort !== null ? 1 : 0);
 }
 
 /**
@@ -635,6 +658,10 @@ function browseRequestFor(
   return {
     query: info?.capabilities.browse?.keyword && keyword ? keyword : null,
     filters: refinement.filters,
+    // Only for a filter that is set: a mode with no values is not a request.
+    modes: Object.fromEntries(
+      Object.entries(refinement.modes).filter(([name]) => name in refinement.filters),
+    ),
     sort: refinement.sort,
     page: 1,
     limit: BROWSE_LIMIT,
@@ -673,6 +700,7 @@ async function runBrowse(
         results: [...(held?.results ?? []), ...unseen(held?.results ?? [], answer.results)],
         page: request.page ?? 1,
         exhausted: answer.results.length < (request.limit ?? BROWSE_LIMIT),
+        total: answer.total ?? null,
         request,
       },
     });
@@ -833,33 +861,49 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
 
   setBrowseOpen: (open) => set({ browseOpen: open }),
 
-  setBrowseFilter: (provider, name, value) =>
+  setBrowseFilter: (provider, name, values, labels) =>
     set((state) => {
       const current = state.refinements[provider] ?? NO_REFINEMENT;
-      const { [name]: _removed, ...rest } = current.filters;
-      return {
-        refinements: {
-          ...state.refinements,
-          [provider]: { ...current, filters: value === "" ? rest : { ...rest, [name]: value } },
-        },
-      };
-    }),
-
-  clearBrowseFilter: (provider, name) =>
-    set((state) => {
-      const current = state.refinements[provider] ?? NO_REFINEMENT;
+      const kept = values.filter((value) => value.trim() !== "");
+      if (kept.length === 0) {
+        return { refinements: { ...state.refinements, [provider]: withoutFilter(current, name) } };
+      }
+      // Labels are kept only for values still chosen, and a label given now
+      // replaces one remembered.
+      const known = { ...(current.labels[name] ?? {}), ...(labels ?? {}) };
+      const named = Object.fromEntries(
+        kept.filter((value) => value in known).map((value) => [value, known[value]]),
+      );
       return {
         refinements: {
           ...state.refinements,
           [provider]: {
             ...current,
-            filters: Object.fromEntries(
-              Object.entries(current.filters).filter(([key]) => filterNameOf(key) !== name),
-            ),
+            filters: { ...current.filters, [name]: kept },
+            labels: { ...current.labels, [name]: named },
           },
         },
       };
     }),
+
+  setBrowseMode: (provider, name, mode) =>
+    set((state) => {
+      const current = state.refinements[provider] ?? NO_REFINEMENT;
+      return {
+        refinements: {
+          ...state.refinements,
+          [provider]: { ...current, modes: { ...current.modes, [name]: mode } },
+        },
+      };
+    }),
+
+  clearBrowseFilter: (provider, name) =>
+    set((state) => ({
+      refinements: {
+        ...state.refinements,
+        [provider]: withoutFilter(state.refinements[provider] ?? NO_REFINEMENT, name),
+      },
+    })),
 
   setBrowseSort: (provider, sort) =>
     set((state) => ({

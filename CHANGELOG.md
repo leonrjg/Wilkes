@@ -4,6 +4,26 @@
 
 ### Added
 
+- Literature filters are no longer kinds. A filter is a clause and a statement
+  of where its value comes from — a closed list, a typed integer, number, date
+  or text, the provider's own suggestions as you type, or a result row — so a
+  provider's manifest can declare filters of any of those shapes with no change
+  to Wilkes. Several values of one filter combine by modes the provider
+  declares once ("Any of", "All of", "None of"), which is how exclusion and
+  intersection are written. OpenAlex goes from 8 filters to 48: author,
+  institution, journal, publisher, funder, topic and keyword by typeahead;
+  language, licence, open-access status, country and more as multi-select with
+  exclusion; text in the title, abstract or full text; and "works citing",
+  "cited by" and "related to" as actions on any result. A listing says how
+  many works match in all. A provider with many filters shows the ones in use
+  and offers the rest from an "Add a filter" menu. **Breaking for manifests:**
+  a `browse` filter written with `kind` is refused by name; a range is now two
+  filters sharing a `group`.
+- Manifests are written one line per entry. A header per filter, or per
+  resolver step followed by a header per part of it, is no longer how Wilkes
+  ships, generates or teaches them; tests hold the shipped manifests, the
+  authoring prompt and the starter manifest to it. A user's own manifest is not
+  refused over layout.
 - A provider that reports no citation count no longer shows "0 citations". The
   count is absent rather than zero in a search result and in the metadata
   cache, the document's own count comes from the first provider *that reported

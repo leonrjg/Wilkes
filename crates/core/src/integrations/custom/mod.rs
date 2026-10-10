@@ -31,16 +31,17 @@ use url::Url;
 
 use self::expr::{Evaluator, Projected};
 use self::manifest::{
-    lookup_field_type, search_field_type, BrowseCapability, FieldSpec, FieldType, FilterSpec,
-    LookupCapability, Manifest, ParamValue, ReferencesCapability, ResolverStep, ResponseFormat,
-    SearchCapability,
+    lookup_field_type, search_field_type, BrowseCapability, FieldSpec, FieldType, LookupCapability,
+    Manifest, ParamValue, ReferencesCapability, ResolverStep, ResponseFormat, SearchCapability,
+    ValueRule, MAX_FILTER_VALUES, MAX_SUGGESTIONS, MIN_SUGGEST_CHARS,
 };
 use crate::integrations::{LiteratureSource, ProviderCapabilities};
 use crate::metadata::doi::normalize_doi;
 use crate::network::{ProviderHttpClient, ProviderHttpErrorKind};
 use crate::types::{
-    BrowseRequest, CustomIntegrationConfig, IntegrationState, IntegrationStatus,
-    LiteratureAcquisition, LiteratureSearchResult, ProviderWork, ResolvedLiteratureDownload,
+    BrowsePage, BrowseRequest, CustomIntegrationConfig, FilterSuggestion, IntegrationState,
+    IntegrationStatus, LiteratureAcquisition, LiteratureSearchResult, ProviderWork,
+    ResolvedLiteratureDownload,
 };
 
 /// How much of a probe's raw response is shown back to the user. Enough to see
@@ -704,10 +705,7 @@ impl CustomSource {
         Ok(projection.results)
     }
 
-    async fn run_browse(
-        &self,
-        request: &BrowseRequest,
-    ) -> anyhow::Result<Vec<LiteratureSearchResult>> {
+    async fn run_browse(&self, request: &BrowseRequest) -> anyhow::Result<BrowsePage> {
         let name = &self.manifest.name;
         let browse = self
             .manifest
@@ -741,7 +739,133 @@ impl CustomSource {
         let body = self.fetch(prepared).await?;
         let projection = self.project_response(search, &body, query.unwrap_or(""), limit)?;
         self.warn_unmapped(&projection);
-        Ok(projection.results)
+        let total = match &browse.total {
+            Some(expression) => self.total_in(expression, &body)?,
+            None => None,
+        };
+        Ok(BrowsePage {
+            results: projection.results,
+            total,
+        })
+    }
+
+    /// How many records match in all, by the manifest's expression. A count
+    /// the response does not carry is absent, and logged: the page is still
+    /// right. One that is there and is not a count is the service having
+    /// changed shape, and is an error rather than a number made up.
+    fn total_in(&self, expression: &str, body: &[u8]) -> anyhow::Result<Option<u64>> {
+        let value: Value = serde_json::from_slice(body)
+            .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
+        let evaluator = Evaluator::new(&self.base_url);
+        match evaluator
+            .eval(expression, &value)
+            .map_err(|error| anyhow::anyhow!("browse.total: {error}"))?
+        {
+            None | Some(Value::Null) => {
+                tracing::warn!(
+                    provider = %self.id,
+                    "the listing carried no total where browse.total looks for one"
+                );
+                Ok(None)
+            }
+            Some(Value::Number(number)) => number.as_u64().map(Some).ok_or_else(|| {
+                anyhow::anyhow!("browse.total yielded {number}, which is not a count")
+            }),
+            Some(other) => anyhow::bail!(
+                "browse.total yielded {}, which is not a count",
+                describe_kind(&other)
+            ),
+        }
+    }
+
+    /// One request for what the service suggests, read as `browse.suggest`
+    /// says. A suggestion whose value the filter would refuse is left out and
+    /// logged: offering it would be offering a choice that then fails.
+    async fn run_suggest(&self, filter: &str, text: &str) -> anyhow::Result<Vec<FilterSuggestion>> {
+        let name = &self.manifest.name;
+        let browse = self
+            .manifest
+            .capabilities
+            .browse
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{name} does not offer browse"))?;
+        let spec = browse
+            .filters
+            .get(filter)
+            .ok_or_else(|| anyhow::anyhow!("'{filter}' is not a filter {name} offers"))?;
+        let (Some(path), Some(reading)) = (&spec.suggest, &browse.suggest) else {
+            anyhow::bail!("{name}'s filter '{filter}' has no suggestions");
+        };
+        let text = text.trim();
+        anyhow::ensure!(
+            text.chars().count() >= MIN_SUGGEST_CHARS,
+            "a suggestion needs at least {MIN_SUGGEST_CHARS} characters"
+        );
+
+        let prepared = self.request(
+            &substitute(
+                path,
+                &[("query", text), ("limit", &MAX_SUGGESTIONS.to_string())],
+            ),
+            &[],
+        )?;
+        let body = self.fetch(prepared).await?;
+        let value: Value = serde_json::from_slice(&body)
+            .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
+        let evaluator = Evaluator::new(&self.base_url);
+        let items = records_in(
+            &evaluator,
+            reading.items.as_deref(),
+            &value,
+            "suggest.items",
+        )?;
+
+        let reserved = browse.reserved();
+        let text_of = |expression: &str, item: &Value| -> anyhow::Result<Option<String>> {
+            Ok(
+                match evaluator
+                    .eval(expression, item)
+                    .map_err(|error| anyhow::anyhow!("browse.suggest: {error}"))?
+                {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(text)) => Some(text),
+                    Some(Value::Number(number)) => Some(number.to_string()),
+                    Some(other) => anyhow::bail!(
+                        "browse.suggest yielded {}, where text was expected",
+                        describe_kind(&other)
+                    ),
+                },
+            )
+        };
+        let mut suggestions = Vec::new();
+        let mut refused = 0usize;
+        for item in items.iter().take(MAX_SUGGESTIONS) {
+            let (Some(value), Some(label)) = (
+                text_of(&reading.value, item)?,
+                text_of(&reading.label, item)?,
+            ) else {
+                refused += 1;
+                continue;
+            };
+            let Ok(value) = spec.rule().admit(&value, &reserved) else {
+                refused += 1;
+                continue;
+            };
+            let hint = match &reading.hint {
+                Some(expression) => text_of(expression, item)?,
+                None => None,
+            };
+            suggestions.push(FilterSuggestion { value, label, hint });
+        }
+        if refused > 0 {
+            tracing::warn!(
+                provider = %self.id,
+                filter,
+                refused,
+                "suggestions left out: no value or label, or a value the filter would refuse"
+            );
+        }
+        Ok(suggestions)
     }
 
     // ── Lookup, references ───────────────────────────────────────────────────
@@ -1235,56 +1359,80 @@ fn browse_parameters(
     query: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
     let mut extra = Vec::new();
-    let mut consumed: Vec<String> = Vec::new();
 
+    // One path for every filter: admit each value by the filter's rule,
+    // combine them as its mode says, write the clause. Filters differ only in
+    // `ValueRule::admit`.
+    let reserved = browse.reserved();
     let mut clauses = Vec::new();
-    for (name, spec) in &browse.filters {
-        match spec {
-            FilterSpec::Choice {
-                clause, options, ..
-            } => {
-                consumed.push(name.clone());
-                if let Some(value) = request.filters.get(name).filter(|v| !v.is_empty()) {
-                    if !options.iter().any(|(option, _)| option == value) {
-                        return Err(format!("'{value}' is not an option of filter '{name}'"));
-                    }
-                    clauses.push(clause.replace("{value}", value));
-                }
-            }
-            FilterSpec::Flag { clause, .. } => {
-                consumed.push(name.clone());
-                match request.filters.get(name).map(String::as_str) {
-                    None | Some("") | Some("false") => {}
-                    Some("true") => clauses.push(clause.clone()),
-                    Some(other) => {
-                        return Err(format!("filter '{name}' is true or false; got '{other}'"))
-                    }
-                }
-            }
-            FilterSpec::Range {
-                min_clause,
-                max_clause,
-                ..
-            } => {
-                for (suffix, clause) in [("min", min_clause), ("max", max_clause)] {
-                    let key = format!("{name}.{suffix}");
-                    consumed.push(key.clone());
-                    let Some(value) = request.filters.get(&key).filter(|v| !v.is_empty()) else {
-                        continue;
-                    };
-                    let Some(clause) = clause else {
-                        return Err(format!("filter '{name}' has no {suffix} bound"));
-                    };
-                    let number: i64 = value.trim().parse().map_err(|_| {
-                        format!("filter '{key}' must be a whole number; got '{value}'")
-                    })?;
-                    clauses.push(clause.replace("{value}", &number.to_string()));
-                }
-            }
-        }
-    }
-    if let Some(unknown) = request.filters.keys().find(|key| !consumed.contains(key)) {
+    if let Some(unknown) = request
+        .filters
+        .keys()
+        .chain(request.modes.keys())
+        .find(|name| !browse.filters.contains_key(*name))
+    {
         return Err(format!("'{unknown}' is not a filter this provider offers"));
+    }
+    // Declaration order, so the request a set of filters makes does not depend
+    // on the order they were set in.
+    for (name, spec) in &browse.filters {
+        let Some(value) = request.filters.get(name) else {
+            continue;
+        };
+        let rule = spec.rule();
+        let raw = value.values();
+        if rule == ValueRule::Toggle {
+            match raw.as_slice() {
+                [] | ["false"] => {}
+                [one] => {
+                    rule.admit(one, &reserved)
+                        .map_err(|problem| format!("filter '{name}' {problem}"))?;
+                    clauses.push(spec.clause.clone());
+                }
+                _ => return Err(format!("filter '{name}' is on or off")),
+            }
+            continue;
+        }
+        if raw.is_empty() {
+            continue;
+        }
+        if raw.len() > MAX_FILTER_VALUES {
+            return Err(format!(
+                "filter '{name}' takes at most {MAX_FILTER_VALUES} values; got {}",
+                raw.len()
+            ));
+        }
+        let admitted = raw
+            .iter()
+            .map(|one| rule.admit(one, &reserved))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|problem| format!("filter '{name}' {problem}"))?;
+
+        let chosen = request.modes.get(name).or_else(|| spec.modes.first());
+        let Some(chosen) = chosen else {
+            // No modes: the filter takes one value, written as it is.
+            if admitted.len() > 1 {
+                return Err(format!("filter '{name}' takes one value"));
+            }
+            clauses.push(spec.clause.replace("{value}", &admitted[0]));
+            continue;
+        };
+        if !spec.modes.contains(chosen) {
+            return Err(format!("'{chosen}' is not a mode of filter '{name}'"));
+        }
+        let mode = browse
+            .modes
+            .get(chosen)
+            .ok_or_else(|| format!("mode '{chosen}' is not declared"))?;
+        let written: Vec<String> = admitted.iter().map(|one| mode.write(one)).collect();
+        match &mode.join {
+            Some(join) => clauses.push(spec.clause.replace("{value}", &written.join(join))),
+            None => clauses.extend(
+                written
+                    .iter()
+                    .map(|one| spec.clause.replace("{value}", one)),
+            ),
+        }
     }
     if !clauses.is_empty() {
         let param = browse
@@ -1579,8 +1727,12 @@ impl LiteratureSource for CustomSource {
         self.run_search(query, limit, page).await
     }
 
-    async fn browse(&self, request: &BrowseRequest) -> anyhow::Result<Vec<LiteratureSearchResult>> {
+    async fn browse(&self, request: &BrowseRequest) -> anyhow::Result<BrowsePage> {
         self.run_browse(request).await
+    }
+
+    async fn suggest(&self, filter: &str, text: &str) -> anyhow::Result<Vec<FilterSuggestion>> {
+        self.run_suggest(filter, text).await
     }
 
     async fn lookup(&self, doi: &str) -> anyhow::Result<ProviderWork> {
@@ -1686,6 +1838,7 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::integrations::builtin;
+    use crate::types::FilterValue;
     use mockito::Matcher;
 
     // ── Fixtures ─────────────────────────────────────────────────────────────
@@ -1758,15 +1911,9 @@ landing_page_url = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr
 url = "{download_url}"
 filename = "{title}.{file_format}"
 
-[[capabilities.resolve_download.steps]]
-path = "/dyn/api/fast_download.json?md5={id}"
-response_format = "json"
-
-[capabilities.resolve_download.steps.query]
-key = { secret = "anna_key" }
-
-[capabilities.resolve_download.steps.fields]
-download_url = "download_url"
+steps = [
+  { path = "/dyn/api/fast_download.json?md5={id}", response_format = "json", query = { key = { secret = "anna_key" } }, fields = { download_url = "download_url" } },
+]
 "#;
 
     const ANNA_BODY: &str = r#"<!doctype html><html><body>
@@ -2588,10 +2735,34 @@ doi = "doi"
         BrowseRequest {
             filters: filters
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|(k, v)| (k.to_string(), FilterValue::One(v.to_string())))
                 .collect(),
             ..BrowseRequest::default()
         }
+    }
+
+    fn many(name: &str, values: &[&str], mode: Option<&str>) -> BrowseRequest {
+        BrowseRequest {
+            filters: [(
+                name.to_string(),
+                FilterValue::Many(values.iter().map(|v| v.to_string()).collect()),
+            )]
+            .into(),
+            modes: mode
+                .map(|mode| (name.to_string(), mode.to_string()))
+                .into_iter()
+                .collect(),
+            ..BrowseRequest::default()
+        }
+    }
+
+    fn filter_param(request: &BrowseRequest) -> String {
+        browse_parameters(&openalex_browse(), request, None)
+            .unwrap()
+            .into_iter()
+            .find(|(param, _)| param == "filter")
+            .map(|(_, value)| value)
+            .unwrap_or_default()
     }
 
     #[test]
@@ -2600,10 +2771,10 @@ doi = "doi"
         let request = browse_request(&[
             // Deliberately out of order: the manifest decides the order.
             ("open_access", "true"),
-            ("year.max", "2024"),
+            ("year_to", "2024"),
             ("field", "17"),
-            ("year.min", "2020"),
-            ("cited_by.min", "100"),
+            ("year_from", "2020"),
+            ("cited_min", "100"),
             ("not_retracted", "false"),
         ]);
         let extra = browse_parameters(&browse, &request, None).unwrap();
@@ -2613,11 +2784,145 @@ doi = "doi"
                 (
                     "filter".to_string(),
                     "from_publication_date:2020-01-01,to_publication_date:2024-12-31,\
-                     cited_by_count:>100,primary_topic.field.id:17,open_access.is_oa:true"
+                     open_access.is_oa:true,cited_by_count:>100,primary_topic.field.id:17"
                         .to_string()
                 ),
                 ("sort".to_string(), "cited_by_count:desc".to_string()),
             ]
+        );
+    }
+
+    /// The three modes are the same three steps with different data: rewrite
+    /// each value, then one clause or one per value.
+    #[test]
+    fn a_mode_decides_how_several_values_are_written() {
+        // The filter's first mode is the default.
+        assert_eq!(
+            filter_param(&many("type", &["article", "review"], None)),
+            "type:article|review"
+        );
+        assert_eq!(
+            filter_param(&many("type", &["article", "review"], Some("none"))),
+            "type:!article,type:!review"
+        );
+        assert_eq!(
+            filter_param(&many(
+                "author",
+                &["https://openalex.org/A1", "https://openalex.org/A2"],
+                Some("all")
+            )),
+            "authorships.author.id:https://openalex.org/A1,\
+             authorships.author.id:https://openalex.org/A2"
+        );
+        // One value under a mode is still written by the mode.
+        assert_eq!(
+            filter_param(&many("language", &["en"], Some("none"))),
+            "language:!en"
+        );
+    }
+
+    #[test]
+    fn a_typed_value_is_written_as_its_type() {
+        assert_eq!(
+            filter_param(&browse_request(&[("impact_min", "2.50")])),
+            "fwci:>2.5"
+        );
+        assert_eq!(
+            filter_param(&browse_request(&[("published_from", "2024-03-01")])),
+            "from_publication_date:2024-03-01"
+        );
+        assert_eq!(
+            filter_param(&browse_request(&[("title", "  deep learning ")])),
+            "title.search:deep learning"
+        );
+        assert_eq!(
+            filter_param(&browse_request(&[("cites", "https://openalex.org/W1")])),
+            "cites:https://openalex.org/W1"
+        );
+    }
+
+    #[test]
+    fn browse_refuses_what_the_manifest_did_not_declare() {
+        let browse = openalex_browse();
+        for (filters, expected) in [
+            (vec![("nope", "1")], "'nope' is not a filter"),
+            (vec![("type", "novel")], "'novel' is not one of its options"),
+            (vec![("open_access", "maybe")], "is on or off"),
+            (vec![("year_from", "soon")], "must be a whole number"),
+            (vec![("impact_min", "high")], "must be a number"),
+            (vec![("published_from", "March 2024")], "YYYY-MM-DD"),
+            (vec![("published_from", "2024-13-01")], "YYYY-MM-DD"),
+            (vec![("year", "2020")], "'year' is not a filter"),
+        ] {
+            let error = browse_parameters(&browse, &browse_request(&filters), None).unwrap_err();
+            assert!(error.contains(expected), "{filters:?}: {error}");
+        }
+        let mut request = browse_request(&[]);
+        request.sort = Some("whatever".into());
+        let error = browse_parameters(&browse, &request, None).unwrap_err();
+        assert!(error.contains("is not a sort option"), "{error}");
+    }
+
+    /// A value nobody declared in advance cannot carry the service's own
+    /// filter syntax, or it would write a clause no manifest author did.
+    #[test]
+    fn a_free_value_cannot_write_filter_syntax() {
+        let browse = openalex_browse();
+        for (filters, expected) in [
+            (
+                vec![("title", "graphs,is_retracted:true")],
+                "cannot contain ','",
+            ),
+            (vec![("title", "graphs|trees")], "cannot contain '|'"),
+            (vec![("title", "!graphs")], "cannot start with '!'"),
+            (vec![("cites", "W1,type:article")], "cannot contain ','"),
+            (vec![("title", "a\nb")], "control character"),
+        ] {
+            let error = browse_parameters(&browse, &browse_request(&filters), None).unwrap_err();
+            assert!(error.contains(expected), "{filters:?}: {error}");
+        }
+        let long = "x".repeat(201);
+        let error =
+            browse_parameters(&browse, &browse_request(&[("title", &long)]), None).unwrap_err();
+        assert!(error.contains("longer than 200"), "{error}");
+    }
+
+    #[test]
+    fn several_values_need_a_filter_that_declares_modes() {
+        let browse = openalex_browse();
+        let error =
+            browse_parameters(&browse, &many("title", &["a", "b"], None), None).unwrap_err();
+        assert!(error.contains("takes one value"), "{error}");
+        let error =
+            browse_parameters(&browse, &many("type", &["article"], Some("all")), None).unwrap_err();
+        assert!(
+            error.contains("'all' is not a mode of filter 'type'"),
+            "{error}"
+        );
+        let eleven: Vec<String> = (0..11)
+            .map(|i| format!("https://openalex.org/A{i}"))
+            .collect();
+        let refs: Vec<&str> = eleven.iter().map(String::as_str).collect();
+        let error = browse_parameters(&browse, &many("author", &refs, None), None).unwrap_err();
+        assert!(error.contains("at most 10 values"), "{error}");
+        // A mode named for a filter that does not exist is refused too.
+        let mut request = browse_request(&[]);
+        request.modes.insert("nope".into(), "any".into());
+        let error = browse_parameters(&browse, &request, None).unwrap_err();
+        assert!(error.contains("'nope' is not a filter"), "{error}");
+    }
+
+    #[test]
+    fn a_blank_filter_value_is_no_filter() {
+        let browse = openalex_browse();
+        let mut request = browse_request(&[("type", ""), ("year_from", ""), ("open_access", "")]);
+        request
+            .filters
+            .insert("author".into(), FilterValue::Many(vec![]));
+        let extra = browse_parameters(&browse, &request, None).unwrap();
+        assert_eq!(
+            extra,
+            vec![("sort".to_string(), "cited_by_count:desc".to_string())]
         );
     }
 
@@ -2639,46 +2944,111 @@ doi = "doi"
         assert_eq!(extra[0].1, "publication_date:desc");
     }
 
-    #[test]
-    fn browse_refuses_what_the_manifest_did_not_declare() {
-        let browse = openalex_browse();
-        for (filters, expected) in [
-            (vec![("nope", "1")], "'nope' is not a filter"),
-            (
-                vec![("type", "novel")],
-                "'novel' is not an option of filter 'type'",
-            ),
-            (vec![("open_access", "maybe")], "true or false"),
-            (vec![("year.min", "soon")], "must be a whole number"),
-            (vec![("year", "2020")], "'year' is not a filter"),
-            (
-                vec![("open_access.min", "1")],
-                "'open_access.min' is not a filter",
-            ),
-            (vec![("cited_by.max", "10")], "has no max bound"),
-        ] {
-            let error = browse_parameters(&browse, &browse_request(&filters), None).unwrap_err();
-            assert!(error.contains(expected), "{filters:?}: {error}");
-        }
-        let mut request = browse_request(&[]);
-        request.sort = Some("whatever".into());
-        let error = browse_parameters(&browse, &request, None).unwrap_err();
-        assert!(error.contains("is not a sort option"), "{error}");
+    #[tokio::test]
+    async fn a_listing_says_how_many_match_in_all() {
+        let mut server = mockito::Server::new_async().await;
+        let _listing = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(OPENALEX_BODY.replacen('{', r#"{"meta":{"count":12430},"#, 1))
+            .create_async()
+            .await;
+        let page = shipped("openalex", &server.url(), &[])
+            .browse(&browse_request(&[("open_access", "true")]))
+            .await
+            .unwrap();
+        assert_eq!(page.total, Some(12430));
+        assert_eq!(page.results.len(), 1);
     }
 
-    #[test]
-    fn a_blank_filter_value_is_no_filter() {
-        let browse = openalex_browse();
-        let extra = browse_parameters(
-            &browse,
-            &browse_request(&[("type", ""), ("year.min", ""), ("open_access", "")]),
-            None,
-        )
-        .unwrap();
+    /// A count that is missing is absent; one that is there and is not a count
+    /// is the service having changed shape, and is not read as a number.
+    #[tokio::test]
+    async fn a_total_that_is_not_a_count_is_an_error_and_a_missing_one_is_absent() {
+        let mut server = mockito::Server::new_async().await;
+        let missing = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(OPENALEX_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let source = shipped("openalex", &server.url(), &[]);
+        let page = source.browse(&browse_request(&[])).await.unwrap();
+        assert_eq!(page.total, None);
+        missing.assert_async().await;
+        missing.remove_async().await;
+
+        let _wrong = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(OPENALEX_BODY.replacen('{', r#"{"meta":{"count":"many"},"#, 1))
+            .create_async()
+            .await;
+        let error = source
+            .browse(&browse_request(&[]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a count"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_filter_is_suggested_values_by_one_declared_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/autocomplete/authors")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("q".into(), "hinton".into()),
+                Matcher::UrlEncoded("mailto".into(), "team@example.com".into()),
+            ]))
+            .with_status(200)
+            .with_body(
+                r#"{"results":[
+                    {"id":"https://openalex.org/A1","display_name":"Geoffrey Hinton","hint":"University of Toronto"},
+                    {"id":"https://openalex.org/A2","display_name":"G. Hinton","hint":null},
+                    {"id":"A3,type:article","display_name":"Smuggler","hint":null},
+                    {"id":null,"display_name":"Nameless","hint":null}
+                ]}"#,
+            )
+            .create_async()
+            .await;
+        let source = shipped("openalex", &server.url(), &[("email", "team@example.com")]);
+        let suggestions = source.suggest("author", " hinton ").await.unwrap();
         assert_eq!(
-            extra,
-            vec![("sort".to_string(), "cited_by_count:desc".to_string())]
+            suggestions,
+            vec![
+                FilterSuggestion {
+                    value: "https://openalex.org/A1".into(),
+                    label: "Geoffrey Hinton".into(),
+                    hint: Some("University of Toronto".into()),
+                },
+                // A missing hint is absent. The entry whose value would write
+                // a clause, and the one with no value, are left out.
+                FilterSuggestion {
+                    value: "https://openalex.org/A2".into(),
+                    label: "G. Hinton".into(),
+                    hint: None,
+                },
+            ]
         );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn suggestions_are_refused_where_the_manifest_declares_none() {
+        let source = shipped("openalex", "https://api.example.test", &[]);
+        for (filter, text, expected) in [
+            ("type", "art", "has no suggestions"),
+            ("nope", "art", "is not a filter"),
+            ("author", "h", "at least 2 characters"),
+        ] {
+            let error = source.suggest(filter, text).await.unwrap_err().to_string();
+            assert!(error.contains(expected), "{filter}: {error}");
+        }
     }
 
     #[tokio::test]
@@ -2701,7 +3071,7 @@ doi = "doi"
             .create_async()
             .await;
 
-        let mut request = browse_request(&[("year.min", "2020"), ("open_access", "true")]);
+        let mut request = browse_request(&[("year_from", "2020"), ("open_access", "true")]);
         request.sort = Some("publication_date:desc".into());
         request.page = Some(3);
         request.limit = Some(5);
@@ -2710,7 +3080,7 @@ doi = "doi"
             .await
             .unwrap();
 
-        assert_eq!(results, vec![expected_openalex_record()]);
+        assert_eq!(results.results, vec![expected_openalex_record()]);
         mock.assert_async().await;
     }
 
@@ -2819,9 +3189,9 @@ doi = "doi"
 
         let manifest = ANNA_MANIFEST
             .replace(
-                "[[capabilities.resolve_download.steps]]",
+                "{ path = \"/dyn/api/fast_download.json?md5={id}\"",
                 &format!(
-                    "[[capabilities.resolve_download.steps]]\nbase_url = {:?}",
+                    "{{ base_url = {:?}, path = \"/dyn/api/fast_download.json?md5={{id}}\"",
                     resolver_server.url()
                 ),
             )
@@ -2829,6 +3199,10 @@ doi = "doi"
                 "download_url = \"download_url\"",
                 "download_url = \"absolute_url(download_url)\"",
             );
+        assert!(
+            manifest.contains("base_url = \"http"),
+            "the step was not moved"
+        );
         let anna = source(&manifest, &search_server.url(), &[("anna_key", "secret")]);
         let book = anna.search("graph networks", 1, 1).await.unwrap().remove(0);
         let download = anna.resolve_download(&book).await.unwrap().unwrap();
@@ -2844,9 +3218,10 @@ doi = "doi"
     #[tokio::test]
     async fn a_same_origin_step_inherits_global_headers_and_may_replace_one() {
         let manifest = ANNA_MANIFEST.replace(
-            "[capabilities.resolve_download.steps.query]",
-            "[capabilities.resolve_download.steps.headers]\nuser-agent = \"Step/1\"\n\n[capabilities.resolve_download.steps.query]",
+            "query = { key = { secret = \"anna_key\" } }",
+            "headers = { user-agent = \"Step/1\" }, query = { key = { secret = \"anna_key\" } }",
         );
+        assert!(manifest.contains("Step/1"), "the step header was not added");
         let mut server = mockito::Server::new_async().await;
         let _search = server
             .mock("GET", "/search")
@@ -3089,7 +3464,10 @@ doi = "doi"
         assert!(!capabilities.resolve_download);
         let controls = capabilities.browse.expect("openalex lists works");
         assert!(controls.keyword);
-        assert!(controls.filters.iter().any(|filter| filter.name == "year"));
+        assert!(controls
+            .filters
+            .iter()
+            .any(|filter| filter.name == "year_from"));
 
         let capabilities = source(KEYED_MANIFEST, "https://example.test", &[]).capabilities();
         assert!(capabilities.browse.is_none() && !capabilities.lookup && !capabilities.references);

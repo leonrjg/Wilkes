@@ -5299,6 +5299,26 @@ impl AppContext {
             .await
     }
 
+    /// What a provider suggests for one of its filters as the user types.
+    pub async fn literature_filter_suggest(
+        &self,
+        provider: String,
+        filter: String,
+        text: String,
+    ) -> Result<
+        Vec<wilkes_core::types::FilterSuggestion>,
+        crate::commands::integrations::literature::LiteratureRequestError,
+    > {
+        let settings = self.get_settings().await;
+        crate::commands::integrations::literature::suggest(
+            &settings.integrations,
+            provider,
+            filter,
+            text,
+        )
+        .await
+    }
+
     /// Authoritative document metadata: file-based extraction overridden by the
     /// Zotero library record when the file resolves to an item. This is the
     /// single owner of that composition — both the on-open viewer and the

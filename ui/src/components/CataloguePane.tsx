@@ -4,7 +4,10 @@ import type {
   BrowseControls,
   CatalogueGrain,
   CatalogueHit,
+  ControlOption,
   FilterControl,
+  FilterInput,
+  FilterSuggestion,
   LiteratureProviderAnswer,
   LiteratureProviderInfo,
 } from "../lib/types";
@@ -13,6 +16,7 @@ import {
   browseProviderIds,
   enabledProviderIds,
   type LiteratureAnswer,
+  NO_REFINEMENT,
   type Refinement,
   type PaneSection,
   refinedProviderIds,
@@ -24,6 +28,7 @@ import {
   useCatalogueStore,
 } from "../stores/useCatalogueStore";
 import { useCatalogueAdd } from "../hooks/useCatalogueAdd";
+import { api } from "../services";
 import CatalogueCandidate, { PaperCandidate } from "./CatalogueCandidate";
 
 const GRAIN_LABELS: Record<CatalogueGrain, string> = {
@@ -528,6 +533,39 @@ function RefineBar({
   );
 }
 
+/** A provider that declares more filters than this shows only the ones in use,
+ *  and offers the rest from a menu: forty controls is not a panel. */
+const FILTERS_SHOWN_AT_ONCE = 8;
+
+/** What is drawn on one line of a provider's filters: one filter, or the
+ *  filters that share a group. */
+interface FilterRow {
+  key: string;
+  label: string;
+  members: FilterControl[];
+}
+
+/** The declared filters as rows, in declaration order, a group standing where
+ *  its first member does. A filter whose value only ever comes from a result
+ *  row has no control of its own and is a row only once it is set. */
+function filterRows(controls: BrowseControls, filters: Record<string, string[]>): FilterRow[] {
+  const rows: FilterRow[] = [];
+  for (const filter of controls.filters) {
+    if (filter.input === "result" && !(filter.name in filters)) continue;
+    const row =
+      filter.group === null ? undefined : rows.find((candidate) => candidate.key === `group:${filter.group}`);
+    if (row !== undefined) row.members.push(filter);
+    else {
+      rows.push({
+        key: filter.group === null ? filter.name : `group:${filter.group}`,
+        label: filter.group ?? filter.label,
+        members: [filter],
+      });
+    }
+  }
+  return rows;
+}
+
 /** One provider's filters and sort, under its name. */
 function ProviderFilters({
   info,
@@ -539,10 +577,12 @@ function ProviderFilters({
   keyword: string;
 }) {
   const refinement = useCatalogueStore((s) => (info ? s.refinements[info.provider] : undefined));
-  const setFilter = useCatalogueStore((s) => s.setBrowseFilter);
   const setSort = useCatalogueStore((s) => s.setBrowseSort);
   const reset = useCatalogueStore((s) => s.resetRefinement);
   const refine = useCatalogueStore((s) => s.refine);
+  // Rows the user asked to see and has not yet set. A display choice, like
+  // the panel being open: it is not part of what is asked.
+  const [added, setAdded] = useState<string[]>([]);
   const controls = info?.capabilities.browse ?? null;
   if (!info || controls === null) return null;
   const provider = info.provider;
@@ -550,6 +590,12 @@ function ProviderFilters({
   const sort = refinement?.sort ?? null;
   const count = refinementCount(refinement);
   const apply = () => void refine(keyword, provider);
+
+  const rows = filterRows(controls, filters);
+  const inUse = (row: FilterRow) => row.members.some((member) => member.name in filters);
+  const compact = controls.filters.length > FILTERS_SHOWN_AT_ONCE;
+  const shown = compact ? rows.filter((row) => inUse(row) || added.includes(row.key)) : rows;
+  const offered = compact ? rows.filter((row) => !shown.includes(row)) : [];
 
   return (
     <div role="group" aria-label={`${info.name} filters`} className="flex flex-col gap-1.5">
@@ -562,6 +608,7 @@ function ProviderFilters({
             type="button"
             onClick={() => {
               reset(provider);
+              setAdded([]);
               apply();
             }}
             aria-label={`Reset ${info.name} filters`}
@@ -573,7 +620,7 @@ function ProviderFilters({
       </div>
       <div className="grid grid-cols-2 gap-1.5">
         {controls.sort !== null && (
-          <ControlRow label="Sort by" wide={controls.filters.length === 0}>
+          <ControlRow label="Sort by" wide={!compact && rows.length === 0}>
             <select
               aria-label="Sort"
               value={sort ?? ""}
@@ -594,12 +641,32 @@ function ProviderFilters({
             </select>
           </ControlRow>
         )}
-        {controls.filters.map((filter) => (
-          <FilterInput
-            key={filter.name}
-            filter={filter}
-            values={filters}
-            onChange={(name, value) => setFilter(provider, name, value)}
+        {offered.length > 0 && (
+          <ControlRow label="Filter by">
+            <select
+              aria-label={`Add a ${info.name} filter`}
+              value=""
+              onChange={(e) => {
+                if (e.target.value !== "") setAdded((current) => [...current, e.target.value]);
+              }}
+              className={CONTROL_CLASS}
+            >
+              <option value="">Add a filter…</option>
+              {offered.map((row) => (
+                <option key={row.key} value={row.key}>
+                  {row.label}
+                </option>
+              ))}
+            </select>
+          </ControlRow>
+        )}
+        {shown.map((row) => (
+          <FilterRowView
+            key={row.key}
+            row={row}
+            provider={provider}
+            modes={controls.modes}
+            refinement={refinement ?? NO_REFINEMENT}
             onApply={apply}
           />
         ))}
@@ -631,6 +698,334 @@ function defaultSortLabel(controls: BrowseControls, keywordTyped: boolean): stri
   return `${optionLabel(sort.options, sort.default, sort.default)} (default)`;
 }
 
+/** What a filter is called on its own: a grouped one by its group as well,
+ *  since "From" says nothing without "Year". */
+function filterName(filter: FilterControl): string {
+  return filter.group === null || filter.input === "toggle"
+    ? filter.label
+    : `${filter.group} ${filter.label.toLowerCase()}`;
+}
+
+/** One row: a lone on/off filter is just its checkbox; anything else is a
+ *  heading over its members, each drawn by the control its value calls for. */
+function FilterRowView({
+  row,
+  provider,
+  modes,
+  refinement,
+  onApply,
+}: {
+  row: FilterRow;
+  provider: string;
+  modes: ControlOption[];
+  refinement: Refinement;
+  onApply: () => void;
+}) {
+  const setFilter = useCatalogueStore((s) => s.setBrowseFilter);
+  const setMode = useCatalogueStore((s) => s.setBrowseMode);
+  const member = (filter: FilterControl) => {
+    const Control = CONTROLS[filter.input];
+    const values = refinement.filters[filter.name] ?? [];
+    return (
+      <div key={filter.name} className="flex min-w-0 flex-1 flex-col gap-1">
+        {filter.modes.length > 1 && values.length > 0 && (
+          <select
+            aria-label={`${filterName(filter)} matches`}
+            value={refinement.modes[filter.name] ?? filter.modes[0]}
+            onChange={(e) => {
+              setMode(provider, filter.name, e.target.value);
+              onApply();
+            }}
+            className="self-start rounded border border-[var(--border-main)] bg-[var(--bg-sidebar)] px-1 py-0.5 text-[10px] text-[var(--text-dim)] outline-none"
+          >
+            {filter.modes.map((id) => (
+              <option key={id} value={id}>
+                {optionLabel(modes, id, id)}
+              </option>
+            ))}
+          </select>
+        )}
+        <Control
+          provider={provider}
+          filter={filter}
+          name={filterName(filter)}
+          caption={row.members.length > 1 ? filter.label : undefined}
+          values={values}
+          labels={refinement.labels[filter.name] ?? {}}
+          onChange={(next, labels) => setFilter(provider, filter.name, next, labels)}
+          onApply={onApply}
+        />
+      </div>
+    );
+  };
+  const only = row.members.length === 1 ? row.members[0] : null;
+  if (only !== null && only.input === "toggle") {
+    return <div className="col-span-2 flex">{member(only)}</div>;
+  }
+  // A single plain control fits half the panel; a group, a checklist or a
+  // typeahead needs its width.
+  const narrow =
+    only !== null &&
+    only.modes.length === 0 &&
+    only.input !== "suggest" &&
+    only.input !== "result";
+  return (
+    <ControlRow label={row.label} wide={!narrow} group>
+      <span className={`flex gap-1.5 ${row.members.every((m) => m.input === "toggle") ? "flex-col" : "items-start"}`}>
+        {row.members.map(member)}
+      </span>
+    </ControlRow>
+  );
+}
+
+/** What every filter control is given. The value is always a list, whatever
+ *  sets it, so a control differs from another only in how it is drawn. */
+interface FilterControlProps {
+  provider: string;
+  filter: FilterControl;
+  /** What the control is called to a screen reader: the filter's full name. */
+  name: string;
+  /** What to say inside the control when it shares a row with others. */
+  caption?: string;
+  values: string[];
+  /** What the chosen values are called, where they cannot be read. */
+  labels: Record<string, string>;
+  onChange: (values: string[], labels?: Record<string, string>) => void;
+  onApply: () => void;
+}
+
+/** The control each value source is set by. A new value type is one row here
+ *  and one arm of the engine's `ValueRule::admit`; nothing else tells filters
+ *  apart. */
+const CONTROLS: Record<FilterInput, (props: FilterControlProps) => ReactNode> = {
+  toggle: ToggleControl,
+  options: OptionsControl,
+  integer: TypedControl,
+  number: TypedControl,
+  date: TypedControl,
+  text: TypedControl,
+  suggest: SuggestControl,
+  result: ChosenValues,
+};
+
+function ToggleControl({ filter, values, onChange, onApply }: FilterControlProps) {
+  return (
+    <label className="flex items-center gap-1.5 text-[11px] text-[var(--text-main)]">
+      <input
+        type="checkbox"
+        checked={values[0] === "true"}
+        onChange={(e) => {
+          onChange(e.target.checked ? ["true"] : []);
+          onApply();
+        }}
+      />
+      {filter.label}
+    </label>
+  );
+}
+
+/** One of a closed list, or several of it where the filter combines values. */
+function OptionsControl({ filter, name, caption, values, onChange, onApply }: FilterControlProps) {
+  if (filter.modes.length === 0) {
+    return (
+      <select
+        aria-label={name}
+        value={values[0] ?? ""}
+        onChange={(e) => {
+          onChange(e.target.value === "" ? [] : [e.target.value]);
+          onApply();
+        }}
+        className={CONTROL_CLASS}
+      >
+        <option value="">{caption ?? "Any"}</option>
+        {filter.options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    );
+  }
+  return (
+    <div
+      role="group"
+      aria-label={name}
+      className="flex max-h-28 flex-col gap-0.5 overflow-y-auto rounded border border-[var(--border-main)] bg-[var(--bg-sidebar)] px-1.5 py-1"
+    >
+      {filter.options.map((option) => (
+        <label key={option.value} className="flex items-center gap-1.5 text-[11px] text-[var(--text-main)]">
+          <input
+            type="checkbox"
+            checked={values.includes(option.value)}
+            onChange={(e) => {
+              onChange(
+                e.target.checked
+                  ? [...values, option.value]
+                  : values.filter((value) => value !== option.value),
+              );
+              onApply();
+            }}
+          />
+          {option.label}
+        </label>
+      ))}
+    </div>
+  );
+}
+
+const TYPED_INPUTS: Partial<Record<FilterInput, { type: string; step?: string; hint: string }>> = {
+  integer: { type: "number", step: "1", hint: "Number" },
+  number: { type: "number", step: "any", hint: "Number" },
+  date: { type: "date", hint: "Date" },
+  text: { type: "text", hint: "Words" },
+};
+
+/** A typed value. Applies when the field is left, and only if it changed while
+ *  it held focus; Enter leaves it, so the two ways of finishing are one
+ *  request, and a value typed a character at a time is asked about once. */
+function TypedControl({ filter, name, caption, values, onChange, onApply }: FilterControlProps) {
+  const value = values[0] ?? "";
+  const atFocus = useRef(value);
+  const shape = TYPED_INPUTS[filter.input];
+  return (
+    <input
+      type={shape?.type ?? "text"}
+      step={shape?.step}
+      aria-label={name}
+      placeholder={caption ?? shape?.hint}
+      value={value}
+      onFocus={() => {
+        atFocus.current = value;
+      }}
+      onChange={(e) => onChange(e.target.value === "" ? [] : [e.target.value])}
+      onBlur={() => {
+        if (value !== atFocus.current) onApply();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          e.currentTarget.blur();
+        }
+      }}
+      className={CONTROL_CLASS}
+    />
+  );
+}
+
+/** The values chosen so far, each removable, called what they were called
+ *  when they were chosen. */
+function ChosenValues({ name, values, labels, onChange, onApply }: FilterControlProps) {
+  if (values.length === 0) return null;
+  return (
+    <span className="flex flex-wrap gap-1">
+      {values.map((value) => (
+        <button
+          key={value}
+          type="button"
+          onClick={() => {
+            onChange(values.filter((kept) => kept !== value));
+            onApply();
+          }}
+          aria-label={`Remove ${labels[value] ?? value} from ${name}`}
+          title={labels[value] ?? value}
+          className="flex max-w-full items-center gap-1 rounded-full border border-[var(--border-strong)] bg-[var(--bg-active)] px-2 py-0.5 text-[10px] text-[var(--text-main)] transition-colors hover:border-red-400"
+        >
+          <span className="truncate">{labels[value] ?? value}</span>
+          <X size={9} className="shrink-0" />
+        </button>
+      ))}
+    </span>
+  );
+}
+
+/** How long typing must pause before the provider is asked. These are
+ *  rate-limited services, and "hin", "hint" and "hinto" are one question. */
+const SUGGEST_PAUSE_MS = 250;
+
+/** A value chosen from what the provider suggests for what was typed. */
+function SuggestControl(props: FilterControlProps) {
+  const { provider, filter, name, caption, values, onChange, onApply } = props;
+  const [text, setText] = useState("");
+  const [suggestions, setSuggestions] = useState<FilterSuggestion[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const asked = useRef(0);
+  const several = filter.modes.length > 0;
+
+  useEffect(() => {
+    const typed = text.trim();
+    const request = ++asked.current;
+    setError(null);
+    if (typed.length < 2) {
+      setSuggestions(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      api
+        .literatureFilterSuggest(provider, filter.name, typed)
+        .then((found) => {
+          if (request === asked.current) setSuggestions(found);
+        })
+        .catch((reason) => {
+          if (request !== asked.current) return;
+          console.error(`filter suggestions for ${provider}/${filter.name} failed:`, reason);
+          setSuggestions(null);
+          setError(reason?.toString?.() ?? "Suggestions could not be read");
+        });
+    }, SUGGEST_PAUSE_MS);
+    return () => clearTimeout(timer);
+  }, [text, provider, filter.name]);
+
+  return (
+    <div className="flex flex-col gap-1">
+      <ChosenValues {...props} />
+      <input
+        type="text"
+        aria-label={name}
+        placeholder={caption ?? "Type to search"}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        className={CONTROL_CLASS}
+      />
+      {error !== null && <p className="text-[10px] leading-snug text-red-400">{error}</p>}
+      {suggestions !== null && suggestions.length === 0 && (
+        <p className="text-[10px] leading-snug text-[var(--text-muted)]">Nothing matches.</p>
+      )}
+      {suggestions !== null && suggestions.length > 0 && (
+        <ul
+          aria-label={`${name} suggestions`}
+          className="flex max-h-36 flex-col overflow-y-auto rounded border border-[var(--border-main)] bg-[var(--bg-sidebar)]"
+        >
+          {suggestions
+            .filter((suggestion) => !values.includes(suggestion.value))
+            .map((suggestion) => (
+              <li key={suggestion.value}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onChange(several ? [...values, suggestion.value] : [suggestion.value], {
+                      [suggestion.value]: suggestion.label,
+                    });
+                    setText("");
+                    setSuggestions(null);
+                    onApply();
+                  }}
+                  className="flex w-full flex-col px-1.5 py-1 text-left transition-colors hover:bg-[var(--bg-active)]"
+                >
+                  <span className="text-[11px] text-[var(--text-main)]">{suggestion.label}</span>
+                  {suggestion.hint !== null && (
+                    <span className="truncate text-[10px] text-[var(--text-muted)]">
+                      {suggestion.hint}
+                    </span>
+                  )}
+                </button>
+              </li>
+            ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 /** The filters that are set, one removable chip each, for when the panel is
  *  closed and the results would otherwise look unexplained. With more than one
  *  provider filtered, each chip is prefixed with the provider it belongs to. */
@@ -653,20 +1048,19 @@ function ActiveFilters({
   for (const provider of listed) {
     const info = options.find((option) => option.provider === provider);
     const controls = info?.capabilities.browse ?? null;
-    if (!info || controls === null) continue;
-    const prefix = listed.length > 1 ? `${info.name} · ` : "";
     const refinement = refinements[provider];
+    if (!info || controls === null || refinement === undefined) continue;
+    const prefix = listed.length > 1 ? `${info.name} · ` : "";
     for (const filter of controls.filters) {
-      const text = filterSummary(filter, refinement?.filters ?? {});
-      if (text !== null) {
-        chips.push({
-          key: `${provider}:${filter.name}`,
-          text: prefix + text,
-          clear: () => onClearFilter(provider, filter.name),
-        });
-      }
+      const values = refinement.filters[filter.name];
+      if (values === undefined) continue;
+      chips.push({
+        key: `${provider}:${filter.name}`,
+        text: prefix + filterSummary(filter, values, refinement, controls.modes),
+        clear: () => onClearFilter(provider, filter.name),
+      });
     }
-    if (refinement?.sort != null && controls.sort !== null) {
+    if (refinement.sort !== null && controls.sort !== null) {
       chips.push({
         key: `${provider}:sort`,
         text: `${prefix}Sort: ${optionLabel(controls.sort.options, refinement.sort, refinement.sort)}`,
@@ -682,11 +1076,11 @@ function ActiveFilters({
           type="button"
           onClick={chip.clear}
           aria-label={`Remove ${chip.text}`}
-          title="Remove"
-          className="flex items-center gap-1 rounded-full border border-[var(--border-strong)] bg-[var(--bg-active)] px-2 py-0.5 text-[10px] text-[var(--text-main)] transition-colors hover:border-red-400"
+          title={chip.text}
+          className="flex max-w-full items-center gap-1 rounded-full border border-[var(--border-strong)] bg-[var(--bg-active)] px-2 py-0.5 text-[10px] text-[var(--text-main)] transition-colors hover:border-red-400"
         >
-          {chip.text}
-          <X size={9} />
+          <span className="truncate">{chip.text}</span>
+          <X size={9} className="shrink-0" />
         </button>
       ))}
       {chips.length > 1 && (
@@ -702,40 +1096,58 @@ function ActiveFilters({
   );
 }
 
-/** How one filter's value reads in a chip, or null when it is not set. */
-function filterSummary(filter: FilterControl, values: Record<string, string>): string | null {
-  if (filter.kind === "choice") {
-    const value = values[filter.name];
-    return value === undefined
-      ? null
-      : `${filter.label}: ${optionLabel(filter.options, value, value)}`;
-  }
-  if (filter.kind === "flag") return values[filter.name] === "true" ? filter.label : null;
-  const min = values[`${filter.name}.min`];
-  const max = values[`${filter.name}.max`];
-  if (min !== undefined && max !== undefined) return `${filter.label}: ${min}–${max}`;
-  if (min !== undefined) return `${filter.label} ≥ ${min}`;
-  if (max !== undefined) return `${filter.label} ≤ ${max}`;
-  return null;
+/** How one set filter reads in a chip: its name, how its values are combined
+ *  where that is not the usual way, and the values as a person would say
+ *  them. */
+function filterSummary(
+  filter: FilterControl,
+  values: string[],
+  refinement: Refinement,
+  modes: ControlOption[],
+): string {
+  if (filter.input === "toggle") return filter.label;
+  const labels = refinement.labels[filter.name] ?? {};
+  const said = values
+    .map((value) => optionLabel(filter.options, value, labels[value] ?? value))
+    .join(", ");
+  const mode = refinement.modes[filter.name];
+  const how =
+    mode !== undefined && mode !== filter.modes[0]
+      ? ` (${optionLabel(modes, mode, mode).toLowerCase()})`
+      : "";
+  return `${filterName(filter)}${how}: ${said}`;
 }
 
 const CONTROL_CLASS =
   "w-full rounded border border-[var(--border-main)] bg-[var(--bg-sidebar)] px-1.5 py-1 text-[11px] text-[var(--text-main)] outline-none focus:border-[var(--border-strong)]";
 
+/** A labelled control. A row holding several controls is a group and not a
+ *  `<label>`, which would name only the first of them. */
 function ControlRow({
   label,
   wide = false,
+  group = false,
   children,
 }: {
   label: string;
   wide?: boolean;
+  group?: boolean;
   children: ReactNode;
 }) {
-  return (
-    <label className={`flex flex-col gap-0.5 ${wide ? "col-span-2" : ""}`}>
-      <span className="text-[9px] font-bold uppercase tracking-wider text-[var(--text-dim)]">
-        {label}
-      </span>
+  const heading = (
+    <span className="text-[9px] font-bold uppercase tracking-wider text-[var(--text-dim)]">
+      {label}
+    </span>
+  );
+  const className = `flex min-w-0 flex-col gap-0.5 ${wide ? "col-span-2" : ""}`;
+  return group ? (
+    <div className={className}>
+      {heading}
+      {children}
+    </div>
+  ) : (
+    <label className={className}>
+      {heading}
       {children}
     </label>
   );
@@ -747,122 +1159,6 @@ function optionLabel(
   fallback: string,
 ): string {
   return options.find((option) => option.value === value)?.label ?? fallback;
-}
-
-/** One declared filter, as the control its kind calls for. */
-function FilterInput({
-  filter,
-  values,
-  onChange,
-  onApply,
-}: {
-  filter: FilterControl;
-  values: Record<string, string>;
-  onChange: (name: string, value: string) => void;
-  onApply: () => void;
-}) {
-  if (filter.kind === "choice") {
-    return (
-      <ControlRow label={filter.label}>
-        <select
-          aria-label={filter.label}
-          value={values[filter.name] ?? ""}
-          onChange={(e) => {
-            onChange(filter.name, e.target.value);
-            onApply();
-          }}
-          className={CONTROL_CLASS}
-        >
-          <option value="">Any</option>
-          {filter.options.map((option) => (
-            <option key={option.value} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-      </ControlRow>
-    );
-  }
-  if (filter.kind === "flag") {
-    return (
-      <label className="col-span-2 flex items-center gap-1.5 text-[11px] text-[var(--text-main)]">
-        <input
-          type="checkbox"
-          checked={values[filter.name] === "true"}
-          onChange={(e) => {
-            onChange(filter.name, e.target.checked ? "true" : "");
-            onApply();
-          }}
-        />
-        {filter.label}
-      </label>
-    );
-  }
-  return (
-    <ControlRow label={filter.label} wide>
-      <span className="flex items-center gap-1.5">
-        {filter.has_min && (
-          <RangeEnd
-            label={`${filter.label} min`}
-            placeholder={filter.has_max ? "From" : "At least"}
-            value={values[`${filter.name}.min`] ?? ""}
-            onChange={(v) => onChange(`${filter.name}.min`, v)}
-            onApply={onApply}
-          />
-        )}
-        {filter.has_max && (
-          <RangeEnd
-            label={`${filter.label} max`}
-            placeholder={filter.has_min ? "To" : "At most"}
-            value={values[`${filter.name}.max`] ?? ""}
-            onChange={(v) => onChange(`${filter.name}.max`, v)}
-            onApply={onApply}
-          />
-        )}
-      </span>
-    </ControlRow>
-  );
-}
-
-/** One end of a range. Applies when left, and only if it changed while it held
- *  focus; Enter leaves it, so the two ways of finishing are one request. */
-function RangeEnd({
-  label,
-  placeholder,
-  value,
-  onChange,
-  onApply,
-}: {
-  label: string;
-  placeholder: string;
-  value: string;
-  onChange: (value: string) => void;
-  onApply: () => void;
-}) {
-  const atFocus = useRef(value);
-  return (
-    <input
-      type="number"
-      inputMode="numeric"
-      aria-label={label}
-      placeholder={placeholder}
-      value={value}
-      onFocus={() => {
-        atFocus.current = value;
-      }}
-      onChange={(e) => onChange(e.target.value)}
-      onBlur={() => {
-        if (value !== atFocus.current) onApply();
-      }}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") {
-          e.preventDefault();
-          e.currentTarget.blur();
-        }
-      }}
-      className={CONTROL_CLASS}
-    />
-  );
 }
 
 /**
@@ -884,7 +1180,15 @@ function ListingBody({ provider, name }: { provider: string; name: string }) {
       <h4 className="mt-2 flex items-baseline gap-1.5 border-b border-[var(--border-strong)] pb-1 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)]">
         {name}
         <span className="font-normal normal-case tracking-normal text-[var(--text-muted)]">
-          filtered{answer !== null ? ` · ${answer.results.length}` : ""}
+          filtered
+          {answer !== null &&
+            ` · ${answer.results.length.toLocaleString()}${
+              // A page of ten out of twelve thousand is a different thing from
+              // ten in all, so the total is said where the provider gives one.
+              answer.total !== null && answer.total > answer.results.length
+                ? ` of ${answer.total.toLocaleString()}`
+                : ""
+            }`}
         </span>
       </h4>
       {answer === null && loading && <Spinner />}

@@ -98,6 +98,21 @@ pub fn precedence(id: &str) -> (usize, &str) {
 mod tests {
     use super::*;
 
+    /// One header per map and one line per entry. A header per filter, then a
+    /// header per part of a filter, restates the path for every entry; it was
+    /// removed once and this is what stops it coming back.
+    #[test]
+    fn shipped_manifests_write_one_line_per_entry() {
+        for builtin in BUILTIN_MANIFESTS {
+            assert_eq!(
+                crate::integrations::custom::manifest::layout_problems(builtin.source),
+                Vec::<String>::new(),
+                "{}",
+                builtin.id
+            );
+        }
+    }
+
     #[test]
     fn shipped_manifests_are_valid_and_registered_under_their_own_ids() {
         for builtin in BUILTIN_MANIFESTS {
