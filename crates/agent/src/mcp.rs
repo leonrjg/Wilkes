@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -21,7 +22,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use wilkes_core::acquire::download_to_root;
 use wilkes_core::integrations::IntegrationRegistry;
-use wilkes_core::types::IntegrationsSettings;
+use wilkes_core::types::{
+    IntegrationsSettings, LiteratureAcquisition, LiteratureSearchResult, ResolvedLiteratureDownload,
+};
 
 use crate::{
     context::{ActiveDoc, ContextFile},
@@ -65,7 +68,6 @@ pub(crate) const WILKES_MCP_TOOL_NAMES: &[&str] = &[
     "list_documents",
     "search",
     "literature_search",
-    "literature_resolve_download",
     "list_smart_collections",
     "read_library",
 ];
@@ -366,10 +368,47 @@ struct WilkesMcp {
     /// no server is pinned to the workspace that was active when it started.
     workspaces: Option<Arc<dyn WorkspaceCatalog>>,
     integrations: Option<IntegrationsSettings>,
+    /// Full literature results by (provider, result id), kept so `download`
+    /// can resolve a chosen result server-side. The model is shown a view
+    /// without file URLs and names a result by id only.
+    literature_results: Arc<std::sync::Mutex<HashMap<(String, String), LiteratureSearchResult>>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl WilkesMcp {
+    /// The file a literature result names, resolved here so the URL never
+    /// passes through the model.
+    async fn resolve_literature_download(
+        &self,
+        provider: &str,
+        result_id: &str,
+    ) -> Result<ResolvedLiteratureDownload, String> {
+        let result = self
+            .literature_results
+            .lock()
+            .unwrap()
+            .get(&(provider.to_string(), result_id.to_string()))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "No result '{result_id}' from {provider} in this session; run literature_search first."
+                )
+            })?;
+        let registry = IntegrationRegistry::from_settings(&self.integrations().await);
+        let source = registry
+            .literature_for_search(provider)
+            .map_err(|error| error.to_string())?;
+        match source.resolve_download(&result).await {
+            Ok(Some(download)) => Ok(download),
+            Ok(None) => Err(format!(
+                "{} did not provide a downloadable file for result '{}'",
+                source.name(),
+                result.id
+            )),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     fn new(
         context: McpContext,
         cwd: PathBuf,
@@ -383,6 +422,7 @@ impl WilkesMcp {
             cwd,
             workspaces,
             integrations,
+            literature_results: Arc::default(),
             tool_router,
         }
     }
@@ -871,15 +911,6 @@ struct LiteratureSearchParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct LiteratureResolveDownloadParams {
-    /// Provider id returned beside the selected literature result.
-    provider: String,
-    /// The complete result object returned by literature_search. Passing it
-    /// intact preserves every provider value a resolver template may require.
-    result: serde_json::Value,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetFileMetadataParams {
     /// Document to read metadata for. Required for external MCP clients; an
     /// in-app chat may omit it to use its active document.
@@ -906,8 +937,14 @@ struct ListDocumentsParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct DownloadParams {
-    /// Direct HTTP(S) URL of the file to download.
-    url: String,
+    /// Direct HTTP(S) URL of the file to download, when the user supplied one.
+    /// Give either url or provider with result_id, not both.
+    url: Option<String>,
+    /// Literature provider id the result came from. Used with result_id.
+    provider: Option<String>,
+    /// The id of a result returned by literature_search for provider. Wilkes
+    /// locates the file itself; no URL is needed.
+    result_id: Option<String>,
     /// File name inside the current Wilkes root. Must not contain directories.
     filename: Option<String>,
     /// Workspace id to read, from list_context. Omit for the workspace that is
@@ -916,10 +953,59 @@ struct DownloadParams {
 }
 
 #[derive(Debug, Serialize)]
-struct LiteratureSearchResponse<T> {
+struct LiteratureSearchResponse {
     query: String,
     provider: String,
-    results: Vec<T>,
+    results: Vec<LiteratureResultView>,
+}
+
+/// What the model sees of a literature result: everything but the file URL,
+/// which stays on the server and is resolved when `download` names the result.
+#[derive(Debug, Serialize)]
+struct LiteratureResultView {
+    id: String,
+    doi: Option<String>,
+    title: Option<String>,
+    year: Option<i64>,
+    publication_date: Option<String>,
+    venue: Option<String>,
+    citation_count: Option<i64>,
+    is_open_access: bool,
+    /// Whether `download` can fetch a file for this result.
+    downloadable: bool,
+    landing_page_url: Option<String>,
+    open_access_status: Option<String>,
+    license: Option<String>,
+    authors: Option<String>,
+    publisher: Option<String>,
+    language: Option<String>,
+    file_format: Option<String>,
+    file_size: Option<String>,
+}
+
+impl From<&LiteratureSearchResult> for LiteratureResultView {
+    fn from(result: &LiteratureSearchResult) -> Self {
+        Self {
+            id: result.id.clone(),
+            doi: result.doi.clone(),
+            title: result.title.clone(),
+            year: result.year,
+            publication_date: result.publication_date.clone(),
+            venue: result.venue.clone(),
+            citation_count: result.citation_count,
+            is_open_access: result.is_open_access,
+            downloadable: result.pdf_url.is_some()
+                || result.acquisition != LiteratureAcquisition::None,
+            landing_page_url: result.landing_page_url.clone(),
+            open_access_status: result.open_access_status.clone(),
+            license: result.license.clone(),
+            authors: result.authors.clone(),
+            publisher: result.publisher.clone(),
+            language: result.language.clone(),
+            file_format: result.file_format.clone(),
+            file_size: result.file_size.clone(),
+        }
+    }
 }
 
 #[derive(
@@ -1139,7 +1225,8 @@ enum SearchMatchKindResponse {
 struct ReadLibraryParams {
     kind: crate::library::LibraryKind,
     workspace: Option<String>,
-    #[serde(default)] offset: usize,
+    #[serde(default)]
+    offset: usize,
     limit: Option<usize>,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -1354,51 +1441,26 @@ impl WilkesMcp {
             }
         };
         match source.search(&query, limit, 1).await {
-            Ok(results) => structured(LiteratureSearchResponse {
-                query,
-                provider: params.provider,
-                results,
-            }),
-            Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
-        }
-    }
-
-    #[tool(
-        description = "Resolve one result returned by literature_search to a direct HTTP(S) file URL and optional safe filename. Pass the complete result object unchanged. This does not write the file; pass its response to download only when the user asked to import or download it."
-    )]
-    async fn literature_resolve_download(
-        &self,
-        Parameters(params): Parameters<LiteratureResolveDownloadParams>,
-    ) -> CallToolResult {
-        let result: wilkes_core::types::LiteratureSearchResult =
-            match serde_json::from_value(params.result) {
-                Ok(result) => result,
-                Err(error) => {
-                    return CallToolResult::error(vec![ContentBlock::text(format!(
-                        "Invalid literature result: {error}"
-                    ))])
+            Ok(results) => {
+                let view = results.iter().map(LiteratureResultView::from).collect();
+                {
+                    let mut cache = self.literature_results.lock().unwrap();
+                    for result in results {
+                        cache.insert((params.provider.clone(), result.id.clone()), result);
+                    }
                 }
-            };
-        let registry = IntegrationRegistry::from_settings(&self.integrations().await);
-        let source = match registry.literature_for_search(&params.provider) {
-            Ok(source) => Arc::clone(source),
-            Err(error) => {
-                return CallToolResult::error(vec![ContentBlock::text(error.to_string())])
+                structured(LiteratureSearchResponse {
+                    query,
+                    provider: params.provider,
+                    results: view,
+                })
             }
-        };
-        match source.resolve_download(&result).await {
-            Ok(Some(download)) => structured(download),
-            Ok(None) => CallToolResult::error(vec![ContentBlock::text(format!(
-                "{} did not provide a downloadable file for result '{}'",
-                source.name(),
-                result.id
-            ))]),
             Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
         }
     }
 
     #[tool(
-        description = "Download a direct HTTP(S) file URL into the current Wilkes root of the active workspace, or of the workspace named by workspace. Use only when the user asks to import or download a file. Pass filename to choose the saved name; existing files are never overwritten. Refused for a workspace list_context reports as read_only, which another application owns. Literature search results may provide pdf_url values suitable for this tool."
+        description = "Download a file into the current Wilkes root of the active workspace, or of the workspace named by workspace. Use only when the user asks to import or download a file. Name the file either by a url the user gave you, or by provider and result_id of a literature_search result whose downloadable is true; Wilkes finds the file itself. Pass filename to choose the saved name; existing files are never overwritten. Refused for a workspace list_context reports as read_only, which another application owns."
     )]
     async fn download(&self, Parameters(params): Parameters<DownloadParams>) -> CallToolResult {
         let scope = match self.scope(params.workspace.as_deref()).await {
@@ -1416,13 +1478,32 @@ impl WilkesMcp {
                 return CallToolResult::error(vec![ContentBlock::text(message)]);
             }
         };
+        let (url, resolved_filename) = match (params.url, params.provider, params.result_id) {
+            (Some(url), None, None) => (url, None),
+            (None, Some(provider), Some(result_id)) => {
+                match self
+                    .resolve_literature_download(&provider, &result_id)
+                    .await
+                {
+                    Ok(resolved) => (resolved.url, resolved.filename),
+                    Err(message) => {
+                        return CallToolResult::error(vec![ContentBlock::text(message)])
+                    }
+                }
+            }
+            _ => {
+                return CallToolResult::error(vec![ContentBlock::text(
+                    "Pass either url, or provider together with result_id, but not both.",
+                )])
+            }
+        };
         // No progress sink: an MCP call is one request and one reply, with
         // nowhere to render a bar between them.
         match download_to_root(
             &root,
             wilkes_core::acquire::DownloadParams {
-                url: params.url,
-                filename: params.filename,
+                url,
+                filename: params.filename.or(resolved_filename),
             },
             None,
         )
@@ -1688,17 +1769,16 @@ async fn search_documents(
         wilkes_core::types::SearchScope::File { path } => Some(display_path(path)),
     };
     let query_text = query.pattern.clone();
-    let mut collected =
-        search
-            .clone()
-            .search(query, max_files)
-            .await
-            // Only a semantic-only search fails for want of an index. Combined
-            // reduces instead, and says so through its notes below.
-            .map_err(|message| match mode {
-                SearchModeParam::Semantic => with_semantic_index_guidance(message),
-                SearchModeParam::Exact | SearchModeParam::Combined => message,
-            })?;
+    let mut collected = search
+        .clone()
+        .search(query, max_files)
+        .await
+        // Only a semantic-only search fails for want of an index. Combined
+        // reduces instead, and says so through its notes below.
+        .map_err(|message| match mode {
+            SearchModeParam::Semantic => with_semantic_index_guidance(message),
+            SearchModeParam::Exact | SearchModeParam::Combined => message,
+        })?;
     // An unavailable semantic lane is the one thing in here that is not a
     // fault: the combined search reduced to exact matching and found what it
     // found. Reported as an error it reads as a failed call, and a client that
@@ -2002,7 +2082,6 @@ fn reports_unavailable_index(message: &str) -> bool {
     .iter()
     .any(|needle| lower.contains(needle))
 }
-
 
 fn build_search_query(
     root: PathBuf,
@@ -2441,11 +2520,19 @@ mod tests {
 
     #[async_trait]
     impl SearchService for FakeSearch {
-        fn is_read_only(&self) -> bool { self.read_only }
-        async fn edit_library(self: Arc<Self>, edit: crate::library::LibraryEdit) -> Result<serde_json::Value, String> {
+        fn is_read_only(&self) -> bool {
+            self.read_only
+        }
+        async fn edit_library(
+            self: Arc<Self>,
+            edit: crate::library::LibraryEdit,
+        ) -> Result<serde_json::Value, String> {
             Ok(serde_json::to_value(edit).unwrap())
         }
-        async fn read_library(self: Arc<Self>, _kind: crate::library::LibraryKind) -> Result<serde_json::Value,String> {
+        async fn read_library(
+            self: Arc<Self>,
+            _kind: crate::library::LibraryKind,
+        ) -> Result<serde_json::Value, String> {
             Ok(serde_json::json!([{"id":"one"},{"id":"two"}]))
         }
 
@@ -3527,8 +3614,7 @@ mod tests {
         assert_eq!(params.mode, SearchModeParam::Combined);
 
         let dir = tempdir().unwrap();
-        let (query, _) =
-            build_search_query(dir.path().to_path_buf(), params, 1024 * 1024).unwrap();
+        let (query, _) = build_search_query(dir.path().to_path_buf(), params, 1024 * 1024).unwrap();
 
         assert_eq!(query.mode, SearchMode::Hybrid);
         assert!(
@@ -3599,7 +3685,11 @@ mod tests {
         ))
         .await;
 
-        assert!(response.stats.errors.is_empty(), "{:?}", response.stats.errors);
+        assert!(
+            response.stats.errors.is_empty(),
+            "{:?}",
+            response.stats.errors
+        );
         assert_eq!(response.notes.len(), 1);
         assert!(response.notes[0].ends_with(COMBINED_INDEX_GUIDANCE));
         // The guidance must not send the caller back to run the exact search
@@ -4410,6 +4500,4 @@ mod tests {
             serde_json::from_slice(&to_bytes(reply.into_body(), 100000).await.unwrap()).unwrap();
         assert_eq!(json["result"]["serverInfo"]["name"], "wilkes");
     }
-
-
 }
