@@ -256,6 +256,7 @@ fn mcp_service(
     integrations: Option<IntegrationsSettings>,
     config: rmcp::transport::streamable_http_server::StreamableHttpServerConfig,
 ) -> McpService {
+    let literature_results = LiteratureResultCache::default();
     McpService::new(
         move || {
             Ok(WilkesMcp::new(
@@ -263,7 +264,8 @@ fn mcp_service(
                 cwd.clone(),
                 workspaces.clone(),
                 integrations.clone(),
-            ))
+            )
+            .with_literature_results(literature_results.clone()))
         },
         Default::default(),
         config,
@@ -360,6 +362,16 @@ async fn require_bearer_token(
     }
 }
 
+/// Shared by every `WilkesMcp` the service builds. The server is stateless, so
+/// each request gets a fresh instance and anything a later call needs from an
+/// earlier one has to live outside it.
+type LiteratureResultCache =
+    Arc<std::sync::Mutex<HashMap<(String, String), LiteratureSearchResult>>>;
+
+/// Results held at most; past this the oldest searches are of no further use,
+/// and the cache is emptied rather than grown without bound.
+const LITERATURE_CACHE_CAPACITY: usize = 2000;
+
 #[derive(Clone)]
 struct WilkesMcp {
     context: McpContext,
@@ -371,7 +383,7 @@ struct WilkesMcp {
     /// Full literature results by (provider, result id), kept so `download`
     /// can resolve a chosen result server-side. The model is shown a view
     /// without file URLs and names a result by id only.
-    literature_results: Arc<std::sync::Mutex<HashMap<(String, String), LiteratureSearchResult>>>,
+    literature_results: LiteratureResultCache,
     tool_router: ToolRouter<Self>,
 }
 
@@ -391,7 +403,7 @@ impl WilkesMcp {
             .cloned()
             .ok_or_else(|| {
                 format!(
-                    "No result '{result_id}' from {provider} in this session; run literature_search first."
+                    "No result '{result_id}' from {provider} is available to download; run literature_search again and use an id it returns."
                 )
             })?;
         let registry = IntegrationRegistry::from_settings(&self.integrations().await);
@@ -407,6 +419,11 @@ impl WilkesMcp {
             )),
             Err(error) => Err(error.to_string()),
         }
+    }
+
+    fn with_literature_results(mut self, cache: LiteratureResultCache) -> Self {
+        self.literature_results = cache;
+        self
     }
 
     fn new(
@@ -1445,6 +1462,9 @@ impl WilkesMcp {
                 let view = results.iter().map(LiteratureResultView::from).collect();
                 {
                     let mut cache = self.literature_results.lock().unwrap();
+                    if cache.len() + results.len() > LITERATURE_CACHE_CAPACITY {
+                        cache.clear();
+                    }
                     for result in results {
                         cache.insert((params.provider.clone(), result.id.clone()), result);
                     }
@@ -3208,6 +3228,52 @@ mod tests {
             search["inputSchema"]["properties"]["case_sensitive"]["type"],
             "boolean"
         );
+    }
+
+    #[tokio::test]
+    async fn literature_results_cached_by_one_request_are_found_by_the_next() {
+        // The server is stateless: every request builds a fresh WilkesMcp, so a
+        // search and the download that follows it never share an instance.
+        let cache = LiteratureResultCache::default();
+        let build = || {
+            WilkesMcp::new(
+                McpContext::Library(ExternalMcpContext::default()),
+                PathBuf::new(),
+                None,
+                None,
+            )
+            .with_literature_results(cache.clone())
+        };
+        let searched = build();
+        searched.literature_results.lock().unwrap().insert(
+            ("openalex".to_string(), "W1".to_string()),
+            LiteratureSearchResult {
+                id: "W1".to_string(),
+                doi: None,
+                title: None,
+                year: None,
+                publication_date: None,
+                venue: None,
+                citation_count: None,
+                is_open_access: true,
+                pdf_url: Some("https://example.org/a.pdf".to_string()),
+                landing_page_url: None,
+                open_access_status: None,
+                license: None,
+                authors: None,
+                publisher: None,
+                language: None,
+                file_format: None,
+                file_size: None,
+                acquisition: LiteratureAcquisition::Direct,
+            },
+        );
+        let downloading = build();
+        assert!(downloading
+            .literature_results
+            .lock()
+            .unwrap()
+            .contains_key(&("openalex".to_string(), "W1".to_string())));
     }
 
     #[tokio::test]
