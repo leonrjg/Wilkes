@@ -269,7 +269,12 @@ impl ProviderHttpClient {
                     let status = response.status();
                     let retry_after = retry_after(response.headers());
                     let body = response.text().await.unwrap_or_default();
-                    if attempt >= attempts {
+                    // The policy owns how long a request may wait. A server
+                    // asking for longer than that (an exhausted daily quota
+                    // answers with hours) has said no retry here can succeed.
+                    let outlasts_policy =
+                        retry_after.is_some_and(|delay| delay > self.retry.max_delay);
+                    if attempt >= attempts || outlasts_policy {
                         return Err(self.status_error(status, body, retry_after));
                     }
                     self.sleep_before_retry(attempt, retry_after).await;
@@ -501,6 +506,35 @@ mod tests {
         assert_eq!(value["ok"], true);
         first.assert_async().await;
         second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_beyond_the_policy_surfaces_the_rate_limit_at_once() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/resource")
+            .with_status(429)
+            .with_header("Retry-After", "72931")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = ProviderHttpClient::new("test").with_retry_policy(RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_secs(8),
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get_status(format!("{}/resource", server.url()), &[]),
+        )
+        .await
+        .expect("a rate limit the policy cannot wait out must not be slept on")
+        .unwrap_err();
+
+        assert_eq!(error.kind, ProviderHttpErrorKind::RateLimited);
+        assert_eq!(error.retry_after, Some(Duration::from_secs(72931)));
+        mock.assert_async().await;
     }
 
     #[tokio::test]
