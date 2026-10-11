@@ -10,6 +10,7 @@ import type {
   CatalogueFetchProgress,
   CatalogueProbe,
   CatalogueSearchResponse,
+  CatalogueRemoveResponse,
   CatalogueStatus,
   CatalogueSyncResponse,
   BrowseRequest,
@@ -515,6 +516,10 @@ export class TauriSearchApi implements SearchApi {
 
   async catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse> {
     return invoke<CatalogueSyncResponse>("catalogue_sync", { providers });
+  }
+
+  async catalogueRemove(provider: string): Promise<CatalogueRemoveResponse> {
+    return invoke<CatalogueRemoveResponse>("catalogue_remove", { provider });
   }
 
   async catalogueAcquire(url: string, filename?: string): Promise<CatalogueDownload> {

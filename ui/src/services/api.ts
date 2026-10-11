@@ -12,6 +12,7 @@ import type {
   CatalogueFetchProgress,
   CatalogueProbe,
   CatalogueSearchResponse,
+  CatalogueRemoveResponse,
   CatalogueStatus,
   CatalogueSyncResponse,
   LiteratureProviderInfo,
@@ -254,6 +255,9 @@ export interface SearchApi {
   /** Refreshes the named providers, or every one of them when none is named.
    *  All four is a minutes-long call; name one at a time to show progress. */
   catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse>;
+  /** Drops one catalogue's records from the mirror, so it is no longer
+   *  searched. Syncing it again is how it comes back. */
+  catalogueRemove(provider: string): Promise<CatalogueRemoveResponse>;
   /** Fetches a candidate into the workspace's uploads directory. Getting it
    *  from there into a library root is a separate, user-driven step. */
   catalogueAcquire(url: string, filename?: string): Promise<CatalogueDownload>;

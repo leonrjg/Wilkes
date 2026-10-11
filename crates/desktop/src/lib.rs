@@ -1901,6 +1901,17 @@ async fn catalogue_status(
         .map_err(catalogue_failed)
 }
 
+/// Drops one catalogue's records from the mirror. Syncing it again is how it
+/// comes back.
+#[tauri::command]
+async fn catalogue_remove(
+    app: AppHandle,
+    provider: String,
+) -> Result<wilkes_api::commands::catalogue::CatalogueRemoveResponse, String> {
+    wilkes_api::commands::catalogue::remove(&app_context(&app).catalogue_dir, provider)
+        .map_err(catalogue_failed)
+}
+
 /// Recall over the mirror. Not a ranking — see `wilkes_core::catalogue`.
 #[tauri::command]
 async fn catalogue_search(
@@ -2411,6 +2422,7 @@ pub fn run() {
             literature_provider_status,
             literature_provider_lookup,
             catalogue_sync,
+            catalogue_remove,
             catalogue_acquire,
             catalogue_acquire_course,
             image_recognizer_catalogue,

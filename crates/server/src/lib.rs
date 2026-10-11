@@ -901,6 +901,24 @@ async fn catalogue_sync_handler(
         .map_err(catalogue_err)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogueRemoveBody {
+    provider: String,
+}
+
+async fn catalogue_remove_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CatalogueRemoveBody>,
+) -> Result<
+    Json<wilkes_api::commands::catalogue::CatalogueRemoveResponse>,
+    (StatusCode, Json<ErrorBody>),
+> {
+    wilkes_api::commands::catalogue::remove(&catalogue_dir(&state), body.provider)
+        .map(Json)
+        .map_err(catalogue_err)
+}
+
 async fn catalogue_status_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<
@@ -2503,6 +2521,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/literature/status", post(literature_status_handler))
         .route("/api/literature/lookup", post(literature_lookup_handler))
         .route("/api/catalogue/sync", post(catalogue_sync_handler))
+        .route("/api/catalogue/remove", post(catalogue_remove_handler))
         .route("/api/catalogue/status", get(catalogue_status_handler))
         .route("/api/catalogue/acquire", post(catalogue_acquire_handler))
         .route(
@@ -2955,6 +2974,20 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn catalogue_remove_refuses_a_provider_it_does_not_have() {
+        let (_dir, state) = handler_state();
+        let body = CatalogueRemoveBody {
+            provider: "nonexistent".into(),
+        };
+        let error = match catalogue_remove_handler(State(state), Json(body)).await {
+            Ok(_) => panic!("unknown provider must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1 .0.error.contains("nonexistent"));
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ import type {
   CatalogueFetchProgress,
   CatalogueProbe,
   CatalogueSearchResponse,
+  CatalogueRemoveResponse,
   CatalogueStatus,
   CatalogueSyncResponse,
   BrowseRequest,
@@ -907,6 +908,16 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw await responseError(res, "catalogueSync");
     return res.json() as Promise<CatalogueSyncResponse>;
+  }
+
+  async catalogueRemove(provider: string): Promise<CatalogueRemoveResponse> {
+    const res = await fetch("/api/catalogue/remove", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider }),
+    });
+    if (!res.ok) throw await responseError(res, "catalogueRemove");
+    return res.json() as Promise<CatalogueRemoveResponse>;
   }
 
   async catalogueAcquire(url: string, filename?: string): Promise<CatalogueDownload> {

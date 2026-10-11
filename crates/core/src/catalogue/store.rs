@@ -338,6 +338,28 @@ impl CatalogueStore {
         Ok(outcome)
     }
 
+    /// Withdraws one provider from the mirror: every record it supplied, and
+    /// the note of when it supplied them. Returns how many records went.
+    ///
+    /// The sync row goes with the records because together they are what
+    /// "held" means: a provider with a sync time and no records would read as
+    /// one that was fetched and found empty, which is not what happened. The
+    /// FTS index follows by trigger.
+    ///
+    /// A provider the mirror holds nothing for removes nothing and is not an
+    /// error; whether the id names anything at all is the caller's to decide,
+    /// since the store does not know the registry.
+    pub fn remove_provider(&mut self, provider: &str) -> anyhow::Result<usize> {
+        let tx = self.conn.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM catalogue_records WHERE provider = ?1",
+            [provider],
+        )?;
+        tx.execute("DELETE FROM catalogue_sync WHERE provider = ?1", [provider])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// BM25 recall over the mirror. See the module docs for why this is not a
     /// ranking.
     ///
@@ -906,6 +928,53 @@ mod tests {
             .hits;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record.title, "Kept Book");
+    }
+
+    #[test]
+    fn removing_a_provider_takes_its_records_its_sync_and_its_recall() {
+        let mut store = CatalogueStore::in_memory().unwrap();
+        store
+            .replace_provider(
+                "libretexts",
+                &[record(
+                    "a",
+                    "Thermodynamics",
+                    "Heat and entropy",
+                    CatalogueGrain::Textbook,
+                )],
+            )
+            .unwrap();
+        store
+            .replace_provider(
+                "devdocs",
+                &[record(
+                    "b",
+                    "Thermodynamics tables",
+                    "Reference values",
+                    CatalogueGrain::Reference,
+                )],
+            )
+            .unwrap();
+
+        assert_eq!(store.remove_provider("libretexts").unwrap(), 1);
+
+        let status = store.status().unwrap();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].provider, "devdocs");
+        let recall = store.search("thermodynamics", &[], 10).unwrap();
+        assert_eq!(recall.hits.len(), 1);
+        assert_eq!(recall.hits[0].record.provider, "devdocs");
+        let synced: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM catalogue_sync WHERE provider = 'libretexts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(synced, 0);
+        // Nothing left to take, and saying so is not a failure.
+        assert_eq!(store.remove_provider("libretexts").unwrap(), 0);
     }
 
     #[test]

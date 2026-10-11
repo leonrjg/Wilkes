@@ -370,6 +370,49 @@ pub async fn sync(
     })
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct CatalogueRemoveResponse {
+    pub provider: String,
+    /// How many records the mirror held for it. Zero for a catalogue that had
+    /// never been fetched.
+    pub removed: usize,
+    pub total_records: i64,
+}
+
+/// Drops one catalogue from the mirror, so that it is no longer searched.
+///
+/// The mirror is what says which catalogues this installation has: there is no
+/// separate list of the ones switched on, so removing a catalogue is removing
+/// what was fetched from it, and fetching it again is how it comes back.
+///
+/// Any provider [`status`] lists can be named — one this build registers, or
+/// one it no longer does but the mirror still holds rows for. The second is the
+/// only way those rows can ever leave, since nothing can sync over them.
+pub fn remove(
+    catalogue_dir: &Path,
+    provider: String,
+) -> Result<CatalogueRemoveResponse, CatalogueError> {
+    let mut store = open(catalogue_dir)?;
+    let registered = registry().iter().any(|source| source.id() == provider);
+    let removed = store
+        .remove_provider(&provider)
+        .map_err(|error| CatalogueError::Failed(format!("Catalogue removal failed: {error:#}")))?;
+    if removed == 0 && !registered {
+        return Err(CatalogueError::Request(format!(
+            "Unknown catalogue provider {provider:?}"
+        )));
+    }
+    tracing::info!(provider = %provider, removed, "catalogue removed from the mirror");
+    let total_records = store
+        .total_records()
+        .map_err(|error| CatalogueError::Failed(format!("Catalogue count failed: {error:#}")))?;
+    Ok(CatalogueRemoveResponse {
+        provider,
+        removed,
+        total_records,
+    })
+}
+
 /// Fetches a candidate's bytes into this workspace's uploads directory.
 ///
 /// Uploads rather than a library root because this is Wilkes writing into its
@@ -695,6 +738,58 @@ mod tests {
         assert_eq!(events[0].1["provider"], "libretexts");
         assert_eq!(events[0].1["pages"], 3);
         assert_eq!(events[0].1["records"], 300);
+    }
+
+    #[test]
+    fn removing_a_catalogue_returns_it_to_never_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = registry()[0].id().to_string();
+        {
+            let mut store = CatalogueStore::open(dir.path()).unwrap();
+            store
+                .replace_provider(
+                    &provider,
+                    &[wilkes_core::types::CatalogueRecord {
+                        provider: provider.clone(),
+                        external_id: "a".into(),
+                        title: "Linear Algebra".into(),
+                        summary: String::new(),
+                        subject: String::new(),
+                        authors: String::new(),
+                        license: String::new(),
+                        landing_url: None,
+                        pdf_url: None,
+                        outline_url: None,
+                        grain: registry()[0].grain(),
+                        pages: None,
+                    }],
+                )
+                .unwrap();
+        }
+
+        let response = remove(dir.path(), provider.clone()).unwrap();
+        assert_eq!(response.removed, 1);
+        assert_eq!(response.total_records, 0);
+        // Still listed, because this build can fetch it again.
+        let listed = status(dir.path()).unwrap();
+        let row = listed
+            .providers
+            .iter()
+            .find(|row| row.provider == provider)
+            .unwrap();
+        assert_eq!(row.records, 0);
+        assert!(row.synced_at_ms.is_none());
+        // A registered catalogue holding nothing is removed without complaint.
+        assert_eq!(remove(dir.path(), provider).unwrap().removed, 0);
+    }
+
+    #[test]
+    fn removing_a_provider_nobody_knows_is_the_callers_mistake() {
+        let dir = tempfile::tempdir().unwrap();
+        match remove(dir.path(), "nonexistent".into()) {
+            Err(CatalogueError::Request(message)) => assert!(message.contains("nonexistent")),
+            other => panic!("expected a request fault, got {other:?}"),
+        }
     }
 
     #[tokio::test]

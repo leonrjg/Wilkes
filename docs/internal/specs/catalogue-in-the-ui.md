@@ -243,6 +243,18 @@ A `catalogue` tab in `SettingsModal`'s union, in its own nav group, showing
 - **One `Sync now` button, per-provider results.** The sync already reports
   outcomes per provider; a single global "failed" would hide that three of four
   succeeded, which is the ordinary case when one provider changes its wire shape.
+- **A catalogue can be removed, and the mirror is what remembers that.**
+  `Remove` on a held catalogue drops its records and its sync time
+  (`CatalogueStore::remove_provider`, `catalogue_remove` on desktop, `POST
+  /api/catalogue/remove` on the server), so it is no longer searched and reads
+  *Never synced* again. There is no separate list of catalogues switched on:
+  held is the only state, and syncing is how a catalogue comes back. The top
+  button therefore refreshes the catalogues the mirror holds — *Sync held* —
+  and is *Sync all* only when that is every one of them or none; a refresh
+  that refetched a removed catalogue would have undone the removal. Removing
+  takes a second click on the same button, because refetching is minutes. A
+  provider the mirror holds rows for but this build no longer registers can be
+  removed too, which is the only way those rows ever leave.
 - **Manual only, in v1.** No sync-on-startup and no staleness timer. Four
   whole-catalogue fetches is a network call the user did not ask for, and the one
   honest trigger — the mirror being empty when someone first opens the pane — is

@@ -46,6 +46,9 @@ describe("CataloguePanel", () => {
   const api = {
     catalogueStatus: vi.fn(() => Promise.resolve(UNSYNCED)),
     catalogueSync: vi.fn(() => Promise.resolve(syncResponse())),
+    catalogueRemove: vi.fn((provider: string) =>
+      Promise.resolve({ provider, removed: 2_219, total_records: 0 }),
+    ),
     onCatalogueSyncProgress: vi.fn(() => Promise.resolve(() => {})),
   } as never;
 
@@ -137,6 +140,49 @@ describe("CataloguePanel", () => {
     withStatus(SYNCED);
     render(<CataloguePanel api={api} isActive />);
     expect(await screen.findByText(/2,219 records · 3 days ago/)).toBeTruthy();
+  });
+
+  /// Refetching a catalogue is minutes, so one click must not be enough to
+  /// drop it.
+  it("removes a held catalogue on the second click, and only a held one", async () => {
+    const remove = (api as unknown as { catalogueRemove: ReturnType<typeof vi.fn> })
+      .catalogueRemove;
+    withStatus(SYNCED);
+    render(<CataloguePanel api={api} isActive />);
+    await screen.findByText("LibreTexts");
+    // Nothing was fetched from MIT OpenCourseWare, so there is nothing to drop.
+    expect(screen.queryByLabelText("Remove MIT OpenCourseWare")).toBeNull();
+
+    fireEvent.click(screen.getByLabelText("Remove LibreTexts"));
+    expect(remove).not.toHaveBeenCalled();
+    withStatus(UNSYNCED);
+    fireEvent.click(screen.getByLabelText("Confirm removing LibreTexts"));
+    await waitFor(() => expect(remove).toHaveBeenCalledWith("libretexts"));
+    await waitFor(() => expect(screen.getAllByText("Never synced").length).toBe(2));
+    expect(screen.queryByLabelText("Remove LibreTexts")).toBeNull();
+  });
+
+  it("disarms a removal the user looked away from", async () => {
+    withStatus(SYNCED);
+    render(<CataloguePanel api={api} isActive />);
+    await screen.findByText("LibreTexts");
+    const button = screen.getByLabelText("Remove LibreTexts");
+    fireEvent.click(button);
+    fireEvent.blur(screen.getByLabelText("Confirm removing LibreTexts"));
+    expect(screen.getByLabelText("Remove LibreTexts")).toBeTruthy();
+  });
+
+  /// A removed catalogue that the next refresh fetched again would not have
+  /// been removed.
+  it("refreshes only the catalogues the mirror holds", async () => {
+    withStatus(SYNCED);
+    render(<CataloguePanel api={api} isActive />);
+    await screen.findByText("LibreTexts");
+    fireEvent.click(screen.getByText("Sync held"));
+    const sync = (api as unknown as { catalogueSync: ReturnType<typeof vi.fn> })
+      .catalogueSync;
+    await waitFor(() => expect(sync.mock.calls.length).toBe(1));
+    expect(sync.mock.calls[0][0]).toEqual(["libretexts"]);
   });
 
   /// The mirror is installation-wide now; a panel that read as workspace-scoped

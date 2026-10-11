@@ -1554,6 +1554,13 @@ export interface CatalogueSyncResponse {
   total_records: number;
 }
 
+/** What removing one catalogue from the mirror took with it. */
+export interface CatalogueRemoveResponse {
+  provider: string;
+  removed: number;
+  total_records: number;
+}
+
 /** How far one provider's fetch has got. `records` rather than a percentage:
  *  no catalogue says how much it holds before it has been walked, and the one
  *  that publishes a total is wrong by about 1,700 books. */

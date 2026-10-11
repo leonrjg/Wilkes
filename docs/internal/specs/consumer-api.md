@@ -393,6 +393,7 @@ route and fail to match it against the other.
 | POST | `/api/catalogue/sync` | `underdog/catalogue/sync` |
 | GET | `/api/catalogue/status` | `underdog/catalogue/status` |
 | POST | `/api/catalogue/acquire` | `underdog/catalogue/acquire` |
+| POST | `/api/catalogue/remove` | — (new) |
 
 The mirror is one per *installation*, in
 `shared_data_dir/catalogue`, alongside the model cache and the managed

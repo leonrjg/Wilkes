@@ -4,6 +4,14 @@
 
 ### Added
 
+- The sidebar remembers which folders are closed. It is kept per workspace and
+  survives a root switch and a restart; a folder that appears later still opens
+  by default.
+- A learning catalogue can be removed in Settings. Removing drops its records
+  from the mirror, so it is no longer searched, and syncing it again brings it
+  back (`POST /api/catalogue/remove`). The panel's one button now refreshes the
+  catalogues the mirror holds rather than every catalogue, so a removed one
+  stays removed.
 - Literature filters are no longer kinds. A filter is a clause and a statement
   of where its value comes from — a closed list, a typed integer, number, date
   or text, the provider's own suggestions as you type, or a result row — so a

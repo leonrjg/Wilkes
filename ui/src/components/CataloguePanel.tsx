@@ -44,6 +44,12 @@ function providerLabel(provider: string): string {
   return PROVIDER_LABELS[provider] ?? provider;
 }
 
+/** Whether the mirror has this catalogue: it was fetched, or — for one this
+ *  build no longer registers — its rows are still there. */
+function isHeld(provider: CatalogueProviderStatus): boolean {
+  return provider.synced_at_ms !== null || provider.records > 0;
+}
+
 function formatSyncedAt(syncedAtMs: number | null): string {
   if (syncedAtMs === null) return "Never";
   const elapsed = Date.now() - syncedAtMs;
@@ -86,6 +92,10 @@ export default function CataloguePanel({ api, isActive }: Props) {
    *  fetch is minutes long; without this the row says "Fetching…" and then
    *  jumps to a final count, which is indistinguishable from being stuck. */
   const [fetching, setFetching] = useState<Record<string, CatalogueFetchProgress>>({});
+  const [removing, setRemoving] = useState<string | null>(null);
+  /** The provider whose Remove has been clicked once. Refetching a catalogue is
+   *  minutes, so dropping one takes a second click on the same button. */
+  const [armed, setArmed] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -167,7 +177,31 @@ export default function CataloguePanel({ api, isActive }: Props) {
     await refresh();
   };
 
-  const busy = syncing !== null;
+  /**
+   * Drops one catalogue from the mirror.
+   *
+   * The row's last sync report goes with it: "2,219 stored" under a catalogue
+   * that now holds nothing would be this panel contradicting the mirror.
+   */
+  const removeProvider = async (provider: string) => {
+    setError(null);
+    setArmed(null);
+    setRemoving(provider);
+    try {
+      await api.catalogueRemove(provider);
+      setReports((prev) => {
+        const { [provider]: _removed, ...rest } = prev;
+        return rest;
+      });
+    } catch (e: any) {
+      console.error("catalogue: removal failed", e);
+      setError(e?.toString?.() ?? "Could not remove the catalogue");
+    }
+    setRemoving(null);
+    await refresh();
+  };
+
+  const busy = syncing !== null || removing !== null;
 
   if (error && status === null) {
     return (
@@ -195,6 +229,12 @@ export default function CataloguePanel({ api, isActive }: Props) {
   }
 
   const empty = status.total_records === 0;
+  // The mirror is what says which catalogues this installation has, so the one
+  // button refreshes those and leaves a removed catalogue removed. With none
+  // held there is nothing to refresh, and it fills the mirror instead.
+  const held = status.providers.filter(isHeld);
+  const syncTargets = held.length > 0 ? held : status.providers;
+  const syncsEverything = syncTargets.length === status.providers.length;
 
   return (
     <div className="flex flex-col gap-6">
@@ -222,11 +262,11 @@ export default function CataloguePanel({ api, isActive }: Props) {
               </span>
             </div>
             <button
-              onClick={() => syncProviders(status.providers.map((p) => p.provider))}
+              onClick={() => syncProviders(syncTargets.map((p) => p.provider))}
               disabled={busy}
               className="px-3 py-1.5 bg-[var(--bg-app)] hover:bg-[var(--bg-active)] text-[var(--text-main)] text-[10px] font-bold uppercase tracking-wider rounded border border-[var(--border-main)] transition-colors disabled:opacity-50"
             >
-              {busy ? "Syncing…" : "Sync all"}
+              {syncing !== null ? "Syncing…" : syncsEverything ? "Sync all" : "Sync held"}
             </button>
           </div>
 
@@ -248,6 +288,10 @@ export default function CataloguePanel({ api, isActive }: Props) {
                 queued={queued.includes(provider.provider)}
                 disabled={busy}
                 onSync={() => syncProviders([provider.provider])}
+                removing={removing === provider.provider}
+                armed={armed === provider.provider}
+                onArm={(next) => setArmed(next ? provider.provider : null)}
+                onRemove={() => removeProvider(provider.provider)}
               />
             ))}
           </div>
@@ -269,6 +313,10 @@ function ProviderRow({
   queued,
   disabled,
   onSync,
+  removing,
+  armed,
+  onArm,
+  onRemove,
 }: {
   provider: CatalogueProviderStatus;
   report: ProviderReport | null;
@@ -277,6 +325,10 @@ function ProviderRow({
   queued: boolean;
   disabled: boolean;
   onSync: () => void;
+  removing: boolean;
+  armed: boolean;
+  onArm: (armed: boolean) => void;
+  onRemove: () => void;
 }) {
   const failed =
     report !== null &&
@@ -297,35 +349,65 @@ function ProviderRow({
             failed ? "text-red-400" : "text-[var(--text-muted)]"
           }`}
         >
-          {syncing
-            ? progress === null
-              ? "Fetching…"
-              : `Fetching… page ${progress.pages.toLocaleString()}, ${progress.records.toLocaleString()} records`
-            : queued
-              ? "Waiting"
-              : report !== null
-                ? outcomeSummary(report)
-                : provider.synced_at_ms === null
-                  ? "Never synced"
-                  : `${provider.records.toLocaleString()} records · ${formatSyncedAt(provider.synced_at_ms)}`}
+          {removing
+            ? "Removing…"
+            : syncing
+              ? progress === null
+                ? "Fetching…"
+                : `Fetching… page ${progress.pages.toLocaleString()}, ${progress.records.toLocaleString()} records`
+              : queued
+                ? "Waiting"
+                : report !== null
+                  ? outcomeSummary(report)
+                  : provider.synced_at_ms === null
+                    ? "Never synced"
+                    : `${provider.records.toLocaleString()} records · ${formatSyncedAt(provider.synced_at_ms)}`}
         </span>
       </div>
-      <Tooltip
-        content={
-          provider.synced_at_ms === null
-            ? "Fetch this catalogue for the first time"
-            : "Replace this catalogue's records with what it publishes now"
-        }
-      >
-        <button
-          onClick={onSync}
-          disabled={disabled}
-          aria-label={`Sync ${providerLabel(provider.provider)}`}
-          className="px-2.5 py-1 shrink-0 bg-[var(--bg-app)] hover:bg-[var(--bg-active)] text-[var(--text-main)] text-[10px] font-bold uppercase tracking-wider rounded border border-[var(--border-main)] transition-colors disabled:opacity-50"
+      <div className="flex shrink-0 items-center gap-1.5">
+        {isHeld(provider) && (
+          <Tooltip
+            content={
+              armed
+                ? "Click again to drop these records from the mirror"
+                : "Stop searching this catalogue and drop its records. Syncing it again brings it back."
+            }
+          >
+            <button
+              onClick={armed ? onRemove : () => onArm(true)}
+              // Both, because a WebKit button is not focused by a click and
+              // so never blurs.
+              onBlur={() => onArm(false)}
+              onMouseLeave={() => onArm(false)}
+              disabled={disabled}
+              aria-label={`${armed ? "Confirm removing" : "Remove"} ${providerLabel(provider.provider)}`}
+              className={`px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider rounded border transition-colors disabled:opacity-50 ${
+                armed
+                  ? "bg-red-900/20 border-red-900/50 text-red-400 hover:bg-red-900/30"
+                  : "bg-[var(--bg-app)] hover:bg-[var(--bg-active)] border-[var(--border-main)] text-[var(--text-muted)]"
+              }`}
+            >
+              {removing ? "…" : armed ? "Confirm" : "Remove"}
+            </button>
+          </Tooltip>
+        )}
+        <Tooltip
+          content={
+            provider.synced_at_ms === null
+              ? "Fetch this catalogue for the first time"
+              : "Replace this catalogue's records with what it publishes now"
+          }
         >
-          {syncing ? "…" : "Sync"}
-        </button>
-      </Tooltip>
+          <button
+            onClick={onSync}
+            disabled={disabled}
+            aria-label={`Sync ${providerLabel(provider.provider)}`}
+            className="px-2.5 py-1 bg-[var(--bg-app)] hover:bg-[var(--bg-active)] text-[var(--text-main)] text-[10px] font-bold uppercase tracking-wider rounded border border-[var(--border-main)] transition-colors disabled:opacity-50"
+          >
+            {syncing ? "…" : "Sync"}
+          </button>
+        </Tooltip>
+      </div>
     </div>
   );
 }
