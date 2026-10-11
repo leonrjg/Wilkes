@@ -6,42 +6,28 @@ import type {
   CatalogueCourseProgress,
   CatalogueDownloadProgress,
   CatalogueGrain,
-  CatalogueHit,
   LiteratureProviderAnswer,
   LiteratureProviderInfo,
   LiteratureSearchResult,
 } from "../lib/types";
 
-export const ALL_GRAINS: CatalogueGrain[] = ["textbook", "course", "reference"];
-
-/** Records per catalogue probe. Ten, because the pane is a list of things to
- *  consider acquiring and not a second search result page: a strip long enough
- *  to scroll past is one nobody reads to the end of. */
-export const CATALOGUE_LIMIT = 10;
-
 /** Where the pane's standing choices live. Still named for the filters it
  *  first held, so that upgrading does not silently reset one. */
 const PREFERENCES_STORAGE_KEY = "wilkes.catalogue.filters";
 
-/** The two halves of the pane, named so a preference can say which it means. */
-export type PaneSection = "catalogues" | "literature";
-
-export const ALL_SECTIONS: PaneSection[] = ["catalogues", "literature"];
-
 /**
- * What each half of the pane is filtered to.
+ * Which sources the pane asks.
  *
  * `null` is *every one of them, including any added later* — the default, and
- * not the same as a selection that happens to name them all: a literature
- * provider the user enables tomorrow joins a `null` selection and would be
- * missing from an enumerated one. An empty array is the other end: nothing
- * selected, so that half is not searched at all.
+ * not the same as a selection that happens to name them all: a provider the
+ * user enables tomorrow, or a catalogue they fetch, joins a `null` selection
+ * and would be missing from an enumerated one. An empty array is the other
+ * end: nothing selected, so nothing is searched at all.
  *
- * Two selections rather than one, because they filter different systems. The
- * grains are the mirror's own vocabulary and mean nothing to a literature
- * provider; the providers are services the user configured and have no grain.
- * The single merged list this replaced put a "Papers" chip beside "Textbooks"
- * and so had to call every live source a paper, which several of them are not.
+ * One selection, because there is one kind of source. A learning catalogue is
+ * a provider like any other, answered from a copy on this machine; the grain
+ * filter this pane once had beside the provider filter named the same four
+ * catalogues a second way.
  */
 export type Selection<T> = T[] | null;
 
@@ -65,53 +51,46 @@ export function toggled<T>(selection: Selection<T>, all: T[], item: T): Selectio
     : all.filter((member) => current.includes(member) || member === item);
 }
 
-function sameSelection<T>(a: Selection<T>, b: Selection<T>): boolean {
-  if (a === null || b === null) return a === b;
-  return a.length === b.length && a.every((member) => b.includes(member));
-}
-
 /**
- * Everything about the pane that outlives one question.
+ * What the pane stored before a catalogue was a provider: a grain filter over
+ * the mirror beside the provider filter, which then named no catalogue.
  *
- * Which sources to ask and which half to look at are both standing choices
- * about how this pane is used, so they are one stored object and one pair of
- * helpers rather than a second storage mechanism beside the first.
- *
- * They are not the same kind of choice, though, and the store never conflates
- * them: a filter decides what is *asked*, and collapsing decides what is
- * *shown*. A collapsed section is still searched, so opening it shows the
- * answer to the question that was asked rather than a blank that needs a
- * re-run.
+ * Read once, to be turned into today's one selection when the provider list
+ * arrives ([`migrated`]) — the list is what says which provider serves which
+ * grain. Undefined when what was stored is already today's shape.
  */
-interface PanePreferences {
-  grains: Selection<CatalogueGrain>;
+type LegacyGrains = { grains: Selection<CatalogueGrain> } | undefined;
+
+interface StoredPreferences {
   providers: Selection<string>;
-  collapsed: PaneSection[];
+  legacy: LegacyGrains;
 }
 
-function readPreferences(): PanePreferences {
-  const empty: PanePreferences = { grains: null, providers: null, collapsed: [] };
+const GRAINS: CatalogueGrain[] = ["textbook", "course", "reference"];
+
+function readPreferences(): StoredPreferences {
+  const empty: StoredPreferences = { providers: null, legacy: undefined };
   if (typeof localStorage === "undefined") return empty;
   try {
     const raw = localStorage.getItem(PREFERENCES_STORAGE_KEY);
     if (raw === null) return empty;
     const parsed = JSON.parse(raw) as unknown;
     if (typeof parsed !== "object" || parsed === null) return empty;
-    const stored = parsed as Partial<PanePreferences>;
+    const stored = parsed as { providers?: unknown; grains?: unknown };
     return {
-      grains: Array.isArray(stored.grains)
-        ? stored.grains.filter((grain): grain is CatalogueGrain =>
-            ALL_GRAINS.includes(grain as CatalogueGrain),
-          )
-        : null,
       providers: Array.isArray(stored.providers)
         ? stored.providers.filter((id): id is string => typeof id === "string")
         : null,
-      collapsed: Array.isArray(stored.collapsed)
-        ? stored.collapsed.filter((section): section is PaneSection =>
-            ALL_SECTIONS.includes(section as PaneSection),
-          )
-        : [],
+      legacy:
+        "grains" in stored
+          ? {
+              grains: Array.isArray(stored.grains)
+                ? stored.grains.filter((grain): grain is CatalogueGrain =>
+                    GRAINS.includes(grain as CatalogueGrain),
+                  )
+                : null,
+            }
+          : undefined,
     };
   } catch (error) {
     console.error("catalogue pane preferences could not be read from storage:", error);
@@ -119,10 +98,10 @@ function readPreferences(): PanePreferences {
   }
 }
 
-function persistPreferences(preferences: PanePreferences): void {
+function persistPreferences(providers: Selection<string>): void {
   if (typeof localStorage === "undefined") return;
   try {
-    localStorage.setItem(PREFERENCES_STORAGE_KEY, JSON.stringify(preferences));
+    localStorage.setItem(PREFERENCES_STORAGE_KEY, JSON.stringify({ providers }));
   } catch (error) {
     // The choice still holds for this session; only its memory is lost.
     console.error("catalogue pane preferences could not be stored:", error);
@@ -130,25 +109,28 @@ function persistPreferences(preferences: PanePreferences): void {
 }
 
 /**
- * One probe's answer, kept apart from the query that produced it.
- *
- * `terms` is what the query reduced to. An empty `hits` with empty `terms` is
- * "nothing in what you typed was searchable", which is a different sentence
- * from "the catalogues hold nothing on this" — and the only way to tell them
- * apart, since the filtering rules live in the store and are not repeated here.
- *
- * `grains` is what the probe was filtered to, so a chip toggle can tell
- * whether this answer still describes the selection.
+ * The one selection the two old filters amount to: the providers that were
+ * selected, and the catalogues whose grain was. Null where that is every
+ * source that is on, so a source added later still joins it.
  */
-export interface CatalogueAnswer {
-  query: string;
-  grains: Selection<CatalogueGrain>;
-  terms: string[];
-  hits: CatalogueHit[];
+function migrated(
+  providers: Selection<string>,
+  grains: Selection<CatalogueGrain>,
+  options: LiteratureProviderInfo[],
+): Selection<string> {
+  if (providers === null && grains === null) return null;
+  const chosen = options
+    .filter((option) =>
+      option.mirror !== null
+        ? selects(grains, option.mirror.grain)
+        : selects(providers, option.provider),
+    )
+    .map((option) => option.provider);
+  return enabledProviderIds(options).every((id) => chosen.includes(id)) ? null : chosen;
 }
 
 /**
- * What the literature providers answered to one query.
+ * What the providers answered to one query.
  *
  * `asked` is which providers the entries actually cover. It is not derivable
  * from `providers`, because narrowing the filter and then widening it again
@@ -252,25 +234,19 @@ export interface Acquirable {
 interface CatalogueStore {
   paneOpen: boolean;
   query: string;
-  /** Which catalogue grains the mirror is asked for. */
-  grains: Selection<CatalogueGrain>;
-  /** Which literature providers are asked. Held by id; the names come from
+  /** Which providers are asked. Held by id; the names come from
    *  `providerOptions`, which is the registry's answer and not this store's. */
   providers: Selection<string>;
-  /** Which halves of the pane are rolled up. A display choice, not a filter:
-   *  a collapsed section is still searched, so opening it shows the answer to
-   *  the question that was asked rather than a blank. */
-  collapsed: PaneSection[];
-  /** Every literature provider this installation knows, enabled ones included
-   *  and disabled ones too, as the backend registry orders them. Empty until
-   *  `loadProviders` has answered. */
+  /** The grain filter an older build stored, until the provider list arrives
+   *  to say which catalogues it meant. */
+  legacy: LegacyGrains;
+  /** Every provider this installation knows — the learning catalogues and the
+   *  remote indexes, on or off — as the backend registry orders them. Empty
+   *  until `loadProviders` has answered. */
   providerOptions: LiteratureProviderInfo[];
   /** Why the provider list could not be read. The pane says so rather than
    *  showing an empty filter row that looks like "no providers configured". */
   providerOptionsError: string | null;
-  loading: boolean;
-  answer: CatalogueAnswer | null;
-  error: string | null;
   literatureLoading: boolean;
   /** The providers whose next page is on its way. */
   literatureMore: string[];
@@ -314,7 +290,7 @@ interface CatalogueStore {
    *  course is dozens of manifest reads and then dozens of downloads, and the
    *  byte stream above cannot say which of them it is reporting. */
   courseProgress: Record<string, CatalogueCourseProgress>;
-  /** What each acquired course produced, per hit key: the directory, the
+  /** What each acquired course produced, per result key: the directory, the
    *  generated document, and what was refused. Kept so a row can say "14
    *  documents, 4 videos skipped" instead of only "added". */
   courses: Record<string, CatalogueCourse>;
@@ -330,9 +306,7 @@ interface CatalogueStore {
   openPane: () => void;
   closePane: () => void;
   setQuery: (query: string) => void;
-  toggleGrain: (grain: CatalogueGrain) => void;
   toggleProvider: (provider: string) => void;
-  toggleSection: (section: PaneSection) => void;
   setBrowseOpen: (open: boolean) => void;
   /** Sets one filter of one provider to these values; none is no filter.
    *  `labels` says what the values are called, for values a person cannot
@@ -363,65 +337,32 @@ interface CatalogueStore {
   /** The next page of one provider's keyword answer, appended to what it has
    *  already said. */
   loadMoreLiterature: (provider: string) => Promise<void>;
-  /** Runs the query afresh against both halves, each as its filter says. */
+  /** Runs the query afresh against every selected provider. */
   search: (query: string) => Promise<void>;
   /** Fetches one file into uploads. Returns the staged path, and raises if it
    *  could not be fetched — the caller drives the whole add and is the one
    *  place that says what became of it. */
   acquire: (item: Acquirable) => Promise<string>;
-  /** Fetches a whole course. Returns the folder it belongs in and the paths
-   *  to import — the generated document first, because it is the thing that
-   *  makes the rest a course. Null means the hit is not a course at all,
-   *  which is a caller's mistake rather than a failed fetch; a failed fetch
-   *  raises. */
+  /** Fetches a whole course from its landing page. Returns the folder it
+   *  belongs in and the paths to import — the generated document first,
+   *  because it is the thing that makes the rest a course. Raises if it could
+   *  not be fetched. */
   acquireCourse: (
-    hit: CatalogueHit,
-  ) => Promise<{ folder: string; paths: string[] } | null>;
+    key: string,
+    courseUrl: string,
+  ) => Promise<{ folder: string; paths: string[] }>;
   reset: () => void;
 }
 
-/** The catalogue key of a hit: unique per provider, not across providers. */
-export function hitKey(hit: CatalogueHit): string {
-  return `${hit.provider}:${hit.external_id}`;
-}
-
-/** The key of a paper. Prefixed because a literature provider's id and a
- *  catalogue provider's id live in different namespaces that could collide. */
+/** The key of a result: unique per provider, not across providers. */
 export function paperKey(provider: string, work: LiteratureSearchResult): string {
   return `literature:${provider}:${work.id}`;
 }
 
-// Each half of a search records the request it belongs to. A literature
-// provider can take seconds to answer, and a reply to a query the user has
-// since replaced must not overwrite the answer to the new one.
-let catalogueRequest = 0;
+// A search records the request it belongs to. A remote provider can take
+// seconds to answer, and a reply to a query the user has since replaced must
+// not overwrite the answer to the new one.
 let literatureRequest = 0;
-
-async function searchCatalogue(
-  set: (partial: Partial<CatalogueStore>) => void,
-  query: string,
-  grains: Selection<CatalogueGrain>,
-): Promise<void> {
-  const request = ++catalogueRequest;
-  set({ loading: true, error: null });
-  try {
-    const response = await api.catalogueSearch(
-      [{ key: "pane", text: query, grains }],
-      CATALOGUE_LIMIT,
-    );
-    if (request !== catalogueRequest) return;
-    const result = response.results.find((r) => r.key === "pane");
-    set({
-      loading: false,
-      answer: result
-        ? { query, grains, terms: result.terms, hits: result.hits }
-        : { query, grains, terms: [], hits: [] },
-    });
-  } catch (e: any) {
-    if (request !== catalogueRequest) return;
-    set({ loading: false, answer: null, error: e?.toString?.() ?? "Catalogue search failed" });
-  }
-}
 
 /**
  * Asks the named providers and folds their answers into what is already held.
@@ -514,14 +455,9 @@ function inRegistryOrder(
   return [...answers].sort((a, b) => rank(a) - rank(b));
 }
 
-/** The stored half of the store's state, for a writer that is changing one
- *  field of it and must not drop the others. */
-function preferences(state: CatalogueStore): PanePreferences {
-  return { grains: state.grains, providers: state.providers, collapsed: state.collapsed };
-}
-
-/** The ids of the providers the user has switched on, in registry order. A
- *  disabled one is never asked, so it is never part of a resolved selection. */
+/** The ids of the providers that are on, in registry order: a remote one the
+ *  user enabled, a catalogue the mirror holds. One that is off is never asked,
+ *  so it is never part of a resolved selection. */
 export function enabledProviderIds(options: LiteratureProviderInfo[]): string[] {
   return options.filter((option) => option.enabled).map((option) => option.provider);
 }
@@ -761,9 +697,6 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
   ...readPreferences(),
   providerOptions: [],
   providerOptionsError: null,
-  loading: false,
-  answer: null,
-  error: null,
   literatureLoading: false,
   literatureMore: [],
   literatureMoreError: {},
@@ -802,31 +735,11 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
   closePane: () => set({ paneOpen: false }),
   setQuery: (query) => set({ query }),
 
-  toggleGrain: (grain) => {
-    const next = toggled(get().grains, ALL_GRAINS, grain);
-    set({ grains: next });
-    persistPreferences({ ...preferences(get()), grains: next });
-    const query = get().query.trim();
-    if (!query) return;
-    // A grain toggle touches the mirror alone. It must not send the query to
-    // every literature provider again: those are rate-limited services on the
-    // other side of the network, and their answer has not changed.
-    if (!selectsAny(next)) {
-      catalogueRequest++;
-      set({ answer: null, error: null, loading: false });
-      return;
-    }
-    const answer = get().answer;
-    if (answer === null || answer.query !== query || !sameSelection(answer.grains, next)) {
-      void searchCatalogue(set, query, next);
-    }
-  },
-
   toggleProvider: (provider) => {
     const enabled = enabledProviderIds(get().providerOptions);
     const next = toggled(get().providers, enabled, provider);
     set({ providers: next });
-    persistPreferences({ ...preferences(get()), providers: next });
+    persistPreferences(next);
     // A filtered listing follows its provider's chip: switching the provider
     // off removes it and switching it on asks for it, as it would a search.
     if (browseProviderIds(get().providerOptions).includes(provider)) {
@@ -848,15 +761,6 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       (id) => !listed.includes(id),
     );
     if (missing.length > 0) void searchLiterature(set, get, query, missing, true);
-  },
-
-  toggleSection: (section) => {
-    const collapsed = get().collapsed;
-    const next = collapsed.includes(section)
-      ? collapsed.filter((member) => member !== section)
-      : [...collapsed, section];
-    set({ collapsed: next });
-    persistPreferences({ ...preferences(get()), collapsed: next });
   },
 
   setBrowseOpen: (open) => set({ browseOpen: open }),
@@ -954,13 +858,23 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
     try {
       const options = await api.literatureProviders();
       const known = options.map((option) => option.provider);
-      const stored = get().providers;
+      const legacy = get().legacy;
+      const stored =
+        legacy === undefined ? get().providers : migrated(get().providers, legacy.grains, options);
       // A selection naming a provider that no longer exists would be refused
       // by the backend on every search, so it is pruned here rather than sent.
       const pruned = stored === null ? null : stored.filter((id) => known.includes(id));
-      set({ providerOptions: options, providerOptionsError: null, providers: pruned });
-      if (stored !== null && pruned !== null && pruned.length !== stored.length) {
-        persistPreferences({ ...preferences(get()), providers: pruned });
+      set({
+        providerOptions: options,
+        providerOptionsError: null,
+        providers: pruned,
+        legacy: undefined,
+      });
+      if (
+        legacy !== undefined ||
+        (stored !== null && pruned !== null && pruned.length !== stored.length)
+      ) {
+        persistPreferences(pruned);
       }
     } catch (e: any) {
       const message = e?.toString?.() ?? "Literature providers could not be listed";
@@ -1034,12 +948,8 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
     const trimmed = query.trim();
     const listed = refinedProviderIds(get());
     if (!trimmed) {
-      catalogueRequest++;
       literatureRequest++;
       set({
-        answer: null,
-        error: null,
-        loading: false,
         literature: null,
         literatureError: null,
         literatureLoading: false,
@@ -1050,7 +960,7 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       return;
     }
     set({ query, acquireError: null });
-    const { grains, providers, providerOptions } = get();
+    const { providers, providerOptions } = get();
     // A provider shown as a filtered listing is asked by the listing, with the
     // keyword beside its filters, and left out of the keyword search.
     const searched =
@@ -1060,16 +970,12 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
             (id) => !listed.includes(id),
           );
     const searchesLiterature = selectsAny(searched);
-    // Both halves run at once and land independently: the mirror is local and
-    // answers in milliseconds, and it should not wait on a remote index. A
-    // fresh query replaces what the providers said rather than merging into
+    // A fresh query replaces what the providers said rather than merging into
     // it — the held answers belong to the question that was asked before.
     await Promise.all([
-      selectsAny(grains) ? searchCatalogue(set, trimmed, grains) : null,
       searchesLiterature ? searchLiterature(set, get, trimmed, searched, false) : null,
       ...applyListings(set, get, trimmed, browseProviderIds(providerOptions)).requests,
     ]);
-    if (!selectsAny(grains)) set({ answer: null, error: null, loading: false });
     if (!searchesLiterature) {
       set({ literature: null, literatureError: null, literatureLoading: false });
     }
@@ -1101,10 +1007,7 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
     }
   },
 
-  acquireCourse: async (hit) => {
-    const courseUrl = hit.landing_url;
-    if (hit.acquisition !== "course" || courseUrl === null) return null;
-    const key = hitKey(hit);
+  acquireCourse: async (key, courseUrl) => {
     try {
       const course = await api.catalogueAcquireCourse(courseUrl);
       set((state) => {
@@ -1134,14 +1037,10 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
    *  touched: they are the user's standing choice about which sources to ask,
    *  which is why they outlive a session at all. */
   reset: () => {
-    catalogueRequest++;
     literatureRequest++;
     for (const provider of Object.keys(browseRequests)) browseRequests[provider]++;
     set({
       query: "",
-      answer: null,
-      error: null,
-      loading: false,
       literature: null,
       literatureError: null,
       literatureLoading: false,

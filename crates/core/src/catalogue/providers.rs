@@ -51,15 +51,23 @@ impl FetchReporter {
     }
 }
 
-/// A catalogue of acquirable teaching resources.
+/// How one catalogue is read from its publisher.
 ///
-/// Modelled on [`crate::integrations::LiteratureSource`]: the
-/// provider-specific identifiers and wire shapes stay behind the trait, and
-/// only [`CatalogueRecord`] crosses it. Adding a fifth catalogue means writing
-/// a fifth implementation and registering it, and touching nothing else.
+/// Not a source anything searches: a catalogue is searched as a
+/// [`crate::integrations::LiteratureSource`], through
+/// [`super::mirrored::MirroredSource`], and this is the half of one that knows
+/// the publisher's wire shape. The provider-specific identifiers stay behind
+/// it and only [`CatalogueRecord`] crosses it, so a fifth catalogue is a fifth
+/// implementation listed in [`fetchers`], and touches nothing else.
 #[async_trait]
-pub trait CatalogueSource: Send + Sync {
+pub trait CatalogueFetch: Send + Sync {
     fn id(&self) -> &'static str;
+
+    /// What the catalogue is called, wherever a person is told about it.
+    fn name(&self) -> &'static str;
+
+    /// The origin it is fetched from.
+    fn base_url(&self) -> &str;
 
     /// What this provider's records can answer. A provider serves exactly one
     /// grain — a documentation set is never a textbook — so this is a property
@@ -95,8 +103,8 @@ pub fn acquisition(record: &CatalogueRecord) -> CatalogueAcquisition {
     CatalogueAcquisition::None
 }
 
-/// Every catalogue this build knows.
-pub fn registry() -> Vec<Box<dyn CatalogueSource>> {
+/// Every catalogue this build can fetch, in the order they are listed.
+pub fn fetchers() -> Vec<Box<dyn CatalogueFetch>> {
     vec![
         Box::new(LibreTexts::default()),
         Box::new(OpenStax::default()),
@@ -215,9 +223,17 @@ const MAX_PAGES: usize = 200;
 const DRY_PAGES_BEFORE_STOP: usize = 3;
 
 #[async_trait]
-impl CatalogueSource for LibreTexts {
+impl CatalogueFetch for LibreTexts {
     fn id(&self) -> &'static str {
         "libretexts"
+    }
+
+    fn name(&self) -> &'static str {
+        "LibreTexts"
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     fn grain(&self) -> CatalogueGrain {
@@ -351,9 +367,17 @@ fn openstax_subjects(values: &[serde_json::Value]) -> String {
 }
 
 #[async_trait]
-impl CatalogueSource for OpenStax {
+impl CatalogueFetch for OpenStax {
     fn id(&self) -> &'static str {
         "openstax"
+    }
+
+    fn name(&self) -> &'static str {
+        "OpenStax"
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     fn grain(&self) -> CatalogueGrain {
@@ -454,9 +478,17 @@ struct MitTopic {
 }
 
 #[async_trait]
-impl CatalogueSource for MitOpenCourseWare {
+impl CatalogueFetch for MitOpenCourseWare {
     fn id(&self) -> &'static str {
         Self::ID
+    }
+
+    fn name(&self) -> &'static str {
+        "MIT OpenCourseWare"
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     fn grain(&self) -> CatalogueGrain {
@@ -594,9 +626,17 @@ struct DevDocsLinks {
 }
 
 #[async_trait]
-impl CatalogueSource for DevDocs {
+impl CatalogueFetch for DevDocs {
     fn id(&self) -> &'static str {
         "devdocs"
+    }
+
+    fn name(&self) -> &'static str {
+        "DevDocs"
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     fn grain(&self) -> CatalogueGrain {
@@ -673,7 +713,7 @@ mod tests {
 
     #[test]
     fn every_registered_provider_has_a_distinct_id() {
-        let registry = registry();
+        let registry = fetchers();
         let mut ids: Vec<&str> = registry.iter().map(|source| source.id()).collect();
         ids.sort_unstable();
         let before = ids.len();

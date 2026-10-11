@@ -8,10 +8,7 @@ import type {
   CatalogueCourseProgress,
   CatalogueDownloadProgress,
   CatalogueFetchProgress,
-  CatalogueProbe,
-  CatalogueSearchResponse,
   CatalogueRemoveResponse,
-  CatalogueStatus,
   CatalogueSyncResponse,
   BrowseRequest,
   FilterSuggestion,
@@ -450,17 +447,6 @@ export class TauriSearchApi implements SearchApi {
 
   async loadGenerationModel(): Promise<boolean> {
     return invoke<boolean>("load_generation_model");
-  }
-
-  async catalogueStatus(): Promise<CatalogueStatus> {
-    return invoke<CatalogueStatus>("catalogue_status");
-  }
-
-  async catalogueSearch(
-    probes: CatalogueProbe[],
-    limit?: number,
-  ): Promise<CatalogueSearchResponse> {
-    return invoke<CatalogueSearchResponse>("catalogue_search", { queries: probes, limit });
   }
 
   async literatureProviders(): Promise<LiteratureProviderInfo[]> {

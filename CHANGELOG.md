@@ -4,12 +4,26 @@
 
 ### Added
 
+- The open learning catalogues are literature providers. LibreTexts, OpenStax,
+  MIT OpenCourseWare and DevDocs are searched, listed and filtered exactly as
+  OpenAlex or a provider you described is — one list in the pane, one filter
+  of providers, one kind of result row — and the MCP `literature_search` tool
+  accepts their ids. A catalogue is on once it has been fetched, and is
+  fetched and removed from a *Catalogues* tab in Settings › Integrations,
+  which replaces the separate Catalogues settings page. The grain chips are
+  gone: a catalogue serves one grain, so the provider chips already choose it,
+  and a stored grain filter is carried over as the catalogues it meant. The
+  strip under an empty search still asks only the catalogues, never a remote
+  provider. **Breaking for the desktop IPC:** the `catalogue_status` and
+  `catalogue_search` commands are removed; the HTTP routes are unchanged.
+  Literature results gain `summary`, `subject`, `kind`, `pages` and
+  `recall_score`, and `acquisition` may be `course`.
 - The sidebar remembers which folders are closed. It is kept per workspace and
   survives a root switch and a restart; a folder that appears later still opens
   by default.
-- A learning catalogue can be removed in Settings. Removing drops its records
-  from the mirror, so it is no longer searched, and syncing it again brings it
-  back (`POST /api/catalogue/remove`). The panel's one button now refreshes the
+- A learning catalogue can be removed in Settings › Integrations › Catalogues.
+  Removing drops its records from the mirror, so it is no longer searched, and
+  syncing it again brings it back (`POST /api/catalogue/remove`). The panel's one button now refreshes the
   catalogues the mirror holds rather than every catalogue, so a removed one
   stays removed.
 - Literature filters are no longer kinds. A filter is a clause and a statement

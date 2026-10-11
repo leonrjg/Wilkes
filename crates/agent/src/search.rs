@@ -38,12 +38,18 @@ pub struct CollectedSearch {
 /// embedders, and index builds.
 #[async_trait]
 pub trait SearchService: Send + Sync {
-    async fn read_library(self: Arc<Self>, kind: crate::library::LibraryKind) -> Result<serde_json::Value, String> {
+    async fn read_library(
+        self: Arc<Self>,
+        kind: crate::library::LibraryKind,
+    ) -> Result<serde_json::Value, String> {
         let _ = kind;
         Err("Research-library reads are not available in this session".into())
     }
 
-    async fn edit_library(self: Arc<Self>, edit: crate::library::LibraryEdit) -> Result<serde_json::Value, String> {
+    async fn edit_library(
+        self: Arc<Self>,
+        edit: crate::library::LibraryEdit,
+    ) -> Result<serde_json::Value, String> {
         let _ = edit;
         Err("Research-library edits are not available in this session".into())
     }
@@ -76,6 +82,13 @@ pub trait SearchService: Send + Sync {
     /// application-scoped server must observe settings edits without a restart.
     async fn integrations(self: Arc<Self>) -> IntegrationsSettings {
         IntegrationsSettings::default()
+    }
+
+    /// Where the installation's catalogue mirror lives, so the catalogues are
+    /// providers here as they are everywhere else. `None` is a service with no
+    /// mirror, which then offers none.
+    fn catalogue_mirror(&self) -> Option<PathBuf> {
+        None
     }
 
     async fn search(

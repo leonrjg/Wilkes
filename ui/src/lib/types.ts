@@ -1045,7 +1045,20 @@ export interface LiteratureSearchResult {
   language: string | null;
   file_format: string | null;
   file_size: string | null;
-  acquisition: "none" | "direct" | "provider";
+  /** What the work says it is about, in its publisher's words. A textbook is
+   *  chosen by this; a bibliographic index rarely returns one. */
+  summary: string | null;
+  subject: string | null;
+  /** What kind of thing the result is, where the source says: a learning
+   *  catalogue's grain. Null for a source that indexes every kind of work. */
+  kind: string | null;
+  pages: number | null;
+  /** How well the result matched, larger being better, for a source answered
+   *  from the catalogue mirror. Comparable between such sources and no others. */
+  recall_score: number | null;
+  /** `course` is many files and a generated syllabus, fetched from the
+   *  result's landing page rather than from one URL. */
+  acquisition: "none" | "direct" | "provider" | "course";
 }
 
 export interface ResolvedLiteratureDownload {
@@ -1143,6 +1156,18 @@ export interface ProviderCapabilities {
   lookup: boolean;
   references: boolean;
   resolve_download: boolean;
+  /** Answered from a copy held on this machine: asking it sends nothing over
+   *  the network, and it holds nothing until it has been fetched. */
+  mirrored: boolean;
+}
+
+/** What the catalogue mirror holds for a provider answered from it. */
+export interface MirrorStatus {
+  /** What kind of source it is; every record it supplies is of this kind. */
+  grain: CatalogueGrain;
+  records: number;
+  /** Null when it has never been fetched, which is also why it is not on. */
+  synced_at_ms: number | null;
 }
 
 /** A request to list a provider's works by filter and sort. A filter's values
@@ -1179,6 +1204,9 @@ export interface LiteratureProviderInfo {
   default_base_url: string | null;
   capabilities: ProviderCapabilities;
   secrets: SecretSlot[];
+  /** Null for a provider asked over the network. For a mirrored one, `enabled`
+   *  follows from it: it is on once it has been fetched. */
+  mirror: MirrorStatus | null;
 }
 
 export interface LiteratureSearchResponse {
@@ -1466,76 +1494,10 @@ export type { AgentBackend, ChatBackendConfig, ChatConfigValue };
 
 // ── Catalogue ────────────────────────────────────────────────────────────────
 
-/** What a catalogue record can answer. A provider serves exactly one grain —
- *  a documentation set is never a textbook — so this describes the source as
- *  much as the record. */
+/** What a learning catalogue's records can answer. A catalogue serves exactly
+ *  one grain — a documentation set is never a textbook — so it describes the
+ *  source, and reaches a result as its `kind`. */
 export type CatalogueGrain = "textbook" | "course" | "reference";
-
-/** One acquirable teaching resource, as some provider publishes it. */
-export interface CatalogueRecord {
-  provider: string;
-  external_id: string;
-  title: string;
-  summary: string;
-  subject: string;
-  authors: string;
-  license: string;
-  landing_url: string | null;
-  /** Present only where the provider serves the whole work at a stable URL.
-   *  Its absence is why a candidate can be discoverable and not acquirable. */
-  pdf_url: string | null;
-  outline_url: string | null;
-  grain: CatalogueGrain;
-  pages: number | null;
-}
-
-/** A record matched against a probe, with the recall score that surfaced it.
- *  BM25 over title, subject and summary — explicitly not a ranking of which
- *  record is the better thing to read. */
-/** What adding a record would do. Derived in core from the provider that
- *  published it, not from the provider id here: a UI that decided this for
- *  itself would be a second copy of the registry, and would offer the wrong
- *  button the first time a new catalogue was added. */
-export type CatalogueAcquisition = "file" | "course" | "none";
-
-export interface CatalogueHit extends CatalogueRecord {
-  recall_score: number;
-  acquisition: CatalogueAcquisition;
-}
-
-/** One probe's answer. `terms` is what the query reduced to after stopword and
- *  length filtering: empty `terms` with empty `hits` means the query held no
- *  usable term, which is a different answer from "the mirror holds nothing". */
-export interface CatalogueQueryResult {
-  key: string;
-  terms: string[];
-  hits: CatalogueHit[];
-}
-
-export interface CatalogueSearchResponse {
-  results: CatalogueQueryResult[];
-}
-
-export interface CatalogueProbe {
-  key: string;
-  text: string;
-  /** Which kinds of source this query accepts; absent or empty means all. */
-  grains?: CatalogueGrain[] | null;
-}
-
-/** Per-provider state of the mirror. `records: 0` with a null `synced_at_ms`
- *  is a provider that has never been fetched, not one that published nothing. */
-export interface CatalogueProviderStatus {
-  provider: string;
-  grain: CatalogueGrain;
-  records: number;
-  synced_at_ms: number | null;
-}
-
-export interface CatalogueStatus {
-  providers: CatalogueProviderStatus[];
-  total_records: number;
-}
 
 /** What one provider's sync did. `records` absent with `error` set is that
  *  provider failing while the others in the same request did not. */

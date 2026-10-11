@@ -1,13 +1,12 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { CatalogueHit } from "../lib/types";
+import type { LiteratureProviderInfo, LiteratureSearchResult } from "../lib/types";
 
 vi.mock("../services", () => ({
   isTauri: true,
   api: {
-    catalogueSearch: vi.fn(),
-    literatureSearch: vi.fn(() => Promise.resolve({ query: "", providers: [] })),
-    catalogueStatus: vi.fn(),
+    literatureProviders: vi.fn(),
+    literatureSearch: vi.fn(),
     catalogueAcquire: vi.fn(),
     listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
   },
@@ -18,80 +17,194 @@ import { api } from "../services";
 import CatalogueGapStrip, { CatalogueGapPrompt } from "./CatalogueGapStrip";
 import { useCatalogueStore } from "../stores/useCatalogueStore";
 
-const HIT: CatalogueHit = {
-  provider: "openstax",
-  external_id: "7",
+const BOOK: LiteratureSearchResult = {
+  id: "7",
+  doi: null,
   title: "Introductory Statistics",
+  year: null,
+  publication_date: null,
+  venue: null,
+  citation_count: null,
+  is_open_access: true,
+  pdf_url: "https://example.invalid/stats.pdf",
+  landing_page_url: "https://example.invalid/stats",
+  open_access_status: null,
+  license: "CC-BY",
+  authors: "OpenStax",
+  publisher: null,
+  language: null,
+  file_format: null,
+  file_size: null,
   summary: "Distributions, inference and regression.",
   subject: "Mathematics",
-  authors: "OpenStax",
-  license: "CC-BY",
-  landing_url: "https://example.invalid/stats",
-  pdf_url: "https://example.invalid/stats.pdf",
-  outline_url: null,
-  grain: "textbook",
+  kind: "textbook",
   pages: 900,
   recall_score: 4.2,
+  acquisition: "direct",
 };
 
-const search = api.catalogueSearch as unknown as ReturnType<typeof vi.fn>;
-const status = api.catalogueStatus as unknown as ReturnType<typeof vi.fn>;
+function provider(
+  id: string,
+  name: string,
+  mirrored: boolean,
+  enabled = true,
+): LiteratureProviderInfo {
+  return {
+    provider: id,
+    name,
+    enabled,
+    builtin: true,
+    base_url: `https://${id}.example`,
+    default_base_url: null,
+    capabilities: {
+      paged_search: !mirrored,
+      browse: null,
+      lookup: !mirrored,
+      references: false,
+      resolve_download: false,
+      mirrored,
+    },
+    secrets: [],
+    mirror: mirrored
+      ? { grain: "textbook", records: enabled ? 700 : 0, synced_at_ms: enabled ? 1 : null }
+      : null,
+  };
+}
+
+const providers = api.literatureProviders as unknown as ReturnType<typeof vi.fn>;
+const search = api.literatureSearch as unknown as ReturnType<typeof vi.fn>;
+
+const answer = (id: string, name: string, results: LiteratureSearchResult[]) => ({
+  provider: id,
+  name,
+  results,
+  error: null,
+  total: null,
+});
 
 describe("CatalogueGapStrip", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useCatalogueStore.getState().reset();
+    useCatalogueStore.setState({ providers: null, legacy: undefined, providerOptions: [] });
+    providers.mockResolvedValue([
+      provider("openstax", "OpenStax", true),
+      provider("libretexts", "LibreTexts", true),
+      provider("openalex", "OpenAlex", false),
+    ]);
+    search.mockResolvedValue({
+      query: "confidence intervals",
+      providers: [answer("openstax", "OpenStax", [BOOK])],
+    });
   });
 
   it("offers what the catalogues hold on the question the library could not answer", async () => {
-    search.mockResolvedValue({
-      results: [{ key: "gap", terms: ["confidence", "intervals"], hits: [HIT] }],
-    });
     render(<CatalogueGapStrip query="confidence intervals" />);
     expect(await screen.findByText("Introductory Statistics")).toBeTruthy();
     expect(screen.getByText("Nothing here teaches this")).toBeTruthy();
+    // The strip mixes catalogues, so a row says whose it is.
+    expect(screen.getByText(/^OpenStax · Mathematics/)).toBeTruthy();
+  });
+
+  /// This runs unprompted after every empty search. A provider answered from
+  /// this machine is the only kind that can be asked without sending the
+  /// user's words somewhere they did not send them — and an index the user
+  /// enabled is still one they have not asked *this* question.
+  it("asks the mirrored providers and never a remote one", async () => {
+    render(<CatalogueGapStrip query="confidence intervals" />);
+    await screen.findByText("Introductory Statistics");
+    expect(search).toHaveBeenCalledTimes(1);
     // The probe is the user's own words, passed through unchanged.
-    expect(search.mock.calls[0][0]).toEqual([{ key: "gap", text: "confidence intervals" }]);
+    expect(search).toHaveBeenCalledWith("confidence intervals", 5, ["openstax", "libretexts"]);
+  });
+
+  /// With no catalogue to ask, the search is not made at all: without a
+  /// provider list it would be every enabled provider's.
+  it("asks nobody when the only providers that are on are remote", async () => {
+    providers.mockResolvedValue([
+      provider("openstax", "OpenStax", true, false),
+      provider("openalex", "OpenAlex", false),
+    ]);
+    render(<CatalogueGapStrip query="topology" />);
+    expect(await screen.findByText(/have not been fetched yet/i)).toBeTruthy();
+    expect(search).not.toHaveBeenCalled();
+  });
+
+  /// The catalogues share one index, so their scores are one scale: the strip
+  /// is the best five across them, not each one's best in turn.
+  it("offers the best matches across the catalogues, five at most", async () => {
+    const scored = (id: string, score: number): LiteratureSearchResult => ({
+      ...BOOK,
+      id,
+      title: `Book ${id}`,
+      recall_score: score,
+    });
+    search.mockResolvedValue({
+      query: "statistics",
+      providers: [
+        answer("openstax", "OpenStax", [scored("a", 3), scored("b", 1)]),
+        answer("libretexts", "LibreTexts", [
+          scored("c", 9),
+          scored("d", 5),
+          scored("e", 4),
+          scored("f", 2),
+        ]),
+      ],
+    });
+    render(<CatalogueGapStrip query="statistics" />);
+    await screen.findByText("Book c");
+    expect(screen.getAllByText(/^Book /).map((row) => row.textContent)).toEqual([
+      "Book c",
+      "Book d",
+      "Book e",
+      "Book a",
+      "Book f",
+    ]);
   });
 
   /// Recall is not a ranking, and the strip is the one place a user could
   /// mistake it for one.
   it("says the order is a text match rather than a recommendation", async () => {
-    search.mockResolvedValue({
-      results: [{ key: "gap", terms: ["confidence"], hits: [HIT] }],
-    });
     render(<CatalogueGapStrip query="confidence" />);
     expect(await screen.findByText(/not by which is the better place to start/i)).toBeTruthy();
   });
 
-  /// A query that reduced to nothing was never looked for. Offering "we found
-  /// nothing" under a failed search would be noise about a search that never ran.
+  /// A query that reduced to nothing was never looked for, and each catalogue
+  /// says so as an error. Offering that under a failed search would be noise
+  /// about a search that never ran.
   it("renders nothing when no term in the query survived filtering", async () => {
-    search.mockResolvedValue({ results: [{ key: "gap", terms: [], hits: [] }] });
+    search.mockResolvedValue({
+      query: "C",
+      providers: [
+        {
+          provider: "openstax",
+          name: "OpenStax",
+          results: null,
+          error: "nothing in “C” could be searched for",
+          total: null,
+        },
+      ],
+    });
     const { container } = render(<CatalogueGapStrip query="C" />);
     await waitFor(() => expect(search).toHaveBeenCalled());
-    expect(container.textContent).toBe("");
-    expect(status).not.toHaveBeenCalled();
+    await waitFor(() => expect(container.textContent).toBe(""));
   });
 
   /// "Nothing matched" and "nothing has been fetched yet" look identical from
   /// here, and only one of them is the user's to fix.
-  it("distinguishes an empty mirror from a genuine absence", async () => {
-    search.mockResolvedValue({
-      results: [{ key: "gap", terms: ["topology"], hits: [] }],
-    });
-    status.mockResolvedValue({ providers: [], total_records: 0 });
+  it("distinguishes an unfetched mirror from a genuine absence", async () => {
+    providers.mockResolvedValue([provider("openstax", "OpenStax", true, false)]);
     render(<CatalogueGapStrip query="topology" />);
     expect(await screen.findByText(/have not been fetched yet/i)).toBeTruthy();
   });
 
-  it("stays silent when the mirror is full and simply holds nothing", async () => {
+  it("stays silent when the catalogues are held and simply hold nothing", async () => {
     search.mockResolvedValue({
-      results: [{ key: "gap", terms: ["topology"], hits: [] }],
+      query: "topology",
+      providers: [answer("openstax", "OpenStax", []), answer("libretexts", "LibreTexts", [])],
     });
-    status.mockResolvedValue({ providers: [], total_records: 4_000 });
     const { container } = render(<CatalogueGapStrip query="topology" />);
-    await waitFor(() => expect(status).toHaveBeenCalled());
+    await waitFor(() => expect(search).toHaveBeenCalled());
     await waitFor(() => expect(container.textContent).toBe(""));
   });
 
@@ -111,19 +224,15 @@ describe("CatalogueGapStrip", () => {
     render(<CatalogueGapPrompt query="confidence intervals" />);
     expect(screen.getByText(/Nothing here teaches this\?/)).toBeTruthy();
     expect(search).not.toHaveBeenCalled();
+    expect(providers).not.toHaveBeenCalled();
   });
 
   it("opens the pane on that query when the offer is taken", async () => {
-    search.mockResolvedValue({
-      results: [{ key: "pane", terms: ["confidence"], hits: [HIT] }],
-    });
     render(<CatalogueGapPrompt query="confidence intervals" />);
     fireEvent.click(screen.getByText(/Nothing here teaches this\?/));
     await waitFor(() => {
       expect(useCatalogueStore.getState().paneOpen).toBe(true);
-      expect(search.mock.calls[0][0]).toEqual([
-        { key: "pane", text: "confidence intervals", grains: null },
-      ]);
+      expect(search).toHaveBeenCalledWith("confidence intervals", 10, undefined);
     });
   });
 });

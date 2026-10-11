@@ -4,10 +4,7 @@ import type {
   CatalogueCourseProgress,
   CatalogueDownloadProgress,
   CatalogueFetchProgress,
-  CatalogueProbe,
-  CatalogueSearchResponse,
   CatalogueRemoveResponse,
-  CatalogueStatus,
   CatalogueSyncResponse,
   BrowseRequest,
   FilterSuggestion,
@@ -792,25 +789,6 @@ export class HttpSearchApi implements SearchApi {
     const res = await fetch("/api/generation/load", { method: "POST" });
     if (!res.ok) throw await responseError(res, "loadGenerationModel");
     return res.json() as Promise<boolean>;
-  }
-
-  async catalogueStatus(): Promise<CatalogueStatus> {
-    const res = await fetch("/api/catalogue/status");
-    if (!res.ok) throw await responseError(res, "catalogueStatus");
-    return res.json() as Promise<CatalogueStatus>;
-  }
-
-  async catalogueSearch(
-    probes: CatalogueProbe[],
-    limit?: number,
-  ): Promise<CatalogueSearchResponse> {
-    const res = await fetch("/api/catalogue/search", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(limit === undefined ? { queries: probes } : { queries: probes, limit }),
-    });
-    if (!res.ok) throw await responseError(res, "catalogueSearch");
-    return res.json() as Promise<CatalogueSearchResponse>;
   }
 
   async literatureProviders(): Promise<LiteratureProviderInfo[]> {

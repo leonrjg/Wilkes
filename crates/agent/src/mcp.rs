@@ -406,7 +406,7 @@ impl WilkesMcp {
                     "No result '{result_id}' from {provider} is available to download; run literature_search again and use an id it returns."
                 )
             })?;
-        let registry = IntegrationRegistry::from_settings(&self.integrations().await);
+        let registry = self.literature_registry().await;
         let source = registry
             .literature_for_search(provider)
             .map_err(|error| error.to_string())?;
@@ -709,11 +709,27 @@ impl WilkesMcp {
                 None => IntegrationsSettings::default(),
             },
         };
-        IntegrationRegistry::from_settings(&settings)
+        let mirror = scope.search().and_then(|search| search.catalogue_mirror());
+        IntegrationRegistry::from_settings(&settings, mirror.as_deref())
             .enabled_literature_ids()
             .into_iter()
             .map(str::to_string)
             .collect()
+    }
+
+    /// Every provider a call may name: the remote ones as settings have them,
+    /// and the catalogues the installation's mirror holds. The mirror is found
+    /// through the active workspace's service because it is the installation's
+    /// and every workspace names the same one.
+    async fn literature_registry(&self) -> IntegrationRegistry {
+        let mirror = match self.scope(None).await {
+            Ok(scope) => scope.search().and_then(|search| search.catalogue_mirror()),
+            Err(error) => {
+                info!(%error, "mcp: catalogue mirror unavailable");
+                None
+            }
+        };
+        IntegrationRegistry::from_settings(&self.integrations().await, mirror.as_deref())
     }
 
     /// Literature and provider settings are global rather than per-workspace,
@@ -998,6 +1014,14 @@ struct LiteratureResultView {
     language: Option<String>,
     file_format: Option<String>,
     file_size: Option<String>,
+    /// What the work says it is about, where the provider carries a blurb.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject: Option<String>,
+    /// `textbook`, `course` or `reference`, for a learning catalogue's record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
 }
 
 impl From<&LiteratureSearchResult> for LiteratureResultView {
@@ -1011,8 +1035,10 @@ impl From<&LiteratureSearchResult> for LiteratureResultView {
             venue: result.venue.clone(),
             citation_count: result.citation_count,
             is_open_access: result.is_open_access,
+            // A course is many files assembled from the publisher's pages;
+            // `download` fetches one file and cannot fetch that.
             downloadable: result.pdf_url.is_some()
-                || result.acquisition != LiteratureAcquisition::None,
+                || result.acquisition == LiteratureAcquisition::Provider,
             landing_page_url: result.landing_page_url.clone(),
             open_access_status: result.open_access_status.clone(),
             license: result.license.clone(),
@@ -1021,6 +1047,9 @@ impl From<&LiteratureSearchResult> for LiteratureResultView {
             language: result.language.clone(),
             file_format: result.file_format.clone(),
             file_size: result.file_size.clone(),
+            summary: result.summary.clone(),
+            subject: result.subject.clone(),
+            kind: result.kind.clone(),
         }
     }
 }
@@ -1430,7 +1459,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Search scholarly literature using an enabled external integration. Pass provider as an id from list_context's literature_providers, for example 'openalex', 'semantic_scholar', or a user-defined 'custom:<id>'."
+        description = "Search scholarly literature, or an open learning catalogue of textbooks, courses or documentation, using an enabled provider. Pass provider as an id from list_context's literature_providers, for example 'openalex', 'semantic_scholar', a catalogue such as 'libretexts', or a user-defined 'custom:<id>'."
     )]
     async fn literature_search(
         &self,
@@ -1450,7 +1479,7 @@ impl WilkesMcp {
         // One lookup replaces what was an arm per provider. Whether the id
         // names a compiled-in client or a manifest the user wrote is not
         // something this tool can see, or needs to.
-        let registry = IntegrationRegistry::from_settings(&self.integrations().await);
+        let registry = self.literature_registry().await;
         let source = match registry.literature_for_search(&params.provider) {
             Ok(source) => Arc::clone(source),
             Err(error) => {
@@ -3265,6 +3294,11 @@ mod tests {
                 language: None,
                 file_format: None,
                 file_size: None,
+                summary: None,
+                subject: None,
+                kind: None,
+                pages: None,
+                recall_score: None,
                 acquisition: LiteratureAcquisition::Direct,
             },
         );

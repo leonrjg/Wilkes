@@ -3280,8 +3280,9 @@ pub struct BrowseRequest {
     pub limit: Option<usize>,
 }
 
-/// Provider-neutral result returned by external literature searches.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// Provider-neutral result returned by a literature source: a remote index's
+/// answer, or a record of the local catalogue mirror.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct LiteratureSearchResult {
     pub id: String,
     pub doi: Option<String>,
@@ -3306,6 +3307,24 @@ pub struct LiteratureSearchResult {
     pub file_format: Option<String>,
     #[serde(default)]
     pub file_size: Option<String>,
+    /// What the work says it is about, in its publisher's words. A textbook
+    /// is chosen by this; a bibliographic index rarely returns one.
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// What kind of thing the result is, where the source says: a learning
+    /// catalogue's grain (`textbook`, `course`, `reference`). Absent for a
+    /// source that indexes works of every kind and names none.
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub pages: Option<i64>,
+    /// How well the result matched, for a source that scores its own answer:
+    /// larger is better, and comparable only between sources answered from the
+    /// same index. Absent for a remote service, whose order is all it reports.
+    #[serde(default)]
+    pub recall_score: Option<f64>,
     /// How the selected result becomes a file. Provider resolution is
     /// deliberately on-demand: listing ten results must not spend ten
     /// credentialed requests before the user chooses one.
@@ -3320,6 +3339,10 @@ pub enum LiteratureAcquisition {
     None,
     Direct,
     Provider,
+    /// Many files and a document describing them, assembled from the
+    /// publisher's own pages. Not served whole at any URL, so it is neither
+    /// `Direct` nor something a resolver can turn into one.
+    Course,
 }
 
 /// A provider's on-demand answer to “what file does this result name?”. The
@@ -3364,13 +3387,11 @@ impl CatalogueGrain {
     }
 }
 
-/// Provider-neutral record for one acquirable teaching resource.
+/// One acquirable teaching resource, as the catalogue mirror stores it.
 ///
-/// Deliberately not [`LiteratureSearchResult`]: that type is shaped by what a
-/// bibliographic index knows about a *paper* — DOI, venue, citation count —
-/// and a textbook has none of those while having a description, a subject and
-/// a licence that decide whether it may be kept. Neither substitutes for the
-/// other, so they do not share a struct.
+/// The mirror's row, not what a search returns: a catalogue is searched as a
+/// [`crate::integrations::LiteratureSource`] like any other, and answers in
+/// [`LiteratureSearchResult`]s.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CatalogueRecord {
     pub provider: String,
@@ -3490,6 +3511,17 @@ pub enum CatalogueCourseStage {
     Manifest,
     /// Fetching the documents the manifest turned out to name.
     Documents,
+}
+
+/// What the mirror holds for a source that is answered from it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MirrorStatus {
+    /// What kind of source this is; every record it supplies is of this kind.
+    pub grain: CatalogueGrain,
+    pub records: i64,
+    /// Null when it has never been fetched, which is also what makes the
+    /// source one that is not searched.
+    pub synced_at_ms: Option<i64>,
 }
 
 /// Per-provider state of the local catalogue mirror.

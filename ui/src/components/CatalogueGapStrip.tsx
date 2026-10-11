@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../services";
-import type { CatalogueHit } from "../lib/types";
+import type { LiteratureSearchResult } from "../lib/types";
 import { useCatalogueStore } from "../stores/useCatalogueStore";
 import CatalogueCandidate from "./CatalogueCandidate";
 
@@ -13,6 +13,22 @@ interface Props {
   query: string;
 }
 
+/** One result and the catalogue it came from: the strip mixes catalogues, so
+ *  each row has to say whose it is. */
+interface Offer {
+  provider: string;
+  name: string;
+  work: LiteratureSearchResult;
+}
+
+/** What the strip found, or why it has nothing to show. */
+type Gap =
+  | { kind: "offers"; offers: Offer[] }
+  /** No catalogue has been fetched: the one empty answer that is the user's to
+   *  fix. */
+  | { kind: "unfetched" }
+  | { kind: "nothing" };
+
 /**
  * What the catalogues hold on a question this library could not answer.
  *
@@ -20,61 +36,81 @@ interface Props {
  * moment Wilkes has proof the library falls short and already holds a probe of
  * the shape the mirror's recall wants — the words the user chose. Nothing is
  * fetched on the user's behalf; each row offers, and the user decides.
+ *
+ * It asks the mirrored providers and no others. This runs unprompted after
+ * every empty search, and a provider answered from this machine is the only
+ * kind that can be asked without sending the user's query somewhere they did
+ * not send it. Which providers those are is the registry's answer
+ * (`capabilities.mirrored`), not a list kept here.
  */
 export default function CatalogueGapStrip({ query }: Props) {
-  const [hits, setHits] = useState<CatalogueHit[] | null>(null);
-  const [terms, setTerms] = useState<string[]>([]);
-  const [mirrorEmpty, setMirrorEmpty] = useState(false);
+  const [gap, setGap] = useState<Gap | null>(null);
   const openPane = useCatalogueStore((s) => s.openPane);
   const paneSearch = useCatalogueStore((s) => s.search);
 
   useEffect(() => {
     let cancelled = false;
     const probe = query.trim();
-    if (!probe) {
-      setHits(null);
-      return;
-    }
-    setHits(null);
-    setMirrorEmpty(false);
-    api
-      .catalogueSearch([{ key: "gap", text: probe }], GAP_LIMIT)
-      .then(async (response) => {
-        if (cancelled) return;
-        const result = response.results.find((r) => r.key === "gap");
-        setTerms(result?.terms ?? []);
-        setHits(result?.hits ?? []);
-        // "Nothing matched" and "nothing has been fetched yet" read the same
-        // from here, and only one of them is the user's to fix. One status
-        // call, and only on the path where the difference matters.
-        if ((result?.hits.length ?? 0) === 0 && (result?.terms.length ?? 0) > 0) {
-          const status = await api.catalogueStatus().catch(() => null);
-          if (!cancelled && status !== null) setMirrorEmpty(status.total_records === 0);
+    setGap(null);
+    if (!probe) return;
+    (async () => {
+      const local = (await api.literatureProviders()).filter(
+        (provider) => provider.capabilities.mirrored,
+      );
+      const held = local.filter((provider) => provider.enabled);
+      if (held.length === 0) {
+        // No catalogue in this build is a different thing from none fetched,
+        // and only the second has a setting to point at.
+        return local.length === 0 ? { kind: "nothing" as const } : { kind: "unfetched" as const };
+      }
+      const response = await api.literatureSearch(
+        probe,
+        GAP_LIMIT,
+        held.map((provider) => provider.provider),
+      );
+      const offers: Offer[] = [];
+      for (const entry of response.providers) {
+        // A catalogue that could not answer — a probe with nothing searchable
+        // in it, say — is left out. The pane explains the rule; under a failed
+        // search it would be noise about a feature the user did not invoke.
+        if (entry.results === null) {
+          console.debug(`catalogue gap lookup: ${entry.provider} did not answer:`, entry.error);
+          continue;
         }
+        for (const work of entry.results) {
+          offers.push({ provider: entry.provider, name: entry.name, work });
+        }
+      }
+      // The catalogues share one index, so their scores are one scale and the
+      // strip is the best five across them rather than each one's best.
+      offers.sort((a, b) => (b.work.recall_score ?? 0) - (a.work.recall_score ?? 0));
+      return offers.length === 0
+        ? { kind: "nothing" as const }
+        : { kind: "offers" as const, offers: offers.slice(0, GAP_LIMIT) };
+    })()
+      .then((found) => {
+        if (!cancelled) setGap(found);
       })
       .catch((error) => {
         // A catalogue that cannot answer must not turn an empty search into an
         // error message about a feature the user did not invoke.
         console.debug("catalogue gap lookup failed:", error);
-        if (!cancelled) setHits([]);
+        if (!cancelled) setGap({ kind: "nothing" });
       });
     return () => {
       cancelled = true;
     };
   }, [query]);
 
-  // Nothing usable in the query means nothing to offer here. The browse pane
-  // explains the rule; under a failed search it would just be noise.
-  if (hits === null || terms.length === 0) return null;
+  if (gap === null || gap.kind === "nothing") return null;
 
-  if (hits.length === 0) {
-    if (!mirrorEmpty) return null;
+  if (gap.kind === "unfetched") {
     return (
       <div className="mx-4 mb-4 rounded-lg border border-[var(--border-main)] bg-[var(--bg-active)] px-3 py-2">
         <p className="text-[10px] leading-relaxed text-[var(--text-muted)]">
           The learning catalogues have not been fetched yet. Settings ›
-          Catalogues will fill them, and this search can then suggest open
-          textbooks and courses when your library has nothing.
+          Integrations › Catalogues will fill them, and this search can then
+          suggest open textbooks and courses when your library has nothing.
         </p>
       </div>
     );
@@ -102,10 +138,12 @@ export default function CatalogueGapStrip({ query }: Props) {
         text match, not by which is the better place to start.
       </p>
       <div className="divide-y divide-[var(--border-main)]">
-        {hits.map((hit) => (
+        {gap.offers.map(({ provider, name, work }) => (
           <CatalogueCandidate
-            key={`${hit.provider}:${hit.external_id}`}
-            hit={hit}
+            key={`${provider}:${work.id}`}
+            provider={provider}
+            work={work}
+            source={name}
             compact
           />
         ))}

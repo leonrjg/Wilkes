@@ -1891,16 +1891,6 @@ fn catalogue_failed(error: wilkes_api::commands::catalogue::CatalogueError) -> S
     format!("{error}")
 }
 
-/// Every provider this build knows, what the mirror holds for it, and when it
-/// last did. Reports a provider that has never synced rather than omitting it.
-#[tauri::command]
-async fn catalogue_status(
-    app: AppHandle,
-) -> Result<wilkes_api::commands::catalogue::CatalogueStatusResponse, String> {
-    wilkes_api::commands::catalogue::status(&app_context(&app).catalogue_dir)
-        .map_err(catalogue_failed)
-}
-
 /// Drops one catalogue's records from the mirror. Syncing it again is how it
 /// comes back.
 #[tauri::command]
@@ -1910,18 +1900,6 @@ async fn catalogue_remove(
 ) -> Result<wilkes_api::commands::catalogue::CatalogueRemoveResponse, String> {
     wilkes_api::commands::catalogue::remove(&app_context(&app).catalogue_dir, provider)
         .map_err(catalogue_failed)
-}
-
-/// Recall over the mirror. Not a ranking — see `wilkes_core::catalogue`.
-#[tauri::command]
-async fn catalogue_search(
-    app: AppHandle,
-    queries: Vec<wilkes_api::commands::catalogue::CatalogueProbe>,
-    limit: Option<usize>,
-) -> Result<wilkes_api::commands::catalogue::CatalogueSearchResponse, String> {
-    let dir = app_context(&app).catalogue_dir.clone();
-    let limit = limit.unwrap_or(wilkes_api::commands::catalogue::DEFAULT_LIMIT);
-    wilkes_api::commands::catalogue::search(&dir, queries, limit).map_err(catalogue_failed)
 }
 
 /// Every literature provider this installation knows, switched on or not.
@@ -2412,8 +2390,6 @@ pub fn run() {
             list_generation_models,
             get_generation_model_size,
             load_generation_model,
-            catalogue_status,
-            catalogue_search,
             literature_providers,
             literature_search,
             literature_resolve_download,

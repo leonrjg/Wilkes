@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { CatalogueHit } from "../lib/types";
+import type { LiteratureSearchResult } from "../lib/types";
 
 vi.mock("../services", () => ({
   isTauri: true,
@@ -24,34 +24,44 @@ import { useCatalogueStore } from "../stores/useCatalogueStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 
-const HIT: CatalogueHit = {
-  provider: "libretexts",
-  external_id: "42",
+/// A textbook as a learning catalogue returns it: the result every provider
+/// answers in, carrying what a catalogue knows.
+const HIT: LiteratureSearchResult = {
+  id: "42",
+  doi: null,
   title: "Combinatorial Optimization",
+  year: null,
+  publication_date: null,
+  venue: null,
+  citation_count: null,
+  is_open_access: true,
+  pdf_url: "https://example.invalid/book.pdf",
+  landing_page_url: "https://example.invalid/book",
+  open_access_status: null,
+  license: "CC-BY",
+  authors: "Someone",
+  publisher: null,
+  language: null,
+  file_format: null,
+  file_size: null,
   summary: "Computational complexity and polynomial-time reductions.",
   subject: "Mathematics",
-  authors: "Someone",
-  license: "CC-BY",
-  landing_url: "https://example.invalid/book",
-  pdf_url: "https://example.invalid/book.pdf",
-  outline_url: null,
-  grain: "textbook",
+  kind: "textbook",
   pages: 412,
   recall_score: 8.5,
-  acquisition: "file",
+  acquisition: "direct",
 };
 
 /// An MIT OpenCourseWare course: no `pdf_url`, because a course is not served
 /// whole at any URL, and `acquisition: "course"` saying so explicitly rather
 /// than leaving the row to infer it from the provider id.
-const COURSE: CatalogueHit = {
+const COURSE: LiteratureSearchResult = {
   ...HIT,
-  provider: "mit_ocw",
-  external_id: "3308",
+  id: "3308",
   title: "Water Quality Control",
-  landing_url: "https://ocw.mit.edu/courses/1-77-water-quality-spring-2006/",
+  landing_page_url: "https://ocw.mit.edu/courses/1-77-water-quality-spring-2006/",
   pdf_url: null,
-  grain: "course",
+  kind: "course",
   pages: null,
   acquisition: "course",
 };
@@ -78,18 +88,43 @@ describe("CatalogueCandidate", () => {
   /// The grain keeps its own chip — it is what the thing *is*. The rest are
   /// one run of text rather than a chip each, because a chip cannot be broken
   /// across lines and three of them took three lines in a pane this narrow.
-  it("shows the grain, the provider and the licence", () => {
-    render(<CatalogueCandidate hit={HIT} />);
+  it("shows the kind, the subject and the licence", () => {
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
     expect(screen.getByText("Textbook")).toBeTruthy();
-    expect(screen.getByText(/LibreTexts/)).toBeTruthy();
     expect(screen.getByText(/CC-BY/)).toBeTruthy();
-    expect(screen.getByText("LibreTexts · Mathematics · CC-BY · 412 pp")).toBeTruthy();
+    // Under its provider's heading the row does not repeat whose it is, and an
+    // open catalogue's licence says more than "open access" would.
+    expect(screen.getByText("Mathematics · Someone · CC-BY · 412 pp")).toBeTruthy();
+    expect(screen.getByText(HIT.summary as string)).toBeTruthy();
+  });
+
+  /// A list that mixes providers has no heading to say whose a row is, so the
+  /// row says it; and an offer under a failed search is not a reading list.
+  it("names its source and drops the blurb where it is one of a mixed strip", () => {
+    render(<CatalogueCandidate provider="libretexts" work={HIT} source="LibreTexts" compact />);
+    expect(
+      screen.getByText("LibreTexts · Mathematics · Someone · CC-BY · 412 pp"),
+    ).toBeTruthy();
+    expect(screen.queryByText(HIT.summary as string)).toBeNull();
+  });
+
+  /// A source that names no kind gets no badge: "Paper" over a provider's
+  /// monographs and standards would be wrong for some of its rows.
+  it("shows no kind for a result whose source named none", () => {
+    render(
+      <CatalogueCandidate
+        provider="openalex"
+        work={{ ...HIT, kind: null, year: 2021, citation_count: 3 }}
+      />,
+    );
+    expect(screen.queryByText("Textbook")).toBeNull();
+    expect(screen.getByText(/^2021 · 3 citations · Open access/)).toBeTruthy();
   });
 
   /// The fetch lands in Wilkes's own uploads directory; the import into the
   /// user's root is a second, separate step.
   it("fetches into uploads and then imports into the current directory", async () => {
-    render(<CatalogueCandidate hit={HIT} />);
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
     fireEvent.click(screen.getByLabelText(/Add Combinatorial Optimization/));
     await waitFor(() => {
       expect(acquire).toHaveBeenCalledWith("https://example.invalid/book.pdf");
@@ -108,7 +143,7 @@ describe("CatalogueCandidate", () => {
   /// Discovery and admission are not the same thing, and a button that fails
   /// on click is worse than no button.
   it("offers no Add for a record nothing can fetch", () => {
-    render(<CatalogueCandidate hit={{ ...HIT, pdf_url: null, acquisition: "none" }} />);
+    render(<CatalogueCandidate provider="libretexts" work={{ ...HIT, pdf_url: null, acquisition: "none" }} />);
     expect(screen.queryByLabelText(/Add Combinatorial Optimization/)).toBeNull();
     expect(screen.getByText(/No downloadable copy/i)).toBeTruthy();
     // The landing page is still offered: it is discoverable, just not fetchable.
@@ -121,7 +156,7 @@ describe("CatalogueCandidate", () => {
   /// does, so the button is labelled like every other and the row does not
   /// explain itself in a paragraph under every OCW result.
   it("offers a course the same Add as anything else", () => {
-    render(<CatalogueCandidate hit={COURSE} />);
+    render(<CatalogueCandidate provider="mit_ocw" work={COURSE} />);
     expect(screen.getByLabelText(/Add Water Quality Control to library/)).toBeTruthy();
     expect(screen.getByText("Course")).toBeTruthy();
     expect(screen.queryByText(/Add course/)).toBeNull();
@@ -136,7 +171,7 @@ describe("CatalogueCandidate", () => {
   it("imports a course into a folder named after the course", async () => {
     const acquireCourse = api.catalogueAcquireCourse as unknown as ReturnType<typeof vi.fn>;
     acquireCourse.mockResolvedValue({
-      course_url: COURSE.landing_url,
+      course_url: COURSE.landing_page_url,
       title: "Water Quality Control",
       folder: "1.77 Water Quality Control (Spring 2006)",
       directory: "/uploads/1.77 Water Quality Control (Spring 2006)",
@@ -152,7 +187,7 @@ describe("CatalogueCandidate", () => {
       failures: [],
       skipped: [],
     });
-    render(<CatalogueCandidate hit={COURSE} />);
+    render(<CatalogueCandidate provider="mit_ocw" work={COURSE} />);
     fireEvent.click(screen.getByLabelText(/Add Water Quality Control to library/));
     await waitFor(() => {
       expect(importFiles).toHaveBeenCalledWith(
@@ -171,11 +206,11 @@ describe("CatalogueCandidate", () => {
   /// a large course it is most of a minute. A row showing only the document
   /// counter would sit blank through all of it.
   it("counts the manifest walk and then the documents", () => {
-    render(<CatalogueCandidate hit={COURSE} />);
+    render(<CatalogueCandidate provider="mit_ocw" work={COURSE} />);
     act(() => {
-      useCatalogueStore.setState({ adding: { "mit_ocw:3308": "fetching" } });
+      useCatalogueStore.setState({ adding: { "literature:mit_ocw:3308": "fetching" } });
       useCatalogueStore.getState().noteCourseProgress({
-        course_url: COURSE.landing_url as string,
+        course_url: COURSE.landing_page_url as string,
         stage: "manifest",
         done: 7,
         total: 31,
@@ -185,7 +220,7 @@ describe("CatalogueCandidate", () => {
     expect(screen.getByText(/Reading the course — 7 of 31/)).toBeTruthy();
     act(() => {
       useCatalogueStore.getState().noteCourseProgress({
-        course_url: COURSE.landing_url as string,
+        course_url: COURSE.landing_page_url as string,
         stage: "documents",
         done: 3,
         total: 20,
@@ -198,13 +233,13 @@ describe("CatalogueCandidate", () => {
   /// A course arrives incomplete by design — its videos are not documents —
   /// so the row has to account for what is missing, not just say "added".
   it("reports what a finished course turned out to be", () => {
-    render(<CatalogueCandidate hit={COURSE} />);
+    render(<CatalogueCandidate provider="mit_ocw" work={COURSE} />);
     act(() => {
       useCatalogueStore.setState({
-        acquired: { "mit_ocw:3308": "/uploads/1-77-water-quality-spring-2006" },
+        acquired: { "literature:mit_ocw:3308": "/uploads/1-77-water-quality-spring-2006" },
         courses: {
-          "mit_ocw:3308": {
-            course_url: COURSE.landing_url as string,
+          "literature:mit_ocw:3308": {
+            course_url: COURSE.landing_page_url as string,
             title: "Water Quality Control",
             directory: "/uploads/1-77-water-quality-spring-2006",
             document: "/uploads/1-77-water-quality-spring-2006/1-77.md",
@@ -227,14 +262,14 @@ describe("CatalogueCandidate", () => {
   /// The desktop webview ignores a plain `target="_blank"`, so the open action
   /// has to go through the same bridge the rest of the app opens links with.
   it("opens the landing page through the application's opener", () => {
-    render(<CatalogueCandidate hit={HIT} />);
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
     fireEvent.click(screen.getByLabelText(/Open Combinatorial Optimization/));
     expect(api.openPath).toHaveBeenCalledWith("https://example.invalid/book");
   });
 
   it("cannot add without a directory to add to", () => {
     useSettingsStore.setState({ directory: "" });
-    render(<CatalogueCandidate hit={HIT} />);
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
     const button = screen.getByLabelText(/Add Combinatorial Optimization/) as HTMLButtonElement;
     expect(button.disabled).toBe(true);
   });
@@ -242,9 +277,9 @@ describe("CatalogueCandidate", () => {
   /// A textbook is tens of megabytes over a link nobody controls; between the
   /// click and the file appearing there has to be something other than "…".
   it("shows the bytes as they arrive, against the total when there is one", () => {
-    render(<CatalogueCandidate hit={HIT} />);
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
     act(() => {
-      useCatalogueStore.setState({ adding: { "libretexts:42": "fetching" } });
+      useCatalogueStore.setState({ adding: { "literature:libretexts:42": "fetching" } });
       useCatalogueStore.getState().noteDownloadProgress({
         url: HIT.pdf_url as string,
         filename: "book.pdf",
@@ -263,9 +298,9 @@ describe("CatalogueCandidate", () => {
   /// forever, so what has arrived is stated and the bar says only that work is
   /// happening — indeterminate, which is what no `aria-valuenow` means.
   it("shows what has arrived, and no fraction, when the server declared no length", () => {
-    render(<CatalogueCandidate hit={HIT} />);
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
     act(() => {
-      useCatalogueStore.setState({ adding: { "libretexts:42": "fetching" } });
+      useCatalogueStore.setState({ adding: { "literature:libretexts:42": "fetching" } });
       useCatalogueStore.getState().noteDownloadProgress({
         url: HIT.pdf_url as string,
         filename: "book.pdf",
@@ -282,9 +317,9 @@ describe("CatalogueCandidate", () => {
 
   /// Two rows can be added at once; neither may render the other's bytes.
   it("ignores progress belonging to another download", () => {
-    render(<CatalogueCandidate hit={HIT} />);
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
     act(() => {
-      useCatalogueStore.setState({ adding: { "libretexts:42": "fetching" } });
+      useCatalogueStore.setState({ adding: { "literature:libretexts:42": "fetching" } });
       useCatalogueStore.getState().noteDownloadProgress({
         url: "https://example.invalid/other.pdf",
         filename: "other.pdf",
@@ -307,7 +342,7 @@ describe("CatalogueCandidate", () => {
     importFiles.mockImplementation(
       () => new Promise<string[]>((resolve) => (finishImport = () => resolve([]))),
     );
-    render(<CatalogueCandidate hit={HIT} />);
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
     fireEvent.click(screen.getByLabelText(/Add Combinatorial Optimization/));
     expect(await screen.findByText("Adding to the library…")).toBeTruthy();
     expect(screen.queryByText("Added")).toBeNull();
@@ -322,7 +357,7 @@ describe("CatalogueCandidate", () => {
   /// single key, so the second add to start erased the first row's indicator
   /// and the first to finish cleared the second's.
   it("keeps each row's progress its own when two are added at once", async () => {
-    const other: CatalogueHit = { ...HIT, external_id: "43", title: "Another Book" };
+    const other: LiteratureSearchResult = { ...HIT, id: "43", title: "Another Book" };
     // One resolver per call: two imports are in flight, and a single handle
     // would only ever release the second.
     const pendingImports: (() => void)[] = [];
@@ -331,8 +366,8 @@ describe("CatalogueCandidate", () => {
     );
     render(
       <>
-        <CatalogueCandidate hit={HIT} />
-        <CatalogueCandidate hit={other} />
+        <CatalogueCandidate provider="libretexts" work={HIT} />
+        <CatalogueCandidate provider="libretexts" work={other} />
       </>,
     );
     fireEvent.click(screen.getByLabelText(/Add Combinatorial Optimization/));
@@ -341,8 +376,8 @@ describe("CatalogueCandidate", () => {
       expect(screen.getAllByText("Adding to the library…")).toHaveLength(2);
     });
     expect(useCatalogueStore.getState().adding).toEqual({
-      "libretexts:42": "importing",
-      "libretexts:43": "importing",
+      "literature:libretexts:42": "importing",
+      "literature:libretexts:43": "importing",
     });
     await act(async () => {
       pendingImports.forEach((finish) => finish());
@@ -354,7 +389,7 @@ describe("CatalogueCandidate", () => {
   /// fails, and used to reject into nothing at all.
   it("reports a failed import instead of rejecting silently", async () => {
     importFiles.mockRejectedValue(new Error("the root is not writable"));
-    render(<CatalogueCandidate hit={HIT} />);
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
     fireEvent.click(screen.getByLabelText(/Add Combinatorial Optimization/));
     await waitFor(() => {
       expect(useCatalogueStore.getState().acquireError).toMatch(/not writable/);
@@ -364,7 +399,7 @@ describe("CatalogueCandidate", () => {
   });
 
   it("stops reporting bytes once the download is over", async () => {
-    render(<CatalogueCandidate hit={HIT} />);
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
     act(() => {
       useCatalogueStore.getState().noteDownloadProgress({
         url: HIT.pdf_url as string,

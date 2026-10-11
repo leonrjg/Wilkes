@@ -40,7 +40,14 @@ function settings(
   };
 }
 
-const NO_BROWSE = { browse: null, lookup: true, references: false, resolve_download: false };
+const NO_BROWSE = {
+  paged_search: true,
+  browse: null,
+  lookup: true,
+  references: false,
+  resolve_download: false,
+  mirrored: false,
+};
 
 /** What the backend reports of the two providers that ship with Wilkes: their
  *  names, their origins and the secrets their manifests name. */
@@ -53,6 +60,7 @@ const SEMANTIC_SCHOLAR: LiteratureProviderInfo = {
   default_base_url: "https://api.semanticscholar.org",
   capabilities: NO_BROWSE,
   secrets: [{ name: "api_key", label: "API key", kind: "password", optional: true }],
+  mirror: null,
 };
 
 const OPENALEX: LiteratureProviderInfo = {
@@ -64,6 +72,7 @@ const OPENALEX: LiteratureProviderInfo = {
   default_base_url: "https://api.openalex.org",
   capabilities: NO_BROWSE,
   secrets: [{ name: "email", label: "Email", kind: "email", optional: true }],
+  mirror: null,
 };
 
 const CUSTOM: LiteratureProviderInfo = {
@@ -75,7 +84,24 @@ const CUSTOM: LiteratureProviderInfo = {
   default_base_url: null,
   capabilities: NO_BROWSE,
   secrets: [],
+  mirror: null,
 };
+
+/** A learning catalogue as the backend reports it: a shipped provider that is
+ *  answered from the mirror, on once the mirror holds it. */
+function catalogue(id: string, name: string, held: boolean): LiteratureProviderInfo {
+  return {
+    provider: id,
+    name,
+    enabled: held,
+    builtin: true,
+    base_url: `https://${id}.example`,
+    default_base_url: null,
+    capabilities: { ...NO_BROWSE, lookup: false, paged_search: false, mirrored: true },
+    secrets: [],
+    mirror: { grain: "textbook", records: held ? 2_219 : 0, synced_at_ms: held ? 1 : null },
+  };
+}
 
 function apiWith(extra: Record<string, unknown> = {}) {
   return {
@@ -437,5 +463,37 @@ describe("IntegrationsPanel", () => {
         builtin: { openalex: { enabled: true } },
       },
     });
+  });
+  /// A catalogue is a provider, so it is configured here with the others —
+  /// but it has nothing to fill in, so the catalogues share one tab that
+  /// fetches and drops them rather than taking a form each.
+  it("gives the catalogues one tab between them, marked when the mirror holds one", async () => {
+    const api = apiWith({
+      literatureProviders: vi
+        .fn()
+        .mockResolvedValue([
+          catalogue("libretexts", "LibreTexts", true),
+          catalogue("devdocs", "DevDocs", false),
+          SEMANTIC_SCHOLAR,
+          OPENALEX,
+        ]),
+      onCatalogueSyncProgress: vi.fn(() => Promise.resolve(() => {})),
+    });
+    await panel(api, settings());
+    expect(screen.queryByRole("tab", { name: /LibreTexts/ })).toBeNull();
+    expect(screen.queryByRole("tab", { name: /DevDocs/ })).toBeNull();
+    const tab = screen.getByRole("tab", { name: /Catalogues/ });
+    expect(tab.querySelector('[aria-label="enabled"]')).not.toBeNull();
+
+    fireEvent.click(tab);
+    expect(await screen.findByLabelText("Sync DevDocs")).toBeTruthy();
+    expect(screen.getByLabelText("Remove LibreTexts")).toBeTruthy();
+    // Nothing fetched from DevDocs, so nothing of it to drop.
+    expect(screen.queryByLabelText("Remove DevDocs")).toBeNull();
+  });
+
+  it("offers no catalogues tab where there is no catalogue", async () => {
+    await panel(apiWith(), settings());
+    expect(screen.queryByRole("tab", { name: /Catalogues/ })).toBeNull();
   });
 });

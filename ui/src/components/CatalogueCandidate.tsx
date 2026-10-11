@@ -2,12 +2,11 @@ import { Check, Download, ExternalLink } from "react-feather";
 import type {
   CatalogueCourseProgress,
   CatalogueDownloadProgress,
-  CatalogueHit,
   LiteratureSearchResult,
 } from "../lib/types";
 import { api } from "../services";
 import { useCatalogueAdd } from "../hooks/useCatalogueAdd";
-import { type AddStage, hitKey, useCatalogueStore } from "../stores/useCatalogueStore";
+import { type AddStage, paperKey, useCatalogueStore } from "../stores/useCatalogueStore";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 
 function formatBytes(bytes: number): string {
@@ -16,17 +15,12 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-const GRAIN_LABELS: Record<string, string> = {
+/** What a learning catalogue calls the kind of thing a result is. A kind this
+ *  build has no name for is shown as the source spelled it. */
+const KIND_LABELS: Record<string, string> = {
   textbook: "Textbook",
   course: "Course",
   reference: "Reference",
-};
-
-const PROVIDER_LABELS: Record<string, string> = {
-  libretexts: "LibreTexts",
-  openstax: "OpenStax",
-  mit_ocw: "MIT OpenCourseWare",
-  devdocs: "DevDocs",
 };
 
 /**
@@ -67,47 +61,60 @@ function RowTitle({ title }: { title: string }) {
 }
 
 interface Props {
-  hit: CatalogueHit;
+  /** The provider that returned the result, as the registry names it. */
+  provider: string;
+  work: LiteratureSearchResult;
   /** Compact drops the blurb: the strip under a search result is an offer, not
    *  a reading list, and four two-line rows beat two paragraphs. */
   compact?: boolean;
+  /** The provider's name, for a list that mixes providers and so has no
+   *  heading to say whose row this is. */
+  source?: string;
 }
 
 /**
- * One catalogue candidate, shared by the browse pane and the search-result
- * strip so that a candidate looks and behaves the same wherever it is offered.
+ * One result a provider returned — a paper, a textbook, a course — shared by
+ * the pane and the search-result strip so that it looks and behaves the same
+ * wherever it is offered.
  *
- * The grain and the licence are shown rather than tucked away: they are what
- * the thing *is* and what may be done with it, and a row that hid either would
- * be inviting a click it cannot describe.
+ * One row for all of them, because they are one type: a result carries the
+ * facts its source knows and the row shows the ones it carries. A paper has a
+ * year, a venue and a citation count; a textbook has a kind, a subject, a
+ * licence and a blurb; neither shows a blank for what the other has.
  */
-export default function CatalogueCandidate({ hit, compact = false }: Props) {
+export default function CatalogueCandidate({ provider, work, compact = false, source }: Props) {
   const { add, canAdd, needsDirectory, readOnly, stageOf, isAdded } = useCatalogueAdd();
-  const stage = stageOf(hit);
+  const stage = stageOf(provider, work);
   const adding = stage !== undefined;
   // Staged is not added. `acquired` is written when the file lands in uploads,
   // which is before it is moved into the library, so a row that read it alone
   // said "Added" — and offered no way to see the move — while the move was
   // still running.
-  const added = !adding && isAdded(hit);
+  const added = !adding && isAdded(provider, work);
   // Keyed by the URL this row asked for, so two rows added at once do not
   // read each other's bytes.
   const download = useCatalogueStore((s) =>
-    hit.pdf_url === null ? undefined : s.downloads[hit.pdf_url],
+    work.pdf_url === null ? undefined : s.downloads[work.pdf_url],
   );
   // A course reports its own two-stage progress; the byte stream above cannot
   // say which of forty documents it belongs to.
   const courseProgress = useCatalogueStore((s) =>
-    hit.landing_url === null ? undefined : s.courseProgress[hit.landing_url],
+    work.landing_page_url === null ? undefined : s.courseProgress[work.landing_page_url],
   );
-  const course = useCatalogueStore((s) => s.courses[hitKey(hit)]);
-  const link = hit.landing_url ?? hit.outline_url;
-
-  // What adding would do was decided in core, from the provider that published
-  // the record. A record nothing can fetch says so rather than offering a
-  // button that would fail on click.
-  const isCourse = hit.acquisition === "course";
-  const acquirable = hit.acquisition !== "none";
+  const course = useCatalogueStore((s) => s.courses[paperKey(provider, work)]);
+  // A provider may return a record with no title. It is still a record the
+  // user can open, so it is named by what identifies it rather than dropped.
+  const title = work.title ?? (work.doi !== null ? `DOI ${work.doi}` : work.id);
+  // A user-described provider may report the DOI already as a resolver URL.
+  const doiLink =
+    work.doi === null ? null : /^https?:\/\//i.test(work.doi) ? work.doi : `https://doi.org/${work.doi}`;
+  const link = work.landing_page_url ?? doiLink;
+  // What adding would do was decided by the source that returned the result.
+  // A result nothing can fetch says so rather than offering a button that
+  // would fail on click.
+  const acquisition = work.acquisition ?? (work.pdf_url === null ? "none" : "direct");
+  const isCourse = acquisition === "course";
+  const acquirable = acquisition !== "none" && !(isCourse && work.landing_page_url === null);
 
   const addTitle = readOnly
     ? "This workspace is read-only"
@@ -126,20 +133,26 @@ export default function CatalogueCandidate({ hit, compact = false }: Props) {
     <div className="flex flex-col gap-0.5 py-1.5">
       <div className="flex items-start justify-between gap-2">
         <div className="flex min-w-0 flex-1 items-start gap-1.5">
-          <RowTitle title={hit.title} />
-          <span className="mt-px shrink-0 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1 text-[9px] uppercase tracking-wider text-[var(--text-dim)]">
-            {GRAIN_LABELS[hit.grain] ?? hit.grain}
-          </span>
+          <RowTitle title={title} />
+          {/* Only where the source says what kind of thing it returned. A
+              bibliographic index names none, and a badge reading "Paper" over
+              its monographs, standards and theses would be wrong for some of
+              its rows. */}
+          {work.kind !== null && (
+            <span className="mt-px shrink-0 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1 text-[9px] uppercase tracking-wider text-[var(--text-dim)]">
+              {KIND_LABELS[work.kind] ?? work.kind}
+            </span>
+          )}
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
-          {link !== null && <OpenLink link={link} title={hit.title} />}
+          {link !== null && <OpenLink link={link} title={title} />}
           {acquirable && (
             <AddButton
-              title={hit.title}
+              title={title}
               tooltip={added ? "Added to this library" : addTitle}
               label="Add"
-              onAdd={() => void add(hit)}
+              onAdd={() => void add(provider, work)}
               disabled={!canAdd || adding || added}
               adding={adding}
               added={added}
@@ -148,23 +161,40 @@ export default function CatalogueCandidate({ hit, compact = false }: Props) {
         </div>
       </div>
 
+      {/* What a person chooses by comes first — when, how cited, whether it
+          can be had — because the line is clamped at two lines and a long
+          author list used to push the citations and the access out of view. A
+          count the provider did not report is left out rather than shown as
+          zero, and "open access" is left to the licence where the whole source
+          is an open catalogue. */}
       <MetaLine
         parts={[
-          PROVIDER_LABELS[hit.provider] ?? hit.provider,
-          hit.subject,
-          hit.license,
-          hit.pages !== null && `${hit.pages.toLocaleString()} pp`,
+          source,
+          work.year !== null && `${work.year}`,
+          work.citation_count !== null &&
+            `${work.citation_count.toLocaleString()} citation${work.citation_count === 1 ? "" : "s"}`,
+          work.is_open_access && work.kind === null && "Open access",
+          work.subject,
+          work.authors,
+          work.venue,
+          work.publisher !== work.venue && work.publisher,
+          work.language,
+          work.file_format,
+          work.file_size,
+          work.license,
+          work.pages !== null && `${work.pages.toLocaleString()} pp`,
         ]}
       />
-      {!compact && hit.summary && (
+      {!compact && work.summary !== null && (
         <p className="line-clamp-2 text-[10px] leading-snug text-[var(--text-muted)]">
-          {hit.summary}
+          {work.summary}
         </p>
       )}
+      {!compact && <ResultFilters provider={provider} work={work} title={title} />}
       {stage !== undefined && (
         <AddProgress
           stage={stage}
-          title={hit.title}
+          title={title}
           download={download}
           course={isCourse ? courseProgress : undefined}
         />
@@ -182,11 +212,15 @@ export default function CatalogueCandidate({ hit, compact = false }: Props) {
       )}
       {/* Why there is no add button, in the space a button would have
           taken. What adding a course *does* is the button's own tooltip:
-          a paragraph of it under every OCW row was the same sentence
+          a paragraph of it under every course row was the same sentence
           repeated down the pane. */}
       {!acquirable && (
         <span className="text-[10px] leading-snug text-[var(--text-dim)]">
-          No downloadable copy — open it to read it where it lives.
+          {work.kind !== null
+            ? "No downloadable copy — open it to read it where it lives."
+            : work.is_open_access
+              ? "Listed as open access, but no file was reported — open it to find one."
+              : "No open-access copy reported — open it to read it where it lives."}
         </span>
       )}
     </div>
@@ -389,111 +423,6 @@ function AddButton({
         )}
       </button>
     </Tooltip>
-  );
-}
-
-interface PaperProps {
-  /** The literature provider that returned the work, as the registry names it. */
-  provider: string;
-  work: LiteratureSearchResult;
-}
-
-/**
- * One scholarly work a literature provider returned, beside the catalogue
- * candidates in the same pane.
- *
- * Its own row rather than a `CatalogueCandidate`: a paper is described by a
- * venue, a year and a citation count, and a textbook by a subject, a grain and
- * a licence, and a row that tried to be both would show blanks in either. The
- * link, the add button and the download progress are the same parts, because
- * adding either one is the same act.
- */
-export function PaperCandidate({ provider, work }: PaperProps) {
-  const { addPaper, canAdd, needsDirectory, readOnly, paperStageOf, isPaperAdded } =
-    useCatalogueAdd();
-  const stage = paperStageOf(provider, work);
-  const adding = stage !== undefined;
-  const added = !adding && isPaperAdded(provider, work);
-  const download = useCatalogueStore((s) =>
-    work.pdf_url === null ? undefined : s.downloads[work.pdf_url],
-  );
-  // A provider may return a record with no title. It is still a record the
-  // user can open, so it is named by what identifies it rather than dropped.
-  const title = work.title ?? (work.doi !== null ? `DOI ${work.doi}` : work.id);
-  // A user-described provider may report the DOI already as a resolver URL.
-  const doiLink =
-    work.doi === null ? null : /^https?:\/\//i.test(work.doi) ? work.doi : `https://doi.org/${work.doi}`;
-  const link = work.landing_page_url ?? doiLink;
-  const acquisition = work.acquisition ?? (work.pdf_url === null ? "none" : "direct");
-
-  const addTitle = readOnly
-    ? "This workspace is read-only"
-    : needsDirectory
-      ? "Choose a directory before adding documents"
-      : "Fetch the open-access copy and add it to the current directory";
-
-  return (
-    /* Laid out like a catalogue row, and for the same reason: only the title
-       shares the buttons' line, so the facts below it have the whole pane. */
-    <div className="flex flex-col gap-0.5 py-1.5">
-      <div className="flex items-start justify-between gap-2">
-        {/* No kind badge. The row already sits under the name of the provider
-            that returned it, and the badge said "Paper" over every one of them
-            — over a monograph, a standard, a thesis, whatever the provider
-            happens to index. A label that is wrong for some of its rows says
-            less than the heading above them already does. */}
-        <div className="flex min-w-0 flex-1">
-          <RowTitle title={title} />
-        </div>
-
-        <div className="flex shrink-0 items-center gap-1">
-          {link !== null && <OpenLink link={link} title={title} />}
-          {acquisition !== "none" && (
-            <AddButton
-              title={title}
-              tooltip={added ? "Added to this library" : addTitle}
-              label="Add"
-              onAdd={() => void addPaper(provider, work)}
-              disabled={!canAdd || adding || added}
-              adding={adding}
-              added={added}
-            />
-          )}
-        </div>
-      </div>
-
-      {/* What a person chooses by comes first — when, how cited, whether it
-          can be had — because the line is clamped at two lines and a long
-          author list used to push the citations and the access out of view. A
-          count the provider did not report is left out rather than shown as
-          zero. */}
-      <MetaLine
-        parts={[
-          work.year !== null && `${work.year}`,
-          work.citation_count !== null &&
-            `${work.citation_count.toLocaleString()} citation${work.citation_count === 1 ? "" : "s"}`,
-          work.is_open_access && "Open access",
-          work.authors,
-          work.venue,
-          work.publisher !== work.venue && work.publisher,
-          work.language,
-          work.file_format,
-          work.file_size,
-          work.license,
-        ]}
-      />
-      <ResultFilters provider={provider} work={work} title={title} />
-      {stage !== undefined && (
-        <AddProgress stage={stage} title={title} download={download} />
-      )}
-      {acquisition === "none" && (
-        <span className="text-[10px] leading-snug text-[var(--text-dim)]">
-          {work.is_open_access
-            ? "Listed as open access, but no file was reported — open it to find one."
-            : "No open-access copy reported — open it to read it where it lives."}
-        </span>
-      )}
-    </div>
   );
 }
 

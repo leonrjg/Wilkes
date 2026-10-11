@@ -1,9 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ChevronDown, ChevronRight, Search, Sliders, X } from "react-feather";
+import { Search, Sliders, X } from "react-feather";
 import type {
   BrowseControls,
   CatalogueGrain,
-  CatalogueHit,
   ControlOption,
   FilterControl,
   FilterInput,
@@ -12,13 +11,11 @@ import type {
   LiteratureProviderInfo,
 } from "../lib/types";
 import {
-  ALL_GRAINS,
   browseProviderIds,
   enabledProviderIds,
   type LiteratureAnswer,
   NO_REFINEMENT,
   type Refinement,
-  type PaneSection,
   refinedProviderIds,
   refinementCount,
   totalRefinements,
@@ -29,8 +26,10 @@ import {
 } from "../stores/useCatalogueStore";
 import { useCatalogueAdd } from "../hooks/useCatalogueAdd";
 import { api } from "../services";
-import CatalogueCandidate, { PaperCandidate } from "./CatalogueCandidate";
+import CatalogueCandidate from "./CatalogueCandidate";
 
+/** What a learning catalogue holds, said beside its name: the one thing a
+ *  catalogue's name does not say about it. */
 const GRAIN_LABELS: Record<CatalogueGrain, string> = {
   textbook: "Textbooks",
   course: "Courses",
@@ -38,35 +37,28 @@ const GRAIN_LABELS: Record<CatalogueGrain, string> = {
 };
 
 /**
- * Looking for something to add: the open learning catalogues and the live
- * sources, asked one question at once.
+ * Looking for something to add: every source that is on, asked one question at
+ * once.
  *
  * Sits with the other ways documents enter a library rather than with the
  * search results: looking for material to acquire is an acquisition, and the
  * pane it opens beside is the file list it will change.
  *
- * The two kinds of source are searched together and listed apart. They are
- * different answers — a textbook that teaches a subject, a work a provider
- * indexes — each with its own empty states, and neither is ranked against the
- * other. Each carries its own filter, under its own heading, because a grain
- * is the mirror's vocabulary and means nothing to a live source, and a
- * provider is a service the user configured and has no grain.
+ * The open learning catalogues and the remote indexes are one list of
+ * providers here, because they are one kind of thing: each is asked the query,
+ * answers under its own name, and is never ranked against another. One filter
+ * chooses which of them are asked. What a catalogue has that an index does not
+ * — it is answered from this machine, and holds one kind of thing — is said
+ * beside its name rather than by a second section with a second filter.
  */
 export default function CataloguePane() {
   const closePane = useCatalogueStore((s) => s.closePane);
-  const grains = useCatalogueStore((s) => s.grains);
   const providers = useCatalogueStore((s) => s.providers);
   const providerOptions = useCatalogueStore((s) => s.providerOptions);
   const providerOptionsError = useCatalogueStore((s) => s.providerOptionsError);
-  const collapsed = useCatalogueStore((s) => s.collapsed);
-  const toggleGrain = useCatalogueStore((s) => s.toggleGrain);
   const toggleProvider = useCatalogueStore((s) => s.toggleProvider);
-  const toggleSection = useCatalogueStore((s) => s.toggleSection);
   const loadProviders = useCatalogueStore((s) => s.loadProviders);
   const runSearch = useCatalogueStore((s) => s.search);
-  const loading = useCatalogueStore((s) => s.loading);
-  const answer = useCatalogueStore((s) => s.answer);
-  const error = useCatalogueStore((s) => s.error);
   const literatureLoading = useCatalogueStore((s) => s.literatureLoading);
   const literature = useCatalogueStore((s) => s.literature);
   const literatureError = useCatalogueStore((s) => s.literatureError);
@@ -88,26 +80,11 @@ export default function CataloguePane() {
   }, [loadProviders]);
 
   const enabled = providerOptions.filter((option) => option.enabled);
-  // What a collapsed section is hiding. A rolled-up heading that said only its
-  // name would be a place results could land unseen.
-  const catalogueCount = answer === null ? null : answer.hits.length;
-  // A provider shown as a filtered listing is counted once, as the listing.
-  const listedCount = listed.reduce(
-    (total, id) => total + (listings[id]?.answer?.results.length ?? 0),
-    0,
-  );
   const listedAsked = listed.some((id) => {
     const listing = listings[id];
     return listing !== undefined && (listing.loading || listing.error !== null || listing.answer !== null);
   });
-  const literatureCount =
-    literature === null && !listedAsked
-      ? null
-      : (literature?.providers ?? [])
-          .filter((entry) => selects(providers, entry.provider) && !listed.includes(entry.provider))
-          .reduce((total, entry) => total + (entry.results?.length ?? 0), 0) + listedCount;
   const asked =
-    (selectsAny(grains) && (loading || error !== null || answer !== null)) ||
     (selectsAny(providers) &&
       (literatureLoading || literatureError !== null || literature !== null)) ||
     listedAsked;
@@ -165,81 +142,46 @@ export default function CataloguePane() {
           <p className="py-1.5 text-[10px] leading-snug text-red-400">{acquireError}</p>
         )}
 
-        <Section
-          section="catalogues"
-          label="Open catalogues"
-          count={catalogueCount}
-          collapsed={collapsed.includes("catalogues")}
-          onToggle={toggleSection}
-        >
+        {providerOptionsError !== null ? (
+          <p className="py-1 text-[10px] leading-snug text-red-400">
+            The providers could not be listed: {providerOptionsError}
+          </p>
+        ) : (
           <FilterChips
-            selection={grains}
-            all={ALL_GRAINS}
-            label={(grain) => GRAIN_LABELS[grain]}
-            onToggle={toggleGrain}
+            selection={providers}
+            all={enabledProviderIds(providerOptions)}
+            label={(id) => enabled.find((option) => option.provider === id)?.name ?? id}
+            onToggle={toggleProvider}
           />
-          {!selectsAny(grains) ? (
-            <Note>No category selected, so the catalogues were not searched.</Note>
-          ) : (
-            <>
-              {loading && <Spinner />}
-              {error !== null && !loading && (
-                <p className="py-2 text-[10px] leading-snug text-red-400">{error}</p>
-              )}
-              {!loading && error === null && answer !== null && (
-                <CatalogueAnswerBody answer={answer} />
-              )}
-            </>
-          )}
-        </Section>
-
-        <Section
-          section="literature"
-          label="Literature"
-          count={literatureCount}
-          collapsed={collapsed.includes("literature")}
-          onToggle={toggleSection}
-        >
-          {providerOptionsError !== null ? (
-            <p className="py-1 text-[10px] leading-snug text-red-400">
-              The providers could not be listed: {providerOptionsError}
-            </p>
-          ) : (
-            <FilterChips
+        )}
+        {!selectsAny(providers) ? (
+          <Note>No source selected, so nothing was searched.</Note>
+        ) : (
+          <>
+            {literatureLoading && <Spinner />}
+            {/* The error and the answer are shown together when both exist.
+                A failed request for a provider the user has just re-selected
+                says nothing about what the others already answered, and
+                hiding their results would take away what is being read. */}
+            {literatureError !== null && !literatureLoading && (
+              <p className="py-2 text-[10px] leading-snug text-red-400">{literatureError}</p>
+            )}
+            <ProviderResults
+              answer={literatureLoading ? null : literature}
+              listed={listed}
+              providerOptions={providerOptions}
               selection={providers}
-              all={enabledProviderIds(providerOptions)}
-              label={(id) => enabled.find((option) => option.provider === id)?.name ?? id}
-              onToggle={toggleProvider}
             />
-          )}
-          {!selectsAny(providers) ? (
-            <Note>No provider selected, so nothing was searched.</Note>
-          ) : (
-            <>
-              {literatureLoading && <Spinner />}
-              {/* The error and the answer are shown together when both exist.
-                  A failed request for a provider the user has just re-selected
-                  says nothing about what the others already answered, and
-                  hiding their results would take away what is being read. */}
-              {literatureError !== null && !literatureLoading && (
-                <p className="py-2 text-[10px] leading-snug text-red-400">{literatureError}</p>
-              )}
-              <ProviderResults
-                answer={literatureLoading ? null : literature}
-                listed={listed}
-                providerOptions={providerOptions}
-                selection={providers}
-              />
-            </>
-          )}
-        </Section>
+          </>
+        )}
 
         {!asked && (
           <>
             <Note>
-              Describe what you are trying to understand. The catalogues are open
-              textbooks, courses and documentation sets; the providers are the
-              live sources enabled in Settings › Integrations.
+              Describe what you are trying to understand. Every source that is on
+              is asked: the open catalogues of textbooks, courses and
+              documentation you have fetched, and the indexes you have enabled,
+              both in Settings › Integrations.
             </Note>
             {browsable.length > 0 && (
               <Note>
@@ -265,55 +207,6 @@ export default function CataloguePane() {
   );
 }
 
-/**
- * One half of the pane: its heading, the control that rolls it up, and what it
- * holds when it is not rolled up.
- *
- * The count is shown rather than only the name, because a collapsed section is
- * still searched — collapsing decides what is *shown*, the filters decide what
- * is *asked* — and a heading that said only "Literature" would be a place
- * results could land unseen. A section's own filter rolls up with it, since a
- * filter with nothing visible under it controls nothing the user can see.
- */
-function Section({
-  section,
-  label,
-  count,
-  collapsed,
-  onToggle,
-  children,
-}: {
-  section: PaneSection;
-  label: string;
-  /** How many results the section holds, or null before it has been asked. */
-  count: number | null;
-  collapsed: boolean;
-  onToggle: (section: PaneSection) => void;
-  children: ReactNode;
-}) {
-  return (
-    <section aria-label={label}>
-      <h3 className="pt-2.5 pb-1">
-        <button
-          type="button"
-          onClick={() => onToggle(section)}
-          aria-expanded={!collapsed}
-          className="flex w-full items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
-        >
-          {collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
-          {label}
-          {count !== null && (
-            <span className="font-normal normal-case tracking-normal text-[var(--text-muted)]">
-              {count}
-            </span>
-          )}
-        </button>
-      </h3>
-      {collapsed ? null : children}
-    </section>
-  );
-}
-
 function Note({ children }: { children: ReactNode }) {
   return (
     <p className="py-1.5 text-[10px] leading-snug text-[var(--text-muted)]">{children}</p>
@@ -321,7 +214,7 @@ function Note({ children }: { children: ReactNode }) {
 }
 
 /**
- * The filter for one section, beside the results it filters.
+ * Which sources are asked, above what they answered.
  *
  * Nothing stored means every member is on, so a chip reads as pressed when the
  * selection admits it rather than when the selection happens to name it —
@@ -344,7 +237,7 @@ function FilterChips<T extends string>({
     // Named for what it decides. These chips choose which sources are asked;
     // the Filters button beside the search box narrows what one of them
     // returns, and both being called "filters" sent people to the wrong one.
-    <div role="group" aria-label="Search in" className="flex flex-wrap items-center gap-1 pb-1">
+    <div role="group" aria-label="Search in" className="flex flex-wrap items-center gap-1 pb-1 pt-2">
       <span className="pr-0.5 text-[9px] uppercase tracking-wider text-[var(--text-muted)]">
         Search in
       </span>
@@ -374,40 +267,6 @@ function Spinner() {
   return (
     <div className="flex items-center justify-center py-4">
       <div className="h-5 w-5 animate-spin rounded-full border-2 border-[var(--accent-blue)] border-t-transparent" />
-    </div>
-  );
-}
-
-function CatalogueAnswerBody({
-  answer,
-}: {
-  answer: { query: string; terms: string[]; hits: CatalogueHit[] };
-}) {
-  // Two different empty answers. Saying "nothing found" to someone who typed a
-  // word the index never looked for would be a lie by omission.
-  if (answer.hits.length === 0 && answer.terms.length === 0) {
-    return (
-      <Note>
-        Nothing in “{answer.query}” could be searched for — single letters and
-        very common words are dropped before the query runs. Try naming the
-        subject in a word or two more.
-      </Note>
-    );
-  }
-  if (answer.hits.length === 0) {
-    return (
-      <Note>
-        No catalogue here holds anything matching{" "}
-        {answer.terms.map((t) => `“${t}”`).join(", ")}. The mirror may also
-        simply be empty — Settings › Catalogues says when each was last fetched.
-      </Note>
-    );
-  }
-  return (
-    <div className="divide-y divide-[var(--border-main)]">
-      {answer.hits.map((hit) => (
-        <CatalogueCandidate key={`${hit.provider}:${hit.external_id}`} hit={hit} />
-      ))}
     </div>
   );
 }
@@ -1203,7 +1062,7 @@ function ListingBody({ provider, name }: { provider: string; name: string }) {
         ) : (
           <div className="divide-y divide-[var(--border-main)]">
             {answer.results.map((work) => (
-              <PaperCandidate key={work.id} provider={provider} work={work} />
+              <CatalogueCandidate key={work.id} provider={provider} work={work} />
             ))}
           </div>
         ))}
@@ -1230,8 +1089,7 @@ function providerAnswerMalformed(provider: string): string {
 }
 
 /**
- * Every selected provider's part of the Literature section, in the registry's
- * order and each under its own name: a filtered listing for a provider with
+ * Every selected provider's part of the answer, in the registry's order and each under its own name: a filtered listing for a provider with
  * filters set, otherwise its answer to the keyword.
  *
  * The held answers can cover more providers than the selection admits —
@@ -1249,13 +1107,14 @@ function ProviderResults({
   providerOptions: LiteratureProviderInfo[];
   selection: Selection<string>;
 }) {
-  // No provider enabled is a setting, not a search result: saying "nothing
+  // No source being on is a setting, not a search result: saying "nothing
   // found" would send someone rephrasing a query no index ever saw.
   if (answer !== null && answer.providers.length === 0 && listed.length === 0) {
     return (
       <Note>
-        No provider is enabled, so nothing was searched. Settings › Integrations
-        turns on the providers that ship with Wilkes, or one you describe.
+        No source is on, so nothing was searched. Settings › Integrations fetches
+        the open catalogues, and turns on the indexes that ship with Wilkes or
+        one you describe.
       </Note>
     );
   }
@@ -1284,6 +1143,7 @@ function ProviderResults({
             answer={answer}
             entry={entry}
             paged={info?.capabilities.paged_search === true}
+            grain={info?.mirror?.grain ?? null}
           />
         );
       })}
@@ -1297,26 +1157,31 @@ function ProviderEntry({
   answer,
   entry,
   paged,
+  grain,
 }: {
   answer: LiteratureAnswer;
   entry: LiteratureProviderAnswer;
   paged: boolean;
+  /** What a learning catalogue holds; null for any other provider. */
+  grain: CatalogueGrain | null;
 }) {
   const moreLoading = useCatalogueStore((s) => s.literatureMore);
   const moreError = useCatalogueStore((s) => s.literatureMoreError);
   const loadMore = useCatalogueStore((s) => s.loadMoreLiterature);
   return (
     <div className="flex flex-col">
-      {/* The provider is the strongest label in this half: it says whose
-          index a row came from, and it is the only thing that does now
-          that no row carries a kind badge. So it reads brighter than the
-          section heading above it and sits on a rule of its own, rather
-          than as a dim line that scanned as part of the row beneath. */}
+      {/* The provider is the strongest label in the pane: it says whose
+          index a row came from, and for most rows it is the only thing that
+          does. So it reads bright and sits on a rule of its own, rather than
+          as a dim line that scanned as part of the row beneath. A catalogue
+          says beside its name what it is a catalogue of. */}
       <h4 className="mt-2 flex items-baseline gap-1.5 border-b border-[var(--border-strong)] pb-1 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)]">
         {entry.name}
-        {entry.results !== null && (
+        {(grain !== null || entry.results !== null) && (
           <span className="font-normal normal-case tracking-normal text-[var(--text-muted)]">
-            {entry.results.length}
+            {[grain !== null ? GRAIN_LABELS[grain] : null, entry.results?.length ?? null]
+              .filter((part) => part !== null)
+              .join(" · ")}
           </span>
         )}
       </h4>
@@ -1331,7 +1196,7 @@ function ProviderEntry({
       ) : (
         <div className="divide-y divide-[var(--border-main)]">
           {entry.results.map((work) => (
-            <PaperCandidate key={work.id} provider={entry.provider} work={work} />
+            <CatalogueCandidate key={work.id} provider={entry.provider} work={work} />
           ))}
         </div>
       )}

@@ -2,8 +2,8 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   BrowseControls,
+  CatalogueGrain,
   FilterControl,
-  CatalogueHit,
   LiteratureProviderInfo,
   LiteratureSearchResult,
 } from "../lib/types";
@@ -11,8 +11,8 @@ import type {
 vi.mock("../services", () => ({
   isTauri: true,
   api: {
-    catalogueSearch: vi.fn(),
     catalogueAcquire: vi.fn(),
+    catalogueAcquireCourse: vi.fn(),
     literatureProviders: vi.fn(),
     literatureSearch: vi.fn(),
     literatureBrowse: vi.fn(),
@@ -33,23 +33,6 @@ import { useCatalogueStore } from "../stores/useCatalogueStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 
-const HIT: CatalogueHit = {
-  provider: "devdocs",
-  external_id: "python~3.12",
-  title: "Python 3.12",
-  summary: "The language reference and standard library.",
-  subject: "Programming",
-  authors: "PSF",
-  license: "PSF",
-  landing_url: "https://example.invalid/python",
-  pdf_url: null,
-  outline_url: null,
-  grain: "reference",
-  pages: null,
-  recall_score: 6.1,
-  acquisition: "none",
-};
-
 const WORK: LiteratureSearchResult = {
   id: "W1",
   doi: "10.1000/lists",
@@ -68,7 +51,34 @@ const WORK: LiteratureSearchResult = {
   language: null,
   file_format: null,
   file_size: null,
+  summary: null,
+  subject: null,
+  kind: null,
+  pages: null,
+  recall_score: null,
   acquisition: "direct",
+};
+
+/** What a learning catalogue answers with: the same result, carrying the
+ *  facts a catalogue knows and none a bibliographic index does. */
+const REFERENCE: LiteratureSearchResult = {
+  ...WORK,
+  id: "python~3.12",
+  doi: null,
+  title: "Python 3.12",
+  year: null,
+  venue: null,
+  citation_count: null,
+  pdf_url: null,
+  landing_page_url: "https://example.invalid/python",
+  open_access_status: null,
+  license: "PSF",
+  authors: "PSF",
+  summary: "The language reference and standard library.",
+  subject: "Programming",
+  kind: "reference",
+  recall_score: 6.1,
+  acquisition: "none",
 };
 
 const control = (
@@ -148,17 +158,43 @@ function provider(
     builtin: true,
     base_url: `https://api.${id}.example`,
     default_base_url: `https://api.${id}.example`,
-    capabilities: { paged_search: true, browse, lookup: true, references: false, resolve_download: false },
+    capabilities: {
+      paged_search: true,
+      browse,
+      lookup: true,
+      references: false,
+      resolve_download: false,
+      mirrored: false,
+    },
     secrets: [],
+    mirror: null,
   };
 }
 
-const search = api.catalogueSearch as unknown as ReturnType<typeof vi.fn>;
+/** A learning catalogue as the registry reports it: a provider answered from
+ *  the mirror, on because the mirror holds it. */
+function catalogue(id: string, name: string, grain: CatalogueGrain): LiteratureProviderInfo {
+  return {
+    ...provider(id, name),
+    default_base_url: null,
+    capabilities: {
+      paged_search: false,
+      browse: null,
+      lookup: false,
+      references: false,
+      resolve_download: false,
+      mirrored: true,
+    },
+    mirror: { grain, records: 700, synced_at_ms: 1 },
+  };
+}
+
 const providers = api.literatureProviders as unknown as ReturnType<typeof vi.fn>;
 const literature = api.literatureSearch as unknown as ReturnType<typeof vi.fn>;
 const browse = api.literatureBrowse as unknown as ReturnType<typeof vi.fn>;
 const resolveDownload = api.literatureResolveDownload as unknown as ReturnType<typeof vi.fn>;
 const acquire = api.catalogueAcquire as unknown as ReturnType<typeof vi.fn>;
+const acquireCourse = api.catalogueAcquireCourse as unknown as ReturnType<typeof vi.fn>;
 const importFiles = (source as unknown as { importFiles: ReturnType<typeof vi.fn> }).importFiles;
 
 describe("CataloguePane", () => {
@@ -170,9 +206,8 @@ describe("CataloguePane", () => {
     // filtered" says so rather than assuming the last test left it that way.
     useCatalogueStore.setState({
       paneOpen: true,
-      grains: null,
       providers: null,
-      collapsed: [],
+      legacy: undefined,
       providerOptions: [],
       providerOptionsError: null,
       browseOpen: false,
@@ -185,9 +220,6 @@ describe("CataloguePane", () => {
       provider("semantic_scholar", "Semantic Scholar"),
       provider("openalex", "OpenAlex", OPENALEX_BROWSE),
     ]);
-    search.mockResolvedValue({
-      results: [{ key: "pane", terms: ["python", "lists"], hits: [HIT] }],
-    });
     literature.mockResolvedValue({
       query: "python lists",
       providers: [{ provider: "openalex", name: "OpenAlex", results: [WORK], error: null }],
@@ -201,63 +233,173 @@ describe("CataloguePane", () => {
     fireEvent.submit(screen.getByLabelText("Search catalogues and literature"));
   };
 
-  it("asks the mirror and the literature providers the same question", async () => {
+  /** The installation the unification is about: a catalogue the mirror holds
+   *  beside an index the user enabled. */
+  const withCatalogue = () => {
+    providers.mockResolvedValue([
+      catalogue("devdocs", "DevDocs", "reference"),
+      provider("openalex", "OpenAlex", OPENALEX_BROWSE),
+    ]);
+    literature.mockResolvedValue({
+      query: "python lists",
+      providers: [
+        { provider: "devdocs", name: "DevDocs", results: [REFERENCE], error: null },
+        { provider: "openalex", name: "OpenAlex", results: [WORK], error: null },
+      ],
+    });
+  };
+
+  /// A catalogue is one more provider: one request asks it and the index, and
+  /// each answers under its own name in the one list.
+  it("asks a catalogue and an index the same question, each under its own name", async () => {
+    withCatalogue();
     render(<CataloguePane />);
+    await screen.findByRole("button", { name: "DevDocs" });
     submit("python lists");
     expect(await screen.findByText("Python 3.12")).toBeTruthy();
-    expect(await screen.findByText("Persistent Lists Revisited")).toBeTruthy();
-    expect(search.mock.calls[0][0]).toEqual([
-      { key: "pane", text: "python lists", grains: null },
-    ]);
-    // Ten records, not the backend's own default: the pane is a shortlist to
-    // consider, not a second page of search results.
-    expect(search.mock.calls[0][1]).toBe(10);
+    expect(screen.getByText("Persistent Lists Revisited")).toBeTruthy();
+    expect(literature).toHaveBeenCalledTimes(1);
     expect(literature).toHaveBeenCalledWith("python lists", 10, undefined);
-    // Listed apart, under headings, because they are different answers. The
-    // live sources are "Literature", not "Papers": a provider may index a
-    // monograph or a standard, and several do.
-    expect(
-      within(screen.getByRole("region", { name: "Open catalogues" })).getByText("Python 3.12"),
-    ).toBeTruthy();
-    expect(
-      within(screen.getByRole("region", { name: "Literature" })).getByText(
-        "Persistent Lists Revisited",
-      ),
-    ).toBeTruthy();
-    expect(screen.queryByRole("region", { name: "Papers" })).toBeNull();
+    // No second section and no second filter: both are chips of the one row.
+    expect(screen.getAllByRole("group", { name: "Search in" })).toHaveLength(1);
+    expect(screen.queryByRole("region", { name: "Open catalogues" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Textbooks" })).toBeNull();
+    // What a catalogue holds is said beside its name, which does not say it.
+    expect(screen.getByRole("heading", { name: /DevDocs\s*Reference · 1/ })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /OpenAlex\s*1/ })).toBeTruthy();
   });
 
-  /// The catalogues publish at different grains and a question is rarely
-  /// answerable at only one, so no selection means all of them — and a chosen
-  /// grain is a filter the caller asked for, not a hint.
-  it("passes only the grains the user selected, without asking the providers again", async () => {
+  /// Deselecting a catalogue is deselecting a provider: it is not asked, and
+  /// nothing else is asked again.
+  it("leaves a deselected catalogue out of the question", async () => {
+    withCatalogue();
     render(<CataloguePane />);
+    fireEvent.click(await screen.findByRole("button", { name: "DevDocs" }));
     submit("python lists");
     await screen.findByText("Persistent Lists Revisited");
-    // Everything is selected, so clicking a grain turns that one off.
-    fireEvent.click(screen.getByRole("button", { name: "Textbooks" }));
-    await waitFor(() => {
-      expect(search.mock.calls[1][0]).toEqual([
-        { key: "pane", text: "python lists", grains: ["course", "reference"] },
-      ]);
-    });
-    // A grain chip is the mirror's business. Nothing about the live sources
-    // changed, so they are not asked again.
-    expect(literature).toHaveBeenCalledTimes(1);
-    expect(screen.getByText("Persistent Lists Revisited")).toBeTruthy();
+    expect(literature).toHaveBeenCalledWith("python lists", 10, ["openalex"]);
+    expect(screen.queryByText("Python 3.12")).toBeNull();
   });
 
-  /// The grain filter belongs to the catalogues and is drawn inside their
-  /// section, because it says nothing a literature provider could act on.
-  it("keeps each filter inside the section it filters", async () => {
+  /// A result carries the facts its source knows and the row shows those: a
+  /// catalogue's record has a kind, a subject and a blurb, and no year or
+  /// citation count to show a blank for.
+  it("shows a catalogue's result by what a catalogue knows about it", async () => {
+    withCatalogue();
     render(<CataloguePane />);
-    await screen.findByRole("button", { name: "OpenAlex" });
-    const catalogues = within(screen.getByRole("region", { name: "Open catalogues" }));
-    expect(catalogues.getByRole("button", { name: "Textbooks" })).toBeTruthy();
-    expect(catalogues.queryByRole("button", { name: "OpenAlex" })).toBeNull();
-    const live = within(screen.getByRole("region", { name: "Literature" }));
-    expect(live.getByRole("button", { name: "Semantic Scholar" })).toBeTruthy();
-    expect(live.queryByRole("button", { name: "Textbooks" })).toBeNull();
+    submit("python lists");
+    await screen.findByText("Python 3.12");
+    expect(screen.getByText("Reference")).toBeTruthy();
+    expect(screen.getByText("The language reference and standard library.")).toBeTruthy();
+    expect(screen.getByTitle("Programming · PSF · PSF")).toBeTruthy();
+    expect(screen.getByText(/No downloadable copy/)).toBeTruthy();
+    // The index's row beside it names no kind, because its source named none.
+    expect(screen.queryByText("Paper")).toBeNull();
+  });
+
+  /// A catalogue that cannot answer says why under its own name, like any
+  /// provider that cannot. "Nothing found" for a word that was never looked
+  /// for would be a lie by omission.
+  it("says under a catalogue's name why it could not search for a query", async () => {
+    withCatalogue();
+    literature.mockResolvedValue({
+      query: "C",
+      providers: [
+        {
+          provider: "devdocs",
+          name: "DevDocs",
+          results: null,
+          error: "nothing in “C” could be searched for; single letters and very common words are dropped before the query runs",
+        },
+      ],
+    });
+    render(<CataloguePane />);
+    submit("C");
+    expect(
+      await screen.findByText(/DevDocs could not answer: nothing in “C” could be searched for/),
+    ).toBeTruthy();
+  });
+
+  /// A course is many files and a syllabus, fetched from its landing page and
+  /// imported into a folder of its own — through the same row and the same
+  /// button as a single file.
+  it("adds a course from a catalogue into its own folder", async () => {
+    const course: LiteratureSearchResult = {
+      ...REFERENCE,
+      id: "18.06",
+      title: "Linear Algebra",
+      kind: "course",
+      landing_page_url: "https://ocw.example.invalid/18-06",
+      acquisition: "course",
+    };
+    providers.mockResolvedValue([catalogue("mit_ocw", "MIT OpenCourseWare", "course")]);
+    literature.mockResolvedValue({
+      query: "linear algebra",
+      providers: [{ provider: "mit_ocw", name: "MIT OpenCourseWare", results: [course], error: null }],
+    });
+    acquireCourse.mockResolvedValue({
+      directory: "/uploads/18-06",
+      folder: "18-06 Linear Algebra",
+      document: "/uploads/18-06/course.md",
+      documents: [{ path: "/uploads/18-06/lecture-1.pdf" }],
+      failures: [],
+      skipped: [{}],
+    });
+    render(<CataloguePane />);
+    submit("linear algebra");
+    fireEvent.click(await screen.findByLabelText("Add Linear Algebra to library"));
+    await waitFor(() => {
+      expect(acquireCourse).toHaveBeenCalledWith("https://ocw.example.invalid/18-06");
+      expect(importFiles).toHaveBeenCalledWith(
+        ["/uploads/18-06/course.md", "/uploads/18-06/lecture-1.pdf"],
+        "/library",
+        "move",
+        "18-06 Linear Algebra",
+      );
+    });
+    expect(await screen.findByText(/1 document and a syllabus, 1 skipped/)).toBeTruthy();
+    expect(acquire).not.toHaveBeenCalled();
+  });
+
+  /// The pane used to store a grain filter beside the provider filter. What
+  /// they amounted to together is one selection, and upgrading keeps it: the
+  /// catalogues of the grains that were on, and the providers that were.
+  it("turns a stored grain filter into the catalogues it meant", async () => {
+    localStorage.setItem(
+      "wilkes.catalogue.filters",
+      JSON.stringify({ grains: ["reference"], providers: null, collapsed: ["literature"] }),
+    );
+    useCatalogueStore.setState({ providers: null, legacy: { grains: ["reference"] } });
+    providers.mockResolvedValue([
+      catalogue("libretexts", "LibreTexts", "textbook"),
+      catalogue("devdocs", "DevDocs", "reference"),
+      provider("openalex", "OpenAlex"),
+    ]);
+    render(<CataloguePane />);
+    await waitFor(() => {
+      expect(useCatalogueStore.getState().providers).toEqual(["devdocs", "openalex"]);
+    });
+    expect(JSON.parse(localStorage.getItem("wilkes.catalogue.filters") ?? "null")).toEqual({
+      providers: ["devdocs", "openalex"],
+    });
+    expect(screen.getByRole("button", { name: "LibreTexts" })).toHaveProperty(
+      "ariaPressed",
+      "false",
+    );
+  });
+
+  /// Nothing was filtered before, so nothing is now — and a source added
+  /// later still joins, which an enumeration of today's would not allow.
+  it("keeps an unfiltered stored choice unfiltered", async () => {
+    useCatalogueStore.setState({ providers: null, legacy: { grains: null } });
+    providers.mockResolvedValue([
+      catalogue("devdocs", "DevDocs", "reference"),
+      provider("openalex", "OpenAlex"),
+    ]);
+    render(<CataloguePane />);
+    await screen.findByRole("button", { name: "DevDocs" });
+    expect(useCatalogueStore.getState().providers).toBeNull();
+    expect(useCatalogueStore.getState().legacy).toBeUndefined();
   });
 
   /// Narrowing to one provider asks that provider alone. Filtering the answer
@@ -271,9 +413,7 @@ describe("CataloguePane", () => {
     await screen.findByText("Persistent Lists Revisited");
     expect(literature).toHaveBeenCalledWith("python lists", 10, ["openalex"]);
     expect(JSON.parse(localStorage.getItem("wilkes.catalogue.filters") ?? "null")).toEqual({
-      grains: null,
       providers: ["openalex"],
-      collapsed: [],
     });
   });
 
@@ -341,44 +481,8 @@ describe("CataloguePane", () => {
     useCatalogueStore.setState({ providers: [] });
     render(<CataloguePane />);
     submit("python lists");
-    expect(await screen.findByText("Python 3.12")).toBeTruthy();
+    expect(await screen.findByText(/No source selected/)).toBeTruthy();
     expect(literature).not.toHaveBeenCalled();
-    expect(screen.getByText(/No provider selected/)).toBeTruthy();
-  });
-
-  /// Collapsing is a display choice, not a filter: the half is still asked,
-  /// so opening it again shows the answer rather than a blank that needs a
-  /// re-run. The count on the heading is what says results are in there.
-  it("rolls a section up without stopping it being searched", async () => {
-    render(<CataloguePane />);
-    submit("python lists");
-    await screen.findByText("Persistent Lists Revisited");
-    fireEvent.click(screen.getByRole("button", { name: /Literature/ }));
-    expect(screen.queryByText("Persistent Lists Revisited")).toBeNull();
-    expect(screen.getByRole("button", { name: /Literature/ })).toHaveProperty(
-      "ariaExpanded",
-      "false",
-    );
-
-    submit("python lists again");
-    await waitFor(() => expect(literature).toHaveBeenCalledTimes(2));
-    fireEvent.click(screen.getByRole("button", { name: /Literature/ }));
-    expect(screen.getByText("Persistent Lists Revisited")).toBeTruthy();
-  });
-
-  /// The same standing-choice storage as the filters, because which half to
-  /// look at is the same kind of choice as which sources to ask.
-  it("remembers which sections were rolled up", async () => {
-    render(<CataloguePane />);
-    await screen.findByRole("button", { name: "OpenAlex" });
-    fireEvent.click(screen.getByRole("button", { name: /Open catalogues/ }));
-    expect(JSON.parse(localStorage.getItem("wilkes.catalogue.filters") ?? "null")).toEqual({
-      grains: null,
-      providers: null,
-      collapsed: ["catalogues"],
-    });
-    // A collapsed section hides its own filter with it.
-    expect(screen.queryByRole("button", { name: "Textbooks" })).toBeNull();
   });
 
   /// A stored filter naming a provider the user has since removed would be
@@ -399,8 +503,7 @@ describe("CataloguePane", () => {
     expect(await screen.findByText(/providers could not be listed/)).toBeTruthy();
   });
 
-  /// A provider that is down is reported beside the ones that answered, and
-  /// does not take the catalogue results with it.
+  /// A provider that is down is reported beside the ones that answered.
   it("reports a failing provider without hiding the others", async () => {
     literature.mockResolvedValue({
       query: "python lists",
@@ -413,16 +516,15 @@ describe("CataloguePane", () => {
     submit("python lists");
     expect(await screen.findByText(/Semantic Scholar could not answer: 429/)).toBeTruthy();
     expect(screen.getByText("Persistent Lists Revisited")).toBeTruthy();
-    expect(screen.getByText("Python 3.12")).toBeTruthy();
   });
 
-  /// No provider enabled is a setting to change, not "nothing found".
-  it("says when no literature provider is enabled", async () => {
+  /// No source being on is a setting to change, not "nothing found".
+  it("says when no source is on", async () => {
     providers.mockResolvedValue([]);
     literature.mockResolvedValue({ query: "python lists", providers: [] });
     render(<CataloguePane />);
     submit("python lists");
-    expect(await screen.findByText(/No provider is enabled/)).toBeTruthy();
+    expect(await screen.findByText(/No source is on/)).toBeTruthy();
   });
 
   // ── Reading on in a keyword search ───────────────────────────────────────
@@ -514,7 +616,7 @@ describe("CataloguePane", () => {
   it("names the source chips for what they decide, apart from the Filters button", async () => {
     render(<CataloguePane />);
     await screen.findByRole("button", { name: "OpenAlex" });
-    expect(screen.getAllByRole("group", { name: "Search in" })).toHaveLength(2);
+    expect(screen.getAllByRole("group", { name: "Search in" })).toHaveLength(1);
     expect(screen.getByRole("button", { name: "Filters" })).toBeTruthy();
   });
 
@@ -622,13 +724,9 @@ describe("CataloguePane", () => {
         limit: 10,
       }),
     );
-    // The listing sits in the Literature section under the provider's name,
-    // and nothing was asked of the keyword search.
-    expect(
-      within(screen.getByRole("region", { name: "Literature" })).getByLabelText(
-        "OpenAlex listing",
-      ),
-    ).toBeTruthy();
+    // The listing sits under the provider's name, and nothing was asked of
+    // the keyword search.
+    expect(screen.getByLabelText("OpenAlex listing")).toBeTruthy();
     expect(literature).not.toHaveBeenCalled();
   });
 
@@ -1142,23 +1240,6 @@ describe("CataloguePane", () => {
     fireEvent.click(await screen.findByLabelText("Add Resolved Book to library"));
     expect(await screen.findByText(/membership required/)).toBeTruthy();
     expect(useCatalogueStore.getState().adding).toEqual({});
-  });
-
-  /// Two empty answers with different causes. Telling someone "nothing found"
-  /// for a word that was never looked for would be a lie by omission.
-  it("separates an unsearchable query from an empty catalogue", async () => {
-    search.mockResolvedValue({ results: [{ key: "pane", terms: [], hits: [] }] });
-    render(<CataloguePane />);
-    submit("C");
-    expect(
-      await screen.findByText(/single letters and very common words are dropped/i),
-    ).toBeTruthy();
-
-    search.mockResolvedValue({
-      results: [{ key: "pane", terms: ["topology"], hits: [] }],
-    });
-    submit("topology");
-    expect(await screen.findByText(/No catalogue here holds anything matching/i)).toBeTruthy();
   });
 
   it("says why nothing can be added to a read-only workspace", async () => {

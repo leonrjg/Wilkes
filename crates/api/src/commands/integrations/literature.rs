@@ -10,17 +10,19 @@
 //! Resolution is the registry's, exactly as the MCP tool's is: the id a
 //! provider is reported under here is the id that tool accepts.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
+use wilkes_core::catalogue::{mirrored_sources, CatalogueStore};
 use wilkes_core::integrations::custom::manifest::SecretSlot;
 use wilkes_core::integrations::{builtin, IntegrationRegistry, ProviderCapabilities};
 use wilkes_core::metadata::cache::MetadataCache;
 use wilkes_core::metadata::doi::normalize_doi;
 use wilkes_core::types::{
-    BrowseRequest, IntegrationStatus, IntegrationsSettings, LiteratureSearchResult, ProviderWork,
-    ResolvedLiteratureDownload,
+    BrowseRequest, IntegrationStatus, IntegrationsSettings, LiteratureSearchResult, MirrorStatus,
+    ProviderWork, ResolvedLiteratureDownload,
 };
 
 /// Works per provider when the caller does not say. The pane lists every
@@ -82,33 +84,75 @@ pub struct LiteratureProviderInfo {
     /// The values this provider asks the user for (an email address, an API
     /// key), each optional or required.
     pub secrets: Vec<SecretSlot>,
+    /// What the catalogue mirror holds for a provider answered from it; null
+    /// for one that is asked over the network. `enabled` follows from it: a
+    /// mirrored provider is on once it has been fetched.
+    pub mirror: Option<MirrorStatus>,
 }
 
 /// Every provider this installation knows, in registry order, each saying
 /// whether the user has it switched on. Disabled ones are listed rather than
 /// dropped: a caller filtering by provider needs to tell *switched off* from
 /// *does not exist*, which are different mistakes with different fixes.
-pub fn providers(settings: &IntegrationsSettings) -> Vec<LiteratureProviderInfo> {
+pub fn providers(
+    settings: &IntegrationsSettings,
+    mirror_dir: Option<&Path>,
+) -> Vec<LiteratureProviderInfo> {
     let shipped = builtin::manifests();
-    IntegrationRegistry::from_settings(settings)
+    let mirror = mirror_dir.map(mirror_statuses).unwrap_or_default();
+    IntegrationRegistry::from_settings(settings, mirror_dir)
         .literature_sources()
         .map(|entry| LiteratureProviderInfo {
             provider: entry.id().to_string(),
             name: entry.name().to_string(),
             enabled: entry.enabled,
             builtin: entry.builtin,
-            base_url: entry.manifest().http.base_url.clone(),
-            default_base_url: entry
-                .builtin
-                .then(|| {
-                    shipped
-                        .iter()
-                        .find(|manifest| manifest.id == entry.id())
-                        .map(|manifest| manifest.http.base_url.clone())
-                })
-                .flatten(),
+            base_url: entry.source().base_url().to_string(),
+            // Only a shipped manifest has an origin the user may move.
+            default_base_url: entry.manifest().filter(|_| entry.builtin).and_then(|_| {
+                shipped
+                    .iter()
+                    .find(|manifest| manifest.id == entry.id())
+                    .map(|manifest| manifest.http.base_url.clone())
+            }),
             capabilities: entry.source().capabilities(),
-            secrets: entry.manifest().secret_slots(),
+            secrets: entry
+                .manifest()
+                .map(|manifest| manifest.secret_slots())
+                .unwrap_or_default(),
+            mirror: mirror
+                .iter()
+                .find(|(id, _)| id == entry.id())
+                .map(|(_, status)| status.clone()),
+        })
+        .collect()
+}
+
+/// What the mirror holds for each catalogue, by provider id.
+///
+/// A mirror that cannot be read reports every catalogue as never fetched,
+/// which is what the registry will have concluded about them too.
+fn mirror_statuses(mirror_dir: &Path) -> Vec<(String, MirrorStatus)> {
+    let held = match CatalogueStore::open(mirror_dir).and_then(|store| store.holdings()) {
+        Ok(held) => held,
+        Err(error) => {
+            tracing::error!("catalogue mirror is unreadable: {error:#}");
+            Vec::new()
+        }
+    };
+    mirrored_sources(mirror_dir)
+        .iter()
+        .map(|source| {
+            let id = wilkes_core::integrations::LiteratureSource::id(source);
+            let holding = held.iter().find(|held| held.provider == id);
+            (
+                id.to_string(),
+                MirrorStatus {
+                    grain: source.grain(),
+                    records: holding.map_or(0, |held| held.records),
+                    synced_at_ms: holding.and_then(|held| held.synced_at_ms),
+                },
+            )
         })
         .collect()
 }
@@ -136,6 +180,7 @@ impl std::error::Error for LiteratureRequestError {}
 /// every enabled provider.
 pub async fn search_all(
     settings: &IntegrationsSettings,
+    mirror_dir: Option<&Path>,
     query: String,
     limit: Option<usize>,
     providers: Option<Vec<String>>,
@@ -167,7 +212,7 @@ pub async fn search_all(
         Some(page) => page,
     };
 
-    let registry = IntegrationRegistry::from_settings(settings);
+    let registry = IntegrationRegistry::from_settings(settings, mirror_dir);
     // A named filter is checked whole before anything is asked, so a caller
     // does not get half an answer before being told it named a provider that
     // does not exist. An empty list is refused rather than read as "all":
@@ -245,10 +290,11 @@ pub async fn search_all(
 /// filesystem writes and their size/duplicate checks.
 pub async fn resolve_download(
     settings: &IntegrationsSettings,
+    mirror_dir: Option<&Path>,
     provider: String,
     result: LiteratureSearchResult,
 ) -> Result<ResolvedLiteratureDownload, LiteratureRequestError> {
-    let registry = IntegrationRegistry::from_settings(settings);
+    let registry = IntegrationRegistry::from_settings(settings, mirror_dir);
     let source = registry
         .literature_for_search(&provider)
         .map_err(|error| LiteratureRequestError(error.to_string()))?;
@@ -274,10 +320,11 @@ pub async fn resolve_download(
 /// look.
 pub async fn browse(
     settings: &IntegrationsSettings,
+    mirror_dir: Option<&Path>,
     provider: String,
     request: BrowseRequest,
 ) -> Result<LiteratureProviderAnswer, LiteratureRequestError> {
-    let registry = IntegrationRegistry::from_settings(settings);
+    let registry = IntegrationRegistry::from_settings(settings, mirror_dir);
     let source = registry
         .literature_for_search(&provider)
         .map_err(|error| LiteratureRequestError(error.to_string()))?;
@@ -309,11 +356,12 @@ pub async fn browse(
 /// provider and one filter, and nothing else in the answer to keep.
 pub async fn suggest(
     settings: &IntegrationsSettings,
+    mirror_dir: Option<&Path>,
     provider: String,
     filter: String,
     text: String,
 ) -> Result<Vec<wilkes_core::types::FilterSuggestion>, LiteratureRequestError> {
-    let registry = IntegrationRegistry::from_settings(settings);
+    let registry = IntegrationRegistry::from_settings(settings, mirror_dir);
     let source = registry
         .literature_for_search(&provider)
         .map_err(|error| LiteratureRequestError(error.to_string()))?;
@@ -330,9 +378,10 @@ pub async fn suggest(
 /// pasted in, so there is one place that says how it is asked.
 pub async fn status(
     settings: &IntegrationsSettings,
+    mirror_dir: Option<&Path>,
     provider: &str,
 ) -> anyhow::Result<IntegrationStatus> {
-    let registry = IntegrationRegistry::from_settings(settings);
+    let registry = IntegrationRegistry::from_settings(settings, mirror_dir);
     let entry = registry.literature(provider).ok_or_else(|| {
         anyhow::anyhow!(
             "Unknown literature provider '{provider}'; known providers are {}",
@@ -346,11 +395,12 @@ pub async fn status(
 /// and from the provider when it does not.
 pub async fn lookup(
     settings: &IntegrationsSettings,
+    mirror_dir: Option<&Path>,
     cache: Option<Arc<Mutex<MetadataCache>>>,
     provider: &str,
     doi: &str,
 ) -> anyhow::Result<ProviderWork> {
-    let registry = IntegrationRegistry::from_settings(settings);
+    let registry = IntegrationRegistry::from_settings(settings, mirror_dir);
     let source = registry.literature_for_search(provider)?;
     let doi = normalize_doi(doi).ok_or_else(|| anyhow::anyhow!("Invalid DOI: {doi}"))?;
 
@@ -413,6 +463,11 @@ mod tests {
             language: None,
             file_format: None,
             file_size: None,
+            summary: None,
+            subject: None,
+            kind: None,
+            pages: None,
+            recall_score: None,
             acquisition: wilkes_core::types::LiteratureAcquisition::Direct,
         }
     }
@@ -421,6 +476,7 @@ mod tests {
     async fn no_enabled_provider_is_an_empty_answer_not_an_error() {
         let response = search_all(
             &IntegrationsSettings::default(),
+            None,
             "graph theory".into(),
             None,
             None,
@@ -436,6 +492,7 @@ mod tests {
     async fn an_empty_query_is_refused() {
         let error = search_all(
             &IntegrationsSettings::default(),
+            None,
             "   ".into(),
             None,
             None,
@@ -451,6 +508,7 @@ mod tests {
         for limit in [0, MAX_LIMIT + 1] {
             let error = search_all(
                 &IntegrationsSettings::default(),
+                None,
                 "q".into(),
                 Some(limit),
                 None,
@@ -466,6 +524,7 @@ mod tests {
     async fn a_filter_naming_an_unknown_provider_is_refused_by_name() {
         let error = search_all(
             &IntegrationsSettings::default(),
+            None,
             "q".into(),
             None,
             Some(vec!["openalex".into(), "custom:gone".into()]),
@@ -482,6 +541,7 @@ mod tests {
     async fn an_empty_filter_is_refused_rather_than_read_as_every_provider() {
         let error = search_all(
             &IntegrationsSettings::default(),
+            None,
             "q".into(),
             None,
             Some(vec![]),
@@ -511,6 +571,7 @@ mod tests {
             .base_url = Some("http://127.0.0.1:1/s2".into());
         let response = search_all(
             &settings,
+            None,
             "graph theory".into(),
             None,
             Some(vec!["openalex".into()]),
@@ -528,10 +589,99 @@ mod tests {
 
     /// Disabled providers are listed, not dropped: a stale selection naming
     /// one must read as "switched off", not as "does not exist".
+    fn textbook(id: &str, title: &str) -> wilkes_core::types::CatalogueRecord {
+        wilkes_core::types::CatalogueRecord {
+            provider: "libretexts".into(),
+            external_id: id.into(),
+            title: title.into(),
+            summary: String::new(),
+            subject: String::new(),
+            authors: String::new(),
+            license: String::new(),
+            landing_url: None,
+            pdf_url: None,
+            outline_url: None,
+            grain: wilkes_core::types::CatalogueGrain::Textbook,
+            pages: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fetched_catalogue_answers_beside_the_other_providers_and_an_unfetched_one_is_not_asked(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        CatalogueStore::open(dir.path())
+            .unwrap()
+            .replace_provider("libretexts", &[textbook("a", "Graph Theory")])
+            .unwrap();
+
+        let response = search_all(
+            &IntegrationsSettings::default(),
+            Some(dir.path()),
+            "graph theory".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response
+                .providers
+                .iter()
+                .map(|entry| entry.provider.as_str())
+                .collect::<Vec<_>>(),
+            vec!["libretexts"]
+        );
+        let results = response.providers[0].results.as_ref().unwrap();
+        assert_eq!(results[0].title.as_deref(), Some("Graph Theory"));
+        assert_eq!(results[0].kind.as_deref(), Some("textbook"));
+    }
+
+    #[test]
+    fn the_provider_list_says_what_the_mirror_holds_for_each_catalogue() {
+        let dir = tempfile::tempdir().unwrap();
+        CatalogueStore::open(dir.path())
+            .unwrap()
+            .replace_provider("libretexts", &[textbook("a", "Graph Theory")])
+            .unwrap();
+
+        let listed = providers(&IntegrationsSettings::default(), Some(dir.path()));
+        let held = listed
+            .iter()
+            .find(|info| info.provider == "libretexts")
+            .unwrap();
+        assert!(held.enabled && held.capabilities.mirrored);
+        let mirror = held.mirror.as_ref().unwrap();
+        assert_eq!(mirror.records, 1);
+        assert!(mirror.synced_at_ms.is_some());
+        // No manifest, so nothing to configure: no secrets, no origin to move.
+        assert!(held.secrets.is_empty() && held.default_base_url.is_none());
+
+        let unfetched = listed
+            .iter()
+            .find(|info| info.provider == "devdocs")
+            .unwrap();
+        assert!(!unfetched.enabled);
+        assert_eq!(
+            unfetched.mirror,
+            Some(MirrorStatus {
+                grain: wilkes_core::types::CatalogueGrain::Reference,
+                records: 0,
+                synced_at_ms: None,
+            })
+        );
+        // A provider asked over the network has no mirror to report.
+        assert!(listed
+            .iter()
+            .filter(|info| !info.capabilities.mirrored)
+            .all(|info| info.mirror.is_none()));
+    }
+
     #[test]
     fn the_provider_list_names_disabled_providers_too() {
         let settings = enabled(&["openalex"]);
-        let listed = providers(&settings);
+        let listed = providers(&settings, None);
         let openalex = listed
             .iter()
             .find(|entry| entry.provider == "openalex")
@@ -548,7 +698,7 @@ mod tests {
     #[tokio::test]
     async fn resolving_a_builtin_result_returns_its_direct_url_without_downloading() {
         let settings = enabled(&["openalex"]);
-        let resolved = resolve_download(&settings, "openalex".to_string(), direct_result())
+        let resolved = resolve_download(&settings, None, "openalex".to_string(), direct_result())
             .await
             .unwrap();
         assert_eq!(resolved.url, "https://example.test/paper.pdf");
@@ -557,7 +707,7 @@ mod tests {
 
     #[test]
     fn the_provider_list_carries_what_the_interface_renders() {
-        let listed = providers(&IntegrationsSettings::default());
+        let listed = providers(&IntegrationsSettings::default(), None);
         let openalex = listed.iter().find(|p| p.provider == "openalex").unwrap();
         assert!(openalex.builtin);
         assert_eq!(openalex.base_url, "https://api.openalex.org");
@@ -583,7 +733,7 @@ mod tests {
         let mut settings = enabled(&["openalex"]);
         settings.builtin.get_mut("openalex").unwrap().base_url =
             Some("https://mirror.example.test".into());
-        let listed = providers(&settings);
+        let listed = providers(&settings, None);
         let openalex = listed.iter().find(|p| p.provider == "openalex").unwrap();
         assert_eq!(openalex.base_url, "https://mirror.example.test");
         assert_eq!(
@@ -594,7 +744,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_names_an_unknown_provider() {
-        let error = status(&IntegrationsSettings::default(), "crossref")
+        let error = status(&IntegrationsSettings::default(), None, "crossref")
             .await
             .unwrap_err()
             .to_string();
@@ -624,7 +774,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let status = status(&settings, "openalex").await.unwrap();
+        let status = status(&settings, None, "openalex").await.unwrap();
         assert_eq!(status.state, wilkes_core::types::IntegrationState::Ready);
         assert!(!status.enabled);
         mock.assert_async().await;
@@ -634,6 +784,7 @@ mod tests {
     async fn lookup_rejects_a_disabled_provider() {
         let error = lookup(
             &IntegrationsSettings::default(),
+            None,
             None,
             "openalex",
             "10.1145/3801158",
@@ -648,6 +799,7 @@ mod tests {
         let settings = enabled(&["openalex"]);
         let answer = browse(
             &settings,
+            None,
             "openalex".into(),
             BrowseRequest {
                 filters: [(
@@ -670,6 +822,7 @@ mod tests {
     async fn browse_names_a_provider_that_is_off_or_unknown() {
         let error = browse(
             &IntegrationsSettings::default(),
+            None,
             "openalex".into(),
             BrowseRequest::default(),
         )
@@ -678,6 +831,7 @@ mod tests {
         assert!(error.0.contains("disabled"), "{error}");
         let error = browse(
             &IntegrationsSettings::default(),
+            None,
             "nowhere".into(),
             BrowseRequest::default(),
         )

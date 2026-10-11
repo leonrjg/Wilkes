@@ -164,6 +164,14 @@ pub struct SyncOutcome {
     pub unusable: usize,
 }
 
+/// One provider's part of the mirror.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MirrorHolding {
+    pub provider: String,
+    pub records: i64,
+    pub synced_at_ms: Option<i64>,
+}
+
 pub struct CatalogueStore {
     conn: Connection,
 }
@@ -376,6 +384,29 @@ impl CatalogueStore {
         grains: &[CatalogueGrain],
         limit: usize,
     ) -> anyhow::Result<CatalogueRecall> {
+        self.recall(query, None, grains, limit)
+    }
+
+    /// The same recall, over one provider's records: what that catalogue
+    /// answers when it is asked as a source in its own right. The scores are
+    /// from the one index every provider shares, so two providers' answers to
+    /// one query can be compared by them.
+    pub fn search_provider(
+        &self,
+        query: &str,
+        provider: &str,
+        limit: usize,
+    ) -> anyhow::Result<CatalogueRecall> {
+        self.recall(query, Some(provider), &[], limit)
+    }
+
+    fn recall(
+        &self,
+        query: &str,
+        provider: Option<&str>,
+        grains: &[CatalogueGrain],
+        limit: usize,
+    ) -> anyhow::Result<CatalogueRecall> {
         let terms = query_terms(query);
         if terms.is_empty() {
             // Not an error: a probe can legitimately reduce to stopwords, and
@@ -398,6 +429,7 @@ impl CatalogueStore {
                      JOIN catalogue_records r ON r.rowid = catalogue_fts.rowid
                     WHERE catalogue_fts MATCH ?1
                       AND (?2 IS NULL OR r.grain IN (SELECT value FROM json_each(?2)))
+                      AND (?4 IS NULL OR r.provider = ?4)
                     ORDER BY bm25(catalogue_fts, 4.0, 2.0, 1.0)
                     LIMIT ?3";
         // A JSON array rather than a generated placeholder list, so the SQL
@@ -410,28 +442,31 @@ impl CatalogueStore {
             )?)
         };
         let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map(params![expression, accepted, limit as i64], |row| {
-            let grain_text: String = row.get(10)?;
-            let record = CatalogueRecord {
-                provider: row.get(0)?,
-                external_id: row.get(1)?,
-                title: row.get(2)?,
-                summary: row.get(3)?,
-                subject: row.get(4)?,
-                authors: row.get(5)?,
-                license: row.get(6)?,
-                landing_url: row.get(7)?,
-                pdf_url: row.get(8)?,
-                outline_url: row.get(9)?,
-                grain: parse_grain(10, grain_text)?,
-                pages: row.get(11)?,
-            };
-            Ok(CatalogueHit {
-                acquisition: super::providers::acquisition(&record),
-                record,
-                recall_score: row.get(12)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![expression, accepted, limit as i64, provider],
+            |row| {
+                let grain_text: String = row.get(10)?;
+                let record = CatalogueRecord {
+                    provider: row.get(0)?,
+                    external_id: row.get(1)?,
+                    title: row.get(2)?,
+                    summary: row.get(3)?,
+                    subject: row.get(4)?,
+                    authors: row.get(5)?,
+                    license: row.get(6)?,
+                    landing_url: row.get(7)?,
+                    pdf_url: row.get(8)?,
+                    outline_url: row.get(9)?,
+                    grain: parse_grain(10, grain_text)?,
+                    pages: row.get(11)?,
+                };
+                Ok(CatalogueHit {
+                    acquisition: super::providers::acquisition(&record),
+                    record,
+                    recall_score: row.get(12)?,
+                })
+            },
+        )?;
         let hits = rows.collect::<Result<Vec<_>, _>>()?;
         Ok(CatalogueRecall { terms, hits })
     }
@@ -451,6 +486,31 @@ impl CatalogueStore {
                 grain: parse_grain(1, grain_text)?,
                 records: row.get(2)?,
                 synced_at_ms: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// What the mirror holds, per provider it holds anything for: how many
+    /// records, and when they were fetched.
+    ///
+    /// A provider is held once it has been fetched, even if the fetch found
+    /// nothing — which is why this reads the sync table as well as the
+    /// records, where [`Self::status`] groups the records alone.
+    pub fn holdings(&self) -> anyhow::Result<Vec<MirrorHolding>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT provider, SUM(records), MAX(synced_at_ms) FROM (
+                 SELECT provider, COUNT(*) AS records, NULL AS synced_at_ms
+                   FROM catalogue_records GROUP BY provider
+                 UNION ALL
+                 SELECT provider, 0, synced_at_ms FROM catalogue_sync
+             ) GROUP BY provider ORDER BY provider",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(MirrorHolding {
+                provider: row.get(0)?,
+                records: row.get(1)?,
+                synced_at_ms: row.get(2)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -975,6 +1035,66 @@ mod tests {
         assert_eq!(synced, 0);
         // Nothing left to take, and saying so is not a failure.
         assert_eq!(store.remove_provider("libretexts").unwrap(), 0);
+    }
+
+    #[test]
+    fn one_provider_is_searched_without_the_others_answering() {
+        let mut store = CatalogueStore::in_memory().unwrap();
+        store
+            .replace_provider(
+                "libretexts",
+                &[record(
+                    "a",
+                    "Thermodynamics",
+                    "Heat and entropy",
+                    CatalogueGrain::Textbook,
+                )],
+            )
+            .unwrap();
+        store
+            .replace_provider(
+                "devdocs",
+                &[record(
+                    "b",
+                    "Thermodynamics tables",
+                    "Reference values",
+                    CatalogueGrain::Reference,
+                )],
+            )
+            .unwrap();
+
+        let recall = store
+            .search_provider("thermodynamics", "devdocs", 10)
+            .unwrap();
+        assert_eq!(recall.hits.len(), 1);
+        assert_eq!(recall.hits[0].record.provider, "devdocs");
+        assert!(store
+            .search_provider("thermodynamics", "openstax", 10)
+            .unwrap()
+            .hits
+            .is_empty());
+    }
+
+    #[test]
+    fn a_provider_fetched_and_found_empty_is_still_held() {
+        let mut store = CatalogueStore::in_memory().unwrap();
+        store.replace_provider("openstax", &[]).unwrap();
+        store
+            .replace_provider(
+                "libretexts",
+                &[record("a", "Algebra", "", CatalogueGrain::Textbook)],
+            )
+            .unwrap();
+
+        let holdings = store.holdings().unwrap();
+        assert_eq!(
+            holdings
+                .iter()
+                .map(|held| (held.provider.as_str(), held.records))
+                .collect::<Vec<_>>(),
+            vec![("libretexts", 1), ("openstax", 0)]
+        );
+        assert!(holdings.iter().all(|held| held.synced_at_ms.is_some()));
     }
 
     #[test]

@@ -30,7 +30,6 @@ describe("SettingsModal", () => {
     onGenerationProgress: vi.fn(() => Promise.resolve(() => {})),
     onGenerationDone: vi.fn(() => Promise.resolve(() => {})),
     onGenerationError: vi.fn(() => Promise.resolve(() => {})),
-    catalogueStatus: vi.fn(() => Promise.resolve({ providers: [], total_records: 0 })),
     catalogueSync: vi.fn(() => Promise.resolve({ providers: [], total_records: 0 })),
     onCatalogueSyncProgress: vi.fn(() => Promise.resolve(() => {})),
     imageRecognizerCatalogue: vi.fn(() =>

@@ -1,6 +1,9 @@
 # Catalogue in the UI — Design
 
-Status: implemented, except §4 (coverage re-ranking) and §5.3, both deferred
+Status: implemented, except §4 (coverage re-ranking) and §5.3, both deferred.
+§9 (a catalogue is a literature provider) supersedes the two-halves design of
+§5.2 and the separate settings tab of §6; those sections now describe what §9
+left standing.
 Depends on: catalogue mirror (schema v2, `shared_data_dir/catalogue`), semantic index, `acquire::download_to_root`
 Premise: the catalogue is Wilkes' feature, not a sidecar's — the same premise that
 took one consumer's name out of the corpus routes in `consumer-api.md`.
@@ -105,9 +108,12 @@ already exists — it is what the user typed.
   the whole text column, so every line under the title was laid out in the width
   left over beside them — 186px of a 316px pane, and the blurb wrapped at 59% of
   the space it had. Below the title, the row is the pane's full width.
-- **Grains:** all of them by default. The store's own comment argues for the set
-  over the single preferred kind, and the UI has less information than the store
-  about which one the user meant, not more.
+- **Sources:** every catalogue the mirror holds, and nothing else. The strip
+  runs unprompted, so it asks only providers answered from this machine — the
+  ones the registry reports as `mirrored` — and never an index the user
+  enabled, which is on but has not been asked *this* question. The rows are the
+  best five across the catalogues by recall score: the catalogues share one
+  FTS index, so the scores are one scale.
 
 ### 5.2 The catalogue pane (browse and add)
 
@@ -130,58 +136,43 @@ things to consider acquiring, not a second page of search results.
   and common case — the field is `Option`, and its absence is why the type's own
   comment separates admission from discovery. Such a row offers its landing URL
   and no Add button, rather than a button that fails on click.
-- **Literature is searched from the same field.** One query goes to the mirror
-  and, at once, to every enabled literature provider (`literature_search` on
-  desktop, `POST /api/literature/search` on the server; both over
+- **Catalogues and indexes are one list of providers.** One query goes to every
+  selected provider that is on (`literature_search` on desktop, `POST
+  /api/literature/search` on the server; both over
   `commands::integrations::literature::search_all`, resolved through
-  `IntegrationRegistry` exactly as the MCP tool resolves one provider). The two
-  answers are listed apart — a literature row (`PaperCandidate`) shows venue,
-  year and citations, not a grain — and are never ranked against each other. A
-  provider that fails is reported in its own entry beside those that answered,
-  and "no provider enabled" is stated as a setting rather than as an empty
-  result. A work with a `pdf_url` is added through the same uploads-then-import
-  path as a textbook. The gap strip (§5.1) stays catalogue-only: it runs
-  unprompted after every empty search, and sending each of those queries to
-  external services is not something the user asked for.
-- **Each half filters itself, under its own heading.** The grains are the
-  mirror's vocabulary and say nothing a literature provider could act on; the
-  providers are services the user configured and have no grain. So the grain
-  chips sit inside the *Open catalogues* section and a chip per enabled provider
-  sits inside *Literature*, each filtering the results beneath it. The single
-  merged chip row this replaced had to name the live half something — it said
-  *Papers* — and so labelled every provider's every row a paper, including the
-  monographs, standards and theses several of them index. The section is named
-  *Literature* and a row carries no kind badge at all: it already sits under the
-  name of the provider that returned it.
+  `IntegrationRegistry` exactly as the MCP tool resolves one provider). Each
+  answers under its own name and none is ranked against another. A provider
+  that fails is reported in its own entry beside those that answered, and "no
+  source is on" is stated as a setting rather than as an empty result. See §9
+  for why there is no longer a catalogue half and a literature half.
+- **One row for every result.** A result carries the facts its source knows and
+  the row shows the ones it carries: a paper has a year, a venue and a citation
+  count; a textbook has a kind, a subject, a licence and a blurb. The kind
+  badge appears only where the source names a kind — a bibliographic index
+  names none, and "Paper" over its monographs and theses would be wrong for
+  some of its rows. Whatever the result, it is added through the same
+  uploads-then-import path; a course is the one result that is many files.
+- **One filter, of providers.** A chip per provider that is on, above the
+  results. The grain chips are gone: a catalogue serves exactly one grain, so
+  choosing grains was choosing catalogues by another name, and the provider
+  chips already do it. What a catalogue holds is said beside its name over its
+  results ("DevDocs · Reference").
 - **Nothing selected means every one of them, including any added later.** A
   selection is `null` by default rather than an enumeration, so a provider the
-  user enables tomorrow joins it. Deselecting every member of one filter is the
-  other end — that half is not searched, and says so.
-- **Either half rolls up, and a rolled-up heading says how much it is
-  hiding.** Collapsing is a display choice and never a filter: the half is
-  still searched, so opening it shows the answer to the question that was
-  asked rather than a blank needing a re-run. A section's own filter rolls up
-  with it — a filter with nothing visible under it controls nothing the user
-  can see.
-- **The provider is the strongest label in the literature half.** It says whose
-  index a row came from, and since no row carries a kind badge it is the only
-  thing that does; so it reads brighter than the section heading above it and
-  sits on a rule of its own, rather than as a dim line that scanned as part of
-  the row beneath.
-- **Both filters and the roll-up persist** to `localStorage` under
-  `wilkes.catalogue.filters`,
-  because which sources to ask and which half to look at are standing choices
-  about how the pane is used, not properties of one question. One stored object
-  and one pair of helpers, rather than a second storage mechanism beside the
-  first; the key keeps its original name so upgrading does not reset a filter. A stored provider id that no longer exists is pruned against the
-  registry's list (`literature_providers` on desktop, `GET
-  /api/literature/providers` on the server) when the pane opens; the backend
-  refuses an unknown id rather than quietly asking nobody.
+  user enables tomorrow, or a catalogue they fetch, joins it. Deselecting every
+  provider is the other end — nothing is searched, and the pane says so.
+- **The filter persists** to `localStorage` under `wilkes.catalogue.filters`.
+  The key keeps its original name so upgrading does not reset a filter, and
+  what an older build stored there — a grain filter beside a provider filter —
+  is turned into the one selection it amounted to when the provider list
+  arrives: the providers that were selected, and the catalogues whose grain
+  was. A stored provider id that no longer exists is pruned against the
+  registry's list when the pane opens; the backend refuses an unknown id
+  rather than quietly asking nobody.
 - **The provider filter is passed down, not applied to the answer.** A provider
   left out of it is not asked — these are rate-limited services, and narrowing
   after the fact would have spent the request anyway. Widening asks only the
-  providers the held answer does not already cover, and merges. A grain toggle
-  re-asks the mirror alone.
+  providers the held answer does not already cover, and merges.
 
 ### 5.3 Prerequisites for the document in the viewer (deferred)
 
@@ -237,8 +228,11 @@ over a link nobody here controls.
 
 ## 6. Settings
 
-A `catalogue` tab in `SettingsModal`'s union, in its own nav group, showing
-`/api/catalogue/status`: provider, grain, record count, last synced.
+A *Catalogues* tab inside Settings › Integrations, beside the tabs of the
+providers asked over the network, listing every provider the registry reports
+with a mirror: name, grain, record count, last synced. It is one tab for all of
+them rather than one each, because a catalogue has nothing to fill in — there
+is no key, no origin to move — and one thing to do, which they all share.
 
 - **One `Sync now` button, per-provider results.** The sync already reports
   outcomes per provider; a single global "failed" would hide that three of four
@@ -253,13 +247,18 @@ A `catalogue` tab in `SettingsModal`'s union, in its own nav group, showing
   and is *Sync all* only when that is every one of them or none; a refresh
   that refetched a removed catalogue would have undone the removal. Removing
   takes a second click on the same button, because refetching is minutes. A
-  provider the mirror holds rows for but this build no longer registers can be
-  removed too, which is the only way those rows ever leave.
+  provider the mirror holds rows for but this build no longer registers is not
+  a provider, so it is not listed here; `POST /api/catalogue/remove` still
+  accepts its id, which is the only way those rows ever leave.
 - **Manual only, in v1.** No sync-on-startup and no staleness timer. Four
   whole-catalogue fetches is a network call the user did not ask for, and the one
   honest trigger — the mirror being empty when someone first opens the pane — is
   better served by the pane saying "this mirror is empty; sync to fill it" with
   the button right there.
+- **Fetching a catalogue is what switches it on.** There is no enable checkbox:
+  a catalogue the mirror holds is searched, and one it does not hold cannot
+  be. After a sync or a removal the panel tells the pane's store and the tab
+  strip to re-read the provider list, since both show which providers are on.
 - **The tab states that the mirror is installation-wide.** It now lives in
   `shared_data_dir/catalogue`, so its numbers do not change when the workspace
   does, and a settings page that looks workspace-scoped would imply otherwise.
@@ -295,3 +294,64 @@ hits and the terms the query was actually run with — and every surface reads
 them: the browse pane says "nothing in that could be searched for", and the gap
 strip renders nothing at all rather than claiming an absence it never tested
 for.
+
+## 9. A catalogue is a literature provider
+
+**Invariant: a catalogue is a `LiteratureSource` whose `search` is answered
+from the mirror.**
+
+Until this, there were two of everything — `CatalogueSource` beside
+`LiteratureSource`, a hardcoded `registry()` beside `IntegrationRegistry`,
+`CatalogueHit` beside `LiteratureSearchResult`, a catalogue half of the pane
+with a grain filter beside a literature half with a provider filter, a settings
+tab beside the integrations panel — for one difference that is real: where the
+ranking happens. The module docs argue that difference carefully and it
+stands. Nothing else about a catalogue differs from an index, so nothing else
+is separate now.
+
+- **One trait.** `catalogue::MirroredSource` implements `LiteratureSource`;
+  its `search` runs `CatalogueStore::search_provider` and maps the mirror's
+  records to `LiteratureSearchResult`. What was `CatalogueSource` is
+  `CatalogueFetch`: the half of a catalogue that knows its publisher's wire
+  shape, held behind `MirroredSource` and searched by nobody.
+- **One registry.** `IntegrationRegistry::from_settings(settings, mirror_dir)`
+  registers the catalogues beside the manifest-described providers, and every
+  caller — the pane, the gap strip, the MCP `literature_search` tool — looks a
+  catalogue up by id like any other provider. `mirror_dir` is `None` for a
+  caller with no mirror, which registers no catalogue rather than catalogues
+  that cannot answer.
+- **One meaning of "on".** For a provider described by a manifest, `enabled`
+  is the user's setting. For a catalogue it is whether the mirror holds it:
+  one that has been fetched is searched, and one that has not is registered
+  and off — *switched off*, not *unknown*, the same distinction a disabled
+  remote provider gets. There is deliberately no second flag: a setting beside
+  the mirror would be two answers to whether a catalogue is in use.
+- **One result type.** `LiteratureSearchResult` gained `summary`, `subject`,
+  `kind` (the grain), `pages` and `recall_score`, and `LiteratureAcquisition`
+  gained `Course`. `CatalogueRecord` remains as the mirror's row.
+- **The query that could not be searched** (§8) is now that catalogue's error
+  in its own entry — "nothing in “C” could be searched for" — beside the
+  providers that answered, rather than a second kind of empty state.
+- **Capabilities say what is particular.** `ProviderCapabilities::mirrored`
+  is what the gap strip filters on and what the settings panel groups by;
+  `LiteratureProviderInfo::mirror` carries the grain, the record count and
+  the sync time. No interface holds a list of catalogue ids or names.
+
+What stayed, and why:
+
+- **`/api/catalogue/search` and `/api/catalogue/status`.** A consumer probes
+  the mirror in batches, by grain, with the terms each probe reduced to; that
+  is a view over the same store and not a second way to search a provider.
+  The desktop commands for them are gone, since nothing in the interface
+  calls them.
+- **`catalogue_sync`, `catalogue_remove`, `catalogue_acquire_course`.**
+  Operations only a mirror has. They are not on the `LiteratureSource` trait,
+  which is what a provider answers, not how its copy is kept.
+- **Ranking across catalogues.** The pane lists each provider's answer under
+  its own name, so the single BM25 order across all catalogues that the old
+  catalogue half showed is gone from it. The scores are still one scale, which
+  the gap strip uses.
+
+Not done here: describing a catalogue by manifest (a `mirror` capability),
+which would make LibreTexts, OpenStax and DevDocs TOML and let a user add
+their own. The trait no longer stands in its way.

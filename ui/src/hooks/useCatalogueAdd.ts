@@ -1,8 +1,8 @@
 import { useCallback } from "react";
 import { api, source } from "../services";
 import type { DesktopSourceApi } from "../services/api";
-import type { CatalogueHit, LiteratureSearchResult } from "../lib/types";
-import { type AddStage, hitKey, paperKey, useCatalogueStore } from "../stores/useCatalogueStore";
+import type { LiteratureSearchResult } from "../lib/types";
+import { type AddStage, paperKey, useCatalogueStore } from "../stores/useCatalogueStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
 
@@ -14,7 +14,7 @@ function parentDirectory(path: string): string {
 }
 
 /**
- * Adding a catalogue candidate, or a paper a literature provider found, to the
+ * Adding what a provider found — a paper, a textbook, a course — to the
  * library.
  *
  * Two steps, deliberately: the fetch lands in Wilkes's own uploads directory,
@@ -90,44 +90,34 @@ export function useCatalogueAdd() {
     [noteAddError, setAddStage],
   );
 
+  /**
+   * Adds one result, whichever provider returned it.
+   *
+   * What adding does travels on the result: a course is many files and a
+   * document describing them, a direct result is one file at a URL the
+   * provider already gave, and anything else is resolved first — only after
+   * selection, because a provider's resolver may spend a credential and search
+   * itself never does that once per displayed row. Every single file then
+   * goes through the same staging downloader.
+   */
   const add = useCallback(
-    async (hit: CatalogueHit): Promise<string | null> => {
-      if (!canAdd) return null;
-      const key = hitKey(hit);
-      // A course is many files and a document describing them; a textbook is
-      // one file. Which of the two this is was decided in core and travels on
-      // the hit, so this does not test the provider id to find out.
-      if (hit.acquisition === "course") {
+    async (provider: string, work: LiteratureSearchResult): Promise<string | null> => {
+      const acquisition = work.acquisition ?? (work.pdf_url === null ? "none" : "direct");
+      if (!canAdd || acquisition === "none") return null;
+      const key = paperKey(provider, work);
+      if (acquisition === "course") {
+        // A course is walked from its landing page; without one there is
+        // nothing to walk, and the row offered no button.
+        const courseUrl = work.landing_page_url;
+        if (courseUrl === null) return null;
         return runAdd(key, async () => {
           setAddStage(key, "fetching");
-          const course = await acquireCourse(hit);
-          if (course === null) return null;
+          const course = await acquireCourse(key, courseUrl);
           setAddStage(key, "importing");
           await install(course.paths, course.folder);
           return course.paths[0] ?? null;
         });
       }
-      if (hit.pdf_url === null) return null;
-      const url = hit.pdf_url;
-      return runAdd(key, async () => {
-        setAddStage(key, "fetching");
-        const staged = await acquire({ key, url });
-        setAddStage(key, "importing");
-        await install([staged]);
-        return staged;
-      });
-    },
-    [canAdd, acquire, acquireCourse, install, runAdd, setAddStage],
-  );
-
-  /** Resolve only after selection, then use the same staging downloader as
-   *  every other single document. A provider resolver may spend a credential;
-   *  search itself never does that once per displayed row. */
-  const addPaper = useCallback(
-    async (provider: string, work: LiteratureSearchResult): Promise<string | null> => {
-      const acquisition = work.acquisition ?? (work.pdf_url === null ? "none" : "direct");
-      if (!canAdd || acquisition === "none") return null;
-      const key = paperKey(provider, work);
       return runAdd(key, async () => {
         // Resolving is a request of its own, and a credentialed resolver is
         // not a fast one. It is named as its own stage rather than spent
@@ -148,24 +138,19 @@ export function useCatalogueAdd() {
         return staged;
       });
     },
-    [canAdd, acquire, install, runAdd, setAddStage],
+    [canAdd, acquire, acquireCourse, install, runAdd, setAddStage],
   );
 
   return {
     add,
-    addPaper,
     canAdd,
     needsDirectory,
     readOnly,
     /** How far this row's add has got, or undefined when it is not adding.
      *  The key is built here so a row never has to know how one is spelled. */
-    stageOf: (hit: CatalogueHit): AddStage | undefined => adding[hitKey(hit)],
-    paperStageOf: (
-      provider: string,
-      work: LiteratureSearchResult,
-    ): AddStage | undefined => adding[paperKey(provider, work)],
-    isAdded: (hit: CatalogueHit) => hitKey(hit) in acquired,
-    isPaperAdded: (provider: string, work: LiteratureSearchResult) =>
+    stageOf: (provider: string, work: LiteratureSearchResult): AddStage | undefined =>
+      adding[paperKey(provider, work)],
+    isAdded: (provider: string, work: LiteratureSearchResult) =>
       paperKey(provider, work) in acquired,
   };
 }

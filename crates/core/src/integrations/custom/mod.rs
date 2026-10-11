@@ -491,6 +491,11 @@ impl CustomSource {
             language: fields.text("language"),
             file_format: fields.text("file_format"),
             file_size: fields.text("file_size"),
+            summary: None,
+            subject: None,
+            kind: None,
+            pages: None,
+            recall_score: None,
             acquisition,
         })
     }
@@ -1700,8 +1705,12 @@ impl LiteratureSource for CustomSource {
         &self.display_name
     }
 
-    fn manifest(&self) -> &Manifest {
-        &self.manifest
+    fn manifest(&self) -> Option<&Manifest> {
+        Some(&self.manifest)
+    }
+
+    fn base_url(&self) -> &str {
+        &self.manifest.http.base_url
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -1715,6 +1724,7 @@ impl LiteratureSource for CustomSource {
             lookup: capabilities.lookup.is_some(),
             references: capabilities.references.is_some(),
             resolve_download: capabilities.resolve_download.is_some(),
+            mirrored: false,
         }
     }
 
@@ -2046,6 +2056,11 @@ filename = "{title}"
             language: None,
             file_format: None,
             file_size: None,
+            summary: None,
+            subject: None,
+            kind: None,
+            pages: None,
+            recall_score: None,
             acquisition: LiteratureAcquisition::Direct,
         }
     }

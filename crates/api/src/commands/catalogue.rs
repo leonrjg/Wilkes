@@ -3,8 +3,15 @@
 //! These lived in `wilkes-server`'s handlers, which is why the desktop had no
 //! catalogue: the sync loop, the provider registry walk and the per-provider
 //! failure accounting were all inside an axum function that Tauri cannot call.
-//! Both shells now call the same four operations here, and each shell's job is
+//! Both shells now call the same operations here, and each shell's job is
 //! reduced to naming its own error type.
+//!
+//! What is here is what only a mirror has: fetching a catalogue, dropping one,
+//! and fetching what a record names. Asking a catalogue a question is not
+//! here — a catalogue is a literature source, and is searched with the others
+//! in [`super::integrations::literature`]. [`search`] and [`status`] remain
+//! for the consumer routes, which probe the mirror in batches by grain and
+//! are views over the same store.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,7 +22,8 @@ use tokio::sync::mpsc;
 use wilkes_core::acquire::{download_to_root, DownloadParams, DownloadProgress, DownloadResponse};
 use wilkes_core::catalogue::ocw;
 use wilkes_core::catalogue::providers::FetchReporter;
-use wilkes_core::catalogue::{registry, CatalogueStore};
+use wilkes_core::catalogue::{mirrored_sources, CatalogueStore};
+use wilkes_core::integrations::LiteratureSource;
 use wilkes_core::network::ProviderHttpClient;
 use wilkes_core::types::{
     CatalogueCourseProgress, CatalogueCourseStage, CatalogueFetchProgress, CatalogueGrain,
@@ -208,7 +216,7 @@ pub fn status(catalogue_dir: &Path) -> Result<CatalogueStatusResponse, Catalogue
         .map_err(|error| CatalogueError::Failed(format!("Catalogue count failed: {error:#}")))?;
 
     let mut providers: Vec<CatalogueProviderStatus> = Vec::new();
-    for source in registry() {
+    for source in mirrored_sources(catalogue_dir) {
         match stored.iter().find(|row| row.provider == source.id()) {
             Some(row) => providers.push(row.clone()),
             None => providers.push(CatalogueProviderStatus {
@@ -288,7 +296,7 @@ pub async fn sync(
     progress: Option<mpsc::Sender<CatalogueFetchProgress>>,
 ) -> Result<CatalogueSyncResponse, CatalogueError> {
     let requested = providers.unwrap_or_default();
-    let sources = registry();
+    let sources = mirrored_sources(catalogue_dir);
     if let Some(unknown) = requested
         .iter()
         .find(|name| !sources.iter().any(|source| source.id() == name.as_str()))
@@ -297,60 +305,47 @@ pub async fn sync(
             "Unknown catalogue provider {unknown:?}"
         )));
     }
-    let mut store = open(catalogue_dir)?;
+    let store = open(catalogue_dir)?;
     let mut outcomes = Vec::new();
     for source in sources {
         if !requested.is_empty() && !requested.iter().any(|name| name == source.id()) {
             continue;
         }
+        let id = source.id().to_string();
         // A provider that is down must not take the others with it, and must
         // not be silent about it either: the failure is reported per provider
         // and the mirror keeps whatever that provider last supplied.
         let reporter = match &progress {
-            Some(tx) => FetchReporter::new(source.id(), tx.clone()),
+            Some(tx) => FetchReporter::new(source.fetch_id(), tx.clone()),
             None => FetchReporter::silent(),
         };
-        tracing::info!(provider = source.id(), "catalogue fetch started");
+        tracing::info!(provider = %id, "catalogue fetch started");
         let started = std::time::Instant::now();
-        match source.fetch_all(&reporter).await {
-            Ok(records) => match store.replace_provider(source.id(), &records) {
-                Ok(written) => {
-                    tracing::info!(
-                        provider = source.id(),
-                        offered = written.offered,
-                        stored = written.stored,
-                        duplicates = written.duplicates,
-                        unusable = written.unusable,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "catalogue fetch complete"
-                    );
-                    outcomes.push(CatalogueSyncOutcome {
-                        provider: source.id().to_string(),
-                        grain: source.grain().as_str(),
-                        records: Some(written.stored),
-                        offered: Some(written.offered),
-                        duplicates: Some(written.duplicates),
-                        unusable: Some(written.unusable),
-                        error: None,
-                    })
-                }
-                Err(error) => {
-                    tracing::warn!(provider = source.id(), "catalogue write failed: {error:#}");
-                    outcomes.push(CatalogueSyncOutcome {
-                        provider: source.id().to_string(),
-                        grain: source.grain().as_str(),
-                        records: None,
-                        offered: None,
-                        duplicates: None,
-                        unusable: None,
-                        error: Some(format!("{error:#}")),
-                    });
-                }
-            },
-            Err(error) => {
-                tracing::warn!(provider = source.id(), "catalogue fetch failed: {error:#}");
+        match source.sync(&reporter).await {
+            Ok(written) => {
+                tracing::info!(
+                    provider = %id,
+                    offered = written.offered,
+                    stored = written.stored,
+                    duplicates = written.duplicates,
+                    unusable = written.unusable,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "catalogue fetch complete"
+                );
                 outcomes.push(CatalogueSyncOutcome {
-                    provider: source.id().to_string(),
+                    provider: id,
+                    grain: source.grain().as_str(),
+                    records: Some(written.stored),
+                    offered: Some(written.offered),
+                    duplicates: Some(written.duplicates),
+                    unusable: Some(written.unusable),
+                    error: None,
+                })
+            }
+            Err(error) => {
+                tracing::warn!(provider = %id, "catalogue sync failed: {error:#}");
+                outcomes.push(CatalogueSyncOutcome {
+                    provider: id,
                     grain: source.grain().as_str(),
                     records: None,
                     offered: None,
@@ -393,7 +388,9 @@ pub fn remove(
     provider: String,
 ) -> Result<CatalogueRemoveResponse, CatalogueError> {
     let mut store = open(catalogue_dir)?;
-    let registered = registry().iter().any(|source| source.id() == provider);
+    let registered = mirrored_sources(catalogue_dir)
+        .iter()
+        .any(|source| source.id() == provider);
     let removed = store
         .remove_provider(&provider)
         .map_err(|error| CatalogueError::Failed(format!("Catalogue removal failed: {error:#}")))?;
@@ -632,7 +629,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let status = status(dir.path()).expect("status");
         assert_eq!(status.total_records, 0);
-        assert_eq!(status.providers.len(), registry().len());
+        assert_eq!(status.providers.len(), mirrored_sources(dir.path()).len());
         // Never synced is a state, not an absence: the panel has to be able to
         // say "this provider holds nothing yet" and offer the button.
         assert!(status
@@ -743,7 +740,7 @@ mod tests {
     #[test]
     fn removing_a_catalogue_returns_it_to_never_synced() {
         let dir = tempfile::tempdir().unwrap();
-        let provider = registry()[0].id().to_string();
+        let provider = mirrored_sources(dir.path())[0].id().to_string();
         {
             let mut store = CatalogueStore::open(dir.path()).unwrap();
             store
@@ -760,7 +757,7 @@ mod tests {
                         landing_url: None,
                         pdf_url: None,
                         outline_url: None,
-                        grain: registry()[0].grain(),
+                        grain: mirrored_sources(dir.path())[0].grain(),
                         pages: None,
                     }],
                 )

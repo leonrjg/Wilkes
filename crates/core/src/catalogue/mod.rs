@@ -27,9 +27,23 @@
 //! knows, which is not a fact about documents and is not something Wilkes
 //! holds. The caller re-ranks. This narrows.
 
+//!
+//! # A catalogue is a literature source
+//!
+//! Nothing outside this module searches the mirror as a mirror. Each catalogue
+//! is registered in [`crate::integrations::IntegrationRegistry`] as a
+//! [`mirrored::MirroredSource`] — a [`crate::integrations::LiteratureSource`]
+//! whose `search` is answered here instead of by a request — beside the
+//! remote indexes, and is asked, listed and filtered exactly as they are.
+//! What stays particular to it is what a remote index does not have: it must
+//! be fetched before it can answer ([`mirrored::MirroredSource::sync`]), and
+//! what was fetched can be dropped.
+
+pub mod mirrored;
 pub mod ocw;
 pub mod providers;
 pub mod store;
 
-pub use providers::{registry, CatalogueSource};
+pub use mirrored::{mirrored_sources, MirroredSource};
+pub use providers::{fetchers, CatalogueFetch};
 pub use store::CatalogueStore;

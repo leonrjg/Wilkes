@@ -8,20 +8,25 @@
 //! reference lists. Nothing provider-specific — an OpenAlex work id, a
 //! Semantic Scholar paper id, the shape of either service's JSON — crosses it.
 //!
-//! There is one implementation: [`custom::CustomSource`], which reads a
+//! A remote service is [`custom::CustomSource`], which reads a
 //! [`custom::manifest::Manifest`]. OpenAlex and Semantic Scholar are manifests
 //! embedded in the binary ([`builtin`]); a manifest a user pastes in is stored
-//! in settings. Both enter [`IntegrationRegistry`] through the same door, and
-//! every caller looks a provider up by id and gets a trait object; none of
-//! them can tell, or needs to tell, which kind it got.
+//! in settings. A learning catalogue is
+//! [`crate::catalogue::MirroredSource`], whose answer comes from a copy of the
+//! catalogue kept on this machine. All of them enter [`IntegrationRegistry`]
+//! through the same door, and every caller looks a provider up by id and gets
+//! a trait object; none of them can tell, or needs to tell, which kind it got.
 //!
 //! Zotero is not a literature provider — it is a local library with a write
 //! surface — and stays what it was.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+use crate::catalogue::{mirrored_sources, CatalogueStore};
 
 use crate::types::{
     BrowsePage, BrowseRequest, FilterSuggestion, IntegrationStatus, IntegrationsSettings,
@@ -49,6 +54,10 @@ pub struct ProviderCapabilities {
     /// Whether the DOIs a work cites can be listed (citation graph).
     pub references: bool,
     pub resolve_download: bool,
+    /// Whether the provider is answered from a copy held on this machine. One
+    /// that is sends nothing anywhere when it is asked, and holds nothing
+    /// until it has been fetched.
+    pub mirrored: bool,
 }
 
 /// A searchable index of scholarly works.
@@ -60,8 +69,12 @@ pub trait LiteratureSource: Send + Sync {
     /// Human-readable name, for status messages and errors.
     fn name(&self) -> &str;
 
-    /// The description this provider was built from.
-    fn manifest(&self) -> &Manifest;
+    /// The description this provider was built from, for one that was built
+    /// from a description.
+    fn manifest(&self) -> Option<&Manifest>;
+
+    /// The origin the provider's records come from.
+    fn base_url(&self) -> &str;
 
     fn capabilities(&self) -> ProviderCapabilities;
 
@@ -133,7 +146,10 @@ pub trait LiteratureSource: Send + Sync {
 /// it switched on.
 ///
 /// `enabled` lives here rather than inside the source because it is a fact
-/// about the user's settings, not about the service. Keeping disabled
+/// about this installation, not about the service: the user's setting for a
+/// remote provider, and for a mirrored one whether it has been fetched — a
+/// catalogue holding nothing cannot answer, and one holding something is one
+/// the user asked for. Keeping disabled
 /// providers in the registry is deliberate — it is what lets a caller
 /// distinguish *you named a provider that is switched off* from *you named a
 /// provider that does not exist*, which are different mistakes with different
@@ -155,7 +171,7 @@ impl RegisteredLiteratureSource {
         self.source.name()
     }
 
-    pub fn manifest(&self) -> &Manifest {
+    pub fn manifest(&self) -> Option<&Manifest> {
         self.source.manifest()
     }
 
@@ -170,18 +186,45 @@ impl RegisteredLiteratureSource {
 ///
 /// # Derived, not stored
 ///
-/// A registry is built from [`IntegrationsSettings`] on demand rather than
-/// held as shared mutable state and invalidated on change. It is a pure
-/// function of settings, so there is no window in which it disagrees with them
-/// and no invalidation to forget; building one parses a handful of small
-/// manifests and allocates a handful of small clients.
+/// A registry is built from [`IntegrationsSettings`] and the catalogue mirror
+/// on demand rather than held as shared mutable state and invalidated on
+/// change. It is a function of those two, so there is no window in which it
+/// disagrees with them and no invalidation to forget; building one parses a
+/// handful of small manifests, allocates a handful of small clients and reads
+/// which catalogues the mirror holds.
 pub struct IntegrationRegistry {
     literature: Vec<RegisteredLiteratureSource>,
 }
 
 impl IntegrationRegistry {
-    pub fn from_settings(settings: &IntegrationsSettings) -> Self {
+    /// `mirror_dir` is where the catalogue mirror lives. `None` is a caller
+    /// with no mirror at all — a test, a tool run outside an installation —
+    /// and registers no catalogue, rather than catalogues that cannot answer.
+    pub fn from_settings(settings: &IntegrationsSettings, mirror_dir: Option<&Path>) -> Self {
         let mut literature: Vec<RegisteredLiteratureSource> = Vec::new();
+
+        // Catalogues first: they are answered locally, so in a list ordered by
+        // who is asked they are the ones that have already replied.
+        if let Some(mirror_dir) = mirror_dir {
+            let held = match CatalogueStore::open(mirror_dir).and_then(|store| store.holdings()) {
+                Ok(held) => held,
+                // The catalogues are still registered: unreadable is not
+                // unknown, and a caller naming one should be told it is off.
+                Err(error) => {
+                    tracing::error!(
+                        "catalogue mirror is unreadable, so no catalogue is searchable: {error:#}"
+                    );
+                    Vec::new()
+                }
+            };
+            for source in mirrored_sources(mirror_dir) {
+                literature.push(RegisteredLiteratureSource {
+                    enabled: held.iter().any(|held| held.provider == source.id()),
+                    builtin: true,
+                    source: Arc::new(source),
+                });
+            }
+        }
 
         for mut manifest in builtin::manifests() {
             let state = settings
@@ -400,7 +443,7 @@ mod tests {
 
     #[test]
     fn built_ins_are_registered_whether_enabled_or_not() {
-        let registry = IntegrationRegistry::from_settings(&settings(false, false));
+        let registry = IntegrationRegistry::from_settings(&settings(false, false), None);
         let mut ids = registry.literature_ids();
         ids.sort();
         assert_eq!(ids, vec!["openalex", "semantic_scholar"]);
@@ -409,7 +452,7 @@ mod tests {
 
     #[test]
     fn a_default_installation_has_both_built_ins_switched_off() {
-        let registry = IntegrationRegistry::from_settings(&IntegrationsSettings::default());
+        let registry = IntegrationRegistry::from_settings(&IntegrationsSettings::default(), None);
         assert_eq!(registry.literature_ids().len(), 2);
         assert!(registry.enabled_literature_ids().is_empty());
         assert!(registry.literature_sources().all(|entry| entry.builtin));
@@ -417,7 +460,7 @@ mod tests {
 
     #[test]
     fn disabled_and_unknown_are_different_errors() {
-        let registry = IntegrationRegistry::from_settings(&settings(true, false));
+        let registry = IntegrationRegistry::from_settings(&settings(true, false), None);
         assert!(registry.literature_for_search("openalex").is_ok());
 
         let disabled = registry
@@ -440,10 +483,10 @@ mod tests {
         let mut settings = settings(true, false);
         settings.builtin.get_mut("openalex").unwrap().base_url =
             Some("https://mirror.example.test".into());
-        let registry = IntegrationRegistry::from_settings(&settings);
+        let registry = IntegrationRegistry::from_settings(&settings, None);
         let entry = registry.literature("openalex").unwrap();
         assert_eq!(
-            entry.manifest().origins(),
+            entry.manifest().unwrap().origins(),
             vec!["https://mirror.example.test"]
         );
     }
@@ -509,8 +552,52 @@ title = "t"
     }
 
     #[test]
+    fn a_catalogue_is_one_more_source_and_is_on_once_the_mirror_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry =
+            IntegrationRegistry::from_settings(&IntegrationsSettings::default(), Some(dir.path()));
+        let catalogues: Vec<&str> = registry
+            .literature_sources()
+            .filter(|entry| entry.source().capabilities().mirrored)
+            .map(|entry| entry.id())
+            .collect();
+        assert_eq!(
+            catalogues,
+            crate::catalogue::fetchers()
+                .iter()
+                .map(|fetch| fetch.id())
+                .collect::<Vec<_>>()
+        );
+        // Nothing fetched: registered, and off — a different answer from
+        // "unknown", as it is for a remote provider the user has not enabled.
+        assert!(registry.enabled_literature_ids().is_empty());
+        let off = registry
+            .literature_for_search("devdocs")
+            .err()
+            .expect("an unfetched catalogue is not searchable");
+        assert!(matches!(off, LiteratureLookupError::Disabled { .. }));
+
+        CatalogueStore::open(dir.path())
+            .unwrap()
+            .replace_provider("devdocs", &[])
+            .unwrap();
+        let registry =
+            IntegrationRegistry::from_settings(&IntegrationsSettings::default(), Some(dir.path()));
+        assert_eq!(registry.enabled_literature_ids(), vec!["devdocs"]);
+        assert!(registry.literature_for_search("devdocs").is_ok());
+    }
+
+    #[test]
+    fn a_caller_with_no_mirror_registers_no_catalogue() {
+        let registry = IntegrationRegistry::from_settings(&IntegrationsSettings::default(), None);
+        assert!(registry
+            .literature_sources()
+            .all(|entry| !entry.source().capabilities().mirrored));
+    }
+
+    #[test]
     fn capabilities_are_what_the_manifest_declares() {
-        let registry = IntegrationRegistry::from_settings(&IntegrationsSettings::default());
+        let registry = IntegrationRegistry::from_settings(&IntegrationsSettings::default(), None);
         let openalex = registry
             .literature("openalex")
             .unwrap()

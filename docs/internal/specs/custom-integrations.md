@@ -425,7 +425,10 @@ ids so the agent is told what it may actually name.
   §14.
 - **`CatalogueSource` (`fetch_all`).** Needs pagination, a dryness heuristic,
   and progress reporting (see `catalogue/providers.rs`). Manifest-expressible
-  in principle, but it is a second design, not a corollary of this one.
+  in principle, but it is a second design, not a corollary of this one. (A
+  catalogue has since become a `LiteratureSource` — `MirroredSource`, see
+  `catalogue-in-the-ui.md` §9 — and this trait its fetch half,
+  `CatalogueFetch`; fetching one by manifest is still excluded.)
 - **Writes.** §7. Resolving a download is a read; the existing downloader
   remains the only writer.
 - **XML responses.** JSON and HTML have concrete cases and typed selectors;

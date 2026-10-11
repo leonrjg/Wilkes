@@ -10,10 +10,7 @@ import type {
   CatalogueCourseProgress,
   CatalogueDownloadProgress,
   CatalogueFetchProgress,
-  CatalogueProbe,
-  CatalogueSearchResponse,
   CatalogueRemoveResponse,
-  CatalogueStatus,
   CatalogueSyncResponse,
   LiteratureProviderInfo,
   LiteratureSearchResponse,
@@ -195,17 +192,12 @@ export interface SearchApi {
    *  call to happen inside a transient user-activation window. */
   writeClipboard(text: string): Promise<void>;
 
-  // ── Catalogue ──────────────────────────────────────────────────────────────
-  /** What the mirror holds, per provider, and when each was last fetched.
-   *  Installation-wide: the mirror lives beside the model cache, not in the
-   *  workspace, so these numbers do not change when the workspace does. */
-  catalogueStatus(): Promise<CatalogueStatus>;
-  /** Recall over the mirror — wide, and explicitly not a ranking of which
-   *  record is the better thing to read. Batched because a caller with several
-   *  gaps should pay for one round trip, and keyed so answers can be reattached
-   *  without relying on order. */
-  catalogueSearch(probes: CatalogueProbe[], limit?: number): Promise<CatalogueSearchResponse>;
-  /** Every literature provider this installation knows, switched on or not.
+  // ── Literature and catalogues ──────────────────────────────────────────────
+  // A learning catalogue is a literature provider answered from a mirror kept
+  // on this machine: it is listed, asked and filtered below like the others,
+  // and has two operations of its own, to fetch it and to drop it.
+  /** Every literature provider this installation knows, switched on or not,
+   *  the learning catalogues among them with what the mirror holds for each.
    *  What a provider filter is offered from before anything has been asked. */
   literatureProviders(): Promise<LiteratureProviderInfo[]>;
   /** Every enabled literature provider asked at once, or only those named by

@@ -11,7 +11,6 @@ import GenerationPanel from "./GenerationPanel";
 import ImageAnalysisPanel from "./ImageAnalysisPanel";
 import { useGenerationStore } from "../stores/useGenerationStore";
 import ChunkingPanel from "./ChunkingPanel";
-import CataloguePanel from "./CataloguePanel";
 import DataPanel from "./DataPanel";
 import ExtensionsPanel from "./ExtensionsPanel";
 import IntegrationsPanel from "./IntegrationsPanel";
@@ -192,7 +191,6 @@ export default function SettingsModal({
     | "generation-models"
     | "servers"
     | "extraction-ocr"
-    | "catalogue"
     | "data"
     | "workers"
     | "logs"
@@ -481,11 +479,6 @@ export default function SettingsModal({
               <TabButton id="general" label="General" />
               <TabButton id="extensions" label="File extensions" />
               <TabButton id="integrations" label="Integrations" />
-              <TabButton
-                id="catalogue"
-                label="Catalogues"
-                accessibleLabel="Learning catalogues"
-              />
               {isTauri && (
                 <TabButton
                   id="servers"
@@ -1239,10 +1232,6 @@ export default function SettingsModal({
               {settings && (
                 <ChunkingPanel api={api} settings={settings} onUpdate={setSettings} />
               )}
-            </div>
-
-            <div className={activeTab === "catalogue" ? "block h-full" : "hidden"}>
-              <CataloguePanel api={api} isActive={activeTab === "catalogue"} />
             </div>
 
             <div className={activeTab === "data" ? "block h-full" : "hidden"}>

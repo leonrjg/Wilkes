@@ -2,10 +2,11 @@ import { useCallback, useEffect, useState } from "react";
 import type { SearchApi } from "../services/api";
 import type {
   CatalogueFetchProgress,
-  CatalogueProviderStatus,
-  CatalogueStatus,
   CatalogueSyncOutcome,
+  LiteratureProviderInfo,
+  MirrorStatus,
 } from "../lib/types";
+import { useCatalogueStore } from "../stores/useCatalogueStore";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 
 /**
@@ -21,16 +22,26 @@ type ProviderReport =
 
 interface Props {
   api: SearchApi;
-  isActive: boolean;
+  /** Told after a catalogue is fetched or removed, which is what turns it on
+   *  or off as a provider: whoever lists providers is now out of date. */
+  onChanged?: () => void;
 }
 
-/** The provider ids are wire values; these are how the four are written down. */
-const PROVIDER_LABELS: Record<string, string> = {
-  libretexts: "LibreTexts",
-  openstax: "OpenStax",
-  mit_ocw: "MIT OpenCourseWare",
-  devdocs: "DevDocs",
-};
+/** One catalogue as this panel shows it: a provider that is answered from the
+ *  mirror, and what the mirror holds for it. */
+interface Catalogue {
+  provider: string;
+  name: string;
+  mirror: MirrorStatus;
+}
+
+/** The providers that keep a mirror, in registry order. Which they are is the
+ *  registry's answer; this panel names no catalogue. */
+function catalogues(providers: LiteratureProviderInfo[]): Catalogue[] {
+  return providers.flatMap((info) =>
+    info.mirror === null ? [] : [{ provider: info.provider, name: info.name, mirror: info.mirror }],
+  );
+}
 
 const GRAIN_LABELS: Record<string, string> = {
   textbook: "Textbooks",
@@ -38,16 +49,10 @@ const GRAIN_LABELS: Record<string, string> = {
   reference: "Reference",
 };
 
-/** A provider the mirror still holds rows for but this build no longer knows
- *  is shown under its raw id rather than hidden: the rows are real. */
-function providerLabel(provider: string): string {
-  return PROVIDER_LABELS[provider] ?? provider;
-}
-
-/** Whether the mirror has this catalogue: it was fetched, or — for one this
- *  build no longer registers — its rows are still there. */
-function isHeld(provider: CatalogueProviderStatus): boolean {
-  return provider.synced_at_ms !== null || provider.records > 0;
+/** Whether the mirror has this catalogue, which is what makes it a provider
+ *  that is searched. */
+function isHeld(catalogue: Catalogue): boolean {
+  return catalogue.mirror.synced_at_ms !== null || catalogue.mirror.records > 0;
 }
 
 function formatSyncedAt(syncedAtMs: number | null): string {
@@ -82,8 +87,17 @@ function outcomeSummary(report: ProviderReport): string {
   return parts.join(", ");
 }
 
-export default function CataloguePanel({ api, isActive }: Props) {
-  const [status, setStatus] = useState<CatalogueStatus | null>(null);
+/**
+ * The learning catalogues: the providers that are answered from a copy kept on
+ * this machine, and so have to be fetched before they can answer.
+ *
+ * A tab of the integrations settings, beside the providers asked over the
+ * network, because that is what a catalogue is. What it has that they do not
+ * is here: fetching it, which is also what switches it on, and dropping what
+ * was fetched, which switches it off.
+ */
+export default function CataloguePanel({ api, onChanged }: Props) {
+  const [status, setStatus] = useState<Catalogue[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState<string | null>(null);
   const [queued, setQueued] = useState<string[]>([]);
@@ -99,17 +113,25 @@ export default function CataloguePanel({ api, isActive }: Props) {
 
   const refresh = useCallback(async () => {
     try {
-      setStatus(await api.catalogueStatus());
+      setStatus(catalogues(await api.literatureProviders()));
     } catch (e: any) {
+      console.error("catalogue: the mirror could not be read", e);
       setError(e?.toString?.() ?? "Failed to read the catalogue mirror");
     }
   }, [api]);
 
   useEffect(() => {
-    if (!isActive) return;
     setError(null);
     refresh();
-  }, [isActive, refresh]);
+  }, [refresh]);
+
+  /** A catalogue was fetched or dropped, so it is now a provider that is on or
+   *  one that is off: the pane's list and the tab strip's are both stale. */
+  const noteChanged = useCallback(async () => {
+    await refresh();
+    void useCatalogueStore.getState().loadProviders();
+    onChanged?.();
+  }, [refresh, onChanged]);
 
   // Subscribed while the tab is open rather than globally: this is the only
   // surface that renders a provider fetch, and a listener outliving it would
@@ -159,9 +181,6 @@ export default function CataloguePanel({ api, isActive }: Props) {
         if (outcome) {
           setReports((prev) => ({ ...prev, [provider]: { kind: "outcome", outcome } }));
         }
-        setStatus((prev) =>
-          prev === null ? prev : { ...prev, total_records: response.total_records },
-        );
       } catch (e: any) {
         // The loop continues: one provider being down is not the others being
         // down, and stopping here would hide that the rest would have worked.
@@ -174,7 +193,7 @@ export default function CataloguePanel({ api, isActive }: Props) {
     setSyncing(null);
     setQueued([]);
     setFetching({});
-    await refresh();
+    await noteChanged();
   };
 
   /**
@@ -198,7 +217,7 @@ export default function CataloguePanel({ api, isActive }: Props) {
       setError(e?.toString?.() ?? "Could not remove the catalogue");
     }
     setRemoving(null);
-    await refresh();
+    await noteChanged();
   };
 
   const busy = syncing !== null || removing !== null;
@@ -228,13 +247,14 @@ export default function CataloguePanel({ api, isActive }: Props) {
     );
   }
 
-  const empty = status.total_records === 0;
+  const totalRecords = status.reduce((total, catalogue) => total + catalogue.mirror.records, 0);
+  const empty = totalRecords === 0;
   // The mirror is what says which catalogues this installation has, so the one
   // button refreshes those and leaves a removed catalogue removed. With none
   // held there is nothing to refresh, and it fills the mirror instead.
-  const held = status.providers.filter(isHeld);
-  const syncTargets = held.length > 0 ? held : status.providers;
-  const syncsEverything = syncTargets.length === status.providers.length;
+  const held = status.filter(isHeld);
+  const syncTargets = held.length > 0 ? held : status;
+  const syncsEverything = syncTargets.length === status.length;
 
   return (
     <div className="flex flex-col gap-6">
@@ -244,10 +264,11 @@ export default function CataloguePanel({ api, isActive }: Props) {
             Learning catalogues
           </h3>
           <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">
-            A local copy of what several open textbook, course and documentation
-            catalogues publish, so that a search which your library cannot answer
-            can suggest something that would. Shared by every workspace on this
-            machine, and refreshed only when you ask.
+            Open textbook, course and documentation catalogues, searched from a
+            copy kept on this machine: fetching one is what switches it on, and
+            asking it sends your query nowhere. A search your library cannot
+            answer can then suggest something that would. Shared by every
+            workspace on this machine, and refreshed only when you ask.
           </p>
         </div>
 
@@ -258,7 +279,7 @@ export default function CataloguePanel({ api, isActive }: Props) {
                 Records held
               </span>
               <span className="text-[10px] text-[var(--text-main)] font-mono">
-                {status.total_records.toLocaleString()}
+                {totalRecords.toLocaleString()}
               </span>
             </div>
             <button
@@ -278,7 +299,7 @@ export default function CataloguePanel({ api, isActive }: Props) {
           )}
 
           <div className="flex flex-col divide-y divide-[var(--border-main)]">
-            {status.providers.map((provider) => (
+            {status.map((provider) => (
               <ProviderRow
                 key={provider.provider}
                 provider={provider}
@@ -318,7 +339,7 @@ function ProviderRow({
   onArm,
   onRemove,
 }: {
-  provider: CatalogueProviderStatus;
+  provider: Catalogue;
   report: ProviderReport | null;
   progress: CatalogueFetchProgress | null;
   syncing: boolean;
@@ -338,10 +359,10 @@ function ProviderRow({
       <div className="flex min-w-0 flex-col gap-1">
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-[var(--text-main)] font-medium truncate">
-            {providerLabel(provider.provider)}
+            {provider.name}
           </span>
           <span className="px-1.5 py-0.5 rounded bg-[var(--bg-app)] border border-[var(--border-main)] text-[9px] uppercase tracking-wider text-[var(--text-dim)]">
-            {GRAIN_LABELS[provider.grain] ?? provider.grain}
+            {GRAIN_LABELS[provider.mirror.grain] ?? provider.mirror.grain}
           </span>
         </div>
         <span
@@ -359,9 +380,9 @@ function ProviderRow({
                 ? "Waiting"
                 : report !== null
                   ? outcomeSummary(report)
-                  : provider.synced_at_ms === null
+                  : provider.mirror.synced_at_ms === null
                     ? "Never synced"
-                    : `${provider.records.toLocaleString()} records · ${formatSyncedAt(provider.synced_at_ms)}`}
+                    : `${provider.mirror.records.toLocaleString()} records · ${formatSyncedAt(provider.mirror.synced_at_ms)}`}
         </span>
       </div>
       <div className="flex shrink-0 items-center gap-1.5">
@@ -380,7 +401,7 @@ function ProviderRow({
               onBlur={() => onArm(false)}
               onMouseLeave={() => onArm(false)}
               disabled={disabled}
-              aria-label={`${armed ? "Confirm removing" : "Remove"} ${providerLabel(provider.provider)}`}
+              aria-label={`${armed ? "Confirm removing" : "Remove"} ${provider.name}`}
               className={`px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider rounded border transition-colors disabled:opacity-50 ${
                 armed
                   ? "bg-red-900/20 border-red-900/50 text-red-400 hover:bg-red-900/30"
@@ -393,7 +414,7 @@ function ProviderRow({
         )}
         <Tooltip
           content={
-            provider.synced_at_ms === null
+            provider.mirror.synced_at_ms === null
               ? "Fetch this catalogue for the first time"
               : "Replace this catalogue's records with what it publishes now"
           }
@@ -401,7 +422,7 @@ function ProviderRow({
           <button
             onClick={onSync}
             disabled={disabled}
-            aria-label={`Sync ${providerLabel(provider.provider)}`}
+            aria-label={`Sync ${provider.name}`}
             className="px-2.5 py-1 bg-[var(--bg-app)] hover:bg-[var(--bg-active)] text-[var(--text-main)] text-[10px] font-bold uppercase tracking-wider rounded border border-[var(--border-main)] transition-colors disabled:opacity-50"
           >
             {syncing ? "…" : "Sync"}

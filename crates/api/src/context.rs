@@ -221,6 +221,10 @@ impl wilkes_agent::search::SearchService for AppContext {
         self.get_settings().await.integrations
     }
 
+    fn catalogue_mirror(&self) -> Option<PathBuf> {
+        Some(self.catalogue_dir.clone())
+    }
+
     async fn search(
         self: Arc<Self>,
         query: SearchQuery,
@@ -4998,7 +5002,9 @@ impl AppContext {
             // it answers is written under that provider's id, keyed by the
             // composed DOI. Which providers exist, and what each can do, is
             // the registry's answer; nothing here names one.
-            let registry = IntegrationRegistry::from_settings(&settings.integrations);
+            // No mirror: this pass asks only providers that can look a DOI
+            // up, and a catalogue answered from the mirror is not one.
+            let registry = IntegrationRegistry::from_settings(&settings.integrations, None);
             for entry in registry.literature_sources().filter(|entry| entry.enabled) {
                 let source = Arc::clone(entry.source());
                 let capabilities = source.capabilities();
@@ -5186,7 +5192,12 @@ impl AppContext {
         provider: String,
     ) -> anyhow::Result<wilkes_core::types::IntegrationStatus> {
         let s = self.get_settings().await;
-        crate::commands::integrations::literature::status(&s.integrations, &provider).await
+        crate::commands::integrations::literature::status(
+            &s.integrations,
+            Some(&self.catalogue_dir),
+            &provider,
+        )
+        .await
     }
 
     /// One provider's record of a work, from the metadata cache when it holds
@@ -5199,6 +5210,7 @@ impl AppContext {
         let s = self.get_settings().await;
         crate::commands::integrations::literature::lookup(
             &s.integrations,
+            Some(&self.catalogue_dir),
             self.metadata_cache(),
             &provider,
             &doi,
@@ -5239,7 +5251,10 @@ impl AppContext {
         &self,
     ) -> Vec<crate::commands::integrations::literature::LiteratureProviderInfo> {
         let s = self.get_settings().await;
-        crate::commands::integrations::literature::providers(&s.integrations)
+        crate::commands::integrations::literature::providers(
+            &s.integrations,
+            Some(&self.catalogue_dir),
+        )
     }
 
     /// One query against every enabled literature provider, or against the
@@ -5258,6 +5273,7 @@ impl AppContext {
         let s = self.get_settings().await;
         crate::commands::integrations::literature::search_all(
             &s.integrations,
+            Some(&self.catalogue_dir),
             query,
             limit,
             providers,
@@ -5277,6 +5293,7 @@ impl AppContext {
         let settings = self.get_settings().await;
         crate::commands::integrations::literature::resolve_download(
             &settings.integrations,
+            Some(&self.catalogue_dir),
             provider,
             result,
         )
@@ -5295,8 +5312,13 @@ impl AppContext {
         crate::commands::integrations::literature::LiteratureRequestError,
     > {
         let settings = self.get_settings().await;
-        crate::commands::integrations::literature::browse(&settings.integrations, provider, request)
-            .await
+        crate::commands::integrations::literature::browse(
+            &settings.integrations,
+            Some(&self.catalogue_dir),
+            provider,
+            request,
+        )
+        .await
     }
 
     /// What a provider suggests for one of its filters as the user types.
@@ -5312,6 +5334,7 @@ impl AppContext {
         let settings = self.get_settings().await;
         crate::commands::integrations::literature::suggest(
             &settings.integrations,
+            Some(&self.catalogue_dir),
             provider,
             filter,
             text,
@@ -6112,7 +6135,8 @@ impl AppContext {
             }
         }
 
-        let registry = IntegrationRegistry::from_settings(&after.integrations);
+        let registry =
+            IntegrationRegistry::from_settings(&after.integrations, Some(&self.catalogue_dir));
         let backfill = changed.iter().any(|id| {
             registry.literature(id).is_some_and(|entry| {
                 entry.enabled && {

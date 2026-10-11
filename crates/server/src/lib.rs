@@ -2910,7 +2910,7 @@ mod tests {
         // that holds nothing yet.
         assert_eq!(
             response.0.providers.len(),
-            wilkes_core::catalogue::registry().len()
+            wilkes_core::catalogue::fetchers().len()
         );
         assert!(response
             .0

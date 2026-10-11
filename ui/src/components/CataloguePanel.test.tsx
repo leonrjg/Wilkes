@@ -1,28 +1,74 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { CatalogueStatus, CatalogueSyncResponse } from "../lib/types";
+import type {
+  CatalogueGrain,
+  CatalogueSyncResponse,
+  LiteratureProviderInfo,
+  MirrorStatus,
+} from "../lib/types";
+
+// The panel tells the pane's store that the providers changed, and the store
+// reads them through the application's own client.
+vi.mock("../services", () => ({
+  isTauri: true,
+  api: { literatureProviders: vi.fn(() => Promise.resolve([])) },
+  source: { type: "desktop" },
+}));
+
+import { api as appApi } from "../services";
 import CataloguePanel from "./CataloguePanel";
 
-const UNSYNCED: CatalogueStatus = {
-  total_records: 0,
-  providers: [
-    { provider: "libretexts", grain: "textbook", records: 0, synced_at_ms: null },
-    { provider: "mit_ocw", grain: "course", records: 0, synced_at_ms: null },
-  ],
-};
-
-const SYNCED: CatalogueStatus = {
-  total_records: 2_219,
-  providers: [
-    {
-      provider: "libretexts",
-      grain: "textbook",
-      records: 2_219,
-      synced_at_ms: Date.now() - 3 * 86_400_000,
+/** A provider as the registry reports it; one with a `mirror` is a catalogue. */
+function provider(
+  id: string,
+  name: string,
+  mirror: MirrorStatus | null,
+): LiteratureProviderInfo {
+  return {
+    provider: id,
+    name,
+    enabled: mirror === null || mirror.synced_at_ms !== null,
+    builtin: true,
+    base_url: `https://${id}.example`,
+    default_base_url: null,
+    capabilities: {
+      paged_search: false,
+      browse: null,
+      lookup: false,
+      references: false,
+      resolve_download: false,
+      mirrored: mirror !== null,
     },
-    { provider: "mit_ocw", grain: "course", records: 0, synced_at_ms: null },
-  ],
-};
+    secrets: [],
+    mirror,
+  };
+}
+
+const unfetched = (grain: CatalogueGrain): MirrorStatus => ({
+  grain,
+  records: 0,
+  synced_at_ms: null,
+});
+
+/** An index asked over the network is listed beside the catalogues and is
+ *  none of this panel's business. */
+const OPENALEX = provider("openalex", "OpenAlex", null);
+
+const UNSYNCED: LiteratureProviderInfo[] = [
+  provider("libretexts", "LibreTexts", unfetched("textbook")),
+  provider("mit_ocw", "MIT OpenCourseWare", unfetched("course")),
+  OPENALEX,
+];
+
+const SYNCED: LiteratureProviderInfo[] = [
+  provider("libretexts", "LibreTexts", {
+    grain: "textbook",
+    records: 2_219,
+    synced_at_ms: Date.now() - 3 * 86_400_000,
+  }),
+  provider("mit_ocw", "MIT OpenCourseWare", unfetched("course")),
+  OPENALEX,
+];
 
 function syncResponse(overrides: Partial<CatalogueSyncResponse["providers"][0]> = {}) {
   return {
@@ -44,7 +90,7 @@ function syncResponse(overrides: Partial<CatalogueSyncResponse["providers"][0]> 
 
 describe("CataloguePanel", () => {
   const api = {
-    catalogueStatus: vi.fn(() => Promise.resolve(UNSYNCED)),
+    literatureProviders: vi.fn(() => Promise.resolve(UNSYNCED)),
     catalogueSync: vi.fn(() => Promise.resolve(syncResponse())),
     catalogueRemove: vi.fn((provider: string) =>
       Promise.resolve({ provider, removed: 2_219, total_records: 0 }),
@@ -52,8 +98,8 @@ describe("CataloguePanel", () => {
     onCatalogueSyncProgress: vi.fn(() => Promise.resolve(() => {})),
   } as never;
 
-  const withStatus = (status: CatalogueStatus) => {
-    (api as unknown as { catalogueStatus: unknown }).catalogueStatus = vi.fn(() =>
+  const withStatus = (status: LiteratureProviderInfo[]) => {
+    (api as unknown as { literatureProviders: unknown }).literatureProviders = vi.fn(() =>
       Promise.resolve(status),
     );
   };
@@ -85,14 +131,14 @@ describe("CataloguePanel", () => {
   /// grouping cannot see it. Listing only what had already synced would show an
   /// empty panel and no way to understand it.
   it("names a provider that has never synced", async () => {
-    render(<CataloguePanel api={api} isActive />);
+    render(<CataloguePanel api={api} />);
     await screen.findByText("LibreTexts");
     expect(screen.getByText("MIT OpenCourseWare")).toBeTruthy();
     expect(screen.getAllByText("Never synced").length).toBe(2);
   });
 
   it("says the mirror is empty and what filling it costs", async () => {
-    render(<CataloguePanel api={api} isActive />);
+    render(<CataloguePanel api={api} />);
     expect(await screen.findByText(/This mirror is empty/i)).toBeTruthy();
     expect(screen.getByText(/takes a few minutes/i)).toBeTruthy();
   });
@@ -100,7 +146,7 @@ describe("CataloguePanel", () => {
   /// Fetching all four at once is minutes with nothing to show; the route takes
   /// a list precisely so a caller that wants progress can decline to use it.
   it("syncs one provider at a time so each can be reported as it lands", async () => {
-    render(<CataloguePanel api={api} isActive />);
+    render(<CataloguePanel api={api} />);
     await screen.findByText("LibreTexts");
     fireEvent.click(screen.getByText("Sync all"));
     await waitFor(() => {
@@ -116,7 +162,7 @@ describe("CataloguePanel", () => {
   /// panel showing only what was stored would make a provider whose pagination
   /// changed look like one that simply shrank.
   it("reports what a provider offered alongside what was stored", async () => {
-    render(<CataloguePanel api={api} isActive />);
+    render(<CataloguePanel api={api} />);
     await screen.findByText("LibreTexts");
     fireEvent.click(screen.getByLabelText("Sync LibreTexts"));
     expect(await screen.findByText(/2,219 stored, 4,100 offered/)).toBeTruthy();
@@ -129,7 +175,7 @@ describe("CataloguePanel", () => {
         syncResponse({ records: null, offered: null, duplicates: null, error: "429 Too Many Requests" }),
       ),
     );
-    render(<CataloguePanel api={api} isActive />);
+    render(<CataloguePanel api={api} />);
     await screen.findByText("LibreTexts");
     fireEvent.click(screen.getByLabelText("Sync LibreTexts"));
     expect(await screen.findByText("429 Too Many Requests")).toBeTruthy();
@@ -138,7 +184,7 @@ describe("CataloguePanel", () => {
 
   it("shows what each provider holds and when it last said so", async () => {
     withStatus(SYNCED);
-    render(<CataloguePanel api={api} isActive />);
+    render(<CataloguePanel api={api} />);
     expect(await screen.findByText(/2,219 records · 3 days ago/)).toBeTruthy();
   });
 
@@ -148,7 +194,7 @@ describe("CataloguePanel", () => {
     const remove = (api as unknown as { catalogueRemove: ReturnType<typeof vi.fn> })
       .catalogueRemove;
     withStatus(SYNCED);
-    render(<CataloguePanel api={api} isActive />);
+    render(<CataloguePanel api={api} />);
     await screen.findByText("LibreTexts");
     // Nothing was fetched from MIT OpenCourseWare, so there is nothing to drop.
     expect(screen.queryByLabelText("Remove MIT OpenCourseWare")).toBeNull();
@@ -164,7 +210,7 @@ describe("CataloguePanel", () => {
 
   it("disarms a removal the user looked away from", async () => {
     withStatus(SYNCED);
-    render(<CataloguePanel api={api} isActive />);
+    render(<CataloguePanel api={api} />);
     await screen.findByText("LibreTexts");
     const button = screen.getByLabelText("Remove LibreTexts");
     fireEvent.click(button);
@@ -176,7 +222,7 @@ describe("CataloguePanel", () => {
   /// been removed.
   it("refreshes only the catalogues the mirror holds", async () => {
     withStatus(SYNCED);
-    render(<CataloguePanel api={api} isActive />);
+    render(<CataloguePanel api={api} />);
     await screen.findByText("LibreTexts");
     fireEvent.click(screen.getByText("Sync held"));
     const sync = (api as unknown as { catalogueSync: ReturnType<typeof vi.fn> })
@@ -185,10 +231,39 @@ describe("CataloguePanel", () => {
     expect(sync.mock.calls[0][0]).toEqual(["libretexts"]);
   });
 
+  /// Which providers are catalogues is the registry's answer. An index asked
+  /// over the network has no mirror, and nothing here to fetch or drop.
+  it("lists the providers that keep a mirror and no others", async () => {
+    render(<CataloguePanel api={api} />);
+    await screen.findByText("LibreTexts");
+    expect(screen.queryByText("OpenAlex")).toBeNull();
+    expect(screen.queryByLabelText("Sync OpenAlex")).toBeNull();
+  });
+
+  /// Fetching a catalogue is what switches it on as a provider, and dropping
+  /// one switches it off: whoever lists providers is out of date afterwards.
+  it("tells the rest of the application when a catalogue was fetched or dropped", async () => {
+    const onChanged = vi.fn();
+    const paneProviders = appApi.literatureProviders as unknown as ReturnType<typeof vi.fn>;
+    withStatus(SYNCED);
+    render(<CataloguePanel api={api} onChanged={onChanged} />);
+    await screen.findByText("LibreTexts");
+    expect(onChanged).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByLabelText("Sync LibreTexts"));
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+    expect(paneProviders).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByLabelText("Remove LibreTexts"));
+    fireEvent.click(screen.getByLabelText("Confirm removing LibreTexts"));
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(2));
+    expect(paneProviders).toHaveBeenCalledTimes(2);
+  });
+
   /// The mirror is installation-wide now; a panel that read as workspace-scoped
   /// would imply these numbers change when the workspace does.
   it("says the mirror is shared across workspaces", async () => {
-    render(<CataloguePanel api={api} isActive />);
+    render(<CataloguePanel api={api} />);
     expect(await screen.findByText(/Shared by every workspace/i)).toBeTruthy();
   });
 
@@ -199,7 +274,7 @@ describe("CataloguePanel", () => {
     (api as unknown as { catalogueSync: unknown }).catalogueSync = vi.fn(
       () => new Promise((resolve) => { release = resolve; }),
     );
-    render(<CataloguePanel api={api} isActive />);
+    render(<CataloguePanel api={api} />);
     await screen.findByText("LibreTexts");
     fireEvent.click(screen.getByLabelText("Sync LibreTexts"));
     await emitProgress({ provider: "libretexts", pages: 12, records: 1_204 });
@@ -215,7 +290,7 @@ describe("CataloguePanel", () => {
     (api as unknown as { catalogueSync: unknown }).catalogueSync = vi.fn(
       () => new Promise((resolve) => { release = resolve; }),
     );
-    render(<CataloguePanel api={api} isActive />);
+    render(<CataloguePanel api={api} />);
     await screen.findByText("LibreTexts");
     fireEvent.click(screen.getByLabelText("Sync LibreTexts"));
     await emitProgress({ provider: "mit_ocw", pages: 9, records: 900 });

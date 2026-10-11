@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { LiteratureProviderInfo, Settings } from "../lib/types";
 import { ZOTERO_ROW, literatureRow } from "../lib/integrations/providers";
 import { ERROR_TEXT_CLASS } from "../lib/integrations/styles";
 import type { SearchApi } from "../services/api";
+import CataloguePanel from "./CataloguePanel";
 import CustomIntegrations from "./CustomIntegrations";
 import ProviderForm from "./ProviderForm";
 
@@ -14,6 +15,9 @@ interface IntegrationsPanelProps {
 
 /** The custom tab is not a provider, so it is not a row. */
 const CUSTOM_TAB = "custom";
+/** Nor is the catalogues tab: it is every provider that keeps a mirror, which
+ *  have nothing to configure and one thing in common to do — be fetched. */
+const CATALOGUES_TAB = "catalogues";
 
 /**
  * The integrations settings, one provider at a time.
@@ -26,7 +30,9 @@ const CUSTOM_TAB = "custom";
  *
  * Zotero is a row written out; every provider shipped with Wilkes is a row
  * built from what the backend reports of it, so the panel names no provider
- * but Zotero.
+ * but Zotero. The learning catalogues are providers too, and share one tab:
+ * they are answered from a mirror on this machine, so what there is to do with
+ * one is fetch it or drop it, not fill in a form.
  */
 export default function IntegrationsPanel({
   api,
@@ -38,28 +44,40 @@ export default function IntegrationsPanel({
   const [listError, setListError] = useState<string | null>(null);
   const custom = settings.integrations?.custom ?? [];
 
+  const list = useCallback(
+    (cancelled: () => boolean = () => false) =>
+      api
+        .literatureProviders()
+        .then((providers) => {
+          if (cancelled()) return;
+          setShipped(providers.filter((provider) => provider.builtin));
+          setListError(null);
+        })
+        .catch((error: unknown) => {
+          console.error("literature providers could not be listed:", error);
+          if (!cancelled()) {
+            setListError(error instanceof Error ? error.message : String(error));
+          }
+        }),
+    [api],
+  );
+
   useEffect(() => {
     let cancelled = false;
-    api
-      .literatureProviders()
-      .then((providers) => {
-        if (cancelled) return;
-        setShipped(providers.filter((provider) => provider.builtin));
-        setListError(null);
-      })
-      .catch((error: unknown) => {
-        console.error("literature providers could not be listed:", error);
-        if (!cancelled) {
-          setListError(error instanceof Error ? error.message : String(error));
-        }
-      });
+    void list(() => cancelled);
     return () => {
       cancelled = true;
     };
-  }, [api]);
+  }, [list]);
 
+  const mirrored = shipped.filter((provider) => provider.capabilities.mirrored);
   const rows = useMemo(
-    () => [ZOTERO_ROW, ...shipped.map((provider) => literatureRow(provider))],
+    () => [
+      ZOTERO_ROW,
+      ...shipped
+        .filter((provider) => !provider.capabilities.mirrored)
+        .map((provider) => literatureRow(provider)),
+    ],
     [shipped],
   );
 
@@ -71,6 +89,16 @@ export default function IntegrationsPanel({
       // ones are live without the user opening each tab to find out.
       on: Boolean(row.read(settings.integrations).enabled),
     })),
+    // Offered only where there is a catalogue to fetch.
+    ...(mirrored.length > 0
+      ? [
+          {
+            id: CATALOGUES_TAB,
+            label: "Catalogues",
+            on: mirrored.some((provider) => provider.enabled),
+          },
+        ]
+      : []),
     {
       id: CUSTOM_TAB,
       label: "Custom",
@@ -126,6 +154,8 @@ export default function IntegrationsPanel({
             settings={settings}
             onUpdate={onUpdate}
           />
+        ) : active === CATALOGUES_TAB ? (
+          <CataloguePanel api={api} onChanged={() => void list()} />
         ) : (
           <CustomIntegrations api={api} settings={settings} onUpdate={onUpdate} />
         )}
