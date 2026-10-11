@@ -12,6 +12,7 @@ import type {
   CatalogueSyncResponse,
   BrowseRequest,
   FilterSuggestion,
+  LiteratureComposition,
   LiteratureProviderAnswer,
   LiteratureProviderInfo,
   ProviderWork,
@@ -480,6 +481,18 @@ export class TauriSearchApi implements SearchApi {
     text: string,
   ): Promise<FilterSuggestion[]> {
     return invoke<FilterSuggestion[]>("literature_filter_suggest", { provider, filter, text });
+  }
+
+  async literatureCompose(
+    requestId: string,
+    text: string,
+    providers: string[],
+  ): Promise<LiteratureComposition> {
+    return invoke<LiteratureComposition>("literature_compose", { requestId, text, providers });
+  }
+
+  async literatureComposeCancel(requestId: string): Promise<void> {
+    await invoke("literature_compose_cancel", { requestId });
   }
 
   async literatureProviderStatus(provider: string): Promise<IntegrationStatus> {

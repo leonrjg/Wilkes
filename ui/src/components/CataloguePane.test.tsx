@@ -17,6 +17,8 @@ vi.mock("../services", () => ({
     literatureSearch: vi.fn(),
     literatureBrowse: vi.fn(),
     literatureFilterSuggest: vi.fn(),
+    literatureCompose: vi.fn(),
+    literatureComposeCancel: vi.fn(() => Promise.resolve()),
     literatureResolveDownload: vi.fn(),
     listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
   },
@@ -30,6 +32,7 @@ vi.mock("../services", () => ({
 import { api, source } from "../services";
 import CataloguePane from "./CataloguePane";
 import { useCatalogueStore } from "../stores/useCatalogueStore";
+import { useGenerationStore } from "../stores/useGenerationStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 
@@ -193,6 +196,8 @@ const providers = api.literatureProviders as unknown as ReturnType<typeof vi.fn>
 const literature = api.literatureSearch as unknown as ReturnType<typeof vi.fn>;
 const browse = api.literatureBrowse as unknown as ReturnType<typeof vi.fn>;
 const resolveDownload = api.literatureResolveDownload as unknown as ReturnType<typeof vi.fn>;
+const composeCall = api.literatureCompose as unknown as ReturnType<typeof vi.fn>;
+const composeCancel = api.literatureComposeCancel as unknown as ReturnType<typeof vi.fn>;
 const acquire = api.catalogueAcquire as unknown as ReturnType<typeof vi.fn>;
 const acquireCourse = api.catalogueAcquireCourse as unknown as ReturnType<typeof vi.fn>;
 const importFiles = (source as unknown as { importFiles: ReturnType<typeof vi.fn> }).importFiles;
@@ -216,6 +221,8 @@ describe("CataloguePane", () => {
     });
     useSettingsStore.setState({ directory: "/library", refreshFileList: vi.fn() as never });
     useWorkspaceStore.setState({ workspaces: [], activeWorkspaceId: null } as never);
+    useGenerationStore.setState({ ready: false });
+    composeCancel.mockResolvedValue(undefined);
     providers.mockResolvedValue([
       provider("semantic_scholar", "Semantic Scholar"),
       provider("openalex", "OpenAlex", OPENALEX_BROWSE),
@@ -1240,6 +1247,204 @@ describe("CataloguePane", () => {
     fireEvent.click(await screen.findByLabelText("Add Resolved Book to library"));
     expect(await screen.findByText(/membership required/)).toBeTruthy();
     expect(useCatalogueStore.getState().adding).toEqual({});
+  });
+
+  // ── Composing filters from a request in words ────────────────────────────
+
+  const REQUEST = "open reviews on CRISPR by Jennifer Doudna since 2020, most cited first";
+  const composeButton = () =>
+    screen.findByRole("button", { name: "Compose filters from what you typed" });
+  const typeRequest = (text: string) =>
+    fireEvent.change(searchBox(), { target: { value: text } });
+  const composition = (
+    overrides: Partial<{
+      filters: Record<string, string[]>;
+      labels: Record<string, Record<string, string>>;
+      sort: string | null;
+      notes: string[];
+      error: string | null;
+    }> = {},
+    keyword: string | null = "crispr",
+  ) => ({
+    text: REQUEST,
+    keyword,
+    providers: [
+      {
+        provider: "openalex",
+        name: "OpenAlex",
+        filters: { type: ["article"], open_access: ["true"], year_from: ["2020"] },
+        labels: {},
+        sort: "publication_date:desc",
+        notes: [],
+        error: null,
+        ...overrides,
+      },
+    ],
+  });
+
+  /// Every model-dependent control is absent, not greyed out, where the model
+  /// is not ready — and this one also where no provider has filters to set.
+  it("offers composing only where there is a model and something to filter", async () => {
+    const { unmount } = render(<CataloguePane />);
+    await screen.findByRole("button", { name: "Filters" });
+    expect(screen.queryByRole("button", { name: /Compose filters/ })).toBeNull();
+    unmount();
+
+    useGenerationStore.setState({ ready: true });
+    providers.mockResolvedValue([provider("semantic_scholar", "Semantic Scholar")]);
+    render(<CataloguePane />);
+    await screen.findByRole("button", { name: "Semantic Scholar" });
+    expect(screen.queryByRole("button", { name: /Compose filters/ })).toBeNull();
+  });
+
+  /// What is composed is set exactly as a hand-set filter is: the same chips,
+  /// removable the same way, asked of the provider through the same listing.
+  /// The subject of the sentence becomes what every source is searched for.
+  it("sets the filters a sentence describes and searches for its subject", async () => {
+    useGenerationStore.setState({ ready: true });
+    composeCall.mockResolvedValue(composition());
+    browse.mockResolvedValue(listing(works(3)));
+    literature.mockResolvedValue(answerOf("semantic_scholar", "Semantic Scholar", []));
+    render(<CataloguePane />);
+    typeRequest(REQUEST);
+    fireEvent.click(await composeButton());
+
+    await screen.findByText(`Filters composed from “${REQUEST}”.`);
+    // Composed for the provider that declares filters, and no other.
+    expect(composeCall).toHaveBeenCalledWith(expect.any(String), REQUEST, ["openalex"]);
+    await waitFor(() =>
+      expect(browse).toHaveBeenCalledWith(
+        "openalex",
+        expect.objectContaining({
+          query: "crispr",
+          filters: { type: ["article"], open_access: ["true"], year_from: ["2020"] },
+          sort: "publication_date:desc",
+        }),
+      ),
+    );
+    // The provider with no filters is searched for the subject, not the sentence.
+    expect(literature).toHaveBeenCalledWith("crispr", 10, ["semantic_scholar"]);
+    // The box says what is searched for now.
+    expect(searchBox()).toHaveProperty("value", "crispr");
+    // And the filters are the ordinary chips, each removable.
+    const active = within(screen.getByLabelText("Active filters"));
+    expect(active.getByRole("button", { name: "Remove Type: Article" })).toBeTruthy();
+    expect(active.getByRole("button", { name: "Remove Open access only" })).toBeTruthy();
+    expect(active.getByRole("button", { name: "Remove Year from: 2020" })).toBeTruthy();
+    expect(active.getByRole("button", { name: "Remove Sort: Newest first" })).toBeTruthy();
+  });
+
+  /// A request with no subject is a listing by filters alone, which is what
+  /// browsing is: nothing is searched by keyword.
+  it("lists by filters alone when the sentence names no subject", async () => {
+    useGenerationStore.setState({ ready: true });
+    composeCall.mockResolvedValue(composition({}, null));
+    browse.mockResolvedValue(listing(works(3)));
+    render(<CataloguePane />);
+    typeRequest("open reviews since 2020");
+    fireEvent.click(await composeButton());
+    await waitFor(() =>
+      expect(browse).toHaveBeenCalledWith("openalex", expect.objectContaining({ query: null })),
+    );
+    expect(literature).not.toHaveBeenCalled();
+    expect(searchBox()).toHaveProperty("value", "");
+  });
+
+  /// A name the provider did not know is a filter silently missing unless
+  /// something says so; and a value it did know is called what it calls it.
+  it("says what was asked for and could not be set, and names what was", async () => {
+    useGenerationStore.setState({ ready: true });
+    providers.mockResolvedValue([provider("openalex", "OpenAlex", RICH_BROWSE)]);
+    composeCall.mockResolvedValue(
+      composition({
+        filters: { author: ["A5001"] },
+        labels: { author: { A5001: "Jennifer A. Doudna" } },
+        sort: null,
+        notes: ["OpenAlex knows no Author called “Nobody Atall”, so it was left out"],
+      }),
+    );
+    browse.mockResolvedValue(listing(works(1)));
+    render(<CataloguePane />);
+    typeRequest(REQUEST);
+    fireEvent.click(await composeButton());
+    expect(await screen.findByText(/knows no Author called “Nobody Atall”/)).toBeTruthy();
+    expect(
+      within(screen.getByLabelText("Active filters")).getByRole("button", {
+        name: "Remove Author: Jennifer A. Doudna",
+      }),
+    ).toBeTruthy();
+  });
+
+  /// A provider that could not be composed for is reported, and with nothing
+  /// composed for anyone there is no search to run: the sentence is not
+  /// quietly searched for as words.
+  it("reports a provider it could not compose for and searches for nothing", async () => {
+    useGenerationStore.setState({ ready: true });
+    composeCall.mockResolvedValue(
+      composition({ filters: {}, sort: null, error: "nothing in the request could be turned into a search" }, null),
+    );
+    render(<CataloguePane />);
+    typeRequest("hello there");
+    fireEvent.click(await composeButton());
+    expect(
+      await screen.findByText(/OpenAlex could not be composed for: nothing in the request/),
+    ).toBeTruthy();
+    expect(browse).not.toHaveBeenCalled();
+    expect(literature).not.toHaveBeenCalled();
+    // What was typed is still there to be searched for, if that was meant.
+    expect(searchBox()).toHaveProperty("value", "hello there");
+  });
+
+  it("says why nothing could be composed and leaves the filters as they were", async () => {
+    useGenerationStore.setState({ ready: true });
+    useCatalogueStore.setState({
+      refinements: { openalex: { filters: { type: ["book"] }, modes: {}, labels: {}, sort: null } },
+    });
+    composeCall.mockRejectedValue(new Error("Generation is not available"));
+    render(<CataloguePane />);
+    typeRequest(REQUEST);
+    fireEvent.click(await composeButton());
+    expect(
+      await screen.findByText(/could not be composed: Error: Generation is not available/),
+    ).toBeTruthy();
+    expect(useCatalogueStore.getState().refinements.openalex.filters).toEqual({ type: ["book"] });
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByText(/could not be composed/)).toBeNull();
+  });
+
+  /// While it works, the button is what stops it: the backend is told, and an
+  /// answer that arrives anyway sets nothing.
+  it("stops a composition in flight and ignores its answer", async () => {
+    useGenerationStore.setState({ ready: true });
+    let answer: (value: unknown) => void = () => {};
+    composeCall.mockReturnValue(new Promise((resolve) => { answer = resolve; }));
+    render(<CataloguePane />);
+    typeRequest(REQUEST);
+    fireEvent.click(await composeButton());
+    expect(await screen.findByText("Composing filters…")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop composing filters" }));
+    expect(composeCancel).toHaveBeenCalledWith(composeCall.mock.calls[0][0]);
+    expect(screen.queryByText("Composing filters…")).toBeNull();
+
+    await act(async () => {
+      answer(composition());
+    });
+    expect(useCatalogueStore.getState().refinements).toEqual({});
+    expect(browse).not.toHaveBeenCalled();
+    expect(searchBox()).toHaveProperty("value", REQUEST);
+  });
+
+  /// Composing follows the source chips, as a search does: a provider that is
+  /// deselected is not composed for.
+  it("composes only for the providers that are selected", async () => {
+    useGenerationStore.setState({ ready: true });
+    useCatalogueStore.setState({ providers: ["semantic_scholar"] });
+    render(<CataloguePane />);
+    typeRequest(REQUEST);
+    fireEvent.click(await composeButton());
+    expect(await screen.findByText(/None of the selected sources can be filtered/)).toBeTruthy();
+    expect(composeCall).not.toHaveBeenCalled();
   });
 
   it("says why nothing can be added to a read-only workspace", async () => {

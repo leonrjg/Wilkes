@@ -1967,6 +1967,29 @@ async fn literature_filter_suggest(
         .map_err(|error| error.to_string())
 }
 
+/// Turns a request written in ordinary words into filters on each named
+/// provider. `request_id` is the caller's, for `literature_compose_cancel`.
+#[tauri::command]
+async fn literature_compose(
+    app: AppHandle,
+    request_id: String,
+    text: String,
+    providers: Vec<String>,
+) -> Result<wilkes_api::commands::integrations::literature::LiteratureComposition, String> {
+    app_context(&app)
+        .literature_compose(request_id, text, providers)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Stops a composition in flight; the request it belongs to answers that it
+/// was cancelled.
+#[tauri::command]
+async fn literature_compose_cancel(app: AppHandle, request_id: String) -> Result<(), String> {
+    app_context(&app).literature_compose_cancel(&request_id);
+    Ok(())
+}
+
 /// Whether one literature provider — shipped or pasted in — is reachable now.
 /// Answers whether or not it is enabled, so a form can check before enabling.
 #[tauri::command]
@@ -2395,6 +2418,8 @@ pub fn run() {
             literature_resolve_download,
             literature_browse,
             literature_filter_suggest,
+            literature_compose,
+            literature_compose_cancel,
             literature_provider_status,
             literature_provider_lookup,
             catalogue_sync,

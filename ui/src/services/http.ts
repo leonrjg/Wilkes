@@ -8,6 +8,7 @@ import type {
   CatalogueSyncResponse,
   BrowseRequest,
   FilterSuggestion,
+  LiteratureComposition,
   LiteratureProviderAnswer,
   LiteratureProviderInfo,
   ProviderWork,
@@ -843,6 +844,29 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw await responseError(res, "literatureFilterSuggest");
     return res.json() as Promise<FilterSuggestion[]>;
+  }
+
+  async literatureCompose(
+    requestId: string,
+    text: string,
+    providers: string[],
+  ): Promise<LiteratureComposition> {
+    const res = await fetch("/api/literature/compose", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: requestId, text, providers }),
+    });
+    if (!res.ok) throw await responseError(res, "literatureCompose");
+    return res.json() as Promise<LiteratureComposition>;
+  }
+
+  async literatureComposeCancel(requestId: string): Promise<void> {
+    const res = await fetch("/api/literature/compose/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: requestId }),
+    });
+    if (!res.ok) throw await responseError(res, "literatureComposeCancel");
   }
 
   async literatureProviderStatus(provider: string): Promise<IntegrationStatus> {

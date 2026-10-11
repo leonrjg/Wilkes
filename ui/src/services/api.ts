@@ -228,6 +228,19 @@ export interface SearchApi {
     filter: string,
     text: string,
   ): Promise<import("../lib/types").FilterSuggestion[]>;
+  /** Turns a request written in ordinary words into filters on each named
+   *  provider, using the generation model. What comes back has been checked
+   *  against each provider's own declaration, so it can be set as it is; a
+   *  provider that could not be composed for says so in its own entry. Rejects
+   *  when nothing could be composed at all: no model, an unknown provider, or
+   *  `literatureComposeCancel` on the same `requestId`. */
+  literatureCompose(
+    requestId: string,
+    text: string,
+    providers: string[],
+  ): Promise<import("../lib/types").LiteratureComposition>;
+  /** Stops a composition in flight; its `literatureCompose` then rejects. */
+  literatureComposeCancel(requestId: string): Promise<void>;
   /** Whether one literature provider — shipped or pasted in — is reachable and
    *  usable now. Answers whether or not it is enabled, so a form can check
    *  before switching it on. */

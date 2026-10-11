@@ -839,6 +839,48 @@ async fn literature_suggest_handler(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct LiteratureComposeBody {
+    /// The caller's, so it can stop the composition with the cancel route.
+    request_id: String,
+    text: String,
+    providers: Vec<String>,
+}
+
+/// Turns a request written in ordinary words into filters on each named
+/// provider. A request that could not be composed at all — no model, an
+/// unknown provider, a cancellation — is a 400 with the reason; a provider
+/// that could not be composed for is reported in its own entry.
+async fn literature_compose_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LiteratureComposeBody>,
+) -> Result<
+    Json<wilkes_api::commands::integrations::literature::LiteratureComposition>,
+    (StatusCode, Json<ErrorBody>),
+> {
+    state
+        .context()
+        .literature_compose(body.request_id, body.text, body.providers)
+        .await
+        .map(Json)
+        .map_err(|error| err(error.to_string()))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiteratureComposeCancelBody {
+    request_id: String,
+}
+
+async fn literature_compose_cancel_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LiteratureComposeCancelBody>,
+) -> StatusCode {
+    state.context().literature_compose_cancel(&body.request_id);
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LiteratureProviderBody {
     provider: String,
 }
@@ -2518,6 +2560,11 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/literature/browse", post(literature_browse_handler))
         .route("/api/literature/suggest", post(literature_suggest_handler))
+        .route("/api/literature/compose", post(literature_compose_handler))
+        .route(
+            "/api/literature/compose/cancel",
+            post(literature_compose_cancel_handler),
+        )
         .route("/api/literature/status", post(literature_status_handler))
         .route("/api/literature/lookup", post(literature_lookup_handler))
         .route("/api/catalogue/sync", post(catalogue_sync_handler))

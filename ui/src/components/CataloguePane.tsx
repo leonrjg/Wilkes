@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Search, Sliders, X } from "react-feather";
+import { Search, Sliders, Square, X, Zap } from "react-feather";
 import type {
   BrowseControls,
   CatalogueGrain,
@@ -24,6 +24,7 @@ import {
   selectsAny,
   useCatalogueStore,
 } from "../stores/useCatalogueStore";
+import { useGenerationStore } from "../stores/useGenerationStore";
 import { useCatalogueAdd } from "../hooks/useCatalogueAdd";
 import { api } from "../services";
 import CatalogueCandidate from "./CatalogueCandidate";
@@ -70,6 +71,8 @@ export default function CataloguePane() {
     [refinements, providerOptions, providers],
   );
   const setBrowseOpen = useCatalogueStore((s) => s.setBrowseOpen);
+  const compose = useCatalogueStore((s) => s.compose);
+  const generationReady = useGenerationStore((s) => s.ready);
   const { readOnly, needsDirectory } = useCatalogueAdd();
   const [draft, setDraft] = useState(useCatalogueStore.getState().query);
 
@@ -124,10 +127,20 @@ export default function CataloguePane() {
               className="w-full bg-transparent py-1.5 text-[11px] text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
             />
           </div>
+          <ComposeButton
+            text={draft}
+            onCompose={async () => {
+              // What was typed was a description; what is searched for now is
+              // its subject, and the box says what is searched for. Where
+              // nothing was composed, what was typed stays.
+              if (await compose(draft)) setDraft(useCatalogueStore.getState().query);
+            }}
+          />
           <FiltersButton />
         </div>
       </form>
       <RefineBar keyword={draft} options={providerOptions} />
+      <ComposeStatus />
 
       {(readOnly || needsDirectory) && (
         <p className="border-b border-[var(--border-main)] px-3 py-1.5 text-[10px] leading-snug text-[var(--text-dim)]">
@@ -200,6 +213,13 @@ export default function CataloguePane() {
                 works by year, type, citations and more.
               </Note>
             )}
+            {browsable.length > 0 && generationReady && (
+              <Note>
+                Or say it in a sentence — “open-access reviews on CRISPR since 2020,
+                most cited first” — and press the lightning button to have the
+                filters set for you.
+              </Note>
+            )}
           </>
         )}
       </div>
@@ -267,6 +287,98 @@ function Spinner() {
   return (
     <div className="flex items-center justify-center py-4">
       <div className="h-5 w-5 animate-spin rounded-full border-2 border-[var(--accent-blue)] border-t-transparent" />
+    </div>
+  );
+}
+
+/**
+ * Turns what is typed into filters.
+ *
+ * Its own button and not a guess about what was typed: Enter searches for the
+ * words, as it always has, and a sentence that happens to read like a
+ * description is still words someone may have meant to search for. Shown only
+ * where it can do something — the generation model is ready and a provider
+ * declares filters — and absent otherwise, like every model-dependent control.
+ * While it works it is the control that stops it.
+ */
+function ComposeButton({ text, onCompose }: { text: string; onCompose: () => void }) {
+  const ready = useGenerationStore((s) => s.ready);
+  const options = useCatalogueStore((s) => s.providerOptions);
+  const composing = useCatalogueStore((s) => s.composing);
+  const cancel = useCatalogueStore((s) => s.cancelCompose);
+  if (!ready || browseProviderIds(options).length === 0) return null;
+  const label = composing ? "Stop composing filters" : "Compose filters from what you typed";
+  return (
+    <button
+      type="button"
+      onClick={composing ? cancel : onCompose}
+      disabled={!composing && text.trim() === ""}
+      aria-label={label}
+      title={
+        composing
+          ? label
+          : "Describe what you want in a sentence, and the filters are set for you"
+      }
+      className="flex shrink-0 items-center rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2 text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)] disabled:opacity-50"
+    >
+      {composing ? <Square size={11} /> : <Zap size={11} />}
+    </button>
+  );
+}
+
+/**
+ * What a composition is doing, or what became of it.
+ *
+ * The filters it set are drawn where filters are drawn, as chips a person can
+ * remove. This says the two things chips cannot: what they were composed
+ * from, and what was asked for and could not be set — a name the provider did
+ * not know is a filter silently missing unless something says so.
+ */
+function ComposeStatus() {
+  const composing = useCatalogueStore((s) => s.composing);
+  const composed = useCatalogueStore((s) => s.composed);
+  const error = useCatalogueStore((s) => s.composeError);
+  const dismiss = useCatalogueStore((s) => s.dismissComposition);
+  if (composing) {
+    return (
+      <p role="status" className="px-3 pb-1.5 text-[10px] leading-snug text-[var(--text-muted)]">
+        Composing filters…
+      </p>
+    );
+  }
+  if (composed === null && error === null) return null;
+  return (
+    <div
+      role="status"
+      aria-label="Composed filters"
+      className="flex items-start justify-between gap-2 px-3 pb-1.5 text-[10px] leading-snug"
+    >
+      <div className="flex min-w-0 flex-col gap-0.5">
+        {error !== null && <p className="text-red-400">The filters could not be composed: {error}</p>}
+        {composed !== null && (
+          <>
+            <p className="text-[var(--text-muted)]">Filters composed from “{composed.text}”.</p>
+            {composed.notes.map((note) => (
+              <p key={note} className="text-[var(--text-dim)]">
+                {note}
+              </p>
+            ))}
+            {composed.failures.map((failure) => (
+              <p key={failure.name} className="text-red-400">
+                {failure.name} could not be composed for: {failure.error}
+              </p>
+            ))}
+          </>
+        )}
+      </div>
+      <button
+        type="button"
+        onClick={dismiss}
+        aria-label="Dismiss"
+        className="shrink-0 text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
+      >
+        <X size={11} />
+      </button>
     </div>
   );
 }

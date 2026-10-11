@@ -1161,6 +1161,32 @@ export interface ProviderCapabilities {
   mirrored: boolean;
 }
 
+/** What a request in words came to for one provider: the filters and the sort
+ *  to set on it, in the shape the filter panel holds them. A provider that
+ *  could not be composed for carries `error` and nothing else. */
+export interface ComposedListing {
+  provider: string;
+  name: string;
+  /** Filter name → its values. Each has passed the provider's own check. */
+  filters: Record<string, string[]>;
+  /** Filter name → value → what the value is called, where it cannot be read:
+   *  the author an identifier names. */
+  labels: Record<string, Record<string, string>>;
+  sort: string | null;
+  /** What was asked for and left out, each in a sentence. */
+  notes: string[];
+  error: string | null;
+}
+
+export interface LiteratureComposition {
+  /** The request as it was composed from. */
+  text: string;
+  /** The words to search for beside the filters, or null when the request
+   *  named no subject. */
+  keyword: string | null;
+  providers: ComposedListing[];
+}
+
 /** What the catalogue mirror holds for a provider answered from it. */
 export interface MirrorStatus {
   /** What kind of source it is; every record it supplies is of this kind. */

@@ -10,19 +10,25 @@
 //! Resolution is the registry's, exactly as the MCP tool's is: the id a
 //! provider is reported under here is the id that tool accepts.
 
+use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
 use wilkes_core::catalogue::{mirrored_sources, CatalogueStore};
+use wilkes_core::generate::tasks::browse_request::compose_browse_request;
+use wilkes_core::generate::Generator;
 use wilkes_core::integrations::custom::manifest::SecretSlot;
+use wilkes_core::integrations::custom::manifest::MIN_SUGGEST_CHARS;
 use wilkes_core::integrations::{builtin, IntegrationRegistry, ProviderCapabilities};
 use wilkes_core::metadata::cache::MetadataCache;
 use wilkes_core::metadata::doi::normalize_doi;
 use wilkes_core::types::{
-    BrowseRequest, IntegrationStatus, IntegrationsSettings, LiteratureSearchResult, MirrorStatus,
-    ProviderWork, ResolvedLiteratureDownload,
+    BrowseRequest, FilterValue, IntegrationStatus, IntegrationsSettings, LiteratureSearchResult,
+    MirrorStatus, ProviderWork, ResolvedLiteratureDownload,
 };
 
 /// Works per provider when the caller does not say. The pane lists every
@@ -369,6 +375,253 @@ pub async fn suggest(
         tracing::warn!(provider = %provider, filter = %filter, "filter suggestion failed: {error:#}");
         LiteratureRequestError(format!("{error:#}"))
     })
+}
+
+/// What a request in words came to for one provider: the filters and the sort
+/// to set on it, in the shape the filter panel holds them.
+///
+/// Exactly one of `filters`-and-`sort` and `error` says something. A provider
+/// that could not be composed for is reported beside those that could, like a
+/// provider that fails a search.
+#[derive(Clone, Debug, Serialize)]
+pub struct ComposedListing {
+    pub provider: String,
+    pub name: String,
+    /// Filter name → its values. Every one has passed the provider's own
+    /// check, so setting them is setting something the listing accepts.
+    pub filters: BTreeMap<String, Vec<String>>,
+    /// Filter name → value → what the value is called, for a value a person
+    /// cannot read: the author an identifier names.
+    pub labels: BTreeMap<String, BTreeMap<String, String>>,
+    pub sort: Option<String>,
+    /// What was asked for and left out, each in a sentence: a name the
+    /// provider does not know, a value its declaration refuses.
+    pub notes: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LiteratureComposition {
+    /// The request as it was composed from.
+    pub text: String,
+    /// The words to search for beside the filters: the first provider's, since
+    /// the pane has one search box and every listing shares it.
+    pub keyword: Option<String>,
+    pub providers: Vec<ComposedListing>,
+}
+
+/// Turns a request written in ordinary words into filters on each named
+/// provider.
+///
+/// The model writes filter names and values in a grammar built from the
+/// provider's own declaration, never a request; what it wrote is then settled
+/// here — a name the provider must be asked about is looked up through
+/// [`LiteratureSource::suggest`], and every filter is put to
+/// [`LiteratureSource::check_browse`] before it is returned, so nothing comes
+/// back that the listing would refuse. A filter that fails either is dropped
+/// with a note saying so; the rest stand.
+///
+/// One provider at a time, because each has its own filters and there is one
+/// model. `cancel` is read at every decoded token and between providers.
+///
+/// [`LiteratureSource::suggest`]: wilkes_core::integrations::LiteratureSource::suggest
+/// [`LiteratureSource::check_browse`]: wilkes_core::integrations::LiteratureSource::check_browse
+pub async fn compose(
+    settings: &IntegrationsSettings,
+    mirror_dir: Option<&Path>,
+    generator: Arc<dyn Generator>,
+    text: String,
+    providers: Vec<String>,
+    today: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<LiteratureComposition, LiteratureRequestError> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err(LiteratureRequestError(
+            "There is no request to compose a search from.".into(),
+        ));
+    }
+    if providers.is_empty() {
+        return Err(LiteratureRequestError(
+            "Composing a search names no providers.".into(),
+        ));
+    }
+    let registry = IntegrationRegistry::from_settings(settings, mirror_dir);
+    // Checked whole before the model is asked anything, as a search's filter is.
+    let mut sources = Vec::with_capacity(providers.len());
+    for provider in providers {
+        let source = registry
+            .literature_for_search(&provider)
+            .map_err(|error| LiteratureRequestError(error.to_string()))?;
+        sources.push((provider, Arc::clone(source)));
+    }
+
+    let cancelled = || LiteratureRequestError("Composing the search was cancelled.".into());
+    let mut keyword = None;
+    let mut listings = Vec::with_capacity(sources.len());
+    for (provider, source) in sources {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled());
+        }
+        let name = source.name().to_string();
+        let composed = compose_for(&source, &generator, &text, today, &cancel).await;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled());
+        }
+        listings.push(match composed {
+            Ok((words, mut listing)) => {
+                if keyword.is_none() {
+                    keyword = words;
+                }
+                listing.provider = provider;
+                listing
+            }
+            Err(error) => {
+                tracing::warn!(provider = %provider, "composing a search failed: {error:#}");
+                ComposedListing {
+                    provider,
+                    name,
+                    filters: BTreeMap::new(),
+                    labels: BTreeMap::new(),
+                    sort: None,
+                    notes: Vec::new(),
+                    error: Some(format!("{error:#}")),
+                }
+            }
+        });
+    }
+    Ok(LiteratureComposition {
+        text,
+        keyword,
+        providers: listings,
+    })
+}
+
+/// One provider's composition: its keyword, and the filters that stood.
+async fn compose_for(
+    source: &Arc<dyn wilkes_core::integrations::LiteratureSource>,
+    generator: &Arc<dyn Generator>,
+    text: &str,
+    today: &str,
+    cancel: &Arc<AtomicBool>,
+) -> anyhow::Result<(Option<String>, ComposedListing)> {
+    let name = source.name().to_string();
+    let controls = source
+        .capabilities()
+        .browse
+        .ok_or_else(|| anyhow::anyhow!("{name} declares nothing to filter or sort by"))?;
+
+    let composition = {
+        let generator = Arc::clone(generator);
+        let controls = controls.clone();
+        let text = text.to_string();
+        let today = today.to_string();
+        let cancel = Arc::clone(cancel);
+        tokio::task::spawn_blocking(move || {
+            compose_browse_request(generator.as_ref(), &controls, &text, &today, &mut |_| {
+                if cancel.load(Ordering::Relaxed) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("composing task failed: {error}"))??
+    };
+
+    let mut listing = ComposedListing {
+        provider: String::new(),
+        name: name.clone(),
+        filters: BTreeMap::new(),
+        labels: BTreeMap::new(),
+        sort: None,
+        notes: composition.notes,
+        error: None,
+    };
+    // What has stood so far, as the request the listing would be asked with.
+    // Each addition is checked against it, so one refused filter costs that
+    // filter and says why, rather than refusing the whole composition.
+    let mut standing = BrowseRequest {
+        query: composition.keyword.clone().filter(|_| controls.keyword),
+        ..BrowseRequest::default()
+    };
+    for (filter, raw) in composition.filters {
+        let control = controls
+            .filters
+            .iter()
+            .find(|control| control.name == filter);
+        let label = control.map_or(filter.as_str(), |control| control.label.as_str());
+        let mut values = Vec::with_capacity(raw.len());
+        if control.is_some_and(|control| control.input == "suggest") {
+            // The model wrote a name; the filter takes the provider's
+            // identifier for it. Asking is the provider's own typeahead.
+            for words in raw {
+                if cancel.load(Ordering::Relaxed) {
+                    anyhow::bail!("composing the search was cancelled");
+                }
+                if words.chars().count() < MIN_SUGGEST_CHARS {
+                    listing
+                        .notes
+                        .push(format!("“{words}” is too short to look up as {label}"));
+                    continue;
+                }
+                match source.suggest(&filter, &words).await {
+                    Ok(found) => match found.into_iter().next() {
+                        Some(suggestion) => {
+                            listing
+                                .labels
+                                .entry(filter.clone())
+                                .or_default()
+                                .insert(suggestion.value.clone(), suggestion.label);
+                            values.push(suggestion.value);
+                        }
+                        None => listing.notes.push(format!(
+                            "{name} knows no {label} called “{words}”, so it was left out"
+                        )),
+                    },
+                    Err(error) => {
+                        tracing::warn!(filter = %filter, "looking up a composed filter value failed: {error:#}");
+                        listing.notes.push(format!(
+                            "{label} “{words}” could not be looked up: {error:#}"
+                        ));
+                    }
+                }
+            }
+        } else {
+            values = raw;
+        }
+        if values.is_empty() {
+            continue;
+        }
+        let mut candidate = standing.clone();
+        candidate
+            .filters
+            .insert(filter.clone(), FilterValue::Many(values.clone()));
+        match source.check_browse(&candidate) {
+            Ok(()) => {
+                standing = candidate;
+                listing.filters.insert(filter, values);
+            }
+            Err(error) => {
+                listing.labels.remove(&filter);
+                listing
+                    .notes
+                    .push(format!("{label} was left out: {error:#}"));
+            }
+        }
+    }
+    if let Some(sort) = composition.sort {
+        let mut candidate = standing.clone();
+        candidate.sort = Some(sort.clone());
+        match source.check_browse(&candidate) {
+            Ok(()) => listing.sort = Some(sort),
+            Err(error) => listing
+                .notes
+                .push(format!("The order was left out: {error:#}")),
+        }
+    }
+    Ok((standing.query, listing))
 }
 
 /// Whether a provider is reachable and usable now.
@@ -838,5 +1091,176 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.0.contains("Unknown literature provider"), "{error}");
+    }
+
+    // ── Composing a search from a request in words ───────────────────────────
+
+    use wilkes_core::generate::mock::MockGenerator;
+
+    /// OpenAlex switched on and pointed at `origin`, so a suggestion lookup
+    /// has somewhere to go and a test can see whether it went.
+    fn openalex_at(origin: &str) -> IntegrationsSettings {
+        let mut settings = enabled(&["openalex", "semantic_scholar"]);
+        settings.builtin.get_mut("openalex").unwrap().base_url = Some(origin.to_string());
+        settings
+    }
+
+    async fn composed(
+        settings: &IntegrationsSettings,
+        generator: &Arc<MockGenerator>,
+        providers: &[&str],
+    ) -> Result<LiteratureComposition, LiteratureRequestError> {
+        compose(
+            settings,
+            None,
+            Arc::clone(generator) as Arc<dyn Generator>,
+            "open reviews on CRISPR by Jennifer Doudna since 2020, most cited first".into(),
+            providers.iter().map(|id| id.to_string()).collect(),
+            "2026-10-11",
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_request_in_words_becomes_filters_the_provider_accepts() {
+        let mut server = mockito::Server::new_async().await;
+        let lookup = server
+            .mock("GET", "/autocomplete/authors")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "q".into(),
+                "Jennifer Doudna".into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"results":[{"id":"https://openalex.org/A5001","display_name":"Jennifer A. Doudna","hint":"UC Berkeley"},{"id":"https://openalex.org/A5002","display_name":"J. Doudna","hint":null}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let generator = Arc::new(MockGenerator::scripted([
+            "keyword: crispr\nfilter: type = review\nfilter: open_access\nfilter: year_from = 2020\nfilter: author = Jennifer Doudna\nsort: cited_by_count:desc\n",
+        ]));
+
+        let composition = composed(&openalex_at(&server.url()), &generator, &["openalex"])
+            .await
+            .unwrap();
+        lookup.assert_async().await;
+
+        assert_eq!(composition.keyword.as_deref(), Some("crispr"));
+        let listing = &composition.providers[0];
+        assert_eq!(listing.provider, "openalex");
+        assert_eq!(listing.error, None);
+        assert_eq!(listing.filters["type"], vec!["review"]);
+        assert_eq!(listing.filters["open_access"], vec!["true"]);
+        assert_eq!(listing.filters["year_from"], vec!["2020"]);
+        // The name became the provider's identifier, and is still called what
+        // the provider calls it.
+        assert_eq!(
+            listing.filters["author"],
+            vec!["https://openalex.org/A5001"]
+        );
+        assert_eq!(
+            listing.labels["author"]["https://openalex.org/A5001"],
+            "Jennifer A. Doudna"
+        );
+        assert_eq!(listing.sort.as_deref(), Some("cited_by_count:desc"));
+        assert!(listing.notes.is_empty(), "{:?}", listing.notes);
+        // The model was shown the request and the provider's own filters.
+        let prompt = &generator.requests()[0].prompt;
+        assert!(prompt.contains("Request: open reviews on CRISPR by Jennifer Doudna"));
+        assert!(prompt.contains("- year_from (Year, From): a whole number"));
+    }
+
+    /// One filter the provider would refuse costs that filter and says why.
+    /// The others are what the user asked for and stand.
+    #[tokio::test]
+    async fn a_value_the_provider_refuses_is_left_out_with_a_note_and_the_rest_stand() {
+        let mut server = mockito::Server::new_async().await;
+        let lookup = server
+            .mock("GET", "/autocomplete/authors")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"results":[]}"#)
+            .create_async()
+            .await;
+        let generator = Arc::new(MockGenerator::scripted([
+            "filter: published_from = 2024-13-01\nfilter: type = review\nfilter: author = Nobody Atall\n",
+        ]));
+
+        let composition = composed(&openalex_at(&server.url()), &generator, &["openalex"])
+            .await
+            .unwrap();
+        lookup.assert_async().await;
+
+        let listing = &composition.providers[0];
+        assert_eq!(
+            listing.filters.keys().collect::<Vec<_>>(),
+            vec!["type"],
+            "{:?}",
+            listing.notes
+        );
+        assert!(listing.labels.is_empty());
+        assert_eq!(listing.notes.len(), 2, "{:?}", listing.notes);
+        assert!(listing.notes.iter().any(|note| note.contains("YYYY-MM-DD")));
+        assert!(listing
+            .notes
+            .iter()
+            .any(|note| note.contains("knows no Author called “Nobody Atall”")));
+    }
+
+    /// A provider with nothing to filter by is reported in its own entry, and
+    /// the model is not asked about it.
+    #[tokio::test]
+    async fn a_provider_that_declares_no_filters_is_reported_and_not_composed_for() {
+        let generator = Arc::new(MockGenerator::scripted(["filter: type = review\n"]));
+        let composition = composed(
+            &openalex_at("http://127.0.0.1:9"),
+            &generator,
+            &["semantic_scholar", "openalex"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(generator.request_count(), 1);
+        let unfilterable = &composition.providers[0];
+        assert_eq!(unfilterable.provider, "semantic_scholar");
+        assert!(unfilterable
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("declares nothing to filter"));
+        assert_eq!(composition.providers[1].filters["type"], vec!["review"]);
+    }
+
+    #[tokio::test]
+    async fn composing_for_an_unknown_provider_is_refused_before_the_model_is_asked() {
+        let generator = Arc::new(MockGenerator::scripted(["filter: type = review\n"]));
+        let error = composed(
+            &openalex_at("http://127.0.0.1:9"),
+            &generator,
+            &["openalex", "crossref"],
+        )
+        .await
+        .expect_err("unknown provider");
+        assert!(error.0.contains("crossref"), "{error}");
+        assert_eq!(generator.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_composition_is_an_error_and_asks_nothing() {
+        let generator = Arc::new(MockGenerator::scripted(["filter: type = review\n"]));
+        let error = compose(
+            &openalex_at("http://127.0.0.1:9"),
+            None,
+            Arc::clone(&generator) as Arc<dyn Generator>,
+            "reviews".into(),
+            vec!["openalex".into()],
+            "2026-10-11",
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .expect_err("cancelled");
+        assert!(error.0.contains("cancelled"), "{error}");
+        assert_eq!(generator.request_count(), 0);
     }
 }

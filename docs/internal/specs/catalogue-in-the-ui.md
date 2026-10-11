@@ -355,3 +355,56 @@ What stayed, and why:
 Not done here: describing a catalogue by manifest (a `mirror` capability),
 which would make LibreTexts, OpenStax and DevDocs TOML and let a user add
 their own. The trait no longer stands in its way.
+
+## 10. Filters from a request in words
+
+**Invariant: the model emits filter names and values from the provider's own
+declaration, never a request; what it emits becomes the same refinements a
+person sets by hand.**
+
+A provider like OpenAlex declares some fifty filters. Finding the six a
+sentence describes is the kind of translation a small local model does well,
+provided it cannot invent anything — and the manifest already says exactly
+what may be asked.
+
+- **The grammar is the declaration.** `generate::tasks::browse_request` builds
+  a grammar from `BrowseControls`: a `keyword:` line where the listing takes
+  one, `filter: <name> = <value>` lines whose names are the declared filters
+  and whose values are the declared options or a typed shape, a `sort:` line
+  over the declared orders. An undeclared filter, an unlisted option and a URL
+  are not strings the decode can produce. Lines rather than JSON, because the
+  grammar subset is non-recursive; unbounded repetition rather than counted,
+  so forty filters do not unroll into forty copies per line.
+- **Two things a grammar cannot pin are settled after it.** A closed list too
+  long to show the model (every country) is written as words and matched
+  against the list by value or label. A filter the provider suggests values
+  for (an author, a journal) is written as a name and looked up through the
+  provider's own `suggest`; the first suggestion is taken and its label kept,
+  so the chip reads "Author: Jennifer A. Doudna" and is changed like any other.
+- **Checked by the provider's rules before it is returned.**
+  `LiteratureSource::check_browse` runs the validation `browse` runs, without
+  sending. Each filter is added to what has stood so far and checked, so one
+  refused value costs that filter and a note saying why, not the composition.
+- **One composition per provider**, sequentially: each has its own filters and
+  there is one model. A provider-neutral "intent" mapped onto every provider
+  would need filters tagged with what they mean, which is the kinds the
+  manifest format was just rid of.
+- **Set as refinements, not shown as an answer.**
+  `literature_compose` (`POST /api/literature/compose`) returns, per provider,
+  `filters`, `labels` and `sort` in the shape the pane's `Refinement` holds.
+  The pane sets them, puts the composed keyword in the search box, and runs
+  the ordinary search: listings for the providers with filters, the keyword
+  for the rest. The status line under the box says what was composed from and
+  what was asked for and left out — a missing filter is otherwise silent.
+- **Its own button.** Enter still searches for the words typed. The button is
+  absent where the generation model is not ready or no provider declares
+  filters, like every model-dependent control, and while a composition runs it
+  is what stops it (`literature_compose_cancel`): the decode ends at its next
+  token, and the pane drops an answer to a composition it stopped.
+- **Nothing is searched for by default.** A request nothing could be composed
+  from is reported; the sentence is not quietly run as a keyword, and stays in
+  the box for the user to do that if they meant it.
+
+Not done: combination modes ("none of" — exclusion — is never composed; every
+filter uses its first mode), and filters set from a result row ("works citing
+this one"), which a sentence has no row to supply.

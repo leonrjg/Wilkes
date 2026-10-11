@@ -4,6 +4,15 @@
 
 ### Added
 
+- Filters from a sentence. With a generation model ready, type what you want
+  into the literature pane — "open-access reviews on CRISPR by Jennifer Doudna
+  since 2020, most cited first" — and press the lightning button: the filters
+  and the sort are set for you on every selected provider that declares them,
+  as the same removable chips you would have set by hand, and the subject
+  becomes the keyword. The model can only name filters and options the
+  provider's manifest declares; names such as an author are looked up with the
+  provider, and anything it could not set is said rather than dropped
+  silently (`POST /api/literature/compose`).
 - The open learning catalogues are literature providers. LibreTexts, OpenStax,
   MIT OpenCourseWare and DevDocs are searched, listed and filtered exactly as
   OpenAlex or a provider you described is — one list in the pane, one filter

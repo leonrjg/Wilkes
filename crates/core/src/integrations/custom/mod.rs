@@ -1741,6 +1741,24 @@ impl LiteratureSource for CustomSource {
         self.run_browse(request).await
     }
 
+    fn check_browse(&self, request: &BrowseRequest) -> anyhow::Result<()> {
+        let name = &self.manifest.name;
+        let browse = self
+            .manifest
+            .capabilities
+            .browse
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{name} does not offer browse"))?;
+        let query = request
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty());
+        browse_parameters(browse, request, query)
+            .map(|_| ())
+            .map_err(|problem| anyhow::anyhow!("{name} browse: {problem}"))
+    }
+
     async fn suggest(&self, filter: &str, text: &str) -> anyhow::Result<Vec<FilterSuggestion>> {
         self.run_suggest(filter, text).await
     }
@@ -2876,6 +2894,30 @@ doi = "doi"
         request.sort = Some("whatever".into());
         let error = browse_parameters(&browse, &request, None).unwrap_err();
         assert!(error.contains("is not a sort option"), "{error}");
+    }
+
+    /// A request can be checked without being sent, by the rules that decide
+    /// whether it would be: nothing reaches the service either way.
+    #[test]
+    fn a_browse_request_is_checked_without_a_request_going_out() {
+        // An origin nothing listens on: a check that sent anything would fail.
+        let source = shipped("openalex", "http://127.0.0.1:9", &[]);
+        source
+            .check_browse(&browse_request(&[
+                ("type", "review"),
+                ("year_from", "2020"),
+            ]))
+            .unwrap();
+        let refused = source
+            .check_browse(&browse_request(&[("type", "novel")]))
+            .unwrap_err();
+        assert!(refused
+            .to_string()
+            .contains("'novel' is not one of its options"));
+        // A provider with nothing to browse says so rather than passing.
+        assert!(shipped("semantic_scholar", "http://127.0.0.1:9", &[])
+            .check_browse(&BrowseRequest::default())
+            .is_err());
     }
 
     /// A value nobody declared in advance cannot carry the service's own

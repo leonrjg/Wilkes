@@ -1544,6 +1544,9 @@ pub struct AppContext {
     /// this application session and share the single core completion pipeline.
     completion_session: PLMutex<CompletionSession>,
     completion_operations: PLMutex<HashMap<String, CompletionOperation>>,
+    /// The search compositions in flight, by request id, each with the flag
+    /// that stops its decode.
+    compose_operations: PLMutex<HashMap<String, Arc<AtomicBool>>>,
     events: Arc<dyn EventEmitter>,
     settings_lock: tokio::sync::Mutex<()>,
     managed_runtime_lock: tokio::sync::Mutex<()>,
@@ -1631,6 +1634,7 @@ impl AppContext {
             semantic_index_revision: AtomicU64::new(0),
             completion_session: PLMutex::new(CompletionSession::default()),
             completion_operations: PLMutex::new(HashMap::new()),
+            compose_operations: PLMutex::new(HashMap::new()),
             events,
             settings_lock: tokio::sync::Mutex::new(()),
             managed_runtime_lock: tokio::sync::Mutex::new(()),
@@ -5340,6 +5344,77 @@ impl AppContext {
             text,
         )
         .await
+    }
+
+    /// Turns a request written in ordinary words into filters on each named
+    /// provider, using the generation model. See
+    /// [`crate::commands::integrations::literature::compose`].
+    ///
+    /// `request_id` is the caller's, so it can stop this with
+    /// [`Self::literature_compose_cancel`]; a second request under an id still
+    /// in flight stops the first.
+    pub async fn literature_compose(
+        &self,
+        request_id: String,
+        text: String,
+        providers: Vec<String>,
+    ) -> Result<
+        crate::commands::integrations::literature::LiteratureComposition,
+        crate::commands::integrations::literature::LiteratureRequestError,
+    > {
+        use crate::commands::integrations::literature::LiteratureRequestError;
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Err(LiteratureRequestError(
+                "Invalid composition request id".into(),
+            ));
+        }
+        if !self.is_generation_ready().await {
+            return Err(LiteratureRequestError("Generation is not available".into()));
+        }
+        let generator = self
+            .generator
+            .lock()
+            .clone()
+            .ok_or_else(|| LiteratureRequestError("Generation model unavailable".into()))?;
+        let settings = self.get_settings().await;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(previous) = self
+            .compose_operations
+            .lock()
+            .insert(request_id.clone(), Arc::clone(&cancel))
+        {
+            previous.store(true, Ordering::Relaxed);
+        }
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let composed = crate::commands::integrations::literature::compose(
+            &settings.integrations,
+            Some(&self.catalogue_dir),
+            generator,
+            text,
+            providers,
+            &today,
+            Arc::clone(&cancel),
+        )
+        .await;
+        // Only this request's own entry: a later one under the same id has
+        // already replaced it and is not this one's to remove.
+        let mut operations = self.compose_operations.lock();
+        if operations
+            .get(&request_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &cancel))
+        {
+            operations.remove(&request_id);
+        }
+        composed
+    }
+
+    /// Stops a composition in flight. The decode ends at its next token, and
+    /// the request it belongs to answers that it was cancelled.
+    pub fn literature_compose_cancel(&self, request_id: &str) {
+        if let Some(cancel) = self.compose_operations.lock().remove(request_id) {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Authoritative document metadata: file-based extraction overridden by the

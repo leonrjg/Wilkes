@@ -93,6 +93,14 @@ pub trait LiteratureSource: Send + Sync {
         anyhow::bail!("{} does not offer browse", self.name())
     }
 
+    /// Whether [`Self::browse`] would send `request`, without sending it: what
+    /// the provider declares decides, so a request built by something other
+    /// than a person at the filter panel can be checked before it is shown as
+    /// one. The error names what was refused.
+    fn check_browse(&self, _request: &BrowseRequest) -> anyhow::Result<()> {
+        anyhow::bail!("{} does not offer browse", self.name())
+    }
+
     /// What the provider suggests for one of its filters as the user types.
     /// Only a filter that declares `suggest` can be asked.
     async fn suggest(&self, _filter: &str, _text: &str) -> anyhow::Result<Vec<FilterSuggestion>> {

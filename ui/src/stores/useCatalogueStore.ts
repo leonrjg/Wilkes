@@ -210,6 +210,24 @@ export interface Listing {
 }
 
 /**
+ * What became of the last request in words that was turned into filters.
+ *
+ * The filters themselves are not here: they were set as refinements, where a
+ * filter chosen by hand lives, and are shown and removed as those are. This is
+ * what a set of chips cannot say — what they were composed from, and what was
+ * asked for and could not be set.
+ */
+export interface ComposeOutcome {
+  /** The request as it was composed from. */
+  text: string;
+  /** What was left out, each in a sentence, prefixed with its provider where
+   *  more than one was composed for. */
+  notes: string[];
+  /** The providers that could not be composed for at all, and why. */
+  failures: { name: string; error: string }[];
+}
+
+/**
  * How far one row's add has got.
  *
  * Adding is three calls, not one: a provider may have to be asked where the
@@ -268,6 +286,13 @@ interface CatalogueStore {
   /** What each filtered provider's listing returned, and how its request is
    *  going, keyed by provider id. */
   listings: Record<string, Listing>;
+  /** A request in words is being turned into filters. */
+  composing: boolean;
+  /** What the last composition came to, until it is dismissed or replaced. */
+  composed: ComposeOutcome | null;
+  /** Why the last composition could not be made at all. One provider that
+   *  could not be composed for is not this: it is one of `composed.failures`. */
+  composeError: string | null;
   /** Why the last add failed, whichever of its three calls failed. Kept apart
    *  from the search errors so a failed download does not replace the results
    *  the user was choosing from. */
@@ -324,6 +349,23 @@ interface CatalogueStore {
   setBrowseSort: (provider: string, sort: string | null) => void;
   /** Drops the filters and sort of one provider, or of every provider. */
   resetRefinement: (provider?: string) => void;
+  /**
+   * Turns a request written in ordinary words into filters, with the
+   * generation model, and lists by them.
+   *
+   * Composed for every selected provider that declares something to filter
+   * by, each from its own declaration. What comes back is set exactly as a
+   * hand-set filter is — it replaces what was set on those providers — and the
+   * subject of the request becomes the keyword every source is searched for.
+   *
+   * Resolves to whether that happened. When nothing could be composed — or it
+   * was stopped, or replaced by a later one — nothing was set and nothing was
+   * searched for, and what was typed is still what was typed.
+   */
+  compose: (text: string) => Promise<boolean>;
+  /** Stops a composition in flight and leaves the filters as they were. */
+  cancelCompose: () => void;
+  dismissComposition: () => void;
   /** Brings listings in line with the filters now set — one provider's, or all
    *  of them — with `keyword` beside the filters wherever a listing takes one.
    *  A provider left with none stops being a listing and is searched by
@@ -499,6 +541,24 @@ function withoutFilter(refinement: Refinement, name: string): Refinement {
 function omitKey<T>(record: Record<string, T>, key: string): Record<string, T> {
   const { [key]: _removed, ...rest } = record;
   return rest;
+}
+
+// The composition in flight, if any. Named to the backend so it can be stopped
+// there, and counted here so an answer to one that was replaced or stopped is
+// recognised and dropped.
+let composeRequest = 0;
+let composeInFlight: string | null = null;
+
+/** Stops the composition in flight, here and in the backend. */
+function stopComposing(): void {
+  composeRequest++;
+  const stopped = composeInFlight;
+  composeInFlight = null;
+  if (stopped !== null) {
+    api.literatureComposeCancel(stopped).catch((error) => {
+      console.error("a composition could not be cancelled:", error);
+    });
+  }
 }
 
 /** In-flight listing requests per provider, so a stale answer is recognised. */
@@ -705,6 +765,9 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
   browseOpen: false,
   refinements: {},
   listings: {},
+  composing: false,
+  composed: null,
+  composeError: null,
   acquireError: null,
   acquired: {},
   adding: {},
@@ -822,6 +885,78 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       refinements:
         provider === undefined ? {} : omitKey(state.refinements, provider),
     })),
+
+  compose: async (text) => {
+    const trimmed = text.trim();
+    if (!trimmed) return false;
+    const targets = browseProviderIds(get().providerOptions).filter((id) =>
+      selects(get().providers, id),
+    );
+    stopComposing();
+    if (targets.length === 0) {
+      set({
+        composing: false,
+        composed: null,
+        composeError: "None of the selected sources can be filtered, so there is nothing to compose.",
+      });
+      return false;
+    }
+    const request = ++composeRequest;
+    const id = `compose-${Date.now()}-${request}`;
+    composeInFlight = id;
+    set({ composing: true, composed: null, composeError: null });
+    try {
+      const composition = await api.literatureCompose(id, trimmed, targets);
+      if (request !== composeRequest) return false;
+      composeInFlight = null;
+      const refinements = { ...get().refinements };
+      const notes: string[] = [];
+      const failures: ComposeOutcome["failures"] = [];
+      const several = composition.providers.length > 1;
+      for (const listing of composition.providers) {
+        if (listing.error !== null) {
+          // What was set on it by hand stays: nothing was composed to replace it.
+          failures.push({ name: listing.name, error: listing.error });
+          continue;
+        }
+        refinements[listing.provider] = {
+          filters: listing.filters,
+          modes: {},
+          labels: listing.labels,
+          sort: listing.sort,
+        };
+        for (const note of listing.notes) {
+          notes.push(several ? `${listing.name}: ${note}` : note);
+        }
+      }
+      set({
+        composing: false,
+        refinements,
+        composed: { text: composition.text, notes, failures },
+      });
+      // Nothing was composed for anyone: there is no search this describes,
+      // and running the sentence as a keyword would not be what was asked.
+      if (failures.length === composition.providers.length) return false;
+      await get().search(composition.keyword ?? "");
+      return true;
+    } catch (e: any) {
+      if (request !== composeRequest) return false;
+      composeInFlight = null;
+      console.error("composing a search failed:", e);
+      set({
+        composing: false,
+        composeError: e?.toString?.() ?? "The search could not be composed",
+      });
+      return false;
+    }
+  },
+
+  cancelCompose: () => {
+    stopComposing();
+    set({ composing: false });
+  },
+
+  dismissComposition: () => set({ composed: null, composeError: null }),
 
   refine: async (keyword, provider) => {
     const trimmed = keyword.trim();
@@ -1038,9 +1173,13 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
    *  which is why they outlive a session at all. */
   reset: () => {
     literatureRequest++;
+    stopComposing();
     for (const provider of Object.keys(browseRequests)) browseRequests[provider]++;
     set({
       query: "",
+      composing: false,
+      composed: null,
+      composeError: null,
       literature: null,
       literatureError: null,
       literatureLoading: false,
