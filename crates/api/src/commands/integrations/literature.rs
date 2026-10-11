@@ -1139,7 +1139,7 @@ mod tests {
             .create_async()
             .await;
         let generator = Arc::new(MockGenerator::scripted([
-            "keyword: crispr\nfilter: type = review\nfilter: open_access\nfilter: year_from = 2020\nfilter: author = Jennifer Doudna\nsort: cited_by_count:desc\n",
+            "search: crispr; type: review; open_access: on; year_from: 2020; author: Jennifer Doudna; sort: cited_by_count:desc; ",
         ]));
 
         let composition = composed(&openalex_at(&server.url()), &generator, &["openalex"])
@@ -1185,7 +1185,7 @@ mod tests {
             .create_async()
             .await;
         let generator = Arc::new(MockGenerator::scripted([
-            "filter: published_from = 2024-13-01\nfilter: type = review\nfilter: author = Nobody Atall\n",
+            "published_from: 2024-13-01; type: review; author: Nobody Atall; ",
         ]));
 
         let composition = composed(&openalex_at(&server.url()), &generator, &["openalex"])
@@ -1213,7 +1213,7 @@ mod tests {
     /// the model is not asked about it.
     #[tokio::test]
     async fn a_provider_that_declares_no_filters_is_reported_and_not_composed_for() {
-        let generator = Arc::new(MockGenerator::scripted(["filter: type = review\n"]));
+        let generator = Arc::new(MockGenerator::scripted(["type: review; "]));
         let composition = composed(
             &openalex_at("http://127.0.0.1:9"),
             &generator,
@@ -1234,7 +1234,7 @@ mod tests {
 
     #[tokio::test]
     async fn composing_for_an_unknown_provider_is_refused_before_the_model_is_asked() {
-        let generator = Arc::new(MockGenerator::scripted(["filter: type = review\n"]));
+        let generator = Arc::new(MockGenerator::scripted(["type: review; "]));
         let error = composed(
             &openalex_at("http://127.0.0.1:9"),
             &generator,
@@ -1248,7 +1248,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancelled_composition_is_an_error_and_asks_nothing() {
-        let generator = Arc::new(MockGenerator::scripted(["filter: type = review\n"]));
+        let generator = Arc::new(MockGenerator::scripted(["type: review; "]));
         let error = compose(
             &openalex_at("http://127.0.0.1:9"),
             None,

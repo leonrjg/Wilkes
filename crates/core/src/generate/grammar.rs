@@ -191,6 +191,22 @@ impl Grammar {
 /// JSON-Schema/ECMAScript regular expression. Ollama accepts JSON Schema as its
 /// structured-output contract; keeping the translation beside the parser
 /// prevents a second, subtly different grammar implementation.
+///
+/// # The pattern is over the string as JSON writes it
+///
+/// The schema is `{"type": "string", "pattern": …}`, and the engine applies
+/// the pattern to the characters it emits *between the quotes* — which are the
+/// string's JSON encoding, not the string. A newline in the grammar's language
+/// is therefore the two characters `\n` here, a quote is `\"`, and a class
+/// that would admit a quote, a backslash or a control character admits none of
+/// them bare. Translating character for character instead produced output no
+/// JSON parser accepts the moment a grammar spanned two lines, or a free-text
+/// class let the model write a quotation mark.
+///
+/// A negated class loses the quote and the backslash altogether rather than
+/// gaining their escaped forms: what such a class is for is free text, and
+/// the decoded string is still in the grammar's language, which is all the
+/// caller checks.
 pub fn json_schema_pattern(src: &str) -> anyhow::Result<String> {
     let rules = parse_rules(src)?;
     let root = rules
@@ -212,25 +228,11 @@ fn expression_pattern(
         Expr::Literal(characters) => {
             let mut output = String::new();
             for character in characters {
-                output.push_str(&escape_regex_literal(*character));
+                output.push_str(&escape_regex_literal(*character)?);
             }
             output
         }
-        Expr::Class(set) => {
-            let mut output = String::from("[");
-            if set.negated {
-                output.push('^');
-            }
-            for (lower, upper) in &set.ranges {
-                output.push_str(&escape_regex_class(*lower));
-                if lower != upper {
-                    output.push('-');
-                    output.push_str(&escape_regex_class(*upper));
-                }
-            }
-            output.push(']');
-            output
-        }
+        Expr::Class(set) => class_pattern(set)?,
         Expr::Reference(name) => {
             anyhow::ensure!(
                 !stack.contains(name),
@@ -277,11 +279,43 @@ fn expression_pattern(
     })
 }
 
-fn escape_regex_literal(character: char) -> String {
+/// The characters JSON cannot write bare inside a string, each with the
+/// escape it is written as. Other control characters have only a `\uXXXX`
+/// form, which no grammar here has needed; see [`json_escape`].
+///
+/// In code-point order, which [`class_pattern`] relies on to cut a range
+/// around each of them in one pass.
+const JSON_ESCAPED: [(char, &str); 5] = [
+    ('\t', "\\t"),
+    ('\n', "\\n"),
+    ('\r', "\\r"),
+    ('"', "\\\""),
+    ('\\', "\\\\"),
+];
+
+/// How JSON writes `character` inside a string, or `None` when it writes it
+/// as itself.
+fn json_escape(character: char) -> anyhow::Result<Option<&'static str>> {
+    if let Some((_, escaped)) = JSON_ESCAPED.iter().find(|(c, _)| *c == character) {
+        return Ok(Some(escaped));
+    }
+    anyhow::ensure!(
+        !character.is_control(),
+        "grammar uses control character {character:?}, which has no short JSON escape"
+    );
+    Ok(None)
+}
+
+/// One character of the grammar's language, as a pattern over its JSON form.
+fn escape_regex_literal(character: char) -> anyhow::Result<String> {
+    Ok(match json_escape(character)? {
+        Some(escaped) => escaped.chars().map(escape_regex_char).collect(),
+        None => escape_regex_char(character),
+    })
+}
+
+fn escape_regex_char(character: char) -> String {
     match character {
-        '\n' => "\\n".to_string(),
-        '\r' => "\\r".to_string(),
-        '\t' => "\\t".to_string(),
         '\\' | '.' | '*' | '+' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
         | '/' => format!("\\{character}"),
         _ => character.to_string(),
@@ -290,12 +324,85 @@ fn escape_regex_literal(character: char) -> String {
 
 fn escape_regex_class(character: char) -> String {
     match character {
-        '\n' => "\\n".to_string(),
-        '\r' => "\\r".to_string(),
-        '\t' => "\\t".to_string(),
-        '\\' | ']' | '^' | '-' => format!("\\{character}"),
+        '\\' | ']' | '[' | '^' | '-' | '"' => format!("\\{character}"),
         _ => character.to_string(),
     }
+}
+
+fn class_ranges(ranges: &[(char, char)]) -> String {
+    let mut output = String::new();
+    for (lower, upper) in ranges {
+        output.push_str(&escape_regex_class(*lower));
+        if lower != upper {
+            output.push('-');
+            output.push_str(&escape_regex_class(*upper));
+        }
+    }
+    output
+}
+
+/// A character class as a pattern over JSON-encoded text.
+fn class_pattern(set: &CharSet) -> anyhow::Result<String> {
+    if set.negated {
+        // Whatever it excludes, plus everything JSON cannot write as one bare
+        // character. Control characters the class names are covered by the
+        // range, and so are left out of what is written before it.
+        let named: Vec<(char, char)> = set
+            .ranges
+            .iter()
+            .copied()
+            .filter(|(lower, upper)| !(lower.is_control() && upper.is_control()))
+            .collect();
+        return Ok(format!("[^{}\\\"\\\\\\x00-\\x1F]", class_ranges(&named)));
+    }
+    // Split out the members JSON escapes: each becomes an alternative spelled
+    // as its escape, beside a class of the members written as themselves.
+    let mut bare: Vec<(char, char)> = Vec::new();
+    let mut escaped: Vec<&'static str> = Vec::new();
+    for &(lower, upper) in &set.ranges {
+        let mut start = Some(lower);
+        for (special, escape) in JSON_ESCAPED {
+            let Some(from) = start else { break };
+            if special < from || special > upper {
+                continue;
+            }
+            if !escaped.contains(&escape) {
+                escaped.push(escape);
+            }
+            if let Some(before) = char::from_u32(special as u32 - 1).filter(|_| special > from) {
+                bare.push((from, before));
+            }
+            start = char::from_u32(special as u32 + 1).filter(|next| *next <= upper);
+        }
+        if let Some(from) = start {
+            bare.push((from, upper));
+        }
+    }
+    // What is left must be writable as itself: a range still holding a control
+    // character names one with no short escape.
+    for (lower, upper) in &bare {
+        anyhow::ensure!(
+            !JSON_ESCAPED
+                .iter()
+                .any(|(special, _)| special >= lower && special <= upper)
+                && !lower.is_control()
+                && !upper.is_control(),
+            "grammar class spans characters JSON cannot write bare"
+        );
+    }
+    let mut alternatives: Vec<String> = Vec::new();
+    if !bare.is_empty() {
+        alternatives.push(format!("[{}]", class_ranges(&bare)));
+    }
+    for escape in escaped {
+        alternatives.push(escape.chars().map(escape_regex_char).collect());
+    }
+    anyhow::ensure!(!alternatives.is_empty(), "grammar class admits nothing");
+    Ok(if alternatives.len() == 1 {
+        alternatives.remove(0)
+    } else {
+        format!("(?:{})", alternatives.join("|"))
+    })
 }
 
 // ── Token vocabulary trie ─────────────────────────────────────────────────────
@@ -877,14 +984,68 @@ mod tests {
         assert!(grammar.advance(&grammar.initial_state(), "-").is_none());
     }
 
+    /// Whether the engine could emit `text`: the pattern is put to the string
+    /// as JSON writes it between the quotes, which is what the engine sees.
+    fn pattern_admits(grammar: &str, text: &str) -> bool {
+        let pattern = json_schema_pattern(grammar).unwrap();
+        let encoded = serde_json::to_string(text).unwrap();
+        let between_quotes: String = encoded
+            .chars()
+            .skip(1)
+            .take(encoded.chars().count() - 2)
+            .collect();
+        regex::Regex::new(&pattern)
+            .unwrap()
+            .is_match(&between_quotes)
+    }
+
     #[test]
     fn json_schema_pattern_preserves_the_label_language() {
-        let pattern = json_schema_pattern(LABEL_GRAMMAR).unwrap();
+        assert!(pattern_admits(LABEL_GRAMMAR, "Topic: Cache invalidation"));
+        assert!(pattern_admits(
+            LABEL_GRAMMAR,
+            "Topic: Cache invalidation and staleness\n"
+        ));
+        assert!(!pattern_admits(LABEL_GRAMMAR, "Cache invalidation"));
+        assert!(!pattern_admits(LABEL_GRAMMAR, "Topic: Cache"));
+    }
+
+    /// The engine is constrained on the string's JSON encoding, so a grammar's
+    /// newline has to be asked for as the escape JSON writes. Asked for as a
+    /// raw newline, a two-line grammar could only produce output no JSON
+    /// parser reads — which is what happened.
+    #[test]
+    fn a_pattern_describes_the_string_as_json_writes_it() {
+        let lines = "plan ::= line line\nline ::= \"k: \" [^\\n]+ \"\\n\"\n";
+        let pattern = json_schema_pattern(lines).unwrap();
+        // A raw newline appears nowhere: not as a literal, not in a class.
+        assert!(!pattern.contains('\n'), "{pattern}");
+        assert!(pattern_admits(lines, "k: one\nk: two\n"));
+        assert!(!pattern_admits(lines, "k: one\n"));
+        // Everything the pattern admits decodes into the grammar's language.
+        let grammar = Grammar::parse(lines).unwrap();
+        assert!(grammar.accepts("k: one\nk: two\n"));
+    }
+
+    /// A free-text class must not let the model close the string or start an
+    /// escape of its own: both end in invalid JSON.
+    #[test]
+    fn a_negated_class_admits_no_quote_backslash_or_control_character() {
+        let free = "root ::= [^\\n]+\n";
+        assert!(pattern_admits(free, "plain words, with punctuation!"));
+        let pattern = json_schema_pattern(free).unwrap();
         let regex = regex::Regex::new(&pattern).unwrap();
-        assert!(regex.is_match("Topic: Cache invalidation"));
-        assert!(regex.is_match("Topic: Cache invalidation and staleness\n"));
-        assert!(!regex.is_match("Cache invalidation"));
-        assert!(!regex.is_match("Topic: Cache"));
+        // Put to the pattern raw, as the engine would have to emit them.
+        assert!(!regex.is_match("a \" b"));
+        assert!(!regex.is_match("a \\ b"));
+        assert!(!regex.is_match("a \t b"));
+    }
+
+    #[test]
+    fn a_class_naming_an_escaped_character_asks_for_its_escape() {
+        let quoted = "root ::= [a-c\"\\n]+\n";
+        assert!(pattern_admits(quoted, "ab\"c\n"));
+        assert!(!pattern_admits(quoted, "abd"));
     }
 
     #[test]

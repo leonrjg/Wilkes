@@ -1,7 +1,7 @@
 //! Turn a request written in ordinary words into a listing of one provider's
 //! works: a keyword, some of the filters the provider declares, a sort.
 //!
-//! The model never writes a request. It writes a few lines naming filters, and
+//! The model never writes a request. It writes a few `name: value` parts, and
 //! the grammar is built from the provider's own declaration
 //! ([`BrowseControls`]), so a filter the provider does not offer, an option it
 //! does not list and a sort it does not have are not things the decode can
@@ -29,16 +29,34 @@ pub const MAX_REQUEST_CHARS: usize = 500;
 pub const MAX_LISTED_OPTIONS: usize = 24;
 /// How many of a long list's options the prompt shows as examples.
 const EXAMPLE_OPTIONS: usize = 4;
-/// The longest free value read back: a name, a phrase.
-const MAX_VALUE_CHARS: usize = 120;
+/// The longest free value: a name, a phrase. Bounded in the grammar and not
+/// only on the way back, because a model given an unbounded line does not
+/// always end it — a small one wrote every filter it had been shown into the
+/// keyword, separated by commas, until the token ceiling.
+const MAX_WORDS_CHARS: usize = 80;
+const MAX_VALUE_CHARS: usize = MAX_WORDS_CHARS;
 /// Enough for a keyword, a sort and a handful of filters. The grammar does not
-/// bound the number of lines, so this is what does.
+/// bound the number of parts, so this is what does.
 const MAX_TOKENS: usize = 192;
 
-const KEYWORD_PREFIX: &str = "keyword: ";
-const FILTER_PREFIX: &str = "filter: ";
-const SORT_PREFIX: &str = "sort: ";
-const ASSIGN: &str = " = ";
+/// The part that carries the words to search for, and the part that carries
+/// the order. Every other part is named by a filter, so a filter a provider
+/// happens to call one of these cannot be composed and is left out.
+const SEARCH: &str = "search";
+const SORT: &str = "sort";
+/// Between a part's name and its value. The form a model writes unprompted:
+/// asked for `filter: type = review`, the ones that are not held to a grammar
+/// wrote `type: review` anyway.
+const ASSIGN: &str = ": ";
+/// How an on/off filter is written. It has a value like every other part,
+/// because a bare name was the one form models did not reproduce.
+const ON: &str = "on";
+const OFF: &str = "off";
+/// What separates parts. One line with a separator rather than a line per
+/// part: one of the two engines carries the output as a JSON string, where a
+/// line break is an escape sequence a model has to remember to write, and
+/// given the choice it wrote a space and ran the filters into the keyword.
+const SEPARATOR: char = ';';
 
 /// What the model asked for, in the provider's own terms.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -94,8 +112,8 @@ fn usable(controls: &BrowseControls) -> Vec<(&FilterControl, Shape)> {
                 "text" | "suggest" => Shape::Words,
                 _ => return None,
             };
-            if literal(&filter.name).is_none() {
-                tracing::debug!(filter = %filter.name, "filter name cannot be written in a grammar; left out of composition");
+            if literal(&filter.name).is_none() || [SEARCH, SORT].contains(&filter.name.as_str()) {
+                tracing::debug!(filter = %filter.name, "filter name cannot be written as a part; left out of composition");
                 return None;
             }
             Some((filter, shape))
@@ -104,9 +122,10 @@ fn usable(controls: &BrowseControls) -> Vec<(&FilterControl, Shape)> {
 }
 
 /// A string as a grammar literal, or `None` where the grammar's own syntax
-/// cannot carry it: a rule is one line and `#` starts a comment.
+/// cannot carry it — a rule is one line and `#` starts a comment — or where
+/// it holds the separator and would read back as two parts.
 fn literal(text: &str) -> Option<String> {
-    if text.is_empty() || text.contains(['#', '\n', '\r']) {
+    if text.is_empty() || text.contains(['#', '\n', '\r', SEPARATOR]) {
         return None;
     }
     let mut out = String::with_capacity(text.len() + 2);
@@ -129,12 +148,16 @@ fn listed(options: &[ControlOption]) -> Vec<(&ControlOption, String)> {
         .collect()
 }
 
-/// The language a composition is written in, for this provider.
+/// The language a composition is written in, for this provider: parts in any
+/// order, each a name and a value.
 ///
-/// Lines are not counted and words are not measured here: both would unroll
-/// into one copy of the grammar per repetition, and a provider with forty
-/// filters would compile to a machine the decode walks at every token. The
-/// token ceiling bounds the first and [`parse`] the second.
+/// In any order because nothing about a search depends on it, and a model not
+/// held to the grammar as it decodes — its reply is checked against this
+/// afterwards instead — does not always lead with the subject.
+///
+/// Parts are not counted: a counted repetition unrolls into one copy of every
+/// filter per part, and a provider with forty filters would compile to a
+/// machine the decode walks at every token. The token ceiling bounds them.
 pub fn build_grammar(controls: &BrowseControls) -> anyhow::Result<String> {
     let filters = usable(controls);
     let sorts: Vec<String> = controls
@@ -143,74 +166,79 @@ pub fn build_grammar(controls: &BrowseControls) -> anyhow::Result<String> {
         .flat_map(|sort| sort.options.iter())
         .filter_map(|option| literal(&option.value))
         .collect();
+    let assign = literal(ASSIGN).expect("a fixed literal");
 
-    let mut parts: Vec<&str> = Vec::new();
+    let mut rules = String::new();
+    let mut kinds: Vec<&str> = Vec::new();
     if controls.keyword {
-        parts.push("keyword?");
-    }
-    if !filters.is_empty() {
-        parts.push("clause*");
-    }
-    if !sorts.is_empty() {
-        parts.push("sort?");
-    }
-    anyhow::ensure!(
-        !parts.is_empty(),
-        "this provider declares nothing a request could be turned into"
-    );
-
-    let mut grammar = format!("plan ::= {}\n", parts.join(" "));
-    if controls.keyword {
-        grammar.push_str(&format!(
-            "keyword ::= {} words \"\\n\"\n",
-            literal(KEYWORD_PREFIX).expect("a fixed literal")
+        kinds.push("search");
+        rules.push_str(&format!(
+            "search ::= {} {assign} words\n",
+            literal(SEARCH).expect("a fixed literal")
         ));
     }
-    if !filters.is_empty() {
-        let mut alternatives = Vec::with_capacity(filters.len());
-        for (filter, shape) in &filters {
-            let name = literal(&filter.name).expect("checked by usable");
-            let assign = literal(ASSIGN).expect("a fixed literal");
-            alternatives.push(match shape {
-                Shape::Toggle => name,
-                Shape::Listed => {
-                    let options = listed(&filter.options);
-                    if options.is_empty() {
-                        continue;
-                    }
-                    format!(
-                        "{name} {assign} ({})",
-                        options
-                            .into_iter()
-                            .map(|(_, spelled)| spelled)
-                            .collect::<Vec<_>>()
-                            .join(" | ")
-                    )
+    let mut clauses = Vec::with_capacity(filters.len());
+    for (filter, shape) in &filters {
+        let name = literal(&filter.name).expect("checked by usable");
+        let value = match shape {
+            Shape::Toggle => format!(
+                "({} | {})",
+                literal(ON).expect("a fixed literal"),
+                literal(OFF).expect("a fixed literal")
+            ),
+            Shape::Listed => {
+                let options = listed(&filter.options);
+                if options.is_empty() {
+                    continue;
                 }
-                Shape::Integer => format!("{name} {assign} integer"),
-                Shape::Number => format!("{name} {assign} number"),
-                Shape::Date => format!("{name} {assign} date"),
-                Shape::Named | Shape::Words => format!("{name} {assign} words"),
-            });
-        }
-        anyhow::ensure!(
-            !alternatives.is_empty(),
-            "none of this provider's filters can be written"
-        );
-        grammar.push_str(&format!(
-            "clause ::= {} ({}) \"\\n\"\n",
-            literal(FILTER_PREFIX).expect("a fixed literal"),
-            alternatives.join(" | ")
-        ));
+                format!(
+                    "({})",
+                    options
+                        .into_iter()
+                        .map(|(_, spelled)| spelled)
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                )
+            }
+            Shape::Integer => "integer".to_string(),
+            Shape::Number => "number".to_string(),
+            Shape::Date => "date".to_string(),
+            Shape::Named | Shape::Words => "words".to_string(),
+        };
+        clauses.push(format!("{name} {assign} {value}"));
+    }
+    if !clauses.is_empty() {
+        kinds.push("clause");
+        rules.push_str(&format!("clause ::= {}\n", clauses.join(" | ")));
     }
     if !sorts.is_empty() {
-        grammar.push_str(&format!(
-            "sort ::= {} ({}) \"\\n\"?\n",
-            literal(SORT_PREFIX).expect("a fixed literal"),
+        kinds.push("sort");
+        // The name is optional: an order's value is not a filter's name, so
+        // one written bare is still unmistakably an order, and models not held
+        // to the grammar sometimes write it so.
+        rules.push_str(&format!(
+            "sort ::= ({} {assign})? ({})\n",
+            literal(SORT).expect("a fixed literal"),
             sorts.join(" | ")
         ));
     }
-    grammar.push_str("words ::= [^\\n]+\n");
+    anyhow::ensure!(
+        !kinds.is_empty(),
+        "this provider declares nothing a request could be turned into"
+    );
+
+    let mut grammar = String::from("plan ::= part (end part)* end?\n");
+    grammar.push_str(&format!("part ::= {}\n", kinds.join(" | ")));
+    grammar.push_str(&rules);
+    // A line break separates parts as well. The prompt asks for the
+    // separator, and a model held to this grammar writes it; one that is not
+    // sometimes puts each part on its own line, which says the same thing.
+    grammar.push_str(&format!(
+        "end ::= \"{SEPARATOR}\" \" \"? \"\\n\"? | \"\\n\"\n"
+    ));
+    grammar.push_str(&format!(
+        "words ::= [^{SEPARATOR}\\n]{{1,{MAX_WORDS_CHARS}}}\n"
+    ));
     grammar.push_str("integer ::= \"-\"? [0-9]+\n");
     grammar.push_str("number ::= \"-\"? [0-9]+ (\".\" [0-9]+)?\n");
     grammar.push_str("date ::= [0-9]{4} \"-\" [0-9]{2} \"-\" [0-9]{2}\n");
@@ -255,27 +283,27 @@ pub fn build_request(
     anyhow::ensure!(!request.is_empty(), "the request is empty");
     let grammar = build_grammar(controls)?;
 
+    let filters = usable(controls);
     let mut prompt = format!(
-        "Today is {today}.\n\nWrite the search below as lines, one per line, in these forms and no others:\n"
+        "Today is {today}.\n\nWrite the search below on one line, as parts separated by \"{SEPARATOR} \". Each part is a name, a colon and a value, and the only names are these:\n"
     );
     if controls.keyword {
-        prompt.push_str("keyword: <the subject, as a few search words>\n");
+        prompt.push_str(&format!(
+            "{SEARCH}{ASSIGN}<the subject, as a few search words>\n"
+        ));
     }
-    let filters = usable(controls);
     if !filters.is_empty() {
-        prompt.push_str(
-            "filter: <name> = <value>\nfilter: <name>    (for a filter that is on or off)\n",
-        );
+        prompt.push_str(&format!("<a filter below>{ASSIGN}<its value>\n"));
     }
     if controls.sort.is_some() {
-        prompt.push_str("sort: <order>\n");
+        prompt.push_str(&format!("{SORT}{ASSIGN}<an order below>\n"));
     }
 
     if !filters.is_empty() {
         prompt.push_str("\nFilters:\n");
         for (filter, shape) in &filters {
             let value = match shape {
-                Shape::Toggle => "on or off".to_string(),
+                Shape::Toggle => format!("{ON} or {OFF}"),
                 Shape::Listed => {
                     let options = listed(&filter.options);
                     if options.is_empty() {
@@ -329,7 +357,7 @@ pub fn build_request(
         "\nUse a filter or an order only where the request asks for what it does. \
 Leave out everything the request does not mention.\n",
     );
-    prompt.push_str(&format!("\nRequest: {request}\nSearch:\n"));
+    prompt.push_str(&format!("\nRequest: {request}\nSearch: "));
 
     Ok(GenerationRequest {
         system: Some(
@@ -363,31 +391,50 @@ fn parse(text: &str, controls: &BrowseControls) -> anyhow::Result<BrowseComposit
         .collect();
     let mut composition = BrowseComposition::default();
 
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        if let Some(words) = line.strip_prefix(KEYWORD_PREFIX) {
-            let words = one_line(words, MAX_VALUE_CHARS);
-            if !words.is_empty() {
+    for part in text.split([SEPARATOR, '\n']) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let is_order = |value: &str| {
+            controls
+                .sort
+                .iter()
+                .flat_map(|sort| sort.options.iter())
+                .any(|option| option.value == value)
+        };
+        if is_order(part) {
+            composition.sort.get_or_insert_with(|| part.to_string());
+            continue;
+        }
+        let Some((name, raw)) = part.split_once(ASSIGN) else {
+            anyhow::bail!("the composition has a part that is not a name and a value");
+        };
+        let name = name.trim();
+        if name == SEARCH {
+            let words = one_line(raw, MAX_VALUE_CHARS);
+            // The first is the subject; a second is a model repeating itself.
+            if !words.is_empty() && composition.keyword.is_none() {
                 composition.keyword = Some(words);
             }
-        } else if let Some(order) = line.strip_prefix(SORT_PREFIX) {
-            composition.sort = Some(order.trim().to_string());
-        } else if let Some(clause) = line.strip_prefix(FILTER_PREFIX) {
-            let (name, raw) = match clause.split_once(ASSIGN) {
-                Some((name, raw)) => (name, Some(raw)),
-                None => (clause, None),
+        } else if name == SORT {
+            composition
+                .sort
+                .get_or_insert_with(|| raw.trim().to_string());
+        } else {
+            let Some((filter, shape)) = filters.get(name) else {
+                anyhow::bail!("the composition names '{name}', which is not a filter");
             };
-            let Some((filter, shape)) = filters.get(name.trim()) else {
-                anyhow::bail!(
-                    "the composition names '{}', which is not a filter",
-                    name.trim()
-                );
-            };
-            let value = match (shape, raw) {
-                (Shape::Toggle, None) => "true".to_string(),
-                (Shape::Toggle, Some(_)) | (_, None) => {
-                    anyhow::bail!("filter '{}' is written in the wrong form", filter.name)
-                }
-                (Shape::Named, Some(raw)) => match named_option(&filter.options, raw) {
+            let value = match shape {
+                Shape::Toggle => match raw.trim() {
+                    ON => "true".to_string(),
+                    // Off is what a filter is when it is not set.
+                    OFF => continue,
+                    other => {
+                        anyhow::bail!("filter '{}' is {ON} or {OFF}, not '{other}'", filter.name)
+                    }
+                },
+                Shape::Named => match named_option(&filter.options, raw) {
                     Some(option) => option.value.clone(),
                     None => {
                         composition.notes.push(format!(
@@ -398,7 +445,7 @@ fn parse(text: &str, controls: &BrowseControls) -> anyhow::Result<BrowseComposit
                         continue;
                     }
                 },
-                (_, Some(raw)) => {
+                _ => {
                     let value = one_line(raw, MAX_VALUE_CHARS);
                     if value.is_empty() {
                         continue;
@@ -422,8 +469,6 @@ fn parse(text: &str, controls: &BrowseControls) -> anyhow::Result<BrowseComposit
                     spoken(filter)
                 )),
             }
-        } else {
-            anyhow::bail!("the composition has a line in none of the declared forms");
         }
     }
     Ok(composition)
@@ -450,10 +495,11 @@ pub fn compose_browse_request(
         generated.stop != StopReason::Cancelled,
         "composing the search was cancelled"
     );
-    // A composition cut off by the ceiling is still lines in the declared
-    // forms up to its last newline; the line it was in the middle of is not.
+    // A composition cut off by the ceiling is still parts in the declared
+    // forms up to its last separator; the part it was in the middle of is not.
     let complete = if generated.stop == StopReason::MaxTokens {
-        text.rsplit_once('\n').map_or("", |(lines, _)| lines)
+        text.rsplit_once([SEPARATOR, '\n'])
+            .map_or("", |(parts, _)| parts)
     } else {
         text.as_str()
     };
@@ -543,25 +589,30 @@ mod tests {
     #[test]
     fn the_grammar_admits_what_the_provider_declares_and_nothing_else() {
         assert!(accepts(
-            "keyword: crispr off-target effects\nfilter: type = review\nfilter: open_access\nfilter: year_from = 2020\nsort: cited_by_count:desc\n"
+            "search: crispr off-target effects; type: review; open_access: on; year_from: 2020; sort: cited_by_count:desc; "
         ));
-        assert!(accepts("filter: author = Jennifer Doudna\n"));
-        assert!(accepts("filter: published_after = 2024-01-31\n"));
+        assert!(accepts("author: Jennifer Doudna; "));
+        assert!(accepts("published_after: 2024-01-31; "));
         assert!(accepts("sort: publication_date:desc"));
+        // An order written without its name is still an order.
+        assert!(accepts("search: crispr; publication_date:desc"));
+        // Parts may be separated by lines, and still not run together.
+        assert!(accepts("search: crispr\ntype: review;\nopen_access: on\n"));
+        assert!(!accepts("search: crispr type: review; ; "));
 
         // An undeclared filter, an unlisted option, an undeclared order.
-        assert!(!accepts("filter: journal = Nature\n"));
-        assert!(!accepts("filter: type = preprint\n"));
-        assert!(!accepts("sort: relevance\n"));
+        assert!(!accepts("journal: Nature; "));
+        assert!(!accepts("type: preprint; "));
+        assert!(!accepts("sort: relevance; "));
         // A value of the wrong shape, and an on/off filter given one.
-        assert!(!accepts("filter: year_from = recent\n"));
-        assert!(!accepts("filter: open_access = true\n"));
-        assert!(!accepts("filter: published_after = 2024\n"));
+        assert!(!accepts("year_from: recent; "));
+        assert!(!accepts("open_access: true; "));
+        assert!(!accepts("published_after: 2024; "));
         // A filter that is only ever set from a result row.
-        assert!(!accepts("filter: cites = W123\n"));
+        assert!(!accepts("cites: W123; "));
         // Anything that is not one of the forms, a request URL least of all.
         assert!(!accepts(
-            "https://api.example.org/works?filter=type:review\n"
+            "https://api.example.org/works?filter=type:review; "
         ));
     }
 
@@ -590,36 +641,12 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{}: {error:#}", manifest.id));
             if manifest.id == "openalex" {
                 assert!(grammar.accepts(
-                    "keyword: crispr\nfilter: type = review\nfilter: open_access\nfilter: year_from = 2020\nfilter: author = Jennifer Doudna\nsort: cited_by_count:desc\n"
+                    "search: crispr; type: review; open_access: on; year_from: 2020; author: Jennifer Doudna; sort: cited_by_count:desc; "
                 ));
-                assert!(!grammar.accepts("filter: type = novel\n"));
+                assert!(!grammar.accepts("type: novel; "));
             }
         }
         assert!(browsable > 0, "no shipped provider declares browse");
-    }
-
-    #[test]
-    #[ignore]
-    fn zz_dump_openalex_request() {
-        let manifest = crate::integrations::builtin::manifests()
-            .into_iter()
-            .find(|manifest| manifest.id == "openalex")
-            .unwrap();
-        let controls = manifest.capabilities.browse.unwrap().controls();
-        let request = build_request(
-            &controls,
-            "open-access reviews on CRISPR by Jennifer Doudna since 2020, most cited first",
-            "2026-10-11",
-        )
-        .unwrap();
-        let Constraint::Grammar(grammar) = &request.constraint else { unreachable!() };
-        let out = serde_json::json!({
-            "system": request.system,
-            "prompt": request.prompt,
-            "grammar": grammar,
-            "pattern": json_schema_pattern(grammar).unwrap(),
-        });
-        std::fs::write(std::env::var("DUMP_TO").unwrap(), out.to_string()).unwrap();
     }
 
     #[test]
@@ -627,8 +654,8 @@ mod tests {
         let mut controls = controls();
         controls.keyword = false;
         let grammar = Grammar::parse(&build_grammar(&controls).unwrap()).unwrap();
-        assert!(!grammar.accepts("keyword: crispr\n"));
-        assert!(grammar.accepts("filter: type = review\n"));
+        assert!(!grammar.accepts("search: crispr; "));
+        assert!(grammar.accepts("type: review; "));
         let request = build_request(&controls, "reviews", "2026-10-11").unwrap();
         assert!(!request.prompt.contains("keyword:"));
     }
@@ -668,7 +695,7 @@ mod tests {
         assert!(!prompt.contains("cites"));
         assert!(prompt.contains("Orders: cited_by_count:desc (Most cited)"));
         // The request is one line of data at the end, whatever it contained.
-        assert!(prompt.ends_with("Request: open reviews on CRISPR since 2020\nSearch:\n"));
+        assert!(prompt.ends_with("Request: open reviews on CRISPR since 2020\nSearch: "));
         assert!(matches!(request.constraint, Constraint::Grammar(_)));
     }
 
@@ -686,7 +713,7 @@ mod tests {
     #[test]
     fn a_composition_is_read_back_in_the_providers_terms() {
         let composition = composed(
-            "keyword: crispr off-target effects\nfilter: type = review\nfilter: open_access\nfilter: year_from = 2020\nfilter: author = Jennifer Doudna\nsort: cited_by_count:desc\n",
+            "search: crispr off-target effects; type: review; open_access: on; year_from: 2020; author: Jennifer Doudna; sort: cited_by_count:desc; ",
         )
         .unwrap();
         assert_eq!(
@@ -706,9 +733,24 @@ mod tests {
     }
 
     #[test]
+    fn an_order_written_bare_is_read_as_the_order() {
+        let composition = composed("search: crispr; publication_date:desc").unwrap();
+        assert_eq!(composition.sort.as_deref(), Some("publication_date:desc"));
+        assert_eq!(composition.keyword.as_deref(), Some("crispr"));
+    }
+
+    #[test]
+    fn an_on_off_filter_written_off_is_not_set() {
+        let composition = composed("type: review\nopen_access: off\n").unwrap();
+        assert_eq!(
+            composition.filters,
+            vec![("type".to_string(), vec!["review".to_string()])]
+        );
+    }
+
+    #[test]
     fn a_long_list_is_matched_by_name_and_a_miss_is_said_rather_than_sent() {
-        let composition =
-            composed("filter: country = country 3\nfilter: country = Atlantis\n").unwrap();
+        let composition = composed("country: country 3; country: Atlantis; ").unwrap();
         assert_eq!(
             composition.filters,
             vec![("country".to_string(), vec!["C3".to_string()])]
@@ -719,10 +761,9 @@ mod tests {
 
     #[test]
     fn a_filter_takes_several_values_only_where_it_combines_them() {
-        let composition = composed(
-            "filter: author = Ada Lovelace\nfilter: author = Alan Turing\nfilter: type = review\nfilter: type = article\n",
-        )
-        .unwrap();
+        let composition =
+            composed("author: Ada Lovelace; author: Alan Turing; type: review; type: article; ")
+                .unwrap();
         assert_eq!(
             composition.filters,
             vec![
@@ -744,7 +785,7 @@ mod tests {
 
     #[test]
     fn a_decode_the_caller_stopped_is_an_error_and_not_half_a_search() {
-        let generator = MockGenerator::scripted(["keyword: crispr\nfilter: type = review\n"]);
+        let generator = MockGenerator::scripted(["search: crispr; type: review; "]);
         let error = compose_browse_request(
             &generator,
             &controls(),

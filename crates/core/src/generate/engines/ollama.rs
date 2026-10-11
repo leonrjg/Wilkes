@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 
 use crate::generate::grammar::{json_schema_pattern, Grammar};
 use crate::generate::{
-    Constraint, Generated, GenerationEngine, GenerationRequest, GenerationRuntime,
+    truncate_chars, Constraint, Generated, GenerationEngine, GenerationRequest, GenerationRuntime,
     GenerationTimings, Generator, StopReason,
 };
 use crate::types::GeneratorDescriptor;
@@ -292,17 +292,30 @@ impl OllamaGenerator {
             anyhow::bail!("Ollama generation failed: {error}");
         }
         anyhow::ensure!(response.done, "Ollama response was not complete");
-        let decoded: String = serde_json::from_str(&response.response)
-            .context("Ollama constrained response was not a JSON string")?;
+        // The constraint asks for a JSON string, and a runner that applies it
+        // answers with one. Ollama's MLX runner accepts `format` and ignores
+        // it, so those models answer with the text itself; that text is the
+        // answer too. Either way it is held to the constraint below, which is
+        // what makes it one — for a model that was not held to it while
+        // decoding, that check is the whole of the enforcement.
+        let decoded = match serde_json::from_str::<String>(&response.response) {
+            Ok(decoded) => decoded,
+            Err(_) => response.response.trim().to_string(),
+        };
+        let violated = |what: &str| {
+            format!(
+                "{} answered outside the {what} it was asked to keep to: {:?}",
+                self.model_id,
+                truncate_chars(&decoded, 200)
+            )
+        };
         match &request.constraint {
-            Constraint::OneOf(options) => anyhow::ensure!(
-                options.contains(&decoded),
-                "Ollama response violated the OneOf constraint"
-            ),
-            Constraint::Grammar(source) => anyhow::ensure!(
-                Grammar::parse(source)?.accepts(&decoded),
-                "Ollama response violated the generation grammar"
-            ),
+            Constraint::OneOf(options) => {
+                anyhow::ensure!(options.contains(&decoded), violated("choices"))
+            }
+            Constraint::Grammar(source) => {
+                anyhow::ensure!(Grammar::parse(source)?.accepts(&decoded), violated("form"))
+            }
             Constraint::Text { .. } => unreachable!("text requests use the streaming path"),
         }
         self.record_metrics(&response);
@@ -719,6 +732,80 @@ mod tests {
         generate.assert();
         assert_eq!(published, "Topic: Cache invalidation");
         assert_eq!(output.stop, StopReason::GrammarComplete);
+    }
+
+    /// Ollama's MLX runner accepts `format` and ignores it, so those models
+    /// answer with the text itself rather than a JSON string of it. A reply in
+    /// the grammar's language is the answer whichever way it arrived.
+    #[test]
+    fn takes_the_text_of_a_reply_from_a_runner_that_ignored_the_constraint() {
+        let mut server = mockito::Server::new();
+        let generator = connected(&mut server);
+        server
+            .mock("POST", "/api/generate")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "response": "Topic: Cache invalidation\n",
+                    "done": true,
+                    "done_reason": "stop",
+                    "eval_count": 5
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut published = String::new();
+        let output = generator
+            .generate_stream(
+                request(Constraint::Grammar(LABEL_GRAMMAR.to_string())),
+                &mut |chunk| {
+                    published.push_str(chunk);
+                    ControlFlow::Continue(())
+                },
+            )
+            .unwrap();
+        assert_eq!(published, "Topic: Cache invalidation");
+        assert_eq!(output.text, "Topic: Cache invalidation");
+    }
+
+    /// Nothing held such a model to the grammar while it decoded, so the check
+    /// afterwards is all there is: prose is refused, and says what was said.
+    #[test]
+    fn refuses_free_text_outside_the_grammar_and_quotes_it() {
+        let mut server = mockito::Server::new();
+        let generator = connected(&mut server);
+        server
+            .mock("POST", "/api/generate")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "response": "Here is a label for those passages: caching.",
+                    "done": true,
+                    "done_reason": "stop"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut published = String::new();
+        let error = generator
+            .generate_stream(
+                request(Constraint::Grammar(LABEL_GRAMMAR.to_string())),
+                &mut |chunk| {
+                    published.push_str(chunk);
+                    ControlFlow::Continue(())
+                },
+            )
+            .expect_err("prose is not a label");
+        assert!(
+            error.to_string().contains("answered outside the form")
+                && error.to_string().contains("Here is a label"),
+            "{error}"
+        );
+        assert!(published.is_empty());
     }
 
     #[test]

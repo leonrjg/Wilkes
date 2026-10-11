@@ -607,6 +607,16 @@
 
 ### Fixed
 
+- Ollama models served by its MLX runner can be used for generation. That
+  runner accepts a constraint on the output and ignores it, answering in plain
+  text where a JSON string was asked for, and every constrained task — a
+  cluster label, a cited summary, a composed search — failed with "Ollama
+  constrained response was not a JSON string". The plain-text reply is now
+  taken as the answer and held to the same grammar a constrained one is; a
+  reply outside it is refused, quoting what the model said.
+- A grammar that spans lines, or lets the model write a quotation mark, no
+  longer produces output Ollama's reply cannot be read from. The pattern
+  Ollama is given now describes the string as JSON writes it.
 - Cancelling an index build is over in three seconds, however deep the build
   is. Pressing cancel used to kill politely and then wait: the workers were
   given the roof knock — stdin closed, three seconds to notice — which a

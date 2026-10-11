@@ -368,13 +368,30 @@ provided it cannot invent anything — and the manifest already says exactly
 what may be asked.
 
 - **The grammar is the declaration.** `generate::tasks::browse_request` builds
-  a grammar from `BrowseControls`: a `keyword:` line where the listing takes
-  one, `filter: <name> = <value>` lines whose names are the declared filters
-  and whose values are the declared options or a typed shape, a `sort:` line
-  over the declared orders. An undeclared filter, an unlisted option and a URL
-  are not strings the decode can produce. Lines rather than JSON, because the
-  grammar subset is non-recursive; unbounded repetition rather than counted,
-  so forty filters do not unroll into forty copies per line.
+  a grammar from `BrowseControls`: `name: value` parts separated by `; `, in
+  any order, where a name is `search` (where the listing takes a keyword),
+  `sort` (over the declared orders) or a declared filter, and a value is one
+  of the filter's declared options or a typed shape. An undeclared filter, an
+  unlisted option and a URL are not strings in the language. Unbounded
+  repetition rather than counted, so forty filters do not unroll into forty
+  copies per part.
+- **The form is the one models write unprompted.** It was first a line per
+  part, `filter: type = review`, with an on/off filter as a bare name. Run
+  against real models, every one not held to the grammar wrote
+  `type: review; open_access: on` regardless, and the one that was held to it
+  could not be relied on to write a line break — which, carried in a JSON
+  string, is an escape sequence — and ran the filters into the keyword. So
+  the form is one line, every part has a value, a line break is accepted as a
+  separator too, and an order may be written without its name.
+- **A model is held to the grammar whether or not its runner does it.** Ollama
+  applies the grammar while decoding for GGUF models, as a JSON-schema
+  `pattern`; its MLX runner accepts the constraint and ignores it, and answers
+  in plain text. Both replies are checked against the same grammar before a
+  task sees them, so an MLX model works wherever its answer is in the
+  language and is refused, with what it said, where it is not. The pattern
+  itself describes the string *as JSON writes it* — a newline is `\n`, a free
+  class admits no bare quote or backslash — since that is the text the engine
+  is constrained on.
 - **Two things a grammar cannot pin are settled after it.** A closed list too
   long to show the model (every country) is written as words and matched
   against the list by value or label. A filter the provider suggests values
