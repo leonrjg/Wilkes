@@ -27,6 +27,7 @@ describe("useWorkspaceStore.remove", () => {
     localStorage.setItem("wilkes.viewer-session.b", "{}");
     localStorage.setItem("wilkes.completion-scopes.b", "{}");
     localStorage.setItem("wilkes.reader-positions.b", "{}");
+    localStorage.setItem("wilkes.file-tree.collapsed.b", "[]");
     deleteWorkspace.mockResolvedValue({
       active_workspace_id: "a",
       workspaces: [workspace("a", "First")],
@@ -41,6 +42,7 @@ describe("useWorkspaceStore.remove", () => {
     expect(localStorage.getItem("wilkes.viewer-session.b")).toBeNull();
     expect(localStorage.getItem("wilkes.completion-scopes.b")).toBeNull();
     expect(localStorage.getItem("wilkes.reader-positions.b")).toBeNull();
+    expect(localStorage.getItem("wilkes.file-tree.collapsed.b")).toBeNull();
   });
 
   it("activates another workspace before deleting the active one", async () => {

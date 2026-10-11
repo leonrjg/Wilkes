@@ -1,15 +1,23 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { capturePointer, pointerEvent } from "../test/pointerDrag";
 import type { FileEntry } from "../lib/types";
 import { createRef } from "react";
 import FileTree, { buildFileTree, relativeFolderPath, type FileTreeHandle } from "./FileTree";
+import { useFolderStateStore } from "../stores/useFolderStateStore";
 
 const file = (path: string): FileEntry => ({
   path,
   size_bytes: 1,
   file_type: "PlainText",
   extension: "txt",
+});
+
+// Which folders are closed outlives a mount by design, so it would outlive a
+// test too.
+beforeEach(() => {
+  localStorage.clear();
+  useFolderStateStore.getState().switchWorkspace("default");
 });
 
 const originalElementFromPoint = Object.getOwnPropertyDescriptor(document, "elementFromPoint");
@@ -83,6 +91,41 @@ describe("FileTree", () => {
 
     expect(screen.queryByRole("button", { name: /folder library/ })).toBeNull();
     expect(screen.getByRole("button", { name: "Collapse folder articles" })).toBeInTheDocument();
+  });
+
+  it("keeps a closed folder closed across a remount and a root switch", () => {
+    const tree = (root: string) => (
+      <FileTree
+        root={root}
+        files={[file(`${root}/articles/paper.txt`)]}
+        movable={false}
+        onMove={vi.fn()}
+        renderFile={(entry) => <span>{entry.path.split("/").pop()}</span>}
+      />
+    );
+    const first = render(tree("/library"));
+    fireEvent.click(screen.getByRole("button", { name: "Collapse folder articles" }));
+    expect(screen.getByRole("button", { name: "Expand folder articles" })).toBeInTheDocument();
+
+    // Another root's folder of the same name is a different folder.
+    first.rerender(tree("/other"));
+    expect(screen.getByRole("button", { name: "Collapse folder articles" })).toBeInTheDocument();
+    first.rerender(tree("/library"));
+    expect(screen.getByRole("button", { name: "Expand folder articles" })).toBeInTheDocument();
+    first.unmount();
+
+    // A restart: the store is rebuilt from what was written.
+    useFolderStateStore.getState().switchWorkspace("default");
+    render(tree("/library"));
+    expect(screen.getByRole("button", { name: "Expand folder articles" })).toBeInTheDocument();
+  });
+
+  it("keeps each workspace's closed folders to itself", () => {
+    useFolderStateStore.getState().toggle("/library/articles");
+    useFolderStateStore.getState().switchWorkspace("second");
+    expect(useFolderStateStore.getState().collapsed.size).toBe(0);
+    useFolderStateStore.getState().switchWorkspace("default");
+    expect([...useFolderStateStore.getState().collapsed]).toEqual(["/library/articles"]);
   });
 
   function setup(movable = true) {

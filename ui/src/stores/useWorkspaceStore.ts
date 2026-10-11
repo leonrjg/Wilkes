@@ -5,6 +5,7 @@ import type { WorkspaceSummary } from "../lib/types";
 import { useBookmarksStore } from "./useBookmarksStore";
 import { useChatStore } from "./useChatStore";
 import { useEditorStore } from "./useEditorStore";
+import { useFolderStateStore } from "./useFolderStateStore";
 import { useResearchStore } from "./useResearchStore";
 import { useSearchStore } from "./useSearchStore";
 import { useSemanticStore } from "./useSemanticStore";
@@ -106,6 +107,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         activeWorkspaceId: state.active_workspace_id,
       });
       useEditorStore.getState().switchWorkspace(state.active_workspace_id);
+      useFolderStateStore.getState().switchWorkspace(state.active_workspace_id);
       await useViewerStore.getState().switchWorkspace(state.active_workspace_id);
     } finally {
       set({ loading: false });
@@ -149,6 +151,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
     const state = await api.deleteWorkspace(workspaceId);
     useEditorStore.getState().forgetWorkspace(workspaceId);
+    useFolderStateStore.getState().forgetWorkspace(workspaceId);
     useViewerStore.getState().forgetWorkspace(workspaceId);
     set({
       workspaces: state.workspaces,
@@ -173,6 +176,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     try {
       const state = await api.switchWorkspace(workspaceId);
       useEditorStore.getState().switchWorkspace(workspaceId);
+      useFolderStateStore.getState().switchWorkspace(workspaceId);
       await useViewerStore.getState().switchWorkspace(workspaceId);
       set({
         workspaces: state.workspaces,
@@ -190,6 +194,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const state = await api.listWorkspaces().catch(() => null);
       if (state) {
         useEditorStore.getState().switchWorkspace(state.active_workspace_id);
+        useFolderStateStore.getState().switchWorkspace(state.active_workspace_id);
+      useFolderStateStore.getState().switchWorkspace(state.active_workspace_id);
         await useViewerStore.getState().switchWorkspace(state.active_workspace_id);
         set({
           workspaces: state.workspaces,

@@ -1,8 +1,9 @@
-import React, { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import React, { forwardRef, useEffect, useImperativeHandle, useMemo, useRef } from "react";
 import { ChevronDown, ChevronRight, Folder, FolderPlus } from "react-feather";
 import type { FileEntry } from "../lib/types";
 import { pathIsWithinRoot, pathsEqual } from "../lib/configuredRoots";
 import { useFileDragStore } from "../stores/useFileDragStore";
+import { useFolderStateStore } from "../stores/useFolderStateStore";
 import { ContextMenu, useContextMenu } from "./ContextMenu";
 
 export type FileTreeDragProps = Pick<React.ButtonHTMLAttributes<HTMLButtonElement>,
@@ -211,8 +212,12 @@ function FileTree({
   );
   // A folder is open unless the user explicitly closes it. New folders from a
   // refresh therefore inherit the required default-open behaviour without
-  // erasing the user's choices for folders that were already present.
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // erasing the user's choices for folders that were already present. The
+  // choices are the workspace's, not this mount's: they outlive a root switch
+  // and a restart.
+  const collapsed = useFolderStateStore((state) => state.collapsed);
+  const toggle = useFolderStateStore((state) => state.toggle);
+  const expand = useFolderStateStore((state) => state.expand);
   // The drag's own state is shared, because the root strip draws it too.
   const dropTarget = useFileDragStore((state) => state.target);
   const draggedPath = useFileDragStore((state) => state.path);
@@ -224,25 +229,12 @@ function FileTree({
   const externalHoverRef = useRef<HoverSession | null>(null);
   const suppressClickRef = useRef(false);
 
-  useEffect(() => {
-    setCollapsed(new Set());
-  }, [root]);
-
   // A gesture belongs to the tree and permissions it started with.
   useEffect(() => () => {
     cancelDragRef.current?.();
     externalHoverRef.current?.stop();
     externalHoverRef.current = null;
   }, [root, movable]);
-
-  const toggle = (path: string) => {
-    setCollapsed((current) => {
-      const next = new Set(current);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  };
 
   /** The directory under a viewport point, or null where there is none.
    *
@@ -347,15 +339,6 @@ function FileTree({
       externalHoverRef.current = null;
     },
   }));
-
-  const expand = (path: string) => {
-    setCollapsed((current) => {
-      if (!current.has(path)) return current;
-      const next = new Set(current);
-      next.delete(path);
-      return next;
-    });
-  };
 
   /** A right-click that no row answered belongs to the folder it landed in:
    *  the space around a folder's entries is that folder, and the space around
