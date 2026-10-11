@@ -383,6 +383,14 @@ what may be asked.
   string, is an escape sequence — and ran the filters into the keyword. So
   the form is one line, every part has a value, a line break is accepted as a
   separator too, and an order may be written without its name.
+- **The prompt works one example, made from the declaration.** Shown only the
+  rules, the smallest model tried wrote values without their names —
+  `search: CRISPR; review; open-access` — on four requests of five. One
+  request and how it is written fixed that on every model tried. It is built
+  from the provider's own first closed-list filter, on/off filter and order,
+  asked for by their labels ("solar cells, Type: Article, Open access only,
+  Most cited"), so it names nothing the provider lacks; and it is a request
+  with its answer because an answer alone was copied into unrelated searches.
 - **A model is held to the grammar whether or not its runner does it.** Ollama
   applies the grammar while decoding for GGUF models, as a JSON-schema
   `pattern`; its MLX runner accepts the constraint and ignores it, and answers

@@ -272,6 +272,69 @@ fn one_line(text: &str, max_chars: usize) -> String {
         .collect()
 }
 
+/// A subject no provider of scholarly works would find strange, for the
+/// worked example.
+const EXAMPLE_SUBJECT: &str = "solar cells";
+
+/// One request and how it is written, made from the provider's own
+/// declaration: its first closed-list filter, its first on/off filter and its
+/// first order, each asked for by the label a person sees and written by the
+/// name and value the provider takes.
+///
+/// A worked example is what gets a small model to write the form at all:
+/// shown only the rules, one answered `search: CRISPR; review; open-access`,
+/// values without their names, on four requests of five, and with this, none.
+/// It is a request and its answer rather than the answer alone because the
+/// answer alone was copied — its subject and its filters turned up in
+/// searches for something else. And it is built from the declaration rather
+/// than written out, so it never names a filter this provider does not have.
+fn example(controls: &BrowseControls) -> Option<(String, String)> {
+    let filters = usable(controls);
+    let mut asked: Vec<String> = Vec::new();
+    let mut written: Vec<String> = Vec::new();
+    if controls.keyword {
+        asked.push(EXAMPLE_SUBJECT.to_string());
+        written.push(format!("{SEARCH}{ASSIGN}{EXAMPLE_SUBJECT}"));
+    }
+    if let Some((filter, option)) = filters
+        .iter()
+        .filter(|(_, shape)| *shape == Shape::Listed)
+        .find_map(|(filter, _)| {
+            listed(&filter.options)
+                .into_iter()
+                .next()
+                .map(|(option, _)| (filter, option))
+        })
+    {
+        let called = if option.label.is_empty() {
+            &option.value
+        } else {
+            &option.label
+        };
+        asked.push(format!("{}: {called}", spoken(filter)));
+        written.push(format!("{}{ASSIGN}{}", filter.name, option.value));
+    }
+    if let Some((filter, _)) = filters.iter().find(|(_, shape)| *shape == Shape::Toggle) {
+        asked.push(spoken(filter));
+        written.push(format!("{}{ASSIGN}{ON}", filter.name));
+    }
+    if let Some(order) = controls
+        .sort
+        .iter()
+        .flat_map(|sort| sort.options.iter())
+        .find(|option| literal(&option.value).is_some())
+    {
+        asked.push(if order.label.is_empty() {
+            order.value.clone()
+        } else {
+            order.label.clone()
+        });
+        written.push(format!("{SORT}{ASSIGN}{}", order.value));
+    }
+    // One part is the rule restated; it takes two to show how parts are joined.
+    (written.len() > 1).then(|| (asked.join(", "), written.join(&format!("{SEPARATOR} "))))
+}
+
 /// `today` is `YYYY-MM-DD`: "since 2020" needs no date, "the last five years"
 /// needs this one.
 pub fn build_request(
@@ -357,6 +420,11 @@ pub fn build_request(
         "\nUse a filter or an order only where the request asks for what it does. \
 Leave out everything the request does not mention.\n",
     );
+    if let Some((asked, written)) = example(controls) {
+        prompt.push_str(&format!(
+            "\nFor example, the request \"{asked}\" is written:\n{written}\n"
+        ));
+    }
     prompt.push_str(&format!("\nRequest: {request}\nSearch: "));
 
     Ok(GenerationRequest {
@@ -647,6 +715,44 @@ mod tests {
             }
         }
         assert!(browsable > 0, "no shipped provider declares browse");
+    }
+
+    /// The example is made of the provider's own names, asked for by its own
+    /// labels — and is itself in the language it is an example of.
+    #[test]
+    fn the_prompt_works_one_example_from_the_providers_own_declaration() {
+        let request = build_request(&controls(), "reviews", "2026-10-11").unwrap();
+        assert!(request.prompt.contains(
+            "For example, the request \"solar cells, Type: Article, Open access only, Most cited\" is written:\nsearch: solar cells; type: article; open_access: on; sort: cited_by_count:desc\n\nRequest: reviews\n"
+        ));
+
+        for manifest in crate::integrations::builtin::manifests() {
+            let Some(browse) = &manifest.capabilities.browse else {
+                continue;
+            };
+            let controls = browse.controls();
+            let (_, written) =
+                example(&controls).unwrap_or_else(|| panic!("{} has no example", manifest.id));
+            let grammar = Grammar::parse(&build_grammar(&controls).unwrap()).unwrap();
+            assert!(grammar.accepts(&written), "{}: {written}", manifest.id);
+            parse(&written, &controls).unwrap();
+        }
+    }
+
+    /// A provider with one thing to say has no example to give: one part
+    /// shows nothing the rules did not.
+    #[test]
+    fn a_provider_with_one_kind_of_part_gets_no_example() {
+        let only_keyword = BrowseControls {
+            keyword: true,
+            total: false,
+            sort: None,
+            modes: Vec::new(),
+            filters: vec![filter("year_from", "From", "integer")],
+        };
+        assert_eq!(example(&only_keyword), None);
+        let request = build_request(&only_keyword, "anything", "2026-10-11").unwrap();
+        assert!(!request.prompt.contains("For example"));
     }
 
     #[test]
