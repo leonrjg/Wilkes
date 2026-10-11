@@ -536,7 +536,7 @@ fn main() -> anyhow::Result<()> {
     // ── The table ────────────────────────────────────────────────────────────
     let head: Vec<String> = threads.iter().map(|n| format!("ms@{n}")).collect();
     println!(
-        "{:<10} {:>5} {:>11} {:>8} {:>8} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>5}  {}",
+        "{:<10} {:>5} {:>11} {:>8} {:>8} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>5}  verdict",
         "id",
         "page",
         "px",
@@ -550,7 +550,6 @@ fn main() -> anyhow::Result<()> {
         "words",
         "rect",
         "score",
-        "verdict",
     );
     for row in &measured {
         println!(

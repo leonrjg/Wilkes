@@ -568,7 +568,7 @@ mod tests {
         );
         assert_eq!(installer.model.0, "BGEBaseENV15");
 
-        assert_eq!(installer.uninstall(dir.path()).is_ok(), true);
+        assert!(installer.uninstall(dir.path()).is_ok());
 
         // build() should work (it creates a WorkerEmbedder)
         let _ = installer.build(dir.path()).unwrap();

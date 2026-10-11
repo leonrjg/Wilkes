@@ -103,11 +103,11 @@ fn main() -> anyhow::Result<()> {
     println!("loaded on ort 2.0.0-rc.13");
     println!("inputs:");
     for input in session.inputs() {
-        println!("  {:<16} {}", input.name(), describe(&input.dtype()));
+        println!("  {:<16} {}", input.name(), describe(input.dtype()));
     }
     println!("outputs:");
     for output in session.outputs() {
-        println!("  {:<16} {}", output.name(), describe(&output.dtype()));
+        println!("  {:<16} {}", output.name(), describe(output.dtype()));
     }
 
     let Some(pdf) = pdf else { return Ok(()) };

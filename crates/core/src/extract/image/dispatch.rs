@@ -100,6 +100,8 @@ impl RecognitionEngine {
     }
 
     /// Every engine this build can actually recognize with.
+    // Each push is behind its own feature gate, which `vec![]` cannot express.
+    #[allow(clippy::vec_init_then_push)]
     pub fn supported_engines() -> Vec<Self> {
         let mut engines = Vec::new();
         #[cfg(feature = "recognize-onnx")]
@@ -223,6 +225,8 @@ pub struct InstallableModelStatus {
 }
 
 /// Everything this build can recognize with, default first, then cached.
+// Each push is behind its own feature gate, which `vec![]` cannot express.
+#[allow(clippy::vec_init_then_push)]
 pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
     use super::ocr::RegionKind;
     let mut models: Vec<RecognizerDescriptor> = Vec::new();

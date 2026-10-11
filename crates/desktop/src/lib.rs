@@ -2459,7 +2459,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    app.run(|app_handle, event| handle_exit_event(&app_handle, event));
+    app.run(handle_exit_event);
 }
 
 #[cfg(test)]
@@ -2472,10 +2472,9 @@ mod tests {
     /// the constant `false`.
     #[test]
     fn the_default_build_offers_the_model_downloads() {
-        assert!(
-            cfg!(feature = "recognize-onnx"),
-            "the desktop build must declare the feature its install commands are gated on"
-        );
+        if !cfg!(feature = "recognize-onnx") {
+            panic!("the desktop build must declare the feature its install commands are gated on");
+        }
     }
 
     /// The engine picker offers what this build contains. Vision is out of
@@ -2508,7 +2507,7 @@ mod tests {
     use wilkes_core::types::SourceOrigin;
     use wilkes_core::worker::manager::WorkerPaths;
 
-    static OPEN_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static OPEN_PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct MockEmitter;
 
@@ -2562,7 +2561,7 @@ mod tests {
     async fn test_open_path_uses_spawned_opener() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = OPEN_PATH_LOCK.lock().unwrap();
+        let _guard = OPEN_PATH_LOCK.lock().await;
         let dir = tempdir().unwrap();
         let opener_name = if cfg!(target_os = "macos") {
             "open"

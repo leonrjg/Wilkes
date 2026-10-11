@@ -615,7 +615,11 @@ impl PaddleOcrVl {
             .ok_or_else(|| anyhow::anyhow!("the tokenizer has no end-of-sequence token"))?;
 
         let weights = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[artifacts.weights.clone()], dtype, &device)?
+            VarBuilder::from_mmaped_safetensors(
+                std::slice::from_ref(&artifacts.weights),
+                dtype,
+                &device,
+            )?
         };
         let model = PaddleOCRVLModel::new(&config, weights)
             .context("could not build the recognizer from its weights")?;
@@ -658,7 +662,7 @@ impl PaddleOcrVl {
         let vision_tokens = grid_height * grid_width / merge;
 
         let mut ids = encode(PROMPT_PREFIX)?;
-        ids.extend(std::iter::repeat(self.image_token_id).take(vision_tokens));
+        ids.extend(std::iter::repeat_n(self.image_token_id, vision_tokens));
         ids.extend(encode(&format!(
             "{PROMPT_SUFFIX}{SPOTTING_PROMPT}\nAssistant:\n"
         ))?);
@@ -1803,7 +1807,8 @@ mod tests {
     fn peak_memory_is_a_real_quantity_or_is_absent() {
         match peak_memory_bytes() {
             Some(bytes) => assert!(bytes > 1_000_000, "{bytes} bytes is not this process"),
-            None => assert!(!cfg!(unix), "unix reports a resident set size"),
+            None if cfg!(unix) => panic!("unix reports a resident set size"),
+            None => {}
         }
     }
 }

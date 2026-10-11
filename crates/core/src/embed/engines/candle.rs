@@ -218,23 +218,21 @@ pub fn realize_device(plan: CandleDevicePlan) -> anyhow::Result<RealizedCandleDe
             #[cfg(target_os = "macos")]
             {
                 match metal_device() {
-                    Ok(device) => {
-                        return Ok(RealizedCandleDevice {
-                            device,
-                            name: "metal".to_string(),
-                            fallback_reason: None,
-                        });
-                    }
+                    Ok(device) => Ok(RealizedCandleDevice {
+                        device,
+                        name: "metal".to_string(),
+                        fallback_reason: None,
+                    }),
                     Err(reason) if plan == CandleDevicePlan::MetalRequired => {
                         anyhow::bail!("{reason}");
                     }
                     Err(reason) => {
                         warn!("{reason}; auto device selection is falling back to CPU");
-                        return Ok(RealizedCandleDevice {
+                        Ok(RealizedCandleDevice {
                             device: Device::Cpu,
                             name: "cpu".to_string(),
                             fallback_reason: Some(reason),
-                        });
+                        })
                     }
                 }
             }

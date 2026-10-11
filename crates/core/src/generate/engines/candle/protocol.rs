@@ -24,7 +24,7 @@ impl ModelFamily {
         }
     }
 
-    pub(super) fn visible_text<'a>(self, raw: &'a str) -> &'a str {
+    pub(super) fn visible_text(self, raw: &str) -> &str {
         match self {
             Self::Qwen3 => strip_qwen3_think_preamble(raw),
             Self::Gemma3 => raw.trim(),

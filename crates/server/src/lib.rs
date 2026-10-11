@@ -310,7 +310,7 @@ async fn ensure_managed_workspace_handler(
     let manager = state
         .workspaces
         .as_ref()
-        .ok_or_else(|| workspace_manager_unavailable())?;
+        .ok_or_else(workspace_manager_unavailable)?;
     let initial = manager
         .ensure_managed_workspace(request)
         .await
@@ -350,7 +350,7 @@ async fn managed_workspace_status_handler(
     let manager = state
         .workspaces
         .as_ref()
-        .ok_or_else(|| workspace_manager_unavailable())?;
+        .ok_or_else(workspace_manager_unavailable)?;
     let status = manager
         .managed_workspace_status(&query.corpus_id)
         .await
@@ -369,7 +369,7 @@ async fn ensure_managed_space_handler(
     let manager = state
         .workspaces
         .as_ref()
-        .ok_or_else(|| workspace_manager_unavailable())?;
+        .ok_or_else(workspace_manager_unavailable)?;
     manager
         .ensure_managed_space(request)
         .await
@@ -410,7 +410,7 @@ async fn import_managed_document_handler(
     let manager = state
         .workspaces
         .as_ref()
-        .ok_or_else(|| workspace_manager_unavailable())?;
+        .ok_or_else(workspace_manager_unavailable)?;
     let status = manager
         .managed_workspace_status(&body.corpus_id)
         .await
@@ -526,7 +526,7 @@ async fn document_snapshot_handler(
     let manager = state
         .workspaces
         .as_ref()
-        .ok_or_else(|| workspace_manager_unavailable())?;
+        .ok_or_else(workspace_manager_unavailable)?;
     let corpus = manager
         .context_for(&body.corpus_id)
         .await
@@ -1060,7 +1060,7 @@ async fn managed_backup_handler(
     let manager = state
         .workspaces
         .as_ref()
-        .ok_or_else(|| workspace_manager_unavailable())?;
+        .ok_or_else(workspace_manager_unavailable)?;
     manager
         .backup_managed_corpus(&body.corpus_id, &body.expected_embedding_space_id)
         .await
@@ -1075,7 +1075,7 @@ async fn managed_restore_handler(
     let manager = state
         .workspaces
         .as_ref()
-        .ok_or_else(|| workspace_manager_unavailable())?;
+        .ok_or_else(workspace_manager_unavailable)?;
     manager
         .restore_managed_workspace(
             &body.backup_name,
@@ -1931,11 +1931,6 @@ struct OpenFileBody {
 struct RenameFileBody {
     path: String,
     new_name: String,
-}
-
-#[derive(Deserialize)]
-struct DoiBody {
-    doi: String,
 }
 
 #[derive(Deserialize)]
@@ -3577,9 +3572,7 @@ mod tests {
         // Note: canonicalize will resolve .. relative to CWD if not absolute,
         // but let's assume it fails validation.
         if let Ok(p) = res {
-            assert!(!p.starts_with(&uploads_dir.canonicalize().unwrap()));
-        } else {
-            assert!(true);
+            assert!(!p.starts_with(uploads_dir.canonicalize().unwrap()));
         }
     }
 

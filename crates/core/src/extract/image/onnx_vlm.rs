@@ -316,7 +316,7 @@ impl OnnxVlm {
     ) -> Result<Vec<DecodedToken>> {
         let hidden = self.hidden_size;
         anyhow::ensure!(
-            prompt_embeds.len() % hidden == 0,
+            prompt_embeds.len().is_multiple_of(hidden),
             "prompt embeddings are not a whole number of {hidden}-wide rows"
         );
         let prompt_len = prompt_embeds.len() / hidden;

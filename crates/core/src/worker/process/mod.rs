@@ -268,7 +268,7 @@ exit 0
         };
 
         let active_pid = AtomicU32::new(0);
-        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
             .await
             .unwrap();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(8);
@@ -394,7 +394,7 @@ echo '"Done"'
         };
 
         let active_pid = AtomicU32::new(0);
-        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
             .await
             .unwrap();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(8);
@@ -441,7 +441,7 @@ echo '"Done"'
         };
 
         let active_pid = AtomicU32::new(0);
-        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
             .await
             .unwrap();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(8);
@@ -494,7 +494,7 @@ exit 0
         };
 
         let active_pid = AtomicU32::new(0);
-        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
             .await
             .unwrap();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(8);
@@ -538,7 +538,7 @@ exit 0
         };
 
         let active_pid = AtomicU32::new(0);
-        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
             .await
             .unwrap();
         proc.shutdown(&active_pid, Stop::RoofKnock).await;
@@ -632,7 +632,7 @@ exit 0
         };
 
         let active_pid = AtomicU32::new(0);
-        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
             .await
             .unwrap();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(8);
@@ -706,7 +706,7 @@ exit 0
         };
 
         let active_pid = AtomicU32::new(0);
-        let mut proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
             .await
             .unwrap();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(8);

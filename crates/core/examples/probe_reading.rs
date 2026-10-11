@@ -171,11 +171,7 @@ fn main() -> anyhow::Result<()> {
         println!(
             "\n#{hits} at byte {start}, page {}, provenance {}",
             page.map_or("?".to_string(), |p| p.to_string()),
-            if provenance.starts_with("ImageOcr") {
-                provenance
-            } else {
-                provenance
-            }
+            provenance
         );
         println!("   …{context}…");
     }

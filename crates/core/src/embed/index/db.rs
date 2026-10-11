@@ -7205,6 +7205,7 @@ impl SemanticIndex {
 
     /// Write a file with the complete source/rendition/chunk identity used by
     /// exact whole-document adoption and managed APIs.
+    #[allow(clippy::too_many_arguments)]
     pub fn write_file_with_recipe(
         &mut self,
         prepared: PreparedFile,

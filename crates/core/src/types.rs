@@ -3875,7 +3875,7 @@ mod tests {
     #[test]
     fn test_semantic_settings_defaults() {
         let settings = SemanticSettings::default();
-        assert_eq!(settings.enabled, false);
+        assert!(!settings.enabled);
         assert_eq!(settings.selected.engine, EmbeddingEngine::default());
         assert_eq!(settings.selected.model.model_id(), "AllMiniLML6V2");
         assert_eq!(settings.selected.dimension, 384);
@@ -4209,7 +4209,7 @@ mod tests {
     fn test_search_query_defaults() {
         let json = r#"{"pattern": "p", "is_regex": false, "case_sensitive": false, "root": ".", "max_results": 10}"#;
         let q: SearchQuery = serde_json::from_str(json).unwrap();
-        assert_eq!(q.respect_gitignore, true);
+        assert!(q.respect_gitignore);
         assert_eq!(q.max_file_size, 0);
         assert_eq!(q.context_lines, 2);
         assert_eq!(q.mode, SearchMode::Grep);

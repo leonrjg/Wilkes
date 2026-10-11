@@ -188,7 +188,7 @@ mod tests {
             "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n".to_string(),
             format!(
                 "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
-                stream.as_bytes().len(),
+                stream.len(),
                 stream
             ),
             "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_string(),

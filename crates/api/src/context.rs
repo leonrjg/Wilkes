@@ -451,7 +451,7 @@ const ACTIVITY_DOCUMENT_LIMIT: usize = 500;
 /// The documents a build is over, and the job whose verdicts it carries on
 /// from. The two travel together because a scope narrower than the root is
 /// always narrower *because* an earlier job already settled the rest.
-struct JobScope {
+pub(crate) struct JobScope {
     documents: Vec<PathBuf>,
     continues: Option<i64>,
 }
@@ -2605,9 +2605,8 @@ impl AppContext {
                     let destination_sha256 = wilkes_core::embed::identity::sha256_file(
                         &destination,
                     )
-                    .map_err(|error| {
+                    .inspect_err(|_| {
                         let _ = std::fs::remove_file(&temporary);
-                        error
                     })?;
                     if destination_sha256 != source_sha256 {
                         let _ = std::fs::remove_file(&temporary);
@@ -7486,7 +7485,7 @@ impl AppContext {
     /// they differ only in which documents are in scope, and having each of
     /// them own a copy of the cancellation and journalling lifecycle is how one
     /// of the copies ends up not raising the cancel flag before killing.
-    pub async fn start_build_index_over(
+    pub(crate) async fn start_build_index_over(
         self: Arc<Self>,
         root: String,
         selected: SelectedEmbedder,
@@ -9048,7 +9047,7 @@ fn label_inputs(
     ordered.sort();
 
     std::iter::once(&cluster.representative_bookmark_id)
-        .chain(ordered.into_iter())
+        .chain(ordered)
         .filter_map(|id| inputs.get(id.as_str()).map(|text| text.to_string()))
         .take(wilkes_core::generate::tasks::cluster_label::MAX_MEMBERS)
         .collect()
@@ -9407,8 +9406,10 @@ mod tests {
         let (dir, ctx) = test_ctx();
         let root = dir.path().join("topic-root");
         std::fs::create_dir_all(&root).unwrap();
-        let mut settings = Settings::default();
-        settings.last_directory = Some(root.clone());
+        let settings = Settings {
+            last_directory: Some(root.clone()),
+            ..Default::default()
+        };
         std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
         let mut index = SemanticIndex::create(
             dir.path(),
@@ -9556,8 +9557,10 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let document = root.join("paper.txt");
         std::fs::write(&document, "chunk export passages").unwrap();
-        let mut settings = Settings::default();
-        settings.last_directory = Some(root.clone());
+        let settings = Settings {
+            last_directory: Some(root.clone()),
+            ..Default::default()
+        };
         std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
 
         // No index yet: loud, actionable error.
@@ -9659,8 +9662,10 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let document = root.join("notes.md");
         std::fs::write(&document, "# One\nbody\n## Two\nmore body\n").unwrap();
-        let mut settings = Settings::default();
-        settings.last_directory = Some(root.clone());
+        let settings = Settings {
+            last_directory: Some(root.clone()),
+            ..Default::default()
+        };
         std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
 
         // No semantic index or embedder is installed. A declared outline is
@@ -9700,8 +9705,10 @@ mod tests {
         let unindexed = root.join("unindexed.txt");
         std::fs::write(&indexed, "alpha passage").unwrap();
         std::fs::write(&unindexed, "beta passage").unwrap();
-        let mut settings = Settings::default();
-        settings.last_directory = Some(root.clone());
+        let settings = Settings {
+            last_directory: Some(root.clone()),
+            ..Default::default()
+        };
         std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
 
         // No index at all: the documents are still there to be seen, and every
@@ -9784,8 +9791,10 @@ mod tests {
         let document = root.join("notes.md");
         let text = "# One\nalpha body\n## One point one\nbeta body\n";
         std::fs::write(&document, text).unwrap();
-        let mut settings = Settings::default();
-        settings.last_directory = Some(root.clone());
+        let settings = Settings {
+            last_directory: Some(root.clone()),
+            ..Default::default()
+        };
         std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
 
         let second_heading = text.find("## One").unwrap();
@@ -9970,8 +9979,10 @@ mod tests {
         let other = root.join("other.txt");
         std::fs::write(&document, "document passages").unwrap();
         std::fs::write(&other, "other passage").unwrap();
-        let mut settings = Settings::default();
-        settings.last_directory = Some(root.clone());
+        let settings = Settings {
+            last_directory: Some(root.clone()),
+            ..Default::default()
+        };
         std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
 
         let mut index = SemanticIndex::create(
@@ -10090,8 +10101,10 @@ mod tests {
         let document = root.join("passages.txt");
         std::fs::write(&document, "cached label passages").unwrap();
 
-        let mut settings = Settings::default();
-        settings.last_directory = Some(root.clone());
+        let mut settings = Settings {
+            last_directory: Some(root.clone()),
+            ..Default::default()
+        };
         // The state under test: a model is chosen, generation is off, and no
         // generator is loaded — so nothing below can run one.
         settings.generation.enabled = false;
@@ -10204,9 +10217,11 @@ mod tests {
         for path in [&source, &matching, &unrelated, &stale_match] {
             std::fs::write(path, "indexed passage").unwrap();
         }
-        let mut settings = Settings::default();
-        settings.last_directory = Some(root.clone());
-        settings.favorites = vec![other_root.clone(), unindexed_root];
+        let settings = Settings {
+            last_directory: Some(root.clone()),
+            favorites: vec![other_root.clone(), unindexed_root],
+            ..Default::default()
+        };
         std::fs::write(&ctx.settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
 
         let mut index = SemanticIndex::create(
@@ -10364,10 +10379,12 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::create_dir_all(&sibling).unwrap();
         let missing = dir.path().join("missing");
-        let mut settings = Settings::default();
-        settings.last_directory = Some(root.clone());
-        settings.favorites = vec![nested, sibling.clone()];
-        settings.recent_dirs = vec![root.clone(), missing.clone()];
+        let settings = Settings {
+            last_directory: Some(root.clone()),
+            favorites: vec![nested, sibling.clone()],
+            recent_dirs: vec![root.clone(), missing.clone()],
+            ..Default::default()
+        };
 
         let (roots, errors) = library_roots(&settings);
 
@@ -12814,7 +12831,7 @@ exit 0
         .await;
 
         let updated = get_settings(&settings_path).await.unwrap();
-        assert_eq!(updated.semantic.enabled, true);
+        assert!(updated.semantic.enabled);
         assert_eq!(updated.semantic.chunk_size, 1234);
     }
 
@@ -13812,7 +13829,7 @@ exit 0
         );
 
         let status = ctx.get_worker_status();
-        assert_eq!(status.active, false);
+        assert!(!status.active);
     }
 
     #[tokio::test]
@@ -14690,7 +14707,7 @@ exit 0
 
         // Should have cleared the stale index reference in settings
         let updated_settings = ctx.get_settings().await;
-        assert_eq!(updated_settings.semantic.enabled, false);
+        assert!(!updated_settings.semantic.enabled);
         assert!(updated_settings.semantic.index_path.is_none());
     }
 
@@ -14770,7 +14787,7 @@ exit 0
 
         ctx.clone().restore_state().await;
         let updated = ctx.get_settings().await;
-        assert_eq!(updated.semantic.enabled, false);
+        assert!(!updated.semantic.enabled);
         assert!(updated.semantic.index_path.is_none());
     }
 
@@ -15100,7 +15117,7 @@ exit 0
         ctx.clone().restore_state().await;
 
         let updated = ctx.get_settings().await;
-        assert_eq!(updated.semantic.enabled, false);
+        assert!(!updated.semantic.enabled);
     }
 
     #[tokio::test]
@@ -15120,7 +15137,7 @@ exit 0
             .await;
 
         let s = ctx.get_settings().await;
-        assert_eq!(s.semantic.enabled, true);
+        assert!(s.semantic.enabled);
         assert!(settings_path.exists());
     }
 

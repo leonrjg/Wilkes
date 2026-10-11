@@ -937,7 +937,7 @@ mod tests {
         assert_eq!(decode(&[0xC0 | b'a']), b" a".to_vec());
         // A back-reference into what has already been produced: distance 5,
         // length 3, over "abcde" gives "abc" again.
-        let pair = (5usize << 3) | (3 - 3);
+        let pair = 5usize << 3;
         let encoded = [
             b'a',
             b'b',
@@ -955,7 +955,7 @@ mod tests {
     #[test]
     fn palmdoc_stops_rather_than_reading_past_its_output() {
         let mut out = Vec::new();
-        let pair = (99usize << 3) | 0;
+        let pair = 99usize << 3;
         decompress_palmdoc(&[0x80 | (pair >> 8) as u8, pair as u8], &mut out);
         assert!(out.is_empty());
         // And a truncated pair at the very end.

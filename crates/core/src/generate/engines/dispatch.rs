@@ -41,6 +41,7 @@ fn candle_installer(
 
 /// Prepare and attach one generator through the lifecycle appropriate to its
 /// engine. This is the sole main-process construction path for both backends.
+#[allow(clippy::too_many_arguments)]
 pub async fn attach_generator(
     engine: GenerationEngine,
     model: GeneratorModel,

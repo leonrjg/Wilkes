@@ -388,7 +388,7 @@ doi = { path = "DOI", coerce = "normalize_doi" }
         let path = dir.path().join("settings.json");
 
         let settings = get_settings(&path).await.unwrap();
-        assert_eq!(settings.respect_gitignore, true);
+        assert!(settings.respect_gitignore);
         assert_eq!(settings.context_lines, 2);
         assert_eq!(settings.file_sort_key, FileSortKey::Filename);
         assert_eq!(settings.file_sort_direction, FileSortDirection::Asc);
@@ -445,14 +445,14 @@ doi = { path = "DOI", coerce = "normalize_doi" }
 
         let updated = update_settings(&path, patch).await.unwrap();
         assert_eq!(updated.context_lines, 5);
-        assert_eq!(updated.respect_gitignore, false);
+        assert!(!updated.respect_gitignore);
         assert_eq!(updated.file_sort_key, FileSortKey::Modified);
         assert_eq!(updated.file_sort_direction, FileSortDirection::Desc);
 
         // Verify it was persisted
         let loaded = get_settings(&path).await.unwrap();
         assert_eq!(loaded.context_lines, 5);
-        assert_eq!(loaded.respect_gitignore, false);
+        assert!(!loaded.respect_gitignore);
         assert_eq!(loaded.file_sort_key, FileSortKey::Modified);
         assert_eq!(loaded.file_sort_direction, FileSortDirection::Desc);
     }
@@ -470,9 +470,11 @@ doi = { path = "DOI", coerce = "normalize_doi" }
         symlink(&parent, &alias).unwrap();
 
         let path = dir.path().join("settings.json");
-        let mut settings = Settings::default();
-        settings.last_directory = Some(parent.clone());
-        settings.favorites = vec![alias.join("child"), child.clone()];
+        let settings = Settings {
+            last_directory: Some(parent.clone()),
+            favorites: vec![alias.join("child"), child.clone()],
+            ..Default::default()
+        };
         tokio::fs::write(&path, serde_json::to_string(&settings).unwrap())
             .await
             .unwrap();
@@ -496,7 +498,7 @@ doi = { path = "DOI", coerce = "normalize_doi" }
         });
 
         let updated = update_settings(&path, patch).await.unwrap();
-        assert_eq!(updated.semantic.enabled, true);
+        assert!(updated.semantic.enabled);
         assert_eq!(updated.semantic.chunk_size, 1000);
     }
 

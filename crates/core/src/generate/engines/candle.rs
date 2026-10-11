@@ -1172,7 +1172,7 @@ mod tests {
         let chunks = prefill_chunks(&token_ids).collect::<Vec<_>>();
 
         assert_eq!(chunks.len(), token_ids.len().div_ceil(PREFILL_CHUNK_TOKENS));
-        assert!(PREFILL_CHUNK_TOKENS <= 512);
+        const { assert!(PREFILL_CHUNK_TOKENS <= 512) };
         assert!(chunks
             .iter()
             .all(|(_, chunk)| !chunk.is_empty() && chunk.len() <= PREFILL_CHUNK_TOKENS));

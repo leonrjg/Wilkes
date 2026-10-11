@@ -119,7 +119,7 @@ pub(crate) fn spawn_reveal_target(target: &str) -> Result<(), String> {
             .arg(target)
             .spawn()
             .map_err(|e| e.to_string())?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]
@@ -128,7 +128,7 @@ pub(crate) fn spawn_reveal_target(target: &str) -> Result<(), String> {
             .arg(format!("/select,{target}"))
             .spawn()
             .map_err(|e| e.to_string())?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

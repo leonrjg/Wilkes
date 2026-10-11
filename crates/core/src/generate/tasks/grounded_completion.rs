@@ -48,9 +48,7 @@ impl SuppressionReason {
 }
 
 pub fn build_request(input: &GroundedCompletionInput) -> GenerationRequest {
-    let stop = if input.at_paragraph_start {
-        vec!["\n\n".to_string()]
-    } else if input.at_sentence_start {
+    let stop = if input.at_paragraph_start || input.at_sentence_start {
         vec!["\n\n".to_string()]
     } else {
         vec!["\n".to_string()]

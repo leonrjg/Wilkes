@@ -445,7 +445,7 @@ mod tests {
         let path = std::env::join_paths([dir.path()]).unwrap();
 
         let resolved = with_temp_env_var("WILKES_PYTHON", None, || {
-            with_temp_env_var("PATH", Some(path), || resolve_python())
+            with_temp_env_var("PATH", Some(path), resolve_python)
         })
         .unwrap();
 

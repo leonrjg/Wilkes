@@ -139,71 +139,6 @@ pub fn surrogate(path: &Path) -> anyhow::Result<Surrogate> {
     Ok(rendered)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A PDF already has pages; asking for a rendering of one is a caller
-    /// mistake, and it must say so rather than spend a document's worth of
-    /// work — or fail re-encoding artwork, which is how this was found.
-    #[test]
-    fn a_pdf_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("paper.pdf");
-        std::fs::write(&path, b"%PDF-1.4").unwrap();
-        let error = match surrogate(&path) {
-            Ok(_) => panic!("a PDF must not be rendered to a surrogate"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("is a PDF"), "{error}");
-    }
-
-    /// The budget evicts, but never the rendering just produced: a comic alone
-    /// exceeds it, and dropping it would mean re-rendering the document the
-    /// user is reading on every request for its pages.
-    #[test]
-    fn the_cache_keeps_the_newest_rendering_even_when_it_alone_exceeds_the_budget() {
-        let mut cache: Vec<(Key, Surrogate)> = Vec::new();
-        let entry = |name: &str, size: usize| {
-            (
-                Key {
-                    path: PathBuf::from(name),
-                    modified_ms: 0,
-                    size_bytes: 0,
-                },
-                Surrogate {
-                    bytes: Arc::new(vec![0u8; size]),
-                    outline: Vec::new(),
-                    links: Vec::new(),
-                },
-            )
-        };
-        cache.push(entry("novel.epub", 6 * 1024 * 1024));
-        cache.push(entry("comic.cbz", CACHE_BUDGET_BYTES + 1));
-        while cache.len() > 1
-            && cache
-                .iter()
-                .map(|(_, held)| held.bytes.len())
-                .sum::<usize>()
-                > CACHE_BUDGET_BYTES
-        {
-            cache.remove(0);
-        }
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache[0].0.path, PathBuf::from("comic.cbz"));
-    }
-
-    /// And a file this backend does not read at all is refused before anything
-    /// is opened.
-    #[test]
-    fn an_unadmitted_file_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("notes.txt");
-        std::fs::write(&path, b"hello").unwrap();
-        assert!(matches!(surrogate(&path), Err(_)));
-    }
-}
-
 fn lock() -> std::sync::MutexGuard<'static, Vec<(Key, Surrogate)>> {
     CACHE
         .lock()
@@ -324,4 +259,69 @@ fn convert_outline(entries: &[mupdf::Outline]) -> Vec<SurrogateOutline> {
             items: convert_outline(&entry.down),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A PDF already has pages; asking for a rendering of one is a caller
+    /// mistake, and it must say so rather than spend a document's worth of
+    /// work — or fail re-encoding artwork, which is how this was found.
+    #[test]
+    fn a_pdf_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.pdf");
+        std::fs::write(&path, b"%PDF-1.4").unwrap();
+        let error = match surrogate(&path) {
+            Ok(_) => panic!("a PDF must not be rendered to a surrogate"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("is a PDF"), "{error}");
+    }
+
+    /// The budget evicts, but never the rendering just produced: a comic alone
+    /// exceeds it, and dropping it would mean re-rendering the document the
+    /// user is reading on every request for its pages.
+    #[test]
+    fn the_cache_keeps_the_newest_rendering_even_when_it_alone_exceeds_the_budget() {
+        let mut cache: Vec<(Key, Surrogate)> = Vec::new();
+        let entry = |name: &str, size: usize| {
+            (
+                Key {
+                    path: PathBuf::from(name),
+                    modified_ms: 0,
+                    size_bytes: 0,
+                },
+                Surrogate {
+                    bytes: Arc::new(vec![0u8; size]),
+                    outline: Vec::new(),
+                    links: Vec::new(),
+                },
+            )
+        };
+        cache.push(entry("novel.epub", 6 * 1024 * 1024));
+        cache.push(entry("comic.cbz", CACHE_BUDGET_BYTES + 1));
+        while cache.len() > 1
+            && cache
+                .iter()
+                .map(|(_, held)| held.bytes.len())
+                .sum::<usize>()
+                > CACHE_BUDGET_BYTES
+        {
+            cache.remove(0);
+        }
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].0.path, PathBuf::from("comic.cbz"));
+    }
+
+    /// And a file this backend does not read at all is refused before anything
+    /// is opened.
+    #[test]
+    fn an_unadmitted_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        assert!(surrogate(&path).is_err());
+    }
 }

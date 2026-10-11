@@ -599,6 +599,30 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn zz_dump_openalex_request() {
+        let manifest = crate::integrations::builtin::manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "openalex")
+            .unwrap();
+        let controls = manifest.capabilities.browse.unwrap().controls();
+        let request = build_request(
+            &controls,
+            "open-access reviews on CRISPR by Jennifer Doudna since 2020, most cited first",
+            "2026-10-11",
+        )
+        .unwrap();
+        let Constraint::Grammar(grammar) = &request.constraint else { unreachable!() };
+        let out = serde_json::json!({
+            "system": request.system,
+            "prompt": request.prompt,
+            "grammar": grammar,
+            "pattern": json_schema_pattern(grammar).unwrap(),
+        });
+        std::fs::write(std::env::var("DUMP_TO").unwrap(), out.to_string()).unwrap();
+    }
+
+    #[test]
     fn a_provider_that_takes_no_keyword_is_not_offered_one() {
         let mut controls = controls();
         controls.keyword = false;

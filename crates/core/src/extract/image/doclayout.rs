@@ -1562,7 +1562,7 @@ mod tests {
         let mut rows = Vec::new();
         rows.extend(row(INLINE, 0.9, 300.0, 300.0, 400.0, 340.0));
         rows.extend(row(INLINE, 0.9, 400.0, 300.0, 500.0, 340.0));
-        let found = decode(&vec![tile(0, 0, &rows)], &tiled(0.5));
+        let found = decode(&[tile(0, 0, &rows)], &tiled(0.5));
         assert_eq!(found.len(), 2, "{found:?}");
     }
 
@@ -1706,14 +1706,18 @@ mod tests {
     fn the_floor_lies_between_the_two_populations_the_fixture_measured() {
         const LOWEST_LABELLED_PAGE: f32 = 0.3884;
         const HIGHEST_UNLABELLED_PAGE: f32 = 0.0519;
-        assert!(
-            TILE_GATE_FLOOR > HIGHEST_UNLABELLED_PAGE,
-            "a floor at or below {HIGHEST_UNLABELLED_PAGE} gates no prose page and buys nothing"
-        );
-        assert!(
-            TILE_GATE_FLOOR < LOWEST_LABELLED_PAGE,
-            "a floor at or above {LOWEST_LABELLED_PAGE} takes MMET02-01_E#21 off the tiled path"
-        );
+        const {
+            assert!(
+                TILE_GATE_FLOOR > HIGHEST_UNLABELLED_PAGE,
+                "a floor at or below the highest unlabelled page gates no prose page and buys nothing"
+            )
+        };
+        const {
+            assert!(
+                TILE_GATE_FLOOR < LOWEST_LABELLED_PAGE,
+                "a floor at or above the lowest labelled page takes MMET02-01_E#21 off the tiled path"
+            )
+        };
         // And it is the production recipe that carries it. A recipe with the
         // constant defined and unused would be a gate nobody runs.
         assert_eq!(Recipe::PRODUCTION.tile_gate, Some(TILE_GATE_FLOOR));

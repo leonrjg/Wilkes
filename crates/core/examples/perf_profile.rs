@@ -66,8 +66,6 @@ struct Entry {
     pdf: PathBuf,
     /// 0-based, as the fixture records it and as MuPDF's `load_page` wants it.
     page: i32,
-    page_width: f32,
-    page_height: f32,
     boxes: Vec<Label>,
 }
 
@@ -152,12 +150,6 @@ impl Cost {
         self.runs += 1;
     }
 
-    fn merge(&mut self, other: &Cost) {
-        self.wall += other.wall;
-        self.cpu += other.cpu;
-        self.runs += other.runs;
-    }
-
     fn ms(&self) -> f64 {
         self.wall.as_secs_f64() * 1000.0
     }
@@ -197,12 +189,6 @@ impl Ledger {
         let (wall, cpu) = (wall0.elapsed(), cpu_seconds() - cpu0);
         self.at(name).add(wall, cpu);
         out
-    }
-
-    fn merge(&mut self, other: &Ledger) {
-        for (name, cost) in other.order.iter().zip(&other.costs) {
-            self.at(name).merge(cost);
-        }
     }
 
     fn total(&self) -> Cost {
@@ -640,7 +626,7 @@ impl Recognizer {
             let mut flat = Vec::with_capacity(n * width);
             for row in &ids {
                 flat.extend_from_slice(row);
-                flat.extend(std::iter::repeat(texify::EOS_TOKEN).take(width - row.len()));
+                flat.extend(std::iter::repeat_n(texify::EOS_TOKEN, width - row.len()));
             }
             let input = Tensor::from_array((vec![n as i64, width as i64], flat))?;
             let states = Tensor::from_array((shape.clone(), hidden.clone()))?;
@@ -1003,7 +989,7 @@ fn run_group(
             batch,
             &mut ledger,
         )
-        .with_context(|| format!("{}", tag(entry)))?;
+        .with_context(|| tag(entry))?;
         crops += out.crops;
         tokens += out.tokens;
     }

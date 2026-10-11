@@ -262,14 +262,14 @@ pub fn tile_grid(width: u32, height: u32) -> (usize, usize, usize, usize) {
     let (mut w, mut h) = if w0 >= h0 {
         let w = LONGEST_EDGE as f64;
         let mut h = (w / aspect) as usize;
-        if h % 2 != 0 {
+        if !h.is_multiple_of(2) {
             h += 1;
         }
         (LONGEST_EDGE, h)
     } else {
         let h = LONGEST_EDGE as f64;
         let mut w = (h * aspect) as usize;
-        if w % 2 != 0 {
+        if !w.is_multiple_of(2) {
             w += 1;
         }
         (w, LONGEST_EDGE)

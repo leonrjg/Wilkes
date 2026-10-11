@@ -283,15 +283,6 @@ fn count_outline(items: &[mupdf::Outline], depth: usize) -> (usize, usize) {
     (total, deepest)
 }
 
-/// A long, distinctive word to search for. Short words appear everywhere and
-/// would make the comparison meaningless.
-fn longest_word(text: &str) -> Option<String> {
-    text.split(|c: char| !c.is_alphabetic())
-        .filter(|word| word.chars().count() >= 8)
-        .max_by_key(|word| word.chars().count())
-        .map(|word| word.to_string())
-}
-
 /// The text of one page, as the extractor would read it.
 fn page_text(doc: &Document, index: i32) -> Result<String, Box<dyn std::error::Error>> {
     let page = doc.load_page(index)?;
@@ -380,8 +371,6 @@ fn palmdb_report(path: &str) {
 /// the recipe and the admission rules, rather than by calling MuPDF directly.
 /// This is what says the wiring is real and not just the engine's capability.
 fn wilkes_path(path: &str) {
-    use wilkes_core::extract::ContentExtractor;
-
     // Extraction reads the whole document — for a 1,255-page scanned book that
     // is minutes, and the sampled mode exists precisely to avoid it.
     let sampled = std::env::var("PROBE_SAMPLE").is_ok();

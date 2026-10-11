@@ -198,6 +198,27 @@ fn apply_curated_prefixes(model_id: &str, config: &mut EmbedderConfig) {
     }
 }
 
+/// Download all auxiliary config files for `model_id` into `cache_dir`.
+/// Best-effort: individual failures are logged at debug level and never propagate.
+pub fn fetch_aux_configs(cache_dir: &Path, model_id: &str) {
+    let api = match hf_hub::api::sync::ApiBuilder::new()
+        .with_cache_dir(cache_dir.to_path_buf())
+        .build()
+    {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::debug!("Could not initialise HF API for aux config fetch of {model_id}: {e}");
+            return;
+        }
+    };
+    let repo = api.model(model_id.to_string());
+    for (filename, _) in AUX_PARSERS {
+        if let Err(e) = repo.get(filename) {
+            tracing::debug!("Could not fetch {filename} for {model_id}: {e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,26 +449,5 @@ mod tests {
                 .max_sequence_length,
             Some(512)
         );
-    }
-}
-
-/// Download all auxiliary config files for `model_id` into `cache_dir`.
-/// Best-effort: individual failures are logged at debug level and never propagate.
-pub fn fetch_aux_configs(cache_dir: &Path, model_id: &str) {
-    let api = match hf_hub::api::sync::ApiBuilder::new()
-        .with_cache_dir(cache_dir.to_path_buf())
-        .build()
-    {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::debug!("Could not initialise HF API for aux config fetch of {model_id}: {e}");
-            return;
-        }
-    };
-    let repo = api.model(model_id.to_string());
-    for (filename, _) in AUX_PARSERS {
-        if let Err(e) = repo.get(filename) {
-            tracing::debug!("Could not fetch {filename} for {model_id}: {e}");
-        }
     }
 }

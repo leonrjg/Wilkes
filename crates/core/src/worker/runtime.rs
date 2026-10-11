@@ -80,6 +80,7 @@ impl WorkerSession for WorkerProcess {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn supervised_manager_loop(
     paths: WorkerPaths,
     kind: WorkerKind,
@@ -253,6 +254,7 @@ fn restart_runtime_after_panic(
 }
 
 impl WorkerRuntime {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         paths: WorkerPaths,
         rx: mpsc::Receiver<ManagerCommand>,
@@ -689,29 +691,22 @@ mod tests {
         }
     }
 
-    fn test_runtime() -> (
+    type TestRuntime = (
         WorkerRuntime,
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
         mpsc::Sender<ManagerCommand>,
         mpsc::Receiver<ManagerEvent>,
-    ) {
+    );
+
+    fn test_runtime() -> TestRuntime {
         test_runtime_sharing(Arc::new(Semaphore::new(1)))
     }
 
     /// A runtime admitted by a caller-supplied semaphore, so a test can build
     /// two that contend the way two managers of one kind in two workspaces do.
-    fn test_runtime_sharing(
-        residency: Arc<Semaphore>,
-    ) -> (
-        WorkerRuntime,
-        Arc<AtomicUsize>,
-        Arc<AtomicUsize>,
-        Arc<AtomicUsize>,
-        mpsc::Sender<ManagerCommand>,
-        mpsc::Receiver<ManagerEvent>,
-    ) {
+    fn test_runtime_sharing(residency: Arc<Semaphore>) -> TestRuntime {
         let paths = WorkerPaths {
             python_path: std::path::PathBuf::from("python"),
             python_package_dir: std::path::PathBuf::from("pkg"),

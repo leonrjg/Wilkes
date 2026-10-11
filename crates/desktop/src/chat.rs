@@ -186,6 +186,7 @@ fn ensure_conversation(
 }
 
 /// Register an opened session and start forwarding its events.
+#[allow(clippy::too_many_arguments)]
 fn adopt(
     app: &AppHandle,
     session: Arc<ChatSession>,

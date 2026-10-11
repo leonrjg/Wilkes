@@ -13,7 +13,7 @@ use crate::embed::index::{SemanticIndex, SemanticQueryScope};
 use crate::embed::Embedder;
 use crate::generate::tasks::grounded_completion::{generate_and_verify, GroundedCompletionInput};
 use crate::generate::tasks::hypothetical_continuation::hypothetical_continuation_stream;
-use crate::generate::{GenerationTimings, Generator};
+use crate::generate::Generator;
 use crate::types::SourceOrigin;
 
 const DENSE_CANDIDATES: usize = 60;
@@ -547,7 +547,7 @@ pub fn run_completion(
                 request.scope.mode,
                 dependencies.generator.model_id(),
             );
-            tracing::info!(completion_id, mode = ?mode, prompt_format = ?format, scope_mode = ?request.scope.mode, retrieval_scores = ?sources.iter().map(|source| source.score).collect::<Vec<_>>(), model = dependencies.generator.model_id(), timings = ?dependencies.generator.last_timings().unwrap_or_else(GenerationTimings::default), "grounded completion shown");
+            tracing::info!(completion_id, mode = ?mode, prompt_format = ?format, scope_mode = ?request.scope.mode, retrieval_scores = ?sources.iter().map(|source| source.score).collect::<Vec<_>>(), model = dependencies.generator.model_id(), timings = ?dependencies.generator.last_timings().unwrap_or_default(), "grounded completion shown");
             emit(CompletionEvent::Shown { text, mode });
         }
         Err(_reason) if cancelled.load(Ordering::Relaxed) => anyhow::bail!("completion cancelled"),
@@ -562,7 +562,7 @@ pub fn run_completion(
                 scope_mode = ?request.scope.mode,
                 retrieval_scores = ?sources.iter().map(|source| source.score).collect::<Vec<_>>(),
                 model = dependencies.generator.model_id(),
-                timings = ?dependencies.generator.last_timings().unwrap_or_else(GenerationTimings::default),
+                timings = ?dependencies.generator.last_timings().unwrap_or_default(),
                 "grounded completion suppressed"
             );
             emit(CompletionEvent::Suppressed {
@@ -862,6 +862,7 @@ fn cosine(left: &[f32], right: &[f32]) -> f32 {
     left.iter().zip(right).map(|(a, b)| a * b).sum()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fuse_lexical(
     hits: &mut Vec<Hit>,
     prefix: &str,
