@@ -293,6 +293,10 @@ interface CatalogueStore {
   /** Why the last composition could not be made at all. One provider that
    *  could not be composed for is not this: it is one of `composed.failures`. */
   composeError: string | null;
+  /** The request the keyword now searched for was composed from, so the box
+   *  can keep saying what was written while every source is asked `keyword`.
+   *  It describes `query` only while `query` is still that keyword. */
+  composedQuery: { text: string; keyword: string } | null;
   /** Why the last add failed, whichever of its three calls failed. Kept apart
    *  from the search errors so a failed download does not replace the results
    *  the user was choosing from. */
@@ -356,7 +360,8 @@ interface CatalogueStore {
    * Composed for every selected provider that declares something to filter
    * by, each from its own declaration. What comes back is set exactly as a
    * hand-set filter is — it replaces what was set on those providers — and the
-   * subject of the request becomes the keyword every source is searched for.
+   * subject of the request becomes the keyword every source is searched for,
+   * kept beside the request it came from in `composedQuery`.
    *
    * Resolves to whether that happened. When nothing could be composed — or it
    * was stopped, or replaced by a later one — nothing was set and nothing was
@@ -768,6 +773,7 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
   composing: false,
   composed: null,
   composeError: null,
+  composedQuery: null,
   acquireError: null,
   acquired: {},
   adding: {},
@@ -937,7 +943,9 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       // Nothing was composed for anyone: there is no search this describes,
       // and running the sentence as a keyword would not be what was asked.
       if (failures.length === composition.providers.length) return false;
-      await get().search(composition.keyword ?? "");
+      const keyword = composition.keyword ?? "";
+      set({ composedQuery: { text, keyword } });
+      await get().search(keyword);
       return true;
     } catch (e: any) {
       if (request !== composeRequest) return false;
@@ -1180,6 +1188,7 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       composing: false,
       composed: null,
       composeError: null,
+      composedQuery: null,
       literature: null,
       literatureError: null,
       literatureLoading: false,

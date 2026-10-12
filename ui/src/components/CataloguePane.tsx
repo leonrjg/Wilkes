@@ -74,7 +74,17 @@ export default function CataloguePane() {
   const compose = useCatalogueStore((s) => s.compose);
   const generationReady = useGenerationStore((s) => s.ready);
   const { readOnly, needsDirectory } = useCatalogueAdd();
-  const [draft, setDraft] = useState(useCatalogueStore.getState().query);
+  const query = useCatalogueStore((s) => s.query);
+  const composedQuery = useCatalogueStore((s) => s.composedQuery);
+  // The box holds what was written. Where that was a request filters were
+  // composed from, the sources are asked its subject, not the sentence.
+  const [draft, setDraft] = useState(() => {
+    const held = useCatalogueStore.getState();
+    return held.composedQuery !== null && held.composedQuery.keyword === held.query
+      ? held.composedQuery.text
+      : held.query;
+  });
+  const [composeMode, setComposeMode] = useState(false);
 
   // The filter is offered before anything has been asked, so the list it is
   // built from is read when the pane opens rather than from a search.
@@ -92,6 +102,15 @@ export default function CataloguePane() {
       (literatureLoading || literatureError !== null || literature !== null)) ||
     listedAsked;
   const browsable = browseProviderIds(providerOptions);
+  const keyword =
+    composedQuery !== null && composedQuery.text === draft && composedQuery.keyword === query
+      ? composedQuery.keyword
+      : draft;
+  // Composing is offered only where it can do something — the generation
+  // model is ready and a provider declares filters — and is in force only
+  // while it is offered.
+  const composable = generationReady && browsable.length > 0;
+  const composeInForce = composeMode && composable;
 
   return (
     <div className="flex h-full flex-col border-l border-[var(--border-main)] bg-[var(--bg-sidebar)]">
@@ -113,11 +132,12 @@ export default function CataloguePane() {
         className="px-3 py-1.5"
         onSubmit={(e) => {
           e.preventDefault();
-          void runSearch(draft);
+          if (composeInForce && draft.trim() !== "") void compose(draft);
+          else void runSearch(draft);
         }}
       >
         <div className="flex items-stretch gap-1.5">
-          <div className="flex min-w-0 flex-1 items-center gap-1.5 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2">
+          <div className="flex min-w-0 flex-1 items-center gap-1.5 rounded border border-[var(--border-main)] bg-[var(--bg-app)] pl-2 pr-1">
             <Search size={12} className="shrink-0 text-[var(--text-dim)]" />
             <input
               value={draft}
@@ -126,20 +146,14 @@ export default function CataloguePane() {
               aria-label="Search catalogues and literature"
               className="w-full bg-transparent py-1.5 text-[11px] text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
             />
+            {composable && (
+              <ComposeToggle active={composeMode} onToggle={() => setComposeMode(!composeMode)} />
+            )}
           </div>
-          <ComposeButton
-            text={draft}
-            onCompose={async () => {
-              // What was typed was a description; what is searched for now is
-              // its subject, and the box says what is searched for. Where
-              // nothing was composed, what was typed stays.
-              if (await compose(draft)) setDraft(useCatalogueStore.getState().query);
-            }}
-          />
           <FiltersButton />
         </div>
       </form>
-      <RefineBar keyword={draft} options={providerOptions} />
+      <RefineBar keyword={keyword} options={providerOptions} />
       <ComposeStatus />
 
       {(readOnly || needsDirectory) && (
@@ -292,34 +306,31 @@ function Spinner() {
 }
 
 /**
- * Turns what is typed into filters.
+ * Chooses whether what is typed is searched for or composed into filters.
  *
- * Its own button and not a guess about what was typed: Enter searches for the
- * words, as it always has, and a sentence that happens to read like a
- * description is still words someone may have meant to search for. Shown only
- * where it can do something — the generation model is ready and a provider
- * declares filters — and absent otherwise, like every model-dependent control.
- * While it works it is the control that stops it.
+ * A choice held in the box and not a guess about what was typed: with it off
+ * Enter searches for the words, as it always has, and a sentence that happens
+ * to read like a description is still words someone may have meant to search
+ * for. While a composition works it is the control that stops it.
  */
-function ComposeButton({ text, onCompose }: { text: string; onCompose: () => void }) {
-  const ready = useGenerationStore((s) => s.ready);
-  const options = useCatalogueStore((s) => s.providerOptions);
+function ComposeToggle({ active, onToggle }: { active: boolean; onToggle: () => void }) {
   const composing = useCatalogueStore((s) => s.composing);
   const cancel = useCatalogueStore((s) => s.cancelCompose);
-  if (!ready || browseProviderIds(options).length === 0) return null;
-  const label = composing ? "Stop composing filters" : "Compose filters from what you typed";
+  const label = composing ? "Stop composing filters" : "Compose filters from what you type";
   return (
     <button
       type="button"
-      onClick={composing ? cancel : onCompose}
-      disabled={!composing && text.trim() === ""}
+      onClick={composing ? cancel : onToggle}
       aria-label={label}
+      aria-pressed={composing ? undefined : active}
       title={
         composing
           ? label
           : "Describe what you want in a sentence, and the filters are set for you"
       }
-      className="flex shrink-0 items-center rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2 text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)] disabled:opacity-50"
+      className={`inline-flex shrink-0 rounded p-1 transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] ${
+        active ? "bg-[var(--accent-blue-muted)] text-[var(--accent-blue)]" : "text-[var(--text-dim)]"
+      }`}
     >
       {composing ? <Square size={11} /> : <Zap size={11} />}
     </button>

@@ -339,10 +339,10 @@ describe("CataloguePane", () => {
       landing_page_url: "https://ocw.example.invalid/18-06",
       acquisition: "course",
     };
-    providers.mockResolvedValue([catalogue("mit_ocw", "MIT OpenCourseWare", "course")]);
+    providers.mockResolvedValue([catalogue("mit_ocw", "MIT OCW", "course")]);
     literature.mockResolvedValue({
       query: "linear algebra",
-      providers: [{ provider: "mit_ocw", name: "MIT OpenCourseWare", results: [course], error: null }],
+      providers: [{ provider: "mit_ocw", name: "MIT OCW", results: [course], error: null }],
     });
     acquireCourse.mockResolvedValue({
       directory: "/uploads/18-06",
@@ -1252,8 +1252,13 @@ describe("CataloguePane", () => {
   // ── Composing filters from a request in words ────────────────────────────
 
   const REQUEST = "open reviews on CRISPR by Jennifer Doudna since 2020, most cited first";
-  const composeButton = () =>
-    screen.findByRole("button", { name: "Compose filters from what you typed" });
+  const composeToggle = () =>
+    screen.findByRole("button", { name: "Compose filters from what you type" });
+  /** Composing is a choice held in the box: switched on, Enter composes. */
+  const composeSubmit = async () => {
+    fireEvent.click(await composeToggle());
+    fireEvent.submit(searchBox());
+  };
   const typeRequest = (text: string) =>
     fireEvent.change(searchBox(), { target: { value: text } });
   const composition = (
@@ -1307,7 +1312,7 @@ describe("CataloguePane", () => {
     literature.mockResolvedValue(answerOf("semantic_scholar", "Semantic Scholar", []));
     render(<CataloguePane />);
     typeRequest(REQUEST);
-    fireEvent.click(await composeButton());
+    await composeSubmit();
 
     await screen.findByText(`Filters composed from “${REQUEST}”.`);
     // Composed for the provider that declares filters, and no other.
@@ -1324,14 +1329,40 @@ describe("CataloguePane", () => {
     );
     // The provider with no filters is searched for the subject, not the sentence.
     expect(literature).toHaveBeenCalledWith("crispr", 10, ["semantic_scholar"]);
-    // The box says what is searched for now.
-    expect(searchBox()).toHaveProperty("value", "crispr");
+    // The box still says what was written.
+    expect(searchBox()).toHaveProperty("value", REQUEST);
     // And the filters are the ordinary chips, each removable.
     const active = within(screen.getByLabelText("Active filters"));
     expect(active.getByRole("button", { name: "Remove Type: Article" })).toBeTruthy();
     expect(active.getByRole("button", { name: "Remove Open access only" })).toBeTruthy();
     expect(active.getByRole("button", { name: "Remove Year from: 2020" })).toBeTruthy();
     expect(active.getByRole("button", { name: "Remove Sort: Newest first" })).toBeTruthy();
+    // A filter changed by hand afterwards rides beside the subject, not the sentence.
+    fireEvent.click(active.getByRole("button", { name: "Remove Type: Article" }));
+    await waitFor(() =>
+      expect(browse).toHaveBeenLastCalledWith(
+        "openalex",
+        expect.objectContaining({
+          query: "crispr",
+          filters: { open_access: ["true"], year_from: ["2020"] },
+        }),
+      ),
+    );
+  });
+
+  /// The choice is a toggle, not an action: off, Enter searches for the words.
+  it("searches for the words while composing is switched off", async () => {
+    useGenerationStore.setState({ ready: true });
+    render(<CataloguePane />);
+    const toggle = await composeToggle();
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(toggle);
+    typeRequest(REQUEST);
+    fireEvent.submit(searchBox());
+    await waitFor(() => expect(literature).toHaveBeenCalled());
+    expect(composeCall).not.toHaveBeenCalled();
   });
 
   /// A request with no subject is a listing by filters alone, which is what
@@ -1342,12 +1373,12 @@ describe("CataloguePane", () => {
     browse.mockResolvedValue(listing(works(3)));
     render(<CataloguePane />);
     typeRequest("open reviews since 2020");
-    fireEvent.click(await composeButton());
+    await composeSubmit();
     await waitFor(() =>
       expect(browse).toHaveBeenCalledWith("openalex", expect.objectContaining({ query: null })),
     );
     expect(literature).not.toHaveBeenCalled();
-    expect(searchBox()).toHaveProperty("value", "");
+    expect(searchBox()).toHaveProperty("value", "open reviews since 2020");
   });
 
   /// A name the provider did not know is a filter silently missing unless
@@ -1366,7 +1397,7 @@ describe("CataloguePane", () => {
     browse.mockResolvedValue(listing(works(1)));
     render(<CataloguePane />);
     typeRequest(REQUEST);
-    fireEvent.click(await composeButton());
+    await composeSubmit();
     expect(await screen.findByText(/knows no Author called “Nobody Atall”/)).toBeTruthy();
     expect(
       within(screen.getByLabelText("Active filters")).getByRole("button", {
@@ -1385,7 +1416,7 @@ describe("CataloguePane", () => {
     );
     render(<CataloguePane />);
     typeRequest("hello there");
-    fireEvent.click(await composeButton());
+    await composeSubmit();
     expect(
       await screen.findByText(/OpenAlex could not be composed for: nothing in the request/),
     ).toBeTruthy();
@@ -1403,7 +1434,7 @@ describe("CataloguePane", () => {
     composeCall.mockRejectedValue(new Error("Generation is not available"));
     render(<CataloguePane />);
     typeRequest(REQUEST);
-    fireEvent.click(await composeButton());
+    await composeSubmit();
     expect(
       await screen.findByText(/could not be composed: Error: Generation is not available/),
     ).toBeTruthy();
@@ -1420,7 +1451,7 @@ describe("CataloguePane", () => {
     composeCall.mockReturnValue(new Promise((resolve) => { answer = resolve; }));
     render(<CataloguePane />);
     typeRequest(REQUEST);
-    fireEvent.click(await composeButton());
+    await composeSubmit();
     expect(await screen.findByText("Composing filters…")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Stop composing filters" }));
@@ -1442,7 +1473,7 @@ describe("CataloguePane", () => {
     useCatalogueStore.setState({ providers: ["semantic_scholar"] });
     render(<CataloguePane />);
     typeRequest(REQUEST);
-    fireEvent.click(await composeButton());
+    await composeSubmit();
     expect(await screen.findByText(/None of the selected sources can be filtered/)).toBeTruthy();
     expect(composeCall).not.toHaveBeenCalled();
   });
