@@ -421,7 +421,6 @@ function FiltersButton() {
       }`}
     >
       <Sliders size={11} />
-      Filters
       {count > 0 && (
         <span className="rounded-full bg-[var(--accent-blue)] px-1 text-[9px] leading-[14px] text-white">
           {count}
