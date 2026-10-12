@@ -276,6 +276,30 @@ that matches nothing is already left empty. A probe whose example result has
 no file says the resolver was not checked: no step reached a URL, which is
 neither a fault nor evidence.
 
+**A file the result already names.** `url` is one template or a list of two to
+four in order of preference:
+
+```toml
+url = ["{pdf_url}", "{download_url}"]
+```
+
+A template can be written once every value it names is known. The URL is the
+first that can be, and the steps run only while none can — checked before each
+step, so a result that already holds a link costs no request and no
+credential, and a second step is skipped when the first found enough. That is
+the whole rule, and it names no field: it serves an open-access PDF, a landing
+page, or a value an early step happens to find. A single template is no choice
+and every step runs for it, as before. Results are still marked as resolved by
+the provider; resolving one that needs no request simply answers at once, so
+the interface and the agent tool are told the same thing by the same code.
+
+Which template is used is decided by what is known and never by what happened:
+a link that turns out dead fails as a download, and the steps are not then
+run. A field marked `missing = "unavailable"` that matches nothing still ends
+resolution with no file, whatever later templates could be written. `filename`
+is one template written from what is known when the URL is chosen, so one that
+names a step's value needs that step to have run.
+
 An Anna-style provider is therefore expressible without code:
 
 ```toml

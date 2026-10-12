@@ -4,6 +4,16 @@
 
 ### Added
 
+- A manifest can list where a file may be, in order of preference:
+  `url = ["{pdf_url}", "{download_url}"]` under `resolve_download`. The first
+  template whose values are all known is the URL, and the steps run only while
+  none can be written — so a result that already carries a link, such as an
+  open-access PDF, is downloaded from it without a resolver request or a
+  credential being spent, and every other result is resolved as before. A list
+  holds two to four templates. A single template is unchanged: all its steps
+  run. Which template is used is decided by what is known, never by whether a
+  download worked, and a `filename` that names a step's value needs that step
+  to have run.
 - A download step can say that a missing value means "no file". A
   `resolve_download` step field written with `missing = "unavailable"` —
   `md5 = { path = "a[href*='md5=']", attribute = "href", missing = "unavailable" }`

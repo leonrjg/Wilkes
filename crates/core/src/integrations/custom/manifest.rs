@@ -844,12 +844,46 @@ pub struct ReferencesResolve {
 pub struct ResolveDownloadCapability {
     #[serde(default)]
     pub steps: Vec<ResolverStep>,
-    /// A template using result fields and values extracted by prior steps.
-    pub url: String,
+    /// A template using result fields and values extracted by prior steps, or
+    /// several in order of preference. See [`UrlTemplate`].
+    pub url: UrlTemplate,
     /// Optional caller-chosen filename. When absent, the downloader derives
     /// one from the URL and response content type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
+}
+
+/// Where the file is: one template, or the first of several that can be
+/// written.
+///
+/// A template can be written once every value it names is known. A list is
+/// how a manifest says a result may already hold what a step would fetch
+/// (`["{pdf_url}", "{download_url}"]`): the steps run only while none of its
+/// templates can be written, so a result that needs no request costs none.
+/// Nothing is tried and retried — which template is used is decided by what
+/// is known, never by whether a download worked.
+///
+/// A single template is no choice, and every step runs for it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum UrlTemplate {
+    One(String),
+    FirstOf(Vec<String>),
+}
+
+impl UrlTemplate {
+    /// The templates, in order of preference.
+    pub fn alternatives(&self) -> &[String] {
+        match self {
+            Self::One(template) => std::slice::from_ref(template),
+            Self::FirstOf(templates) => templates,
+        }
+    }
+
+    /// Whether the steps stop as soon as a template can be written.
+    pub fn chooses(&self) -> bool {
+        matches!(self, Self::FirstOf(_))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1117,6 +1151,9 @@ const LOOKUP_PLACEHOLDERS: &[&str] = &["doi"];
 const REFERENCES_PLACEHOLDERS: &[&str] = &["doi"];
 const REFERENCES_RESOLVE_PLACEHOLDERS: &[&str] = &["ids", "count"];
 const MAX_RESOLVER_STEPS: usize = 4;
+/// A list of URL templates is a choice, so it has at least two to choose from.
+const MIN_URL_ALTERNATIVES: usize = 2;
+const MAX_URL_ALTERNATIVES: usize = 4;
 pub const MAX_LOOKUP_PATHS: usize = 3;
 pub const MAX_REFERENCE_CHUNK: usize = 100;
 
@@ -1488,7 +1525,9 @@ items = "expression"                  # optional; where the records are
 doi = "expression"                    # JMESPath over one record yielding its DOI (null or a non-DOI leaves the record out)
 
 [capabilities.resolve_download]       # optional; runs only after the user selects a result
-url = "{result_or_step_value}"        # required; HTTP(S) or relative to http.base_url
+url = "{result_or_step_value}"        # required; HTTP(S) or relative to http.base_url. Or a list in order of preference,
+                                      # url = ["{pdf_url}", "{step_value}"]: the first whose values are all known is used, and
+                                      # steps run only while none is, so a result that already holds the URL costs no request
 filename = "{title}.{file_format}"   # optional; sanitized before download
 
 steps = [                             # optional; one inline table per step, in order; never a header per step
@@ -1889,14 +1928,25 @@ impl Manifest {
             }
         }
 
-        problems.extend(template_problems_owned(
-            "resolve_download.url",
-            &resolve.url,
-            &available,
-            false,
-        ));
-        if resolve.url.trim().is_empty() {
-            problems.push("resolve_download.url cannot be empty".to_string());
+        let alternatives = resolve.url.alternatives();
+        if resolve.url.chooses()
+            && !(MIN_URL_ALTERNATIVES..=MAX_URL_ALTERNATIVES).contains(&alternatives.len())
+        {
+            problems.push(format!(
+                "resolve_download.url lists {} templates; a list is {MIN_URL_ALTERNATIVES} to {MAX_URL_ALTERNATIVES}, and one template is written as a string",
+                alternatives.len()
+            ));
+        }
+        for template in alternatives {
+            problems.extend(template_problems_owned(
+                "resolve_download.url",
+                template,
+                &available,
+                false,
+            ));
+            if template.trim().is_empty() {
+                problems.push("resolve_download.url cannot be empty".to_string());
+            }
         }
         if let Some(filename) = &resolve.filename {
             problems.extend(template_problems_owned(
@@ -3065,6 +3115,42 @@ url = "{id}"
         assert!(error.contains("outside 1-100"), "{error}");
         let source = AUTHORING_FULL_EXAMPLE.replace("chunk = 50", "chunk = 0");
         assert!(Manifest::parse(&source).is_err());
+    }
+
+    #[test]
+    fn a_resolver_url_is_one_template_or_a_short_list_of_them() {
+        let with_url = |url: &str| {
+            let from = r#"url = "{download_url}""#;
+            assert!(AUTHORING_HTML_EXAMPLE.contains(from));
+            Manifest::parse(&AUTHORING_HTML_EXAMPLE.replace(from, &format!("url = {url}")))
+        };
+        let listed = with_url(r#"["{pdf_url}", "{download_url}"]"#).unwrap();
+        let url = listed.capabilities.resolve_download.unwrap().url;
+        assert!(url.chooses());
+        assert_eq!(url.alternatives(), ["{pdf_url}", "{download_url}"]);
+
+        for (url, expected) in [
+            (r#"[]"#, "lists 0 templates"),
+            (
+                r#"["{download_url}"]"#,
+                "one template is written as a string",
+            ),
+            (
+                r#"["{id}", "{doi}", "{title}", "{pdf_url}", "{download_url}"]"#,
+                "lists 5 templates",
+            ),
+            (
+                r#"["{pdf_url}", "{nowhere}"]"#,
+                "resolve_download.url: '{nowhere}' is not available here",
+            ),
+            (
+                r#"["{pdf_url}", ""]"#,
+                "resolve_download.url cannot be empty",
+            ),
+        ] {
+            let error = with_url(url).unwrap_err().to_string();
+            assert!(error.contains(expected), "{url}: {error}");
+        }
     }
 
     #[test]

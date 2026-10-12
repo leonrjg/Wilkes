@@ -25,7 +25,7 @@ use serde::Deserialize;
 use super::manifest::{
     Capabilities, FieldSpec, HealthCapability, HttpSpec, Manifest, Missing, ParamValue,
     ResolveDownloadCapability, ResolverStep, ResponseFormat, SearchCapability, SecretRef,
-    MANIFEST_VERSION,
+    UrlTemplate, MANIFEST_VERSION,
 };
 
 const LEGACY_VERSION: u32 = 1;
@@ -280,7 +280,7 @@ fn convert(legacy: V1Manifest) -> anyhow::Result<Manifest> {
                                 })
                             })
                             .collect::<anyhow::Result<Vec<_>>>()?,
-                        url: resolve.url,
+                        url: UrlTemplate::One(resolve.url),
                         filename: resolve.filename,
                     })
                 })

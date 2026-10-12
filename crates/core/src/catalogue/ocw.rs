@@ -279,8 +279,8 @@ async fn read_course_at(
     base: &str,
     progress: Option<&mpsc::Sender<CatalogueCourseProgress>>,
 ) -> anyhow::Result<CourseManifest> {
-    let slug = slug_of(base)
-        .ok_or_else(|| anyhow::anyhow!("MIT OCW URL names no course: {base}"))?;
+    let slug =
+        slug_of(base).ok_or_else(|| anyhow::anyhow!("MIT OCW URL names no course: {base}"))?;
 
     let course: RawCourse = http.get_json(format!("{base}/data.json"), &[]).await?;
     let map: HashMap<String, String> = http

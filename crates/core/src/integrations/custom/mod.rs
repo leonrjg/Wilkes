@@ -1116,7 +1116,13 @@ impl CustomSource {
         };
 
         let mut values = result_values(result);
+        let alternatives = resolve.url.alternatives();
         for (index, step) in resolve.steps.iter().enumerate() {
+            // A manifest that lists where the file may be needs no more
+            // requests once one of those places is known.
+            if resolve.url.chooses() && writable(alternatives, &values).is_some() {
+                break;
+            }
             let path = substitute_values(&step.path, &values, Substitution::UrlComponent)
                 .map_err(|error| anyhow::anyhow!("resolver step {}: {error}", index + 1))?;
             let step_base_url = self.resolver_step_base_url(step).map_err(|error| {
@@ -1156,7 +1162,17 @@ impl CustomSource {
             }
         }
 
-        let rendered = substitute_values(&resolve.url, &values, Substitution::ExactRawOtherwiseUrl)
+        let template = match writable(alternatives, &values) {
+            Some(template) => template,
+            // One template names the value it lacks when it is written below;
+            // several have no single value to name.
+            None if !resolve.url.chooses() => &alternatives[0],
+            None => anyhow::bail!(
+                "resolve_download.url: none of its templates can be written from what is known: {}",
+                alternatives.join(", ")
+            ),
+        };
+        let rendered = substitute_values(template, &values, Substitution::ExactRawOtherwiseUrl)
             .map_err(|error| anyhow::anyhow!("resolve_download.url: {error}"))?;
         let url = match Url::parse(&rendered) {
             Ok(url) => url,
@@ -1625,6 +1641,17 @@ fn result_values(result: &LiteratureSearchResult) -> HashMap<String, String> {
         values.insert("citation_count".to_string(), count.to_string());
     }
     values
+}
+
+/// The first template every placeholder of which has a value.
+fn writable<'a>(templates: &'a [String], values: &HashMap<String, String>) -> Option<&'a String> {
+    templates.iter().find(|template| {
+        template
+            .split('{')
+            .skip(1)
+            .filter_map(|after| after.split_once('}'))
+            .all(|(name, _)| values.contains_key(name))
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -3394,6 +3421,87 @@ doi = "doi"
         .to_string();
         assert!(error.contains("field 'md5'"), "{error}");
         assert!(error.contains("capture group 1 matched nothing"), "{error}");
+    }
+
+    /// Anna's one result resolved under `url`, and how often the resolver's
+    /// page was asked for.
+    async fn resolve_with_url(
+        url: &str,
+        page_requests: usize,
+    ) -> anyhow::Result<Option<ResolvedLiteratureDownload>> {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/search")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(ANNA_BODY)
+            .create_async()
+            .await;
+        let page = server
+            .mock("GET", "/scidb")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(PAGE_WITH_FILE)
+            .expect(page_requests)
+            .create_async()
+            .await;
+        let manifest = page_resolver(MD5_OR_UNAVAILABLE);
+        assert!(manifest.contains(r#"url = "/get/{md5}""#));
+        let manifest = manifest.replace(r#"url = "/get/{md5}""#, &format!("url = {url}"));
+        let anna = source(&manifest, &server.url(), &[]);
+        let book = anna.search("graph networks", 1, 1).await.unwrap().remove(0);
+        let resolved = anna.resolve_download(&book).await;
+        page.assert_async().await;
+        resolved
+    }
+
+    /// The result already holds a place the file may be, so nothing is asked.
+    #[tokio::test]
+    async fn a_listed_url_the_result_already_holds_costs_no_request() {
+        let download = resolve_with_url(r#"["{landing_page_url}", "/get/{md5}"]"#, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(download.url.ends_with("/md5/deadbeef"), "{}", download.url);
+    }
+
+    /// Anna's results carry no `pdf_url`, so the step is what finds the file.
+    #[tokio::test]
+    async fn steps_run_while_no_listed_url_can_be_written() {
+        let download = resolve_with_url(r#"["{pdf_url}", "/get/{md5}"]"#, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            download
+                .url
+                .ends_with("/get/0123456789abcdef0123456789ABCDEF"),
+            "{}",
+            download.url
+        );
+    }
+
+    /// One template is no choice: its steps run although it names nothing
+    /// they find, as they always have.
+    #[tokio::test]
+    async fn a_single_url_runs_every_step() {
+        let download = resolve_with_url(r#""{landing_page_url}""#, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(download.url.ends_with("/md5/deadbeef"), "{}", download.url);
+    }
+
+    #[tokio::test]
+    async fn a_list_none_of_which_can_be_written_says_so() {
+        let error = resolve_with_url(r#"["{pdf_url}", "{doi}"]"#, 1)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "resolve_download.url: none of its templates can be written from what is known: {pdf_url}, {doi}"
+        );
     }
 
     #[tokio::test]

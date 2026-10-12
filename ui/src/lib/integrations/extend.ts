@@ -42,9 +42,10 @@ export function extendingManifest(
     lines.push(
       "",
       `## Add what ${base.name} does not do. A download step for its results reads a`,
-      "## result's fields, such as {doi}, and what earlier steps found:",
+      "## result's fields, such as {doi}, and what earlier steps found. Listing the",
+      "## result's own {pdf_url} first uses it where there is one, with no request:",
       "## [capabilities.resolve_download]",
-      '## url = "{download_url}"',
+      '## url = ["{pdf_url}", "{download_url}"]',
       "## steps = [",
       '##   { base_url = "https://files.example", path = "/by-doi?doi={doi}", fields = { download_url = "url" } },',
       "## ]",
