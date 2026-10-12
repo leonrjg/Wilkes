@@ -4,6 +4,19 @@
 
 ### Added
 
+- A custom integration can extend another provider instead of repeating it.
+  `extends = { provider = "openalex", capabilities = ["search", "browse"] }`
+  takes those capabilities whole — every OpenAlex filter, as shipped and as
+  later releases change it — and the manifest declares only what it adds, such
+  as a `resolve_download` step. A shipped provider or one you wrote
+  (`custom:<id>`) can be extended, from an "Extend" button on its tab or row.
+  The extending manifest has no `[http]`: it reaches the provider's origin,
+  including a mirror or proxy you set, with that provider's secrets, which stay
+  set there. Nothing is taken that is not listed, a capability is either taken
+  or declared and never both, a provider that itself extends cannot be
+  extended, and one that another extends cannot be removed. Literature
+  providers report `extendable`, and a manifest summary reports `extends` and
+  `result_fields`.
 - Filters from a sentence. With a generation model ready, type what you want
   into the literature pane — "open-access reviews on CRISPR by Jennifer Doudna
   since 2020, most cited first" — and press the lightning button: the filters

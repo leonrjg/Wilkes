@@ -335,8 +335,11 @@ async fn literature_provider_lookup_for_ctx(
         .map_err(|e| e.to_string())
 }
 
-fn custom_integration_summary_for_ctx(ctx: Arc<AppContext>, manifest: String) -> ManifestSummary {
-    ctx.custom_integration_summary(manifest)
+async fn custom_integration_summary_for_ctx(
+    ctx: Arc<AppContext>,
+    manifest: String,
+) -> ManifestSummary {
+    ctx.custom_integration_summary(manifest).await
 }
 
 async fn custom_integration_probe_for_ctx(
@@ -1729,8 +1732,8 @@ async fn zotero_generate_citation(path: String, app: AppHandle) -> Result<Citati
 }
 
 #[tauri::command]
-fn custom_integration_summary(manifest: String, app: AppHandle) -> ManifestSummary {
-    custom_integration_summary_for_ctx(app_context(&app), manifest)
+async fn custom_integration_summary(manifest: String, app: AppHandle) -> ManifestSummary {
+    custom_integration_summary_for_ctx(app_context(&app), manifest).await
 }
 
 #[tauri::command]

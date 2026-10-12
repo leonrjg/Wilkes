@@ -570,7 +570,8 @@ loop a manifest controls.
 
 **Every capability but `health` requires `search`**, for the reason
 `resolve_download` always did: each works on what search returns or on a work a
-search result names.
+search result names. A manifest that extends another provider (§17) may take its
+`search` rather than declare one.
 
 
 ## 15. Layout: one header per map, one line per entry
@@ -736,3 +737,89 @@ updated-date filters need a paid plan.
 **Migration.** There is none: `kind` is refused, with no fallback. `browse`
 shipped one commit earlier, so this reached the shipped OpenAlex manifest and
 whatever a user had written since.
+
+## 17. Extending a provider
+
+**The invariant.** A capability has exactly one author. Wanting OpenAlex's
+filters with a download step of one's own used to mean pasting OpenAlex's
+manifest into a second one, which is a second author for forty-eight filters
+and is out of date at the next release that adds a forty-ninth.
+
+**The change.** A manifest may name one provider and the capabilities it takes
+from it, and declare the rest:
+
+```toml
+manifest_version = 2
+id = "openalex-files"
+name = "OpenAlex with downloads"
+extends = { provider = "openalex", capabilities = ["health", "search", "browse"] }
+
+[capabilities.resolve_download]
+url = "{download_url}"
+steps = [
+  { base_url = "https://files.example", path = "/by-doi?doi={doi}", query = { key = { secret = "files_key" } }, fields = { download_url = "url" } },
+]
+```
+
+**One place knows.** `Manifest::resolve` reads the written form, asks a `Bases`
+for the provider named, and returns an ordinary `Manifest`: the base's `http`,
+the capabilities taken from it, the ones declared. The engine, validation, the
+probe, `origins()`, the filter panel and the agent tool read that and nothing
+else, so none of them changed and none can tell a derived provider from one
+written out in full. `Manifest::parse` reads a manifest that stands on its own
+and refuses one that extends. `IntegrationsSettings` is the `Bases` every
+caller uses — the registry, the save check, the summary and the probe.
+
+**The rules, and what each is for.**
+
+- **Whole capabilities.** `browse` is a path, a separator, modes and filters
+  that mean something only together. A capability is taken or declared;
+  naming one in both is refused, and there is no merging into one.
+- **Named, not implied.** Only the capabilities listed are taken. Taking all of
+  them would make a derived OpenAlex one more provider asked for every
+  document's DOI, and a base that gains a capability would hand it to manifests
+  that never asked. The draft the interface starts from leaves `lookup` and
+  `references` out for the first reason and says so.
+- **No `[http]`.** Every path taken is relative to the base's origin, so the
+  origin and what identifies a request to it are the base's. What the manifest
+  adds runs against that origin too; a resolver step reaches another through
+  its own `base_url`, `headers` and `query`, as it always could.
+- **The base's installation state stays the base's.** The origin is the one the
+  user moved the base to, if they did, and the secrets are the base's own
+  values, sent where the base would send them. A derived provider stores and
+  is asked for only the secrets it names itself, and naming one the base names
+  is refused. Otherwise an OpenAlex behind a proxy would have a twin that went
+  around it.
+- **One level.** A base stands on its own. A manifest that extends cannot be
+  extended, so there is no chain to follow and no cycle to detect.
+- **A description, not a provider.** Whether the base is switched on is not
+  asked. Switching the shipped OpenAlex off and its derived twin on is how one
+  list of results is kept from being two.
+
+**What falls out of what was already there.** The save check loads every
+custom manifest, so removing a provider that another extends is refused by
+name. `IntegrationRegistry::fingerprints` includes the resolved manifest and
+the base's secrets, so moving the base or changing its secret drops the derived
+provider's cached records exactly as it drops the base's. A shipped manifest
+that changes in a release changes every manifest that extends it; one that
+loses a capability a manifest takes leaves that manifest unloadable, named in
+the log, like any other the build can no longer read.
+
+**The interface.** `literature_providers` reports `extendable`, the
+capabilities a manifest may take from each provider — answered by the same
+`Bases` lookup, so what is offered and what is accepted cannot disagree. An
+"Extend" button on a shipped provider's tab, or a custom provider's row, opens
+the editor on a manifest that takes them. The summary names the provider
+extended, what is taken, and the result fields its search fills, which are what
+a download step can count on.
+
+**Not covered, deliberately.**
+
+- **Taking from two providers** — OpenAlex's search with another provider's
+  resolver. A resolver whose steps name no `base_url` runs against its own
+  provider's origin with that provider's identification, so taking it means
+  rewriting it; a second design.
+- **Changing part of a capability** — one more filter, one field mapped
+  differently. That is a second author for the capability.
+- **A result that already has a `pdf_url`.** A provider that declares
+  `resolve_download` resolves every result through it, as before.

@@ -31,9 +31,9 @@ use url::Url;
 
 use self::expr::{Evaluator, Projected};
 use self::manifest::{
-    lookup_field_type, search_field_type, BrowseCapability, FieldSpec, FieldType, LookupCapability,
-    Manifest, ParamValue, ReferencesCapability, ResolverStep, ResponseFormat, SearchCapability,
-    ValueRule, MAX_FILTER_VALUES, MAX_SUGGESTIONS, MIN_SUGGEST_CHARS,
+    lookup_field_type, search_field_type, Bases, BrowseCapability, FieldSpec, FieldType,
+    LookupCapability, Manifest, ParamValue, ReferencesCapability, ResolverStep, ResponseFormat,
+    SearchCapability, ValueRule, MAX_FILTER_VALUES, MAX_SUGGESTIONS, MIN_SUGGEST_CHARS,
 };
 use crate::integrations::{LiteratureSource, ProviderCapabilities};
 use crate::metadata::doi::normalize_doi;
@@ -85,20 +85,43 @@ pub struct CustomSource {
 }
 
 impl CustomSource {
-    pub fn from_config(config: &CustomIntegrationConfig) -> anyhow::Result<Self> {
-        let manifest = Manifest::parse(&config.manifest)?;
-        anyhow::ensure!(
-            manifest.id == config.id,
-            "stored id '{}' does not match the manifest's id '{}'",
-            config.id,
-            manifest.id
-        );
-        Self::build(
-            manifest,
+    pub fn from_config(
+        config: &CustomIntegrationConfig,
+        bases: &dyn Bases,
+    ) -> anyhow::Result<Self> {
+        let source = Self::from_draft(
+            &config.manifest,
             config.secrets.clone(),
             config.name.clone(),
-            Standing::Custom,
-        )
+            bases,
+        )?;
+        anyhow::ensure!(
+            source.manifest.id == config.id,
+            "stored id '{}' does not match the manifest's id '{}'",
+            config.id,
+            source.manifest.id
+        );
+        Ok(source)
+    }
+
+    /// A provider from a manifest as the user wrote it, saved or not.
+    ///
+    /// One that extends another provider is asked with that provider's secrets
+    /// beside its own, since it sends them to the same origin for the same
+    /// reason; a name the base uses is the base's, which reading the manifest
+    /// has already enforced.
+    pub fn from_draft(
+        manifest: &str,
+        mut secrets: HashMap<String, String>,
+        name: Option<String>,
+        bases: &dyn Bases,
+    ) -> anyhow::Result<Self> {
+        let resolved = Manifest::resolve(manifest, bases)?;
+        if let Some(inherited) = resolved.inherited {
+            secrets.retain(|name, _| !inherited.secrets_named.contains(name));
+            secrets.extend(inherited.secrets);
+        }
+        Self::build(resolved.manifest, secrets, name, Standing::Custom)
     }
 
     pub fn new(manifest: Manifest, secrets: HashMap<String, String>) -> anyhow::Result<Self> {
@@ -2016,7 +2039,9 @@ filename = "{title}"
             manifest: KEYED_MANIFEST.replace("BASE_URL", "https://example.test"),
             secrets: HashMap::new(),
         };
-        let source = CustomSource::from_config(&config).expect("loads");
+        let source =
+            CustomSource::from_config(&config, &crate::types::IntegrationsSettings::default())
+                .expect("loads");
         assert_eq!(source.name(), "My Keyed");
         // The id is the manifest's and is untouched by a rename: it is what
         // every stored selection and every log line names.
@@ -2034,7 +2059,9 @@ filename = "{title}"
                 manifest: KEYED_MANIFEST.replace("BASE_URL", "https://example.test"),
                 secrets: HashMap::new(),
             };
-            let source = CustomSource::from_config(&config).expect("loads");
+            let source =
+                CustomSource::from_config(&config, &crate::types::IntegrationsSettings::default())
+                    .expect("loads");
             assert_eq!(source.name(), "Keyed");
         }
     }

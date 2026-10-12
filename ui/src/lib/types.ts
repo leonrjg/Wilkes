@@ -990,6 +990,12 @@ export interface ManifestSummary {
   optional_secrets: string[];
   /** Every secret, once, as a form needs to render it. */
   secrets: SecretSlot[];
+  /** The provider this manifest extends, and the capabilities it takes from
+   *  it. That provider's secrets are not in `secrets`: they are set on it. */
+  extends?: { provider: string; name: string; capabilities: string[] } | null;
+  /** The result fields the manifest's search fills: what a download step can
+   *  count on finding in a result. */
+  result_fields?: string[];
   /** Empty when valid. Every problem at once, never just the first. */
   problems: string[];
   /** When the manifest was written before version 2, the same manifest as
@@ -1233,6 +1239,9 @@ export interface LiteratureProviderInfo {
   /** Null for a provider asked over the network. For a mirrored one, `enabled`
    *  follows from it: it is on once it has been fetched. */
   mirror: MirrorStatus | null;
+  /** The capabilities a manifest may take from this provider by extending it.
+   *  Empty for one that cannot be extended. */
+  extendable?: string[];
 }
 
 export interface LiteratureSearchResponse {

@@ -21,8 +21,7 @@ use serde::Serialize;
 use wilkes_core::catalogue::{mirrored_sources, CatalogueStore};
 use wilkes_core::generate::tasks::browse_request::compose_browse_request;
 use wilkes_core::generate::Generator;
-use wilkes_core::integrations::custom::manifest::SecretSlot;
-use wilkes_core::integrations::custom::manifest::MIN_SUGGEST_CHARS;
+use wilkes_core::integrations::custom::manifest::{Bases, SecretSlot, MIN_SUGGEST_CHARS};
 use wilkes_core::integrations::{builtin, IntegrationRegistry, ProviderCapabilities};
 use wilkes_core::metadata::cache::MetadataCache;
 use wilkes_core::metadata::doi::normalize_doi;
@@ -94,6 +93,10 @@ pub struct LiteratureProviderInfo {
     /// for one that is asked over the network. `enabled` follows from it: a
     /// mirrored provider is on once it has been fetched.
     pub mirror: Option<MirrorStatus>,
+    /// The capabilities a manifest may take from this provider by extending
+    /// it. Empty for one that cannot be extended: a catalogue, or a provider
+    /// that itself extends another.
+    pub extendable: Vec<String>,
 }
 
 /// Every provider this installation knows, in registry order, each saying
@@ -130,6 +133,19 @@ pub fn providers(
                 .iter()
                 .find(|(id, _)| id == entry.id())
                 .map(|(_, status)| status.clone()),
+            // The same question a manifest that extends asks, so the offer
+            // and the rule cannot disagree.
+            extendable: settings
+                .base(entry.id())
+                .map(|base| {
+                    base.manifest
+                        .capabilities
+                        .declared()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
         .collect()
 }
@@ -910,6 +926,7 @@ mod tests {
         assert!(mirror.synced_at_ms.is_some());
         // No manifest, so nothing to configure: no secrets, no origin to move.
         assert!(held.secrets.is_empty() && held.default_base_url.is_none());
+        assert!(held.extendable.is_empty(), "a catalogue is not a manifest");
 
         let unfetched = listed
             .iter()
@@ -972,6 +989,10 @@ mod tests {
         assert_eq!(openalex.secrets.len(), 1);
         assert_eq!(openalex.secrets[0].name, "email");
         assert!(openalex.secrets[0].optional);
+        assert_eq!(
+            openalex.extendable,
+            vec!["search", "browse", "health", "lookup", "references"]
+        );
 
         let semantic = listed
             .iter()

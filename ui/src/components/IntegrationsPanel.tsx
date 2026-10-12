@@ -40,7 +40,10 @@ export default function IntegrationsPanel({
   onUpdate,
 }: IntegrationsPanelProps) {
   const [active, setActive] = useState<string>(ZOTERO_ROW.key);
-  const [shipped, setShipped] = useState<LiteratureProviderInfo[]>([]);
+  const [providers, setProviders] = useState<LiteratureProviderInfo[]>([]);
+  /** The provider whose "Extend" was pressed on its own tab, carried to the
+   *  custom tab, which is where a manifest is written. */
+  const [extending, setExtending] = useState<LiteratureProviderInfo | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const custom = settings.integrations?.custom ?? [];
 
@@ -48,9 +51,9 @@ export default function IntegrationsPanel({
     (cancelled: () => boolean = () => false) =>
       api
         .literatureProviders()
-        .then((providers) => {
+        .then((listed) => {
           if (cancelled()) return;
-          setShipped(providers.filter((provider) => provider.builtin));
+          setProviders(listed);
           setListError(null);
         })
         .catch((error: unknown) => {
@@ -62,13 +65,20 @@ export default function IntegrationsPanel({
     [api],
   );
 
+  // Listed again when the integrations change: a provider the user just wrote
+  // is one that can be extended.
   useEffect(() => {
     let cancelled = false;
     void list(() => cancelled);
     return () => {
       cancelled = true;
     };
-  }, [list]);
+  }, [list, settings.integrations]);
+
+  const shipped = useMemo(
+    () => providers.filter((provider) => provider.builtin),
+    [providers],
+  );
 
   const mirrored = shipped.filter((provider) => provider.capabilities.mirrored);
   const rows = useMemo(
@@ -107,6 +117,10 @@ export default function IntegrationsPanel({
   ];
 
   const activeRow = rows.find((row) => row.key === active);
+  const activeProvider = shipped.find(
+    (provider) =>
+      provider.provider === activeRow?.key && (provider.extendable?.length ?? 0) > 0,
+  );
 
   return (
     <div className="space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300 p-1">
@@ -121,7 +135,10 @@ export default function IntegrationsPanel({
             type="button"
             role="tab"
             aria-selected={active === tab.id}
-            onClick={() => setActive(tab.id)}
+            onClick={() => {
+              setActive(tab.id);
+              setExtending(null);
+            }}
             className={`flex items-center gap-1.5 px-3 py-1.5 -mb-px text-xs border-b-2 transition-colors ${
               active === tab.id
                 ? "border-[var(--accent-blue)] text-[var(--text-main)] font-medium"
@@ -153,11 +170,24 @@ export default function IntegrationsPanel({
             api={api}
             settings={settings}
             onUpdate={onUpdate}
+            onExtend={
+              activeProvider &&
+              (() => {
+                setExtending(activeProvider);
+                setActive(CUSTOM_TAB);
+              })
+            }
           />
         ) : active === CATALOGUES_TAB ? (
           <CataloguePanel api={api} onChanged={() => void list()} />
         ) : (
-          <CustomIntegrations api={api} settings={settings} onUpdate={onUpdate} />
+          <CustomIntegrations
+            api={api}
+            settings={settings}
+            onUpdate={onUpdate}
+            providers={providers}
+            extending={extending}
+          />
         )}
       </div>
     </div>

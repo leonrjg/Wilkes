@@ -67,7 +67,11 @@ pub async fn update_settings(path: &Path, patch: serde_json::Value) -> anyhow::R
 fn validate_custom_integrations(settings: &Settings) -> anyhow::Result<()> {
     let mut seen: Vec<&str> = Vec::new();
     for config in &settings.integrations.custom {
-        wilkes_core::integrations::custom::CustomSource::from_config(config).map_err(|error| {
+        wilkes_core::integrations::custom::CustomSource::from_config(
+            config,
+            &settings.integrations,
+        )
+        .map_err(|error| {
             anyhow::anyhow!(
                 "custom integration '{}' cannot be saved: {error}",
                 config.id
@@ -364,6 +368,51 @@ doi = { path = "DOI", coerce = "normalize_doi" }
             .unwrap_err()
             .to_string();
         assert!(error.contains("does not match"), "{error}");
+    }
+
+    /// A provider another one extends cannot be removed from under it: the
+    /// save that would leave the second unloadable is the save that is refused.
+    #[tokio::test]
+    async fn a_provider_that_another_extends_cannot_be_removed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let derived = r#"
+manifest_version = 2
+id = "crossref-more"
+name = "Crossref, checked"
+extends = { provider = "custom:crossref", capabilities = ["search"] }
+[capabilities.health]
+path = "/works?rows=0"
+"#;
+        let base = serde_json::json!({"id": "crossref", "enabled": true, "manifest": VALID_MANIFEST, "secrets": {}});
+        let extending = serde_json::json!({"id": "crossref-more", "enabled": true, "manifest": derived, "secrets": {}});
+
+        update_settings(
+            &path,
+            serde_json::json!({"integrations": {"custom": [base, extending.clone()]}}),
+        )
+        .await
+        .unwrap();
+
+        let error = update_settings(
+            &path,
+            serde_json::json!({"integrations": {"custom": [extending]}}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("custom integration 'crossref-more' cannot be saved"),
+            "{error}"
+        );
+        assert!(
+            error.contains("'custom:crossref', which is not a provider here"),
+            "{error}"
+        );
+        assert_eq!(
+            get_settings(&path).await.unwrap().integrations.custom.len(),
+            2
+        );
     }
 
     #[tokio::test]

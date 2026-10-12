@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type {
   CustomIntegrationConfig,
   IntegrationStatus,
+  LiteratureProviderInfo,
   ManifestSummary,
   ProbeReport,
   Settings,
@@ -14,6 +15,7 @@ import {
   GHOST_BUTTON_CLASS,
   INPUT_CLASS,
 } from "../lib/integrations/styles";
+import { extendingManifest } from "../lib/integrations/extend";
 import type { SearchApi } from "../services/api";
 import { CopyButton } from "./CopyButton";
 
@@ -21,6 +23,12 @@ interface CustomIntegrationsProps {
   api: SearchApi;
   settings: Settings;
   onUpdate: (patch: Partial<Settings>) => Promise<void> | void;
+  /** Every provider the backend lists, which is where a row learns whether it
+   *  can be extended and what there is to take from it. */
+  providers?: LiteratureProviderInfo[];
+  /** A provider the user asked to extend from its own tab: the editor opens
+   *  on a manifest that takes that provider's capabilities. */
+  extending?: LiteratureProviderInfo | null;
 }
 
 const INITIAL_PROBE_QUERY = "graph neural networks";
@@ -90,13 +98,22 @@ export default function CustomIntegrations({
   api,
   settings,
   onUpdate,
+  providers = [],
+  extending = null,
 }: CustomIntegrationsProps) {
   const configured = useMemo(
     () => settings.integrations?.custom ?? [],
     [settings.integrations],
   );
 
-  const [draft, setDraft] = useState<string | null>(null);
+  const [draft, setDraft] = useState<string | null>(() =>
+    extending
+      ? extendingManifest(
+          extending,
+          configured.map((config) => config.id),
+        )
+      : null,
+  );
   const [editingId, setEditingId] = useState<string | null>(null);
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [probeQuery, setProbeQuery] = useState(INITIAL_PROBE_QUERY);
@@ -164,6 +181,25 @@ export default function CustomIntegrations({
     setReport(null);
     setSaveError(null);
   };
+
+  /** Opens the editor on a new manifest that takes `base`'s capabilities. The
+   *  capabilities themselves stay where they are written: in `base`. */
+  const extend = (base: LiteratureProviderInfo) => {
+    openEditor();
+    setDraft(
+      extendingManifest(
+        base,
+        configured.map((config) => config.id),
+      ),
+    );
+  };
+
+  const extendable = (config: CustomIntegrationConfig) =>
+    providers.find(
+      (provider) =>
+        provider.provider === `custom:${config.id}` &&
+        (provider.extendable?.length ?? 0) > 0,
+    );
 
   const closeEditor = () => {
     setDraft(null);
@@ -396,6 +432,15 @@ export default function CustomIntegrations({
                   >
                     Edit
                   </button>
+                  {extendable(config) && (
+                    <button
+                      type="button"
+                      onClick={() => extend(extendable(config)!)}
+                      className={GHOST_BUTTON_CLASS}
+                    >
+                      Extend
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => remove(config)}
@@ -511,6 +556,28 @@ export default function CustomIntegrations({
                   <dt className="text-[var(--text-dim)]">Capabilities</dt>
                   <dd>{summary.capabilities.join(", ") || "none"}</dd>
                 </div>
+                {/* What is another provider's is said apart from what is this
+                    manifest's own, and its secrets are not asked for here. */}
+                {summary.extends && (
+                  <>
+                    <div className="flex gap-2">
+                      <dt className="text-[var(--text-dim)]">Extends</dt>
+                      <dd>
+                        {summary.extends.name} ({summary.extends.provider}), taking{" "}
+                        {summary.extends.capabilities.join(", ")}. Its origin and
+                        secrets are set on {summary.extends.name}.
+                      </dd>
+                    </div>
+                    {(summary.result_fields?.length ?? 0) > 0 && (
+                      <div className="flex gap-2">
+                        <dt className="text-[var(--text-dim)]">Result fields</dt>
+                        <dd className="font-mono">
+                          {summary.result_fields?.join(", ")}
+                        </dd>
+                      </div>
+                    )}
+                  </>
+                )}
               </dl>
 
               {summary.secrets.map((slot) => (

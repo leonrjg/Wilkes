@@ -4426,7 +4426,7 @@ doi = { path = "DOI", coerce = "normalize_doi" }
             config.manifest
         );
         // The rewrite is a manifest the engine loads.
-        crate::integrations::custom::CustomSource::from_config(config).unwrap();
+        crate::integrations::custom::CustomSource::from_config(config, &settings).unwrap();
     }
 
     #[test]

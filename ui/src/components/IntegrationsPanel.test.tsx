@@ -335,6 +335,43 @@ describe("IntegrationsPanel", () => {
     });
   });
 
+  it("starts a manifest that extends a shipped provider from that provider's tab", async () => {
+    const openalex: LiteratureProviderInfo = {
+      ...OPENALEX,
+      extendable: ["search", "browse", "health", "lookup", "references"],
+    };
+    const api = apiWith({
+      literatureProviders: vi.fn().mockResolvedValue([SEMANTIC_SCHOLAR, openalex]),
+    });
+    const onUpdate = await panel(api, settings(false));
+
+    // One that reports nothing to take offers nothing.
+    fireEvent.click(screen.getByRole("tab", { name: /Semantic Scholar/ }));
+    expect(screen.queryByRole("button", { name: "Extend" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: /OpenAlex/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Extend" }));
+
+    expect(screen.getByRole("tab", { name: /Custom/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    const manifest = (screen.getByLabelText("Manifest") as HTMLTextAreaElement).value;
+    // It names the capabilities and repeats none of them: no filter of
+    // OpenAlex's is written here to go stale.
+    expect(manifest).toContain(
+      'extends = { provider = "openalex", capabilities = ["search", "browse", "health"] }',
+    );
+    expect(manifest).not.toMatch(/^\[http\]/m);
+    expect(manifest).not.toMatch(/^\[capabilities/m);
+    expect(onUpdate).not.toHaveBeenCalled();
+
+    // Leaving the tab leaves the draft: coming back is not extending again.
+    fireEvent.click(screen.getByRole("tab", { name: /OpenAlex/ }));
+    fireEvent.click(screen.getByRole("tab", { name: /Custom/ }));
+    expect(screen.queryByLabelText("Manifest")).not.toBeInTheDocument();
+  });
+
   it("does not make a tab of a provider the user wrote", async () => {
     await panel(apiWith(), settings(false));
     expect(screen.queryByRole("tab", { name: /Crossref/ })).not.toBeInTheDocument();

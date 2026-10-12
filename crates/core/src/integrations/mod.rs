@@ -29,15 +29,15 @@ use serde::{Deserialize, Serialize};
 use crate::catalogue::{mirrored_sources, CatalogueStore};
 
 use crate::types::{
-    BrowsePage, BrowseRequest, FilterSuggestion, IntegrationStatus, IntegrationsSettings,
-    LiteratureSearchResult, ProviderWork, ResolvedLiteratureDownload,
+    BrowsePage, BrowseRequest, BuiltinProviderState, FilterSuggestion, IntegrationStatus,
+    IntegrationsSettings, LiteratureSearchResult, ProviderWork, ResolvedLiteratureDownload,
 };
 
 pub mod builtin;
 pub mod custom;
 pub mod zotero;
 
-use custom::manifest::{BrowseControls, Manifest};
+use custom::manifest::{Base, Bases, BrowseControls, Manifest};
 use custom::{CustomSource, Standing};
 
 /// What a provider can do beyond keyword search, for a caller that has to offer
@@ -150,6 +150,94 @@ pub trait LiteratureSource: Send + Sync {
     async fn status(&self, enabled: bool) -> anyhow::Result<IntegrationStatus>;
 }
 
+/// The shipped manifests as this installation reaches them: each beside the
+/// user's part of it, with a mirror or proxy the user chose already in place
+/// of the shipped origin. The origin a manifest then contacts is that one, and
+/// is the one the settings form shows.
+fn shipped(
+    settings: &IntegrationsSettings,
+) -> impl Iterator<Item = (Manifest, BuiltinProviderState)> + '_ {
+    builtin::manifests().into_iter().map(|mut manifest| {
+        let state = settings
+            .builtin
+            .get(&manifest.id)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(base_url) = state
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|base_url| !base_url.is_empty())
+        {
+            manifest.http.base_url = base_url.to_string();
+        }
+        (manifest, state)
+    })
+}
+
+/// The providers a manifest in these settings may extend: the shipped ones as
+/// this installation reaches them, and the user's own that stand on their own.
+///
+/// Whether the base is switched on is not asked. Extending reads a description
+/// of a service; it does not go through the provider that description runs as.
+impl Bases for IntegrationsSettings {
+    fn base(&self, provider: &str) -> anyhow::Result<Base> {
+        if let Some((manifest, state)) = shipped(self).find(|(manifest, _)| manifest.id == provider)
+        {
+            return Ok(Base {
+                manifest,
+                secrets: state.secrets,
+            });
+        }
+        let config = provider
+            .strip_prefix("custom:")
+            .and_then(|id| self.custom.iter().find(|config| config.id == id))
+            .ok_or_else(|| {
+                let known: Vec<String> = builtin::BUILTIN_MANIFESTS
+                    .iter()
+                    .map(|shipped| shipped.id.to_string())
+                    .chain(self.custom.iter().map(|config| format!("custom:{}", config.id)))
+                    .collect();
+                anyhow::anyhow!(
+                    "manifest extends '{provider}', which is not a provider here; expected one of: {}",
+                    known.join(", ")
+                )
+            })?;
+        let manifest = Manifest::parse(&config.manifest)
+            .map_err(|error| anyhow::anyhow!("'{provider}' cannot be extended: {error}"))?;
+        Ok(Base {
+            manifest,
+            secrets: config.secrets.clone(),
+        })
+    }
+}
+
+/// What a derived provider takes from its base, for [`IntegrationRegistry::fingerprints`]:
+/// the manifest it resolves to and the base's secrets. A provider that extends
+/// nothing, or cannot be read, has none.
+fn inherited_fingerprint(
+    config: &crate::types::CustomIntegrationConfig,
+    settings: &IntegrationsSettings,
+) -> serde_json::Value {
+    match Manifest::resolve(&config.manifest, settings) {
+        Ok(resolved) => match resolved.inherited {
+            Some(inherited) => serde_json::json!({
+                "manifest": resolved.manifest,
+                "secrets": inherited.secrets.iter().collect::<std::collections::BTreeMap<_, _>>(),
+            }),
+            None => serde_json::Value::Null,
+        },
+        // The registry names an unloadable manifest when it drops it.
+        Err(error) => {
+            tracing::debug!(
+                integration = %config.id,
+                "custom integration has no resolved manifest to compare: {error:#}"
+            );
+            serde_json::Value::Null
+        }
+    }
+}
+
 /// One provider as the registry holds it: the source plus whether the user has
 /// it switched on.
 ///
@@ -234,22 +322,7 @@ impl IntegrationRegistry {
             }
         }
 
-        for mut manifest in builtin::manifests() {
-            let state = settings
-                .builtin
-                .get(&manifest.id)
-                .cloned()
-                .unwrap_or_default();
-            // A user's own mirror or proxy. The origin the manifest then
-            // contacts is this one, and is the one the settings form shows.
-            if let Some(base_url) = state
-                .base_url
-                .as_deref()
-                .map(str::trim)
-                .filter(|base_url| !base_url.is_empty())
-            {
-                manifest.http.base_url = base_url.to_string();
-            }
+        for (manifest, state) in shipped(settings) {
             let id = manifest.id.clone();
             match CustomSource::build(manifest, state.secrets, None, Standing::BuiltIn) {
                 Ok(source) => literature.push(RegisteredLiteratureSource {
@@ -268,7 +341,7 @@ impl IntegrationRegistry {
         }
 
         for config in &settings.custom {
-            match CustomSource::from_config(config) {
+            match CustomSource::from_config(config, settings) {
                 // Only a manifest that declares the capability becomes a
                 // literature entry, so "unknown provider" and "provider cannot
                 // search" stay one already-handled case rather than two.
@@ -331,6 +404,7 @@ impl IntegrationRegistry {
                 serde_json::json!({
                     "enabled": config.enabled,
                     "manifest": config.manifest,
+                    "base": inherited_fingerprint(config, settings),
                     "secrets": config.secrets.iter().collect::<std::collections::BTreeMap<_, _>>(),
                 })
                 .to_string(),
@@ -621,5 +695,302 @@ title = "t"
         assert!(s2.lookup);
         assert!(!s2.references);
         assert!(s2.browse.is_none());
+    }
+
+    /// What a user writes to add a download step to OpenAlex and nothing else.
+    const OPENALEX_WITH_DOWNLOADS: &str = r#"
+manifest_version = 2
+id = "openalex-files"
+name = "OpenAlex with downloads"
+extends = { provider = "openalex", capabilities = ["search", "browse"] }
+
+[capabilities.resolve_download]
+url = "{download_url}"
+steps = [
+  { path = "/files?doi={doi}", query = { key = { secret = "files_key" } }, fields = { download_url = "url" } },
+]
+"#;
+
+    const STANDALONE: &str = r#"
+manifest_version = 2
+id = "plain"
+name = "Plain"
+[http]
+base_url = "https://plain.test"
+[http.headers]
+x-key = { secret = "plain_key" }
+[capabilities.search]
+path = "/s?q={query}"
+items = "r"
+[capabilities.search.fields]
+id = "id"
+title = "t"
+"#;
+
+    fn custom(
+        id: &str,
+        manifest: &str,
+        secrets: &[(&str, &str)],
+    ) -> crate::types::CustomIntegrationConfig {
+        crate::types::CustomIntegrationConfig {
+            id: id.into(),
+            name: None,
+            enabled: true,
+            manifest: manifest.to_string(),
+            secrets: secrets
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        }
+    }
+
+    fn with_custom(configs: Vec<crate::types::CustomIntegrationConfig>) -> IntegrationsSettings {
+        IntegrationsSettings {
+            custom: configs,
+            ..Default::default()
+        }
+    }
+
+    fn resolve_error(settings: &IntegrationsSettings, manifest: &str) -> String {
+        match Manifest::resolve(manifest, settings) {
+            Ok(_) => panic!("the manifest was accepted"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_derived_provider_has_what_it_took_and_what_it_declared_and_nothing_else() {
+        let settings = with_custom(vec![custom("openalex-files", OPENALEX_WITH_DOWNLOADS, &[])]);
+        let registry = IntegrationRegistry::from_settings(&settings, None);
+        let derived = registry.literature("custom:openalex-files").unwrap();
+        let shipped = registry.literature("openalex").unwrap();
+
+        let capabilities = derived.source().capabilities();
+        assert_eq!(
+            capabilities.browse,
+            shipped.source().capabilities().browse,
+            "the filters are the base's, not a copy of them"
+        );
+        assert!(capabilities.resolve_download);
+        // Not asked for, so not taken: the base goes on being the one provider
+        // that enriches metadata and feeds the citation graph.
+        assert!(!capabilities.lookup && !capabilities.references);
+        assert_eq!(derived.name(), "OpenAlex with downloads");
+        assert_eq!(
+            derived.manifest().unwrap().origins(),
+            vec!["https://api.openalex.org"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_derived_provider_reaches_its_base_as_this_installation_does() {
+        let mut server = mockito::Server::new_async().await;
+        let search = server
+            .mock("GET", "/works")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("search".into(), "graphs".into()),
+                mockito::Matcher::UrlEncoded("mailto".into(), "me@example.org".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"results":[{"id":"https://openalex.org/W1","display_name":"A work","ids":{"doi":"https://doi.org/10.1/x"}}]}"#)
+            .create_async()
+            .await;
+        let files = server
+            .mock("GET", "/files")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("doi".into(), "10.1/x".into()),
+                mockito::Matcher::UrlEncoded("key".into(), "k".into()),
+                mockito::Matcher::UrlEncoded("mailto".into(), "me@example.org".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"url":"https://files.test/x.pdf"}"#)
+            .create_async()
+            .await;
+
+        // The base is switched off: it is read as a description, not asked.
+        // A stale value under the base's secret name is not the base's value.
+        let mut settings = with_custom(vec![custom(
+            "openalex-files",
+            OPENALEX_WITH_DOWNLOADS,
+            &[("files_key", "k"), ("email", "stale@example.org")],
+        )]);
+        settings.builtin.insert(
+            "openalex".into(),
+            BuiltinProviderState {
+                enabled: false,
+                base_url: Some(server.url()),
+                secrets: [("email".to_string(), "me@example.org".to_string())].into(),
+            },
+        );
+
+        let registry = IntegrationRegistry::from_settings(&settings, None);
+        let source = registry
+            .literature_for_search("custom:openalex-files")
+            .unwrap();
+        let work = source.search("graphs", 1, 1).await.unwrap().remove(0);
+        let download = source.resolve_download(&work).await.unwrap().unwrap();
+
+        assert_eq!(download.url, "https://files.test/x.pdf");
+        search.assert_async().await;
+        files.assert_async().await;
+    }
+
+    #[test]
+    fn a_users_own_provider_can_be_extended() {
+        let derived = r#"
+manifest_version = 2
+id = "plain-more"
+name = "Plain, with health"
+extends = { provider = "custom:plain", capabilities = ["search"] }
+[capabilities.health]
+path = "/ping"
+"#;
+        let settings = with_custom(vec![
+            custom("plain", STANDALONE, &[("plain_key", "k")]),
+            custom("plain-more", derived, &[]),
+        ]);
+        let resolved = Manifest::resolve(derived, &settings).unwrap();
+        assert_eq!(resolved.manifest.http.base_url, "https://plain.test");
+        assert_eq!(
+            resolved.manifest.capabilities.declared(),
+            vec!["search", "health"]
+        );
+        let inherited = resolved.inherited.as_ref().unwrap();
+        assert_eq!(inherited.secrets["plain_key"], "k");
+        // The base's secret is set on the base, so this one has none to ask for.
+        assert!(resolved.own_secret_slots().is_empty());
+        assert!(IntegrationRegistry::from_settings(&settings, None)
+            .literature("custom:plain-more")
+            .is_some());
+    }
+
+    #[test]
+    fn a_base_stands_on_its_own_and_exists() {
+        let chained = r#"
+manifest_version = 2
+id = "second"
+name = "Second"
+extends = { provider = "custom:openalex-files", capabilities = ["search"] }
+[capabilities.health]
+path = "/ping"
+"#;
+        let settings = with_custom(vec![custom("openalex-files", OPENALEX_WITH_DOWNLOADS, &[])]);
+        let error = resolve_error(&settings, chained);
+        assert!(
+            error.contains("'custom:openalex-files' cannot be extended"),
+            "{error}"
+        );
+        assert!(error.contains("does not stand on its own"), "{error}");
+
+        let missing = chained.replace("custom:openalex-files", "custom:gone");
+        let error = resolve_error(&settings, &missing);
+        assert!(
+            error.contains("'custom:gone', which is not a provider here"),
+            "{error}"
+        );
+        // The message names what could have been written instead.
+        assert!(error.contains("openalex, custom:openalex-files"), "{error}");
+
+        let itself = chained.replace("custom:openalex-files", "custom:second");
+        assert!(resolve_error(&settings, &itself).contains("which is itself"));
+    }
+
+    #[test]
+    fn a_capability_has_one_author() {
+        let settings = IntegrationsSettings::default();
+        for (from, to, expected) in [
+            (
+                "[capabilities.resolve_download]",
+                "[http]\nbase_url = \"https://elsewhere.test\"\n[capabilities.resolve_download]",
+                "[http] is taken from 'openalex'",
+            ),
+            (
+                "\"search\", \"browse\"",
+                "\"search\", \"resolve_download\"",
+                "resolve_download is both taken from 'openalex' and declared here",
+            ),
+            (
+                "\"search\", \"browse\"",
+                "\"search\", \"search\"",
+                "names 'search' twice",
+            ),
+            (
+                "\"search\", \"browse\"",
+                "\"search\", \"filters\"",
+                "'filters' is not a capability",
+            ),
+            ("\"search\", \"browse\"", "", "names nothing to take"),
+            (
+                "\"search\", \"browse\"",
+                "\"browse\"",
+                "resolve_download requires search",
+            ),
+            (
+                "secret = \"files_key\"",
+                "secret = \"email\"",
+                "secret 'email' is one 'openalex' names",
+            ),
+        ] {
+            assert!(OPENALEX_WITH_DOWNLOADS.contains(from), "{from}");
+            let error = resolve_error(&settings, &OPENALEX_WITH_DOWNLOADS.replace(from, to));
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+
+        let semantic = OPENALEX_WITH_DOWNLOADS.replace("\"openalex\"", "\"semantic_scholar\"");
+        let error = resolve_error(&settings, &semantic);
+        assert!(
+            error.contains("'semantic_scholar' declares no browse to take"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_that_extends_is_not_read_on_its_own() {
+        let error = Manifest::parse(OPENALEX_WITH_DOWNLOADS)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("extends 'openalex'"), "{error}");
+        // And one that extends nothing still names its own origin.
+        let error = Manifest::parse("manifest_version = 2\nid = \"x\"\nname = \"X\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("declares no [http]"), "{error}");
+    }
+
+    #[test]
+    fn a_derived_providers_fingerprint_follows_its_base() {
+        let settings = with_custom(vec![custom("openalex-files", OPENALEX_WITH_DOWNLOADS, &[])]);
+        let before = IntegrationRegistry::fingerprints(&settings);
+
+        let mut moved = settings.clone();
+        moved.builtin.entry("openalex".into()).or_default().base_url =
+            Some("https://mirror.test".into());
+        let mut keyed = settings.clone();
+        keyed
+            .builtin
+            .entry("openalex".into())
+            .or_default()
+            .secrets
+            .insert("email".into(), "me@example.org".into());
+        for changed in [moved, keyed] {
+            let after = IntegrationRegistry::fingerprints(&changed);
+            assert_ne!(
+                before["custom:openalex-files"],
+                after["custom:openalex-files"]
+            );
+        }
+
+        // Switching the base on or off changes nothing about what the derived
+        // provider would send.
+        let mut toggled = settings.clone();
+        toggled
+            .builtin
+            .entry("openalex".into())
+            .or_default()
+            .enabled = true;
+        assert_eq!(
+            before["custom:openalex-files"],
+            IntegrationRegistry::fingerprints(&toggled)["custom:openalex-files"]
+        );
     }
 }

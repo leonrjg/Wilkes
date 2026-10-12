@@ -6,6 +6,7 @@ import {
   BUTTON_CLASS,
   CHECKBOX_CLASS,
   FIELD_LABEL_CLASS,
+  GHOST_BUTTON_CLASS,
   INPUT_CLASS,
 } from "../lib/integrations/styles";
 import type { SearchApi } from "../services/api";
@@ -15,6 +16,9 @@ interface ProviderFormProps {
   api: SearchApi;
   settings: Settings;
   onUpdate: (patch: Partial<Settings>) => Promise<void> | void;
+  /** Present for a provider a manifest can extend: starts one that takes
+   *  this provider's capabilities and adds its own. */
+  onExtend?: () => void;
 }
 
 /**
@@ -32,6 +36,7 @@ export default function ProviderForm({
   api,
   settings,
   onUpdate,
+  onExtend,
 }: ProviderFormProps) {
   const values = provider.read(settings.integrations);
   const [status, setStatus] = useState<IntegrationStatus | null>(null);
@@ -114,6 +119,11 @@ export default function ProviderForm({
         >
           {testing ? "Testing" : "Test connection"}
         </button>
+        {onExtend && (
+          <button type="button" onClick={onExtend} className={GHOST_BUTTON_CLASS}>
+            Extend
+          </button>
+        )}
         {status && (
           <span className="text-xs text-[var(--text-muted)]">{status.message}</span>
         )}

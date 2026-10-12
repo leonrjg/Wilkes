@@ -176,6 +176,87 @@ describe("CustomIntegrations", () => {
     expect(manifest).not.toContain("coerce");
   });
 
+  it("says what a manifest takes from the provider it extends, and asks for none of that provider's secrets", async () => {
+    const api = apiWith({
+      customIntegrationSummary: vi.fn().mockResolvedValue({
+        id: "openalex-extended",
+        name: "OpenAlex (extended)",
+        origins: ["https://api.openalex.org", "https://files.example"],
+        capabilities: ["search", "browse", "resolve_download"],
+        required_secrets: ["files_key"],
+        optional_secrets: [],
+        secrets: [{ name: "files_key", label: "files_key", kind: "password", optional: false }],
+        extends: { provider: "openalex", name: "OpenAlex", capabilities: ["search", "browse"] },
+        result_fields: ["doi", "id", "title"],
+        problems: [],
+      }),
+    });
+    render(<CustomIntegrations api={api} settings={settings()} onUpdate={vi.fn()} />);
+
+    fireEvent.click(screen.getByText("Add integration"));
+    fireEvent.click(screen.getByText("Read manifest"));
+
+    expect(
+      await screen.findByText(/OpenAlex \(openalex\), taking search, browse\./),
+    ).toBeInTheDocument();
+    expect(screen.getByText("doi, id, title")).toBeInTheDocument();
+    expect(screen.getByLabelText("Secret files_key")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Secret email")).not.toBeInTheDocument();
+  });
+
+  it("extends a provider the user wrote from its row, under an id not already taken", async () => {
+    const crossref: CustomIntegrationConfig = {
+      id: "crossref",
+      enabled: true,
+      manifest: "manifest_version = 2",
+      secrets: {},
+    };
+    const taken: CustomIntegrationConfig = { ...crossref, id: "crossref-extended" };
+    const listed = (id: string, extendable: string[]) => ({
+      provider: `custom:${id}`,
+      name: "Crossref",
+      enabled: true,
+      builtin: false,
+      base_url: "https://api.crossref.org",
+      default_base_url: null,
+      capabilities: {
+        paged_search: false,
+        browse: null,
+        lookup: false,
+        references: false,
+        resolve_download: true,
+        mirrored: false,
+      },
+      secrets: [],
+      mirror: null,
+      extendable,
+    });
+    render(
+      <CustomIntegrations
+        api={apiWith()}
+        settings={settings([crossref, taken])}
+        onUpdate={vi.fn()}
+        providers={[
+          listed("crossref", ["search", "resolve_download"]),
+          // One that itself extends has nothing to take, and offers nothing.
+          listed("crossref-extended", []),
+        ]}
+      />,
+    );
+
+    const buttons = await screen.findAllByRole("button", { name: "Extend" });
+    expect(buttons).toHaveLength(1);
+    fireEvent.click(buttons[0]);
+
+    const manifest = (screen.getByLabelText("Manifest") as HTMLTextAreaElement).value;
+    expect(manifest).toContain('id = "crossref-extended-2"');
+    expect(manifest).toContain(
+      'extends = { provider = "custom:crossref", capabilities = ["search", "resolve_download"] }',
+    );
+    // It already resolves downloads, so no download step is suggested.
+    expect(manifest).not.toContain("capabilities.resolve_download");
+  });
+
   it("names every origin a manifest will contact before anything is saved", async () => {
     const onUpdate = vi.fn();
     const api = apiWith({

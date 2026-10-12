@@ -5221,14 +5221,18 @@ impl AppContext {
         .await
     }
 
-    /// What a draft manifest declares. Takes no settings: a manifest being
-    /// considered has not been saved, and reading it must not depend on
-    /// whether it ever is.
-    pub fn custom_integration_summary(
+    /// What a draft manifest declares. Nothing is saved or sent; the saved
+    /// integrations are read only because a draft that extends another
+    /// provider is described together with what it takes from it.
+    pub async fn custom_integration_summary(
         &self,
         manifest: String,
     ) -> crate::commands::integrations::custom::ManifestSummary {
-        crate::commands::integrations::custom::custom_integration_summary(manifest)
+        let settings = self.get_settings().await;
+        crate::commands::integrations::custom::custom_integration_summary(
+            manifest,
+            &settings.integrations,
+        )
     }
 
     /// Self-contained instructions for asking a model to translate service
@@ -5243,8 +5247,14 @@ impl AppContext {
         secrets: std::collections::HashMap<String, String>,
         query: String,
     ) -> anyhow::Result<wilkes_core::integrations::custom::ProbeReport> {
-        crate::commands::integrations::custom::custom_integration_probe(manifest, secrets, query)
-            .await
+        let settings = self.get_settings().await;
+        crate::commands::integrations::custom::custom_integration_probe(
+            manifest,
+            secrets,
+            query,
+            &settings.integrations,
+        )
+        .await
     }
 
     /// Every literature provider this installation knows, each saying whether

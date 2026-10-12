@@ -2005,7 +2005,12 @@ async fn custom_integration_summary_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManifestBody>,
 ) -> Json<wilkes_api::commands::integrations::custom::ManifestSummary> {
-    Json(state.context().custom_integration_summary(body.manifest))
+    Json(
+        state
+            .context()
+            .custom_integration_summary(body.manifest)
+            .await,
+    )
 }
 
 async fn custom_integration_authoring_prompt_handler(State(state): State<Arc<AppState>>) -> String {

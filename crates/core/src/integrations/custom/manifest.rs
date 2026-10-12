@@ -27,7 +27,7 @@
 //! Anything a manifest cannot say, it says loudly by failing to load — never
 //! by producing a plausible-looking wrong record.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 
 use indexmap::IndexMap;
@@ -61,6 +61,84 @@ pub struct Manifest {
     pub http: HttpSpec,
     #[serde(default)]
     pub capabilities: Capabilities,
+}
+
+/// A manifest as it is written, which is a [`Manifest`] or the part of one a
+/// derived manifest adds to its base. Read only by [`Manifest::resolve`],
+/// which is the one place the two become the same thing.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Written {
+    manifest_version: u32,
+    id: String,
+    name: String,
+    #[serde(default)]
+    extends: Option<Extends>,
+    #[serde(default)]
+    http: Option<HttpSpec>,
+    #[serde(default)]
+    capabilities: Capabilities,
+}
+
+/// What a derived manifest takes from another provider.
+///
+/// Whole capabilities, named one by one: a capability has exactly one author,
+/// so it is either taken from the base or declared, never merged from both,
+/// and a base that later gains one does not hand it to a manifest that never
+/// asked for it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Extends {
+    /// The base as the registry names it: `openalex`, `custom:crossref`.
+    pub provider: String,
+    pub capabilities: Vec<String>,
+}
+
+/// A provider a manifest may extend, as this installation reaches it.
+pub struct Base {
+    /// With any origin the user moved it to already in place.
+    pub manifest: Manifest,
+    /// The values this installation holds for the secrets the base names.
+    pub secrets: HashMap<String, String>,
+}
+
+/// Where a derived manifest's base is found.
+pub trait Bases {
+    /// The provider named `provider`, or why it cannot be extended. A base
+    /// stands on its own: one that itself extends is refused, so inheritance
+    /// is one level deep and cannot form a cycle.
+    fn base(&self, provider: &str) -> anyhow::Result<Base>;
+}
+
+/// A manifest ready for the engine, and what it took from a base to get there.
+pub struct Resolved {
+    pub manifest: Manifest,
+    pub inherited: Option<Inherited>,
+}
+
+/// The part of a resolved manifest that is its base's.
+pub struct Inherited {
+    pub provider: String,
+    /// What the base calls itself.
+    pub name: String,
+    pub capabilities: Vec<String>,
+    /// The base's secrets, which stay the base's: a derived provider sends
+    /// them where the base would and stores none of them.
+    pub secrets: HashMap<String, String>,
+    /// Every secret the base's manifest names, set or not.
+    pub secrets_named: Vec<String>,
+}
+
+impl Resolved {
+    /// The secrets this manifest names itself, which are the ones its own
+    /// settings hold. A base's are set on the base.
+    pub fn own_secret_slots(&self) -> Vec<SecretSlot> {
+        let mut slots = self.manifest.secret_slots();
+        if let Some(inherited) = &self.inherited {
+            slots.retain(|slot| !inherited.secrets_named.contains(&slot.name));
+        }
+        slots
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -168,6 +246,66 @@ pub struct Capabilities {
     /// DOI in, the DOIs the work cites out: the edges of the citation graph.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references: Option<ReferencesCapability>,
+}
+
+/// Every capability a manifest may declare, in the order a summary names them.
+pub const CAPABILITY_NAMES: &[&str] = &[
+    "search",
+    "browse",
+    "health",
+    "lookup",
+    "references",
+    "resolve_download",
+];
+
+impl Capabilities {
+    pub fn declares(&self, name: &str) -> bool {
+        match name {
+            "search" => self.search.is_some(),
+            "browse" => self.browse.is_some(),
+            "health" => self.health.is_some(),
+            "lookup" => self.lookup.is_some(),
+            "references" => self.references.is_some(),
+            "resolve_download" => self.resolve_download.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The capabilities declared, in [`CAPABILITY_NAMES`] order.
+    pub fn declared(&self) -> Vec<&'static str> {
+        CAPABILITY_NAMES
+            .iter()
+            .copied()
+            .filter(|name| self.declares(name))
+            .collect()
+    }
+
+    /// Take one capability, whole, from `base`.
+    fn inherit(&mut self, name: &str, base: &Capabilities) {
+        match name {
+            "search" => self.search = base.search.clone(),
+            "browse" => self.browse = base.browse.clone(),
+            "health" => self.health = base.health.clone(),
+            "lookup" => self.lookup = base.lookup.clone(),
+            "references" => self.references = base.references.clone(),
+            "resolve_download" => self.resolve_download = base.resolve_download.clone(),
+            _ => {}
+        }
+    }
+
+    /// Names of the secrets these capabilities declare themselves, which is
+    /// only ever in a resolver step.
+    fn secret_names(&self) -> Vec<&str> {
+        self.resolve_download
+            .iter()
+            .flat_map(|resolve| &resolve.steps)
+            .flat_map(|step| step.headers.values().chain(step.query.values()))
+            .filter_map(|value| match value {
+                ParamValue::Secret(secret) => Some(secret.secret.as_str()),
+                ParamValue::Literal(_) => None,
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1130,6 +1268,19 @@ items = "results"
 doi = "doi"
 "#;
 
+const AUTHORING_EXTENDS_EXAMPLE: &str = r#"manifest_version = 2
+id = "openalex-files"
+name = "OpenAlex with downloads"
+extends = { provider = "openalex", capabilities = ["health", "search", "browse"] }
+
+[capabilities.resolve_download]
+url = "{download_url}"
+
+steps = [
+  { base_url = "https://files.example.test", path = "/by-doi?doi={doi}", query = { key = { secret = "files_key" } }, fields = { download_url = "absolute_url(url)" } },
+]
+"#;
+
 /// A self-contained prompt for translating service documentation or an
 /// existing client into a manifest. The vocabulary is assembled from the same
 /// registries validation uses; examples live beside the parser and are parsed
@@ -1201,8 +1352,9 @@ TOML schema (comments name optional fields and alternatives):
 manifest_version = 2
 id = "lowercase-slug"                 # required; a-z, 0-9, - or _; at most 64 characters
 name = "Human-readable name"          # required
+extends = { provider = "openalex", capabilities = ["search", "browse"] }   # optional; see "Extending a provider" below
 
-[http]
+[http]                                # required, unless the manifest extends a provider: then it is that provider's and is left out
 base_url = "https://one-origin.test"  # required; http or https
 
 [http.headers]                        # optional; primary-origin requests, including same-origin resolver steps
@@ -1296,6 +1448,13 @@ steps = [                             # optional; one inline table per step, in 
   { base_url = "https://other-origin.test", path = "/resolve?id={id}", response_format = "json", query = { param = { secret = "symbolic_secret_name" } }, fields = { new_value = "expression" } },
 ]
 
+Extending a provider:
+`extends` takes whole capabilities from a provider that already exists, named as Wilkes names it: one it ships with (`openalex`, `semantic_scholar`) or one the user wrote (`custom:<id>`). Use it when the service is already described and only something is to be added, such as a download step for its results.
+- `capabilities` lists every capability taken; nothing is taken that is not listed. A listed capability is not also declared, and there is no partial merge.
+- The manifest has no `[http]`: requests go to the provider's origin with its headers, query parameters and secrets, which stay set on that provider.
+- Capabilities declared here run against that same origin. A resolver step reaches another origin through its own `base_url`, `headers` and `query`, and its secret names must differ from the provider's.
+- The provider extended must not itself extend another.
+
 JMESPath selects keys (`a.b`), indices (`a[0]`, `a[-1]`), projections (`a[*].b`), filters (`a[?k == 'v']`), alternatives (`not_null(a, b)`) and disjunctions (`a || b`). Quote keys that are not plain identifiers: `published."date-parts"[0][0]`. Standard JMESPath functions are available, plus these:
 "#,
     );
@@ -1319,6 +1478,8 @@ JMESPath selects keys (`a.b`), indices (`a[0]`, `a[-1]`), projections (`a[*].b`)
     prompt.push_str(AUTHORING_HTML_EXAMPLE);
     prompt.push_str("\nValid example using browse, lookup and references:\n\n");
     prompt.push_str(AUTHORING_FULL_EXAMPLE);
+    prompt.push_str("\nValid example extending a provider to add a download step:\n\n");
+    prompt.push_str(AUTHORING_EXTENDS_EXAMPLE);
     prompt.push_str(
         "\nSOURCE MATERIAL TO TRANSLATE\nPaste the service documentation, HTTP examples, or existing implementation below this line before sending the prompt to the model.\n",
     );
@@ -1326,30 +1487,157 @@ JMESPath selects keys (`a.b`), indices (`a[0]`, `a[-1]`), projections (`a[*].b`)
 }
 
 impl Manifest {
+    /// Read a manifest that stands on its own. One that extends another
+    /// provider is read by [`Self::resolve`], which knows where to find it.
     pub fn parse(source: &str) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            source.len() <= MAX_MANIFEST_BYTES,
-            "manifest is too long ({} bytes, limit {MAX_MANIFEST_BYTES})",
-            source.len()
-        );
-        let is_json = source.trim_start().starts_with('{');
-        // The version is read before anything else, so a manifest written for
-        // another version is told so by number. Read as this version it would
-        // fail on the first field that moved, with an error about that field
-        // and not about the thing the author needs to know.
-        if let Some(version) = declared_version(source, is_json) {
-            anyhow::ensure!(
-                version == u64::from(MANIFEST_VERSION),
-                "manifest_version {version} is not supported (this build reads version {MANIFEST_VERSION})"
+        let written = Written::read(source)?;
+        if let Some(extends) = &written.extends {
+            anyhow::bail!(
+                "manifest extends '{}', so it does not stand on its own",
+                extends.provider
             );
         }
-        let manifest: Manifest = if is_json {
-            serde_json::from_str(source)?
-        } else {
-            toml::from_str(source)?
+        Ok(Self::flatten(written, None)?.manifest)
+    }
+
+    /// Read a manifest, taking from its base what it says it takes.
+    ///
+    /// This is the only place a derived manifest is treated as one. What comes
+    /// out is an ordinary manifest — the base's origin and identification, the
+    /// capabilities taken from it, the ones declared here — so the engine,
+    /// validation and everything drawn from a manifest have one thing to read.
+    pub fn resolve(source: &str, bases: &dyn Bases) -> anyhow::Result<Resolved> {
+        let written = Written::read(source)?;
+        let base = match &written.extends {
+            Some(extends) => {
+                anyhow::ensure!(
+                    extends.provider != format!("custom:{}", written.id),
+                    "manifest extends '{}', which is itself",
+                    extends.provider
+                );
+                Some(bases.base(&extends.provider)?)
+            }
+            None => None,
         };
-        manifest.validate()?;
-        Ok(manifest)
+        Self::flatten(written, base)
+    }
+
+    fn flatten(written: Written, base: Option<Base>) -> anyhow::Result<Resolved> {
+        let Written {
+            manifest_version,
+            id,
+            name,
+            extends,
+            http,
+            mut capabilities,
+        } = written;
+
+        let (Some(extends), Some(base)) = (extends, base) else {
+            let http = http.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "manifest declares no [http]; one that extends no provider names its own origin"
+                )
+            })?;
+            let manifest = Manifest {
+                manifest_version,
+                id,
+                name,
+                http,
+                capabilities,
+            };
+            manifest.validate()?;
+            return Ok(Resolved {
+                manifest,
+                inherited: None,
+            });
+        };
+
+        let provider = &extends.provider;
+        let mut problems = Vec::new();
+        // Every inherited path is relative to the base's origin, so the origin
+        // and what identifies a request to it are the base's to declare.
+        if http.is_some() {
+            problems.push(format!(
+                "[http] is taken from '{provider}'; a manifest that extends declares none"
+            ));
+        }
+        if extends.capabilities.is_empty() {
+            problems.push(format!(
+                "extends.capabilities names nothing to take from '{provider}'"
+            ));
+        }
+        let declared = capabilities.declared();
+        // Read before anything is taken from the base: these are the names
+        // this manifest chose.
+        let own_secrets: Vec<String> = capabilities
+            .secret_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for (index, capability) in extends.capabilities.iter().enumerate() {
+            let capability = capability.as_str();
+            if !CAPABILITY_NAMES.contains(&capability) {
+                problems.push(format!(
+                    "extends.capabilities: '{capability}' is not a capability; expected one of: {}",
+                    CAPABILITY_NAMES.join(", ")
+                ));
+            } else if extends.capabilities[..index]
+                .iter()
+                .any(|seen| seen == capability)
+            {
+                problems.push(format!("extends.capabilities names '{capability}' twice"));
+            } else if declared.contains(&capability) {
+                problems.push(format!(
+                    "{capability} is both taken from '{provider}' and declared here; a capability has one author"
+                ));
+            } else if !base.manifest.capabilities.declares(capability) {
+                problems.push(format!("'{provider}' declares no {capability} to take"));
+            } else {
+                capabilities.inherit(capability, &base.manifest.capabilities);
+            }
+        }
+        // A name the base uses is the base's: its value is set there, once.
+        let secrets_named: Vec<String> = base
+            .manifest
+            .secret_slots()
+            .into_iter()
+            .map(|slot| slot.name)
+            .collect();
+        let mut clashes: Vec<&String> = own_secrets
+            .iter()
+            .filter(|name| secrets_named.contains(name))
+            .collect();
+        clashes.sort_unstable();
+        clashes.dedup();
+        for name in clashes {
+            problems.push(format!(
+                "secret '{name}' is one '{provider}' names; give this manifest's own a different name"
+            ));
+        }
+
+        let manifest = Manifest {
+            manifest_version,
+            id,
+            name,
+            http: base.manifest.http.clone(),
+            capabilities,
+        };
+        problems.extend(manifest.problems());
+        anyhow::ensure!(
+            problems.is_empty(),
+            "manifest is invalid:\n  - {}",
+            problems.join("\n  - ")
+        );
+        Ok(Resolved {
+            manifest,
+            inherited: Some(Inherited {
+                provider: extends.provider,
+                name: base.manifest.name,
+                capabilities: extends.capabilities,
+                secrets: base.secrets,
+                secrets_named,
+            }),
+        })
     }
 
     /// Everything checkable without touching the network.
@@ -1658,6 +1946,32 @@ impl Manifest {
         names.sort_unstable();
         names.dedup();
         names
+    }
+}
+
+impl Written {
+    fn read(source: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            source.len() <= MAX_MANIFEST_BYTES,
+            "manifest is too long ({} bytes, limit {MAX_MANIFEST_BYTES})",
+            source.len()
+        );
+        let is_json = source.trim_start().starts_with('{');
+        // The version is read before anything else, so a manifest written for
+        // another version is told so by number. Read as this version it would
+        // fail on the first field that moved, with an error about that field
+        // and not about the thing the author needs to know.
+        if let Some(version) = declared_version(source, is_json) {
+            anyhow::ensure!(
+                version == u64::from(MANIFEST_VERSION),
+                "manifest_version {version} is not supported (this build reads version {MANIFEST_VERSION})"
+            );
+        }
+        Ok(if is_json {
+            serde_json::from_str(source)?
+        } else {
+            toml::from_str(source)?
+        })
     }
 }
 
@@ -2711,6 +3025,16 @@ url = "{id}"
         Manifest::parse(AUTHORING_JSON_EXAMPLE).unwrap();
         Manifest::parse(AUTHORING_HTML_EXAMPLE).unwrap();
         Manifest::parse(AUTHORING_FULL_EXAMPLE).unwrap();
+        // The one that extends is read where there is something to extend.
+        let resolved = Manifest::resolve(
+            AUTHORING_EXTENDS_EXAMPLE,
+            &crate::types::IntegrationsSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.manifest.capabilities.declared(),
+            vec!["search", "browse", "health", "resolve_download"]
+        );
     }
 
     #[test]
@@ -2744,6 +3068,7 @@ url = "{id}"
         assert!(prompt.contains(AUTHORING_JSON_EXAMPLE));
         assert!(prompt.contains(AUTHORING_HTML_EXAMPLE));
         assert!(prompt.contains(AUTHORING_FULL_EXAMPLE));
+        assert!(prompt.contains(AUTHORING_EXTENDS_EXAMPLE));
         assert!(prompt.contains("base_url = \"https://other-origin.test\""));
         assert!(prompt.contains("never copied to a cross-origin step"));
         assert!(prompt.contains(&format!("limited to {MAX_RESOLVER_STEPS}")));
