@@ -1,4 +1,4 @@
-//! Reading one MIT OpenCourseWare course into the documents it is made of.
+//! Reading one MIT OCW course into the documents it is made of.
 //!
 //! A course is not one file, which is why it has no `pdf_url` and cannot be
 //! acquired the way a textbook is. It is a few dozen PDFs — lecture notes,
@@ -245,11 +245,11 @@ fn course_base(course_url: &str) -> anyhow::Result<String> {
         .map_err(|error| anyhow::anyhow!("Not a usable course URL: {error}"))?;
     anyhow::ensure!(
         parsed.scheme() == "https" && parsed.host_str() == Some("ocw.mit.edu"),
-        "Not an MIT OpenCourseWare course URL: {course_url}"
+        "Not an MIT OCW course URL: {course_url}"
     );
     anyhow::ensure!(
         parsed.path().contains("/courses/"),
-        "MIT OpenCourseWare URL names no course: {course_url}"
+        "MIT OCW URL names no course: {course_url}"
     );
     Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
@@ -280,7 +280,7 @@ async fn read_course_at(
     progress: Option<&mpsc::Sender<CatalogueCourseProgress>>,
 ) -> anyhow::Result<CourseManifest> {
     let slug = slug_of(base)
-        .ok_or_else(|| anyhow::anyhow!("MIT OpenCourseWare URL names no course: {base}"))?;
+        .ok_or_else(|| anyhow::anyhow!("MIT OCW URL names no course: {base}"))?;
 
     let course: RawCourse = http.get_json(format!("{base}/data.json"), &[]).await?;
     let map: HashMap<String, String> = http
@@ -626,7 +626,7 @@ pub fn course_document(manifest: &CourseManifest) -> String {
     }
     out.push_str(&format!("Source: <{}>  \n", manifest.course_url));
     out.push_str(
-        "License: CC BY-NC-SA 4.0, MIT OpenCourseWare  \n\
+        "License: CC BY-NC-SA 4.0, MIT OCW  \n\
          Assembled by Wilkes from the course manifest; the prose below is the \
          course's own web pages, which OCW does not publish as documents.\n\n",
     );

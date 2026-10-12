@@ -2042,7 +2042,7 @@ async fn catalogue_acquire(
         .map_err(catalogue_failed)
 }
 
-/// Fetches a whole MIT OpenCourseWare course — its PDFs plus a generated
+/// Fetches a whole MIT OCW course — its PDFs plus a generated
 /// Markdown document carrying the syllabus, calendar and reading list that
 /// OCW publishes only as web pages — into a directory of its own under
 /// uploads. The walk and the per-document counter arrive on

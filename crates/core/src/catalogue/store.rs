@@ -295,7 +295,7 @@ impl CatalogueStore {
             offered: records.len(),
             ..SyncOutcome::default()
         };
-        // Providers repeat themselves: LibreTexts and MIT OpenCourseWare both
+        // Providers repeat themselves: LibreTexts and MIT OCW both
         // return the same external id more than once across a paged fetch.
         // `INSERT OR REPLACE` would absorb that silently and leave the caller
         // told it stored 4,100 records when the table gained 2,219. Dedupe
@@ -899,7 +899,7 @@ mod tests {
     /// publishes courses would then answer with that one provider and nothing
     /// else, hiding every textbook on the subject. Measured against the live
     /// mirror on 2026-08-25: "organic chemistry" filtered to `course` returned
-    /// 24 MIT OpenCourseWare records and zero LibreTexts, which holds an
+    /// 24 MIT OCW records and zero LibreTexts, which holds an
     /// organic chemistry library.
     #[test]
     fn a_query_that_accepts_two_grains_is_answered_by_both() {

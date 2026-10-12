@@ -4,898 +4,169 @@
 
 ### Added
 
-- A custom integration can extend another provider instead of repeating it.
-  `extends = { provider = "openalex", capabilities = ["search", "browse"] }`
-  takes those capabilities whole — every OpenAlex filter, as shipped and as
-  later releases change it — and the manifest declares only what it adds, such
-  as a `resolve_download` step. A shipped provider or one you wrote
-  (`custom:<id>`) can be extended, from an "Extend" button on its tab or row.
-  The extending manifest has no `[http]`: it reaches the provider's origin,
-  including a mirror or proxy you set, with that provider's secrets, which stay
-  set there. Nothing is taken that is not listed, a capability is either taken
-  or declared and never both, a provider that itself extends cannot be
-  extended, and one that another extends cannot be removed. Literature
-  providers report `extendable`, and a manifest summary reports `extends` and
-  `result_fields`.
-- Filters from a sentence. With a generation model ready, type what you want
-  into the literature pane — "open-access reviews on CRISPR by Jennifer Doudna
-  since 2020, most cited first" — and press the lightning button: the filters
-  and the sort are set for you on every selected provider that declares them,
-  as the same removable chips you would have set by hand, and the subject
-  becomes the keyword. The model can only name filters and options the
-  provider's manifest declares; names such as an author are looked up with the
-  provider, and anything it could not set is said rather than dropped
-  silently (`POST /api/literature/compose`).
-- The open learning catalogues are literature providers. LibreTexts, OpenStax,
-  MIT OpenCourseWare and DevDocs are searched, listed and filtered exactly as
-  OpenAlex or a provider you described is — one list in the pane, one filter
-  of providers, one kind of result row — and the MCP `literature_search` tool
-  accepts their ids. A catalogue is on once it has been fetched, and is
-  fetched and removed from a *Catalogues* tab in Settings › Integrations,
-  which replaces the separate Catalogues settings page. The grain chips are
-  gone: a catalogue serves one grain, so the provider chips already choose it,
-  and a stored grain filter is carried over as the catalogues it meant. The
-  strip under an empty search still asks only the catalogues, never a remote
-  provider. **Breaking for the desktop IPC:** the `catalogue_status` and
-  `catalogue_search` commands are removed; the HTTP routes are unchanged.
-  Literature results gain `summary`, `subject`, `kind`, `pages` and
-  `recall_score`, and `acquisition` may be `course`.
-- The sidebar remembers which folders are closed. It is kept per workspace and
-  survives a root switch and a restart; a folder that appears later still opens
-  by default.
-- A learning catalogue can be removed in Settings › Integrations › Catalogues.
-  Removing drops its records from the mirror, so it is no longer searched, and
-  syncing it again brings it back (`POST /api/catalogue/remove`). The panel's one button now refreshes the
-  catalogues the mirror holds rather than every catalogue, so a removed one
-  stays removed.
-- Literature filters are no longer kinds. A filter is a clause and a statement
-  of where its value comes from — a closed list, a typed integer, number, date
-  or text, the provider's own suggestions as you type, or a result row — so a
-  provider's manifest can declare filters of any of those shapes with no change
-  to Wilkes. Several values of one filter combine by modes the provider
-  declares once ("Any of", "All of", "None of"), which is how exclusion and
-  intersection are written. OpenAlex goes from 8 filters to 48: author,
-  institution, journal, publisher, funder, topic and keyword by typeahead;
-  language, licence, open-access status, country and more as multi-select with
-  exclusion; text in the title, abstract or full text; and "works citing",
-  "cited by" and "related to" as actions on any result. A listing says how
-  many works match in all. A provider with many filters shows the ones in use
-  and offers the rest from an "Add a filter" menu. **Breaking for manifests:**
-  a `browse` filter written with `kind` is refused by name; a range is now two
-  filters sharing a `group`.
-- Manifests are written one line per entry. A header per filter, or per
-  resolver step followed by a header per part of it, is no longer how Wilkes
-  ships, generates or teaches them; tests hold the shipped manifests, the
-  authoring prompt and the starter manifest to it. A user's own manifest is not
-  refused over layout.
-- A provider that reports no citation count no longer shows "0 citations". The
-  count is absent rather than zero in a search result and in the metadata
-  cache, the document's own count comes from the first provider *that reported
-  one*, and a cached value that is not a number is an error rather than a zero.
-  Counts already cached as 0 for a provider that never reported one cannot be
-  told apart from a real zero and stay until that document is refreshed.
-- A paper's facts now lead with year, citations and open access, then authors
-  and venue, so a long author list can no longer push them out of the two lines
-  the row shows.
-- Keyword search in the literature pane can be read past its first page: each
-  provider has its own "Load more", and a manifest's `search.path` may name
-  `{page}` (1-based) or `{offset}` for a service that pages. OpenAlex pages by
-  page and Semantic Scholar by offset. A provider whose search path names
-  neither is asked for one page, and a second is refused rather than repeating
-  the first. The two rows of source chips are now labelled "Search in", apart
-  from the Filters button.
-- The literature pane can browse as well as search. A "Filters" button beside
-  the search box opens controls that list a provider's works by filter and sort
-  with no keyword at all, applying each change as it is made, showing what is
-  set as removable chips when the panel is closed, and listing each filtered
-  provider once, in the Literature section, in place of its keyword answer.
-  Filters belong to the provider that declares them: every selected provider
-  with a sort or filters gets its own set, several can be filtered at once, and
-  a provider that is switched off simply has none — OpenAlex by year range, field and domain, type, minimum
-  citations, open access, full text and retraction, sorted by citations or
-  date — and combines a keyword with the same filters when one is typed. The
-  panel is drawn from what the provider's manifest *declares* (its `browse`
-  capability: a sort, a keyword parameter, and typed filters that are a choice,
-  a flag or an integer range), so it names no provider, and a provider added
-  tomorrow gets one by declaring it. A page is ten works with "Load more"; a
-  request the manifest does not allow is refused by name, in the answer, beside
-  the provider's name. A manifest may also declare `lookup` (a DOI to a
-  bibliographic record, with up to three requests tried in order until one
-  holds a record) and `references` (the DOIs a work cites, resolved in
-  declared, bounded batches).
-
-- Where a document was left survives a restart: a PDF's or book's page, offset
-  and zoom, a text document's scroll position on each of its surfaces and its
-  zoom, and whether a Markdown or HTML file was last read rendered or as
-  source. These used to be module-level maps inside the readers, gone with the
-  window. The readers now take a position store from their host, and Wilkes
-  keeps one per workspace in localStorage beside the tab session, capped at
-  the 500 most recently read documents. A renamed or moved document starts
-  again from its beginning, and a standalone document window remembers nothing.
-
-- EPUB, MOBI, AZW3, FB2 books and CBZ/CBT comic archives are searched, indexed
-  and read alongside PDFs. MuPDF has
-  read all three since it was first linked here — its EPUB, HTML and MOBI
-  handlers are compiled in and registered — and nothing ever routed a file to
-  them: the extractor's `can_handle` matched `pdf` alone, and every other
-  extension fell to a plain-text reading that failed on the first byte of a zip.
-  What was missing was admission, not capability. A book now gets the same
-  reading a PDF gets, with real pages, bounding boxes, an outline where the
-  format declares one, and its own title and author, so it is searchable
-  exactly, semantically and by metadata, and its passages are quotable and
-  bookmarkable like any other document's.
-
-  Three things make that reading stable rather than merely possible. Which
-  files reach the backend is a closed list, never MuPDF's own recognition:
-  MuPDF also claims `.txt`, `.html`, `.xml`, `.zip` and `.log`, all of which
-  Wilkes already reads as plain text with exact line and column origins, and
-  admitting them would have moved every such file in every library onto a
-  paginated recipe — a full re-extraction, and every line-and-column locator
-  turned into a page. The page a reflowable book is laid out onto is named in
-  one place and carried in the extraction recipe, because a book has no
-  pagination of its own and MuPDF's defaults are not ours: relying on them
-  would let a point release repaginate a library silently, with no recipe
-  change to force a re-read. And a Kindle KF8 book is refused outright. MuPDF
-  opens one, reports success, and returns a single empty page — indistinguishable
-  from a book that genuinely holds no text — so `.azw3` is admitted only so far
-  as to fail with a reason naming KF8, which is visible and retryable, rather
-  than being omitted in silence.
-
-  A book opens as pages, and reads like any other document: the same find bar,
-  zoom, selection, bookmarks and highlights, with its own table of contents in
-  the sidebar and its footnote links live. The reader draws pages through
-  pdf.js, out of the file's own bytes, and pdf.js does not open an EPUB — so
-  Wilkes renders the pages it laid out into a PDF and hands the reader that.
-  Because both descend from the same pinned layout, the page and box a search
-  result carries land on the words they were taken from. It is built once per
-  book and kept, so returning to one is instant; a book with no pages of its
-  own also has no outline or links to draw, and those travel beside the
-  rendering because the host resolved them when it laid the book out.
-
-  A comic archive is a book with no text: its pages are images, so it reads and
-  indexes exactly as a scanned PDF does — empty unless a recognizer is
-  configured, and every page offered to that recognizer when one is. Its
-  rendering is correspondingly expensive, around seven seconds and 48 MB for a
-  196-page volume against a few hundred milliseconds and 4 MB for a novel,
-  which is why renderings are now held to a memory budget rather than a count:
-  "two documents" is 12 MB or 96 MB depending on what was opened.
-
-  Kindle's AZW3 books are read by rebuilding them. Amazon's two formats share
-  one container and are told apart only by a version field in its header — the
-  compression word, which is the thing one reaches for first, says PalmDOC for
-  both. MuPDF reads the older MOBI 6 records; a KF8 book has none, so MuPDF
-  opened it, reported success and returned a single empty page. Two measured
-  books did exactly that, one of them reporting its title as "Table of
-  Contents". So a KF8 book now has its text and images unpacked from the
-  container, its markup reassembled into one document, and *that* laid out —
-  which yields 580 pages and 1.41 million characters for a book that read as
-  empty before, with its images and its real title and author.
-
-  Three details are load-bearing. The unpacked flow begins with several hundred
-  NUL bytes, and MuPDF's HTML parser stops at the first one: removing them is
-  the whole difference between an empty document and the book. The flow is not
-  one document but every chapter's skeleton concatenated with the fragments
-  belonging to it, so the per-document wrappers come off and what is left is
-  wrapped once. And the rebuilt copy is keyed to the book's identity and kept
-  on disk rather than in memory, because an index build can read several books
-  at once and an eviction that deleted a rebuild would delete it out from under
-  whoever was reading it.
-
-  The rebuild checks its own output. KF8's markup is not well formed — one
-  measured book carries 160 `<head` against 158 `</head>` — so a pattern that
-  strips the per-document wrappers can run past the end of its document and
-  take the next one's prose with it, which an early version of this did to
-  5,178 words without a word about it. The wrappers are now removed by a scan
-  that stops at the next document rather than a pattern that cannot, and the
-  rebuild compares the words that came out against the words that went in,
-  warning when a book loses more than a twentieth of itself and refusing
-  outright when it loses half. That check is what stands where the blanket
-  refusal of KF8 used to, and the rebuild is covered end to end by a test that
-  lays its output out with the same engine the application uses and reads the
-  book's words back.
-
-  The container is read directly rather than through an ebook crate, because
-  the crate loses a large part of the text without
-  saying so — 12.6%, 14.4% and 23.5% of the three books measured, against the
-  length each container declares for itself. It treats the header record as
-  content and strips a fixed number of trailing bytes from every text record,
-  where the format puts a variable count encoded backwards in each record's own
-  tail; the effect is that it eats compressed bytes and the text decompresses
-  short. Reading the records directly matches the declared length exactly on
-  all three books, so that length is now checked on every read and a book that
-  comes up short is refused rather than indexed as a fraction of itself. The
-  independent corroboration: this book's AZW3 and its MOBI 6 edition are
-  different files read by different pipelines, and they now agree on its text
-  to within 0.05%. Metadata comes from the container's own EXTH block for the
-  same reason, and Wilkes gained no dependency for any of it.
-
-  A Kindle book's inner links are removed rather than offered. Their
-  targets are named by a fragment id and an offset into it, both of which live
-  in an index this rebuild does not read, so they cannot be followed; left in
-  the markup they reached the layout engine as an unknown scheme, became
-  external links, and clicking a footnote handed `kindle:pos:fid:00AS:off:…`
-  to the operating system. The text of the link stays and the link does not.
-  Approximating them was measured and rejected: matching each table-of-contents
-  entry's own label against the document a candidate mapping sends it to, the
-  best mapping was right 12% of the time.
-
-    This is not a faithful KF8 reader: fragments are kept in the order the file
-  stores them rather than being placed inside their skeletons at the offsets
-  recorded in the format's index tables, so a book's structure is approximate
-  even though its text is complete. MOBI 6 deliberately does not come through
-  this path — measured both ways, MuPDF reads it at 2,890 characters per page
-  over 553 pages where the rebuild gives 5,265 pages of 266 characters and
-  loses a tenth of the text. Kindle metadata now comes from the container for
-  both formats, which is where the title, author and publication date actually
-  live; MuPDF reported none of them.
-
-  Already-indexed PDFs are untouched: their recipe string is unchanged, so
-  nothing re-extracts and nothing re-embeds.
+- A download step can say that a missing value means "no file". A
+  `resolve_download` step field written with `missing = "unavailable"` —
+  `md5 = { path = "a[href*='md5=']", attribute = "href", missing = "unavailable" }`
+  — makes a selector that finds nothing the answer that the service holds no
+  file for that result, reported as the provider not providing one, instead of
+  `field 'md5' matched nothing`. Unsaid, a field that matches nothing is still
+  an error, and a value that is found and does not fit (a capture that does not
+  match) is an error either way. A probe whose example result has no file says
+  the resolver was not checked rather than that it failed.
+- Custom integrations can extend a built-in or custom provider's capabilities and declare only what they add. Use the "Extend" button on a provider's tab or row to get started.
+- With a generation model ready, describe a literature search in a sentence and press the lightning button to set filters, sort order and keywords. Anything the selected providers cannot apply is reported.
+- LibreTexts, OpenStax, MIT OCW and DevDocs can be synced locally, searched in the literature pane and added to the workspace. Manage them in Settings › Integrations › Catalogues; records without a full download offer their landing page. Library searches also suggest catalogue matches. **Breaking for desktop IPC:** `catalogue_status` and `catalogue_search` are removed; HTTP routes are unchanged.
+- The sidebar remembers closed folders per workspace across root switches and restarts. New folders open by default.
+- Learning catalogues can be removed in Settings › Integrations › Catalogues and restored by syncing again. Refresh updates only installed catalogues.
+- Literature providers can declare more filter types and combine values with "Any of", "All of" or "None of". OpenAlex now offers 48 filters, including author and institution suggestions, citation relationships and exclusions. An "Add a filter" menu keeps large filter sets manageable. **Breaking for manifests:** `browse` filters using `kind` must be updated; ranges use two filters sharing a `group`.
+- Keyword searches in the literature pane have a "Load more" button per provider. Custom providers can enable pagination with `{page}` or `{offset}` in `search.path`.
+- The literature pane supports browsing by filters and sort order, with or without keywords. Each selected provider has its own controls and removable filter chips. Manifests can also declare DOI lookup and reference retrieval.
+- Readers remember page, scroll position, zoom and source/rendered mode across restarts, for up to 500 documents per workspace. Moved or renamed documents start at the beginning; standalone windows do not save reading positions.
+- EPUB, MOBI, AZW3 and FB2 books, plus CBZ/CBT comic archives, can be read, searched and indexed alongside PDFs, with bookmarks, highlights and tables of contents where supported. Comic text requires a configured recognizer. AZW3 layout is approximate and internal Kindle links are unavailable; incomplete text extraction is reported. Existing PDFs do not need reindexing.
+- Workspaces keep separate library roots, indexes, research data and saved sessions. Create, rename and switch workspaces from the workspace picker.
+- Libraries can include multiple roots, with whole-library and global search across them.
+- Save document selections as bookmarks with notes, revisit highlighted passages and copy quotes as Markdown. Related bookmarks can be grouped by meaning.
+- Organize documents with tags and saved smart collections, use collections to scope searches, and revisit search history.
+- Zotero integration looks up documents in the local Zotero library, copies formatted citations and adds documents to Zotero.
+- OpenAlex and Semantic Scholar provide bibliographic enrichment and literature search, available from the literature pane and chat tools.
+- In-app chat gives an agent access to the active document, attached files and Wilkes document and literature tools.
+- An external MCP server exposes Wilkes tools to other clients, with configurable network binding and optional bearer authentication. HTTP API and MCP controls are grouped under Settings › Servers; the desktop can also expose the HTTP API.
+- MCP tools can read bookmarks, tags, smart collections and search history, and edit research data, rename files or refresh metadata. Edits preserve research links and refresh the UI. MCP is also available at `/mcp` on the shared HTTP API.
+- Local generation with Candle or Ollama provides document summaries, cited search summaries, bookmark and topic labels, and explanations of related documents.
+- Text documents can be edited with inline completions grounded in the library, pinned sources, source provenance and an inspectable context budget.
+- Semantic search supports optional HyDE query expansion and automatic relevance feedback from top results.
+- Topic clouds let you explore related passages across a library or within one document. Related-document suggestions and a citation graph offer more ways to explore connections.
+- Open multiple documents in viewer tabs and restore the session after restarting.
+- Markdown has rendered and source views. Text readers support find, zoom, selections and bookmarks; PDF readers support tables of contents, internal links and destination previews on hover.
+- The sidebar includes a file tree, file sorting and configurable metadata columns. Files can be imported by pasting.
+- Custom providers can be added from manifests, validated and tested before enabling. Copyable authoring instructions help an LLM write a manifest; download resolvers can contact explicitly declared origins.
+- Indexing can recognize scanned pages, images, formulas and tables, with page layout detection and specialized readers. Formula readers include Texify, PP-FormulaNet and UniMERNet.
+- Applications can export document outlines and figure inventories, find figures associated with passages and retrieve their images through `/api/export/outline`, `/api/export/figures`, `/api/chunks/figures` and `/api/figure`.
+- Applications can import documents into managed corpora with retained source copies and stable passage identities. Managed corpora support backup and restore through `/api/corpora/backup` and `/api/corpora/restore`.
 
 ### Changed
 
-- OpenAlex and Semantic Scholar are manifests, not code. The two hand-written
-  clients, their wire models, their per-provider commands and routes, their
-  per-provider settings structs and the two copies of their metadata-cache
-  and settings-change handling are gone: each provider is a document embedded
-  in the binary and loaded through the engine that loads a manifest a user
-  pasted in, so a built-in and a custom provider enter the registry through the
-  same door and nothing downstream can tell them apart. Metadata enrichment,
-  the citation graph, the file list's citation count, the primary-metadata-source
-  choice and the cache's provenance rows are all keyed by provider id now, so a
-  custom provider that declares `lookup` enriches documents too. The rows the
-  old shape wrote are the rows the new one reads — provider ids are the
-  strings they were already stored under — so no cache was rebuilt.
-
-  Manifest format version 2 replaces the `[[http.params]]` list with
-  `[http.headers]` and `[http.query]` maps (a secret is `{ secret = "name",
-  optional = true }`, so a service that works anonymously and better with a key
-  no longer has to refuse to run), selects JSON with JMESPath instead of a
-  dotted-path grammar, and replaces the closed `coerce` list and `first_of`
-  with functions in the expression (`normalize_doi(x)`, `not_null(a, b)`,
-  `a || b`). That closes the one divergence the old manifest proved against the
-  Rust client, OpenAlex's `is_open_access`, which is a disjunction. Settings
-  and stored manifests written before this are rewritten as they load — the
-  `openalex` and `semantic_scholar` objects become `builtin` entries, a version
-  1 manifest becomes version 2 — and the next save writes only the new shape.
-  The rewrite keeps everything a manifest says and loses one thing: comments in
-  the stored text. A manifest that cannot be converted is left as it was and
-  reported by name rather than guessed at.
-
-  Visible edges: `get_file_metadata` and the file metadata events carry
-  `providers` (a map by provider id) instead of `semantic_scholar` and
-  `openalex`; the `openalex_*`, `semantic_scholar_*` and
-  `custom_integration_status` commands and routes are replaced by
-  `literature_provider_status`, `literature_provider_lookup` and
-  `literature_browse`; when two providers describe one document, the shipped
-  ones are still preferred in the order they were (Semantic Scholar, then
-  OpenAlex), then any other by id.
-
-- The extractor that reads documents is no longer named for the one format it
-  used to read. `PdfExtractor` is `DocumentExtractor`, `PdfBackend` is
-  `LayoutBackend`, `extract::pdf` is `extract::document`, `metadata::pdf` is
-  `metadata::document`, and `FileType::Pdf` is `FileType::Paged` — which is
-  what it has always meant, "read as laid-out pages rather than as text", and
-  what it now covers for four formats rather than one. This is not cosmetic:
-  the old names are why three separate attempts to design EPUB support
-  concluded that a new dependency was required, when the capability was linked
-  in the whole time and only `can_handle` stood in front of it.
-
-  Nothing changes on the wire. `FileType::Paged` still serializes as `"Pdf"`,
-  because that value appears in saved settings and in search results, and a
-  test now holds it there. Saved collection filters keep their exact meaning
-  too: `file_type == "pdf"` still selects PDFs rather than quietly widening to
-  every book, and books answer to `"epub"`, `"mobi"` and `"fb2"`.
-
-- Right-clicking the empty space of the sidebar's folder tree offers a new
-  folder, created where the click landed: the space around a folder's entries
-  is that folder, so it nests, and the space around the tree's own entries is
-  the root, so it becomes a sibling of the folders already there. Creating a
-  folder previously meant the strip's button and its destination dialog, which
-  is a tree of the whole library to point at a folder the pointer was already
-  on. The menu names the folder it will create in, opens it if it was closed —
-  a folder created into a closed folder is one nobody sees — and takes the name
-  inline, so the whole gesture is one right-click and a word. It is the hit
-  test a drag already uses, asked of the element the click names rather than of
-  a point; a file row answers its own right-click, and the tree does not answer
-  it twice.
-
-- A file dragged out of the sidebar can be dropped on any root in the strip at
-  the top of the window, which moves it there. Moving a document to another
-  root was a context menu, a dialog and a dropdown, while the drag that already
-  existed could only reach folders of the root being viewed. It is now the same
-  gesture and the same hit test: the root under the drag rings blue as a folder
-  does, says nothing when the file is already in it, and drops through the move
-  that rekeys the file's research notes and its place in the semantic index.
-  Resting the drag at either end of the strip scrolls it, so a root off the
-  side of the window is reachable without letting go — the strip's scroll
-  arrows stand aside for the length of the drag, since a drag holds the pointer
-  and they could not be pressed anyway. Because the drag's destination is now
-  drawn by two components that do not contain one another, what the drag is
-  over is held in one small store that the tree writes and both read. Dropping
-  files from outside the application still reaches only the folders of the open
-  root, since the import command admits no other.
-
-- A file dragged into the sidebar from the file manager lands in the folder it
-  was dropped on, not always in the root. The sidebar already highlighted a
-  folder under a row being dragged within it and moved the file there on
-  release; a drag that started outside the application is reported by the
-  desktop shell as a position rather than as pointer events, so it never
-  reached that machinery and every import went to the top level, to be dragged
-  down by hand afterwards. Both drags now run the same hover: the same hit
-  test, the same "Drop here" highlight, the same edge auto-scroll, and the same
-  spring-loaded opening of a collapsed folder the drag rests on. Dropping on
-  the empty space around the entries still means the root, and a read-only
-  workspace still offers no destination at all. The import command accordingly
-  takes a path beneath the root rather than a single folder name, each
-  component validated as before, so no drop can name its way out of the root.
-
-- Advanced > Data lists every workspace on this installation and deletes any of
-  them, the corpora other applications keep here included. A managed corpus
-  refuses every write — its owning application is its only writer — and that
-  protects its contents, not its existence: the index is gigabytes on the
-  user's own disk, and until now the only way to reclaim them was to find the
-  directory by hand. Deleting a corpus takes the hidden projections that
-  re-embed it with it, since a projection of a corpus that is gone is nothing.
-  The active workspace is deleted by activating another one first, and the last
-  remaining workspace is not deletable at all. What goes is the workspace's own
-  index, settings, bookmarks, research and uploads; the documents in the
-  folders it indexed are left where they are. Available to consumers as
-  `DELETE /api/workspaces/{id}`.
-
-- Clearing the logs, deleting an index and switching away from a workspace with
-  unsaved edits ask before they act again. They called `window.confirm`, which
-  the desktop shell's dialog plugin patches and its capabilities do not permit:
-  the call failed with `plugin:dialog|confirm not allowed by ACL` and the
-  caller read that as the user saying no, so the button did nothing and said
-  nothing. Every confirmation in the application now goes through the one
-  helper that asks the way this installation permits.
-
-- The root strip marks each root with what the semantic index holds for it: a
-  filled dot for a root that is fully indexed, a hollow one for a root the index
-  is behind on, and the count in the tooltip. Coverage is the directory as it is
-  now against the index as it is now, so a root indexed last month and added to
-  since reads as incomplete rather than as done. Both sources are consulted
-  because neither is complete alone: the index says which documents it holds,
-  and the job journal says which were read and found to hold no text — those
-  have no index row and never will, and counting them as missing would leave a
-  fully-read root reported as incomplete forever. Available to consumers as
-  `POST /api/embed/coverage`.
-
-- An application that imported a document into a managed corpus can now read
-  its bytes back, with `POST /api/corpora/documents/snapshot`, the `corpus_id`,
-  and the `snapshot_id` the import reply carried. Addressed by corpus, the way
-  the import it mirrors is, and deliberately without an embedding pin: a pin
-  routes to its space's own workspace, and a secondary space is a projection
-  holding the canonical rendition re-embedded, with no retained source of its
-  own. A corpus retains the document; a coordinate system does not. The corpus already retained an
-  immutable copy of every source it imported; until now nothing served it, so a
-  consumer wanting the document it had itself registered had to keep the
-  original path and open it directly. That works only while the consumer and
-  Wilkes share a filesystem — on separate machines the path resolves to nothing
-  and the consumer reports its whole library as missing, which is a fact about
-  the wrong disk rather than about the library.
-
-  The retained copy only, never the original it was taken from: the copy cannot
-  have been edited since the passages were carved out of it, and bytes that no
-  longer match the rendition a consumer holds are worse than a refusal, because
-  they look like an answer. A corpus retaining no such snapshot says so with
-  `DOCUMENT_INDEX_INCOMPLETE`.
-
-- Other applications can send a reader straight to a document with a
-  `wilkes://open?path=...` link — a "Read on Wilkes" button, the way an
-  `obsidian://` link reaches a note. A link that names only a path opens the
-  standalone reader, which is what a file opened from Finder already does and
-  disturbs nothing about the running session. A link that also names a
-  workspace opens the main window instead: Wilkes switches to that workspace,
-  makes the root holding the document visible, and opens it as a click in the
-  file list would. `page` and `line` land the reader inside the document.
-
-  Naming a workspace is therefore what asks for the library, and it is the
-  only thing that does. A place the document cannot have — a page of something
-  that is not a PDF, a path outside every root of the workspace named — is
-  refused and said out loud rather than opened somewhere else, because a
-  reader who followed a link to page 40 has no way to notice they were given
-  page 1.
-
-- Long indexing runs have an activity view, under Settings › Activity. It names
-  the document being read and the stage it is at, how much is already saved, and
-  which documents need attention — with the reader's own error kept verbatim
-  beside each one. A document that failed to extract used to be logged and
-  skipped, so the corpus finished with a hole in it and nothing said which
-  document was missing or why. Worker diagnostics live beneath the job, where
-  they belong once the question has narrowed to which model is holding a
-  document up.
-
-  The view is the same whether it watched the whole run or was opened for the
-  first time after a restart, because it reads a durable record rather than
-  accumulating events. An indexing run left unfinished by a crash or a quit is
-  reported as interrupted the next time the workspace opens.
-
-- Stopping an index build now keeps the documents it finished, and offers to
-  continue with the rest. A build fills a temporary database and publishes it at
-  the end, so cancelling one used to throw away everything it had read — pause a
-  four-hundred-page corpus overnight and it started again at page one. An
-  interrupted build is now published for the documents it completed, and
-  continuing runs only over the ones it never reached.
-
-  Retrying the documents that failed is its own action, never part of
-  continuing: a file that breaks the reader breaks it again, and a continuation
-  that swept failures up would re-attempt it forever without ever saying so. A
-  continuation carries the earlier run's verdicts forward, so a failure found an
-  hour ago is still reported and still retryable after the work resumes.
-
-  Cancelling still means the work stops. The cancel flag is raised before the
-  workers are killed, and a batch ended by that kill leaves its documents
-  unfinished for a continuation rather than being recorded as failures that
-  never happened.
-
-- Search considers wording and meaning together. The Semantic checkbox is now
-  Combined, and with it on a query runs both lanes over the same catalog: the
-  exact lane finds the query text as written, the semantic lane finds passages
-  about the same subject in whatever words they use, and the two rankings are
-  fused so a document both lanes found outranks either lane's own top hit.
-  "instrumental variables weak identification" no longer makes the reader
-  choose, before seeing either, between the terminology and the problem.
-
-  Each result says which of the two put it there — "Exact phrase", "Related
-  passage", or both — because a combined list whose rows do not explain
-  themselves is a list you cannot act on. Exact search is unchanged and stays a
-  click away, and a regular expression still describes wording, so while one is
-  in force the search is the exact lane alone and the checkbox says so; the
-  preference itself is untouched, and combined returns when the expression
-  goes.
-
-  The combined mode's exact lane needs no index, so a combined search whose
-  semantic lane is unavailable returns exact matches and reports what it could
-  not reach, rather than failing or quietly returning a shorter list.
-
-  The MCP `search` tool defaults to it too. `mode` was required and had no
-  default, so every caller had to guess which half of the question it was
-  asking; omitting it now asks both, and each returned document carries the
-  same `evidence` the app shows. `exact` and `semantic` remain, as the
-  narrower searches they are.
-
-- Folders can be dropped onto the window to become library roots. A dropped
-  folder joins the root strip and becomes the active root, as if it had been
-  chosen through Open — previously a dropped folder was refused as an import,
-  and a drop that mixed folders with files imported nothing at all. A mixed drop
-  now does both, with the files landing in the root that was active when the
-  drop happened rather than in a folder the same drop is adding. A read-only
-  workspace still refuses both, since roots and imports are equally the
-  manifest's business.
-
-- A viewer tab's context menu closes documents. Close dismisses the tab that was
-  right-clicked — not whichever one happens to be active — and Close All empties
-  the tab strip; both sit below the file actions the menu already offered, which
-  every surface still shares.
-
-- HTML files are read rather than inspected. A `.html` or `.htm` document opens
-  rendered, with the same source/rendered toggle Markdown has, the same
-  remembered choice per document, the same find bar and zoom, and bookmarks,
-  search highlights and selections in the file's own bytes — a selection in a
-  rendered page produces the same bookmark the source view would have.
-
-  It is a reader, not a browser. The file supplies structure and text and the
-  reader supplies the typography: scripts, author stylesheets, frames, forms
-  and plugins do not survive parsing, and nothing in a document can cause a
-  request to leave the machine, so opening a file cannot tell anyone that it
-  was opened. Pictures beside the document do load — a relative `src` is
-  resolved against the document and served through the application, which is
-  also the only place that reach into the filesystem is judged — while remote
-  addresses are refused and `data:` images, being part of the file, are kept.
-  Links are destinations rather than navigations: `#fragment` scrolls within
-  the document, a link to a neighbouring file is opened by the application, and
-  anything else goes to the browser.
-
-- Catalogue fetches say where they have got to. A provider sync reports each
-  page as it lands — "Fetching… page 12, 1,204 records" — and a document
-  download reports its bytes against the total, or without one when the server
-  declared no length. Both travel on their own event streams
-  (`catalogue-sync-progress`, `catalogue-download-progress`), and both are
-  logged: every download now records its start, its outcome and each refusal,
-  and every provider fetch records what it offered, stored and dropped, with
-  how long it took.
-
-  Reading the body a chunk at a time is what makes the byte count possible, and
-  it fixes something else on the way: a response that lied about its length, or
-  declared none, is now refused at the moment it crosses the 100 MiB limit
-  rather than after all of it has been buffered.
-
-- The learning catalogues are part of Wilkes rather than a route nobody called.
-  Settings › Catalogues says what the mirror holds per provider, when each was
-  last fetched, and syncs them one at a time so a five-minute refresh reports
-  each catalogue as it lands instead of going quiet; a provider that fails is
-  reported next to the three that did not. A catalogue pane searches the mirror
-  and adds what it finds — fetched into the workspace's uploads directory and
-  imported from there, so nothing is written into a library root behind the
-  user's back — and a record the provider does not serve whole offers its
-  landing page instead of an Add button that would fail. A search of your own
-  library that returns nothing now offers what the catalogues hold on the same
-  question, in your own words, fetching nothing until you ask; a search that
-  returns something offers the same in one line.
-
-  The operations moved to `wilkes_api::commands::catalogue`, which is why any
-  of this is possible: the sync loop and the provider registry walk used to
-  live inside an axum handler, so the desktop shell had nothing to call. The
-  HTTP routes are now wrappers over the same four operations the Tauri commands
-  call.
-
-  Recall is presented as recall. The order is a text match and every surface
-  says so — ranking these by which is the better place to start needs the
-  library-coverage measure that is not built yet.
-
-- The managed corpus lifecycle is addressed at `/api/corpora/*`, and
-  `/api/integrations/underdog/` is gone. A route path that names one consumer
-  claims that surface belongs to it; a corpus belongs to whichever application
-  created it, and `owner` — which the ensure request now carries — is where
-  that is said. Nothing about the corpus contract changes: the six routes,
-  their shapes and their refusals are what they were, at paths that describe
-  what they do rather than who asked.
-
-- Passages are addressed at `/api/chunks/{resolve,accumulate,similarity,search}`
-  with one vocabulary: a `scope` naming the index and stable `ChunkRef`s naming
-  the passages. Every one of these existed twice — once taking a corpus id and
-  a pinned embedding space, once taking a workspace id and SQLite rowids — and
-  the second vocabulary was never safe for a caller that stored anything, since
-  a rowid is reissued when its file is re-indexed. `/api/embed/centroid`,
-  `/api/embed/similarity` and `/api/export/chunk-text` are deleted, and
-  `/api/embed/text` and the `/api/export/*` routes take the same `scope`.
-
-  Refs work on an ordinary workspace, not only a managed corpus: the indexing
-  path already writes them. An index built before they existed refuses with
-  `INDEX_IDENTITY_UNVERIFIED`, naming a rebuild, rather than answering with
-  nulls that read like passages. `/api/export/chunks` therefore names its
-  chunks by `chunk_ref` and carries `text_sha256`, in the same shape
-  `chunks/resolve` returns plus the vector — one definition of what a chunk
-  looks like on the wire.
-
-  `accumulate` returns the unnormalized sum of individually L2-normalized
-  members and their count, and the normalized mean `/api/embed/centroid`
-  returned is gone: the mean is derivable from the sum and the reverse is not,
-  so a caller partitioning a large group across requests adds the sums and
-  normalizes exactly once. `resolve` caps at 512 refs, reconciling a 64 that
-  was sized for displaying a passage against an 8,192 borrowed from an
-  operation that returns two scalars.
-
-- One answer about what this build can embed with, at
-  `GET /api/embed/capabilities`. It replaces `/api/embed/engines`,
-  `/api/embed/models`, and the consumer's own model list: the UI's picker used
-  to assemble a model from two replies and then merge the user's hand-added
-  entries itself, which is how a picker and a backend come to disagree about
-  which models exist. `EmbedderCapability` gains `is_default` and
-  `is_recommended` so the picker has everything it displayed before, and its
-  two load-bearing nulls are unchanged — `dimension` is null for a model whose
-  width only a first load reveals, and `prefix_source` says whether anything
-  has established the model's prefixes at all.
-
-- The catalogue mirror is addressed at `/api/catalogue/*` rather than under a
-  consumer's name. Reading the open learning catalogues has nothing to do with
-  which application asked, and a route path that names one consumer is a claim
-  about ownership that was never true.
-
-- A managed corpus can carry more than one embedding space.
-  `PUT /api/corpora/spaces` adds a projection of an existing
-  corpus under a second model: it reads that corpus's admitted renditions and
-  computes only its own vectors, so the source is retained once, extracted
-  once, and every space shares the same rendition ids and chunk refs. The
-  projection is an internal workspace — it is not listed beside the user's own
-  and is never a corpus id callers address. Corpus status now reports a
-  `corpus_generation` and one entry per space; an import brings every space to
-  the document it admitted, and a space that has not indexed the current
-  generation is refused with `EMBEDDING_SPACE_STALE` rather than answering from
-  membership it lacks. A model that is unavailable does not decide whether a
-  document is in the corpus: its own projection is left behind and unservable,
-  the other spaces still follow, and catching up is idempotent from the
-  canonical renditions, so the work is owed rather than lost.
-
-- A local mirror of the open learning catalogues — LibreTexts, OpenStax, MIT
-  OpenCourseWare and DevDocs — with BM25 search over it, at
-  `POST /api/catalogue/{search,sync}` and `GET /api/catalogue/status`. These
-  catalogues are small enough to hold whole, which is what makes searching them
-  locally possible; papers are not, and literature search is unchanged. Search returns *recall*, not a ranking:
-  deciding which of these teaches a particular reader best needs to know what
-  that reader already knows, which is not a fact about documents. Sync reports
-  what each provider offered against what was stored, because both LibreTexts
-  and MIT OpenCourseWare repeat ids across a paged fetch, and LibreTexts keeps
-  yielding new records well past the `numTotal` it reports.
-
-- A catalogue search query names the *set* of grains it will accept (`grains`)
-  rather than one. Which kinds of source could answer a question is a judgement
-  about the question and usually admits more than one; filtering to the single
-  preferred kind hid every provider publishing at another grain, and on this
-  mirror only one provider publishes courses — so a query for a broad subject
-  came back entirely from it, with no textbook on the subject anywhere in the
-  answer.
-
-- MCP tools accept a `workspace` id and read that workspace's library — its
-  roots, access boundary and index — without switching the app to it.
-  `list_context` reports every workspace and marks the active one; omitting
-  `workspace` reads the active workspace as before. The external listener
-  resolves its workspace per call, so switching workspaces in Wilkes no longer
-  restarts it.
-- Search matches cached author alongside filename and title. Author hits are
-  reported as `kind='author'` over MCP and labelled `Author` in the result
-  list.
+- OpenAlex and Semantic Scholar use the same manifest engine as custom integrations. Custom providers with DOI lookup can enrich document metadata. Existing settings and manifests migrate automatically to format version 2; stored manifest comments are lost, and conversion failures are reported.
+- Document extraction names now cover paged formats beyond PDF. Serialized file types and saved collection filters remain compatible.
+- Right-clicking empty space in the sidebar creates a folder at that location, with an inline name field.
+- Files can be dragged from the sidebar onto another root in the top strip to move them there. The strip scrolls when the drag reaches either end.
+- Files dragged in from the file manager are imported into the folder under the pointer, with highlighting, auto-scroll and automatic opening of closed folders.
+- Advanced › Data can delete workspaces, including managed corpora and their projections, without deleting source documents. The last workspace cannot be deleted. Also available through `DELETE /api/workspaces/{id}`.
+- The root strip shows whether each root is fully indexed or needs updating, with document counts in the tooltip. API clients can use `POST /api/embed/coverage`.
+- Applications can retrieve retained copies of managed-corpus documents through `POST /api/corpora/documents/snapshot`. Missing snapshots report `DOCUMENT_INDEX_INCOMPLETE`.
+- Documents opened through the operating system use a standalone reader. Other applications can also use `wilkes://open?path=...` links; add a workspace for the main window, and `page` or `line` for a position. Invalid destinations are reported.
+- Settings › Activity is now Workers, showing the current document, indexing stage, saved work, extraction failures and worker diagnostics. Progress survives restarts, and unfinished runs are marked as interrupted.
+- Interrupted index builds keep completed documents and offer to continue unfinished work. Failed documents have a separate retry action.
+- Combined search finds both exact wording and related passages, and labels each result's evidence. It replaces the Semantic checkbox and is the default for MCP `search`. Regular expressions use exact search; if semantic search is unavailable, exact results are returned with a note.
+- Dropping folders onto the window adds them as library roots. Mixed drops also import files into the root that was active when the drop began.
+- Viewer tab context menus offer "Close" and "Close All".
+- HTML files open rendered, with a source toggle, find, zoom, bookmarks and highlights. Local images and document links work; scripts, author styles and remote images are blocked.
+- Catalogue syncs show page and record counts; downloads show byte progress. Downloads exceeding 100 MiB are stopped while being received.
+- **API change:** managed-corpus routes move from `/api/integrations/underdog/` to `/api/corpora/*`. Ensure requests include `owner`.
+- **API change:** passage operations use `/api/chunks/{resolve,accumulate,similarity,search}`, a shared `scope` and stable `ChunkRef`s. `/api/embed/centroid`, `/api/embed/similarity` and `/api/export/chunk-text` are removed; embedding and export routes use `scope`. Chunk exports include `chunk_ref` and `text_sha256`; older indexes require a rebuild. `accumulate` returns a sum and count, and `resolve` accepts 512 refs.
+- **API change:** `GET /api/embed/capabilities` replaces `/api/embed/engines` and `/api/embed/models`, including default and recommended model flags.
+- **API change:** catalogue routes move to `/api/catalogue/*`.
+- Managed corpora can use multiple embedding models without duplicating source documents or extraction. Add a space with `PUT /api/corpora/spaces`; unavailable or outdated spaces must catch up before serving results.
+- Catalogue searches accept multiple source grains through `grains`, allowing courses, textbooks and other kinds of material in one query.
+- MCP tools can read a specific `workspace` without switching the app. `list_context` lists workspaces and marks the active one; switching no longer restarts the external listener.
+- Search matches cached authors as well as filenames and titles, with author matches labelled in the results.
+- General OCR can be disabled independently of formula and table recognition. At least one reader must remain enabled. Changing reader roles causes affected documents to be re-extracted.
+- Switching roots shows indexing coverage instead of starting an index build. Builds are started explicitly from Settings › Semantic.
+- `/api/catalogue/search` returns the searchable `terms`. The UI explains when a query contains none instead of implying that the catalogues are empty.
+- Data settings show separate application-data and active-workspace paths, each with its own open button.
+- The catalogue mirror is shared across workspaces. Existing workspace mirrors are not migrated; sync once to populate the shared mirror.
+- Catalogue databases accept new source grains without a schema constraint update. Existing databases migrate automatically; unknown grains are reported.
+- Pre-workspace installations migrate automatically into the Default workspace on startup. Migration can resume after interruption; conflicting library files are reported before anything moves. The manual migration script is removed.
+- Application-managed workspaces are visible and searchable. Their contents remain read-only to users, and listings include `read_only` and `managed_by`.
+- Catalogue acquisition and MCP `download` share the same download handling.
+- PDF extraction joins words split across lines, removes repeated headers and page numbers, and places margin notes after the page text. Search, embeddings and document exports use the cleaned text; queries copied from PDF viewers still match across line-wrap hyphenation.
+- PDF outlines include offsets into the extracted text and report how each destination was resolved.
+- Extraction recipe `wilkes-extractors-v2` re-extracts and re-embeds managed documents. Legacy indexed files update through their normal reindexing path.
+- Shipped and generated manifests use one line per entry. Existing custom manifests do not need to change their layout.
+- Literature results show year, citations and open-access status before authors and venue, keeping key facts visible with long author lists.
+- **API changes:** document metadata uses a `providers` map. Desktop provider commands are replaced by `literature_provider_status`, `literature_provider_lookup` and `literature_browse`; HTTP clients use `/api/literature/status`, `/api/literature/lookup` and `/api/literature/browse`.
+- **Breaking MCP change:** literature downloads use `provider` and `result_id`, with file URLs resolved by Wilkes. Search results report `downloadable` instead of direct file URLs, and `literature_resolve_download` is removed. User-supplied URLs remain supported by `download`.
+- Supported document formats are always enabled. Extension settings configure text formats separately.
+- Window and browser-tab titles identify the active document, root and workspace.
 
 ### Fixed
 
-- Ollama models served by its MLX runner can be used for generation. That
-  runner accepts a constraint on the output and ignores it, answering in plain
-  text where a JSON string was asked for, and every constrained task — a
-  cluster label, a cited summary, a composed search — failed with "Ollama
-  constrained response was not a JSON string". The plain-text reply is now
-  taken as the answer and held to the same grammar a constrained one is; a
-  reply outside it is refused, quoting what the model said.
-- A grammar that spans lines, or lets the model write a quotation mark, no
-  longer produces output Ollama's reply cannot be read from. The pattern
-  Ollama is given now describes the string as JSON writes it.
-- Cancelling an index build is over in three seconds, however deep the build
-  is. Pressing cancel used to kill politely and then wait: the workers were
-  given the roof knock — stdin closed, three seconds to notice — which a
-  worker in the middle of inference is not reading its stdin to hear, so the
-  whole budget was spent before the kill began; and the cancel then waited for
-  the build task to unwind, through the page it was rendering, an integrity
-  check over the temporary database and the merge that publishes it. None of
-  that is bounded by anything, and all of it happened with "Cancelling…" on
-  screen and a log line, "awaiting build task cleanup", that read like
-  tidying up.
-
-  A cancel now kills without a grace period and *seals* the managers, so a
-  caller that was already mid-document cannot start a replacement worker on
-  its way out, and the loops that render a book's pages for a request stop
-  when the seal goes up rather than rendering four hundred pages for a worker
-  that is gone. The user is told at the moment they ask — the cancellation
-  writes the job's verdict and announces it, rather than waiting for the build
-  to be in a position to speak for itself. What the stopped build still has to
-  do, publishing the documents it finished, now happens behind the
-  cancellation: the next build waits for it, the user does not, and quitting
-  gives it thirty seconds so an interrupted corpus is not re-read from page
-  one. A build still running at the deadline, or a worker still alive, is
-  logged as an error naming the invariant and killed again.
-
-- A search no longer starts an index build. Reaching an unindexed root used to
-  be reason enough to begin one: the search failed with "indexing has been
-  requested, please try again", and hours of inference started behind it. From
-  the interface that was merely presumptuous — the interface has its own build
-  button, and the semantic panel had already been separated from building for
-  the same reason. From an MCP tool call it was invisible: nothing on screen
-  named it, nothing offered to stop it, and the tool call that triggered it
-  then competed with it. The search now says the root is not indexed and stops
-  there, and building stays the one thing the user does deliberately.
-
-- A `search` MCP tool call answers within sixty seconds instead of timing
-  out. A combined search whose semantic lane is unavailable falls back
-  to exact matching over the corpus, which for a library of PDFs with no index
-  to read from means extracting every one of them — minutes. The interface
-  spends those minutes showing results as they arrive; an MCP client holds one
-  request open and gives up, and the search's answer was then discarded
-  unread, with the client reporting a timeout and the log reporting a closed
-  channel. The scan now stops at its budget and returns the matches it has,
-  with `complete: false` saying the corpus was not read to the end.
-
-- A combined `search` whose semantic lane was unavailable no longer reports it
-  as an error. The exact lane ran and its matches are the answer, so the
-  missing lane is a note about the search rather than a fault in it — it now
-  travels in the response's `notes`, and `stats.errors` carries only faults. A
-  client that read the reduction as a failure had no reason not to run the
-  search again, and it reduced the same way every time.
-
-- Indexing no longer takes the machine into swap collapse. How many texts the
-  embedding worker puts through the model at once is now a setting, under
-  Workers, and it defaults to sixteen. It is the only thing that decides the
-  worker's peak memory: not the size of a request, and not how many batches it
-  is split into — peak was flat across four of them — because
-  sentence-transformers sorts a request longest first and the first batch is
-  therefore always the largest chunks in it. Measured on a 24 GB machine
-  against the longest chunks a real corpus holds, peak footprint went 4.3 GB at
-  a batch of four, 5.6 at sixteen, 8.5 at twenty-four and past 9.5 at
-  thirty-two, on a model that occupies 1.9 GB at rest; at thirty-two, with the
-  rest of the machine, that was enough to leave every application on it paged
-  out and the kernel killing idle daemons to reclaim. Sixteen is the last size
-  before the curve turns sharp. Raise it where there is memory to spare — a
-  machine with more of it can afford more, which is why it is a setting and not
-  a constant — and lower it if indexing makes the machine swap.
-
-- Two workspaces reading at once no longer hold two copies of the same weights.
-  A worker is bounded by a permit shared across the whole process rather than
-  by the manager that starts it: the host builds a manager per worker kind per
-  workspace context, and it opens a context for every workspace anything
-  reaches — the HTTP API opens one per corpus it is asked about, a managed
-  import opens one for the corpus and one for each projection of it, and each
-  stays open for the life of the application. Nothing could see across them, so
-  a second workspace reading meant a second recognition worker, and a
-  recognition worker keeps four models resident by design. One permit per kind,
-  so a build — which alternates recognition and embedding, and holds one worker
-  of each — runs exactly as before, while the second workspace asking for the
-  same kind waits for the first worker to reach its idle timeout instead of
-  doubling the memory.
-
-- The topic cloud shows the names it already has when text generation is off.
-  Topic names are generated, and they are cached against the model that wrote
-  them; but the cache was read only after checking that a generator was loaded
-  and generation was switched on, so turning generation off made every name
-  already paid for unreadable. Reading the cache and generating the misses are
-  now separate: the cache is consulted whenever a model is configured, and only
-  the misses need a loaded generator.
-
-  A topic with no name and none coming used to render as a pulsing placeholder
-  that never resolved — a whole cloud of them, indistinguishable from a pane
-  still loading. Such a topic now shows the one thing it can state about
-  itself, the number of passages it groups, and stays clickable; the pane says
-  once why the names are missing. The cloud also no longer reports itself as
-  busy while waiting for names that are not coming.
-
-- The topic cloud says why it is empty. A failed build left the pane blank with
-  the error in a toast that had already gone, which reads as a feature that
-  does nothing; the error is now kept and shown in the pane, and a pane with no
-  folder chosen says that instead of showing nothing. A superseded request that
-  failed is logged rather than discarded.
-
-- Reading a document's table of contents no longer runs the recognizers. An
-  outline is anchored in a reading, so producing one meant producing the
-  reading — and it produced the enriched one, which is layout detection and
-  recognition over every page: minutes of inference for a book, started by an
-  export endpoint, a chat tool call or a managed import, with nothing on
-  screen to say it was happening and no way to stop it. Outlines are now read
-  from the page's own glyphs, enforced in the PDF backend rather than left to
-  each of the four callers to remember.
-
-  Four more reads that were never indexing jobs did the same thing and no
-  longer do: document summaries, citation labels, the chat's `get_document_text`
-  and `fs/read_text_file`, and the legacy `full_text` backfill that runs in the
-  background on every index load. Summaries and citation labels now prefer the
-  text the index already holds and only read the file when it holds none.
-  Inference happens where the user asked for it and can watch it: an indexing
-  job.
-
-  What a PDF read this way misses is text that exists only inside its
-  pictures — the same reading exact search has always fallen back to, and the
-  way to have that text is to index the file. Outline entries keep their
-  titles, levels, pages and anchors either way; what changes is that their byte
-  offsets index the unenriched reading, so an export that resolves an outline
-  against indexed chunks now places each entry by its page and title rather
-  than by an offset into a reading those chunks do not belong to.
-
-- A document indexed by the live file watcher now carries the same stable
-  passage identities a build writes. The watcher called `write_file` where the
-  build calls `write_file_with_recipe`, so a file edited while Wilkes was
-  running landed with no `chunk_ref` — passages that could not be named,
-  indistinguishable from passages that do not exist to every route that
-  addresses one by ref.
-
-- Downloading the same content to the same name reports it as already present
-  instead of refusing. The name was checked before the request, so a fetch that
-  succeeded and failed downstream left a file that made every retry impossible
-  — the second attempt would have written exactly the same bytes. Different
-  content under the same name is still refused and the existing file is still
-  never overwritten.
-
-- A download whose URL ends without a file extension is named from the
-  server's content type instead of being saved under a name nothing can type.
-  LibreTexts serves whole books from `.../download/<id>/pdf`, which previously
-  produced a file called `pdf` that the managed importer then refused. An
-  unrecognised content type is reported rather than guessed at.
-
-### Changed
-
-- General OCR is a reader that can be switched off, not the feature switch. The
-  page recognizer used to answer two questions at once — "is a page reader
-  attached" and "are pictures read at all" — so switching it off in Extraction →
-  OCR switched off the formula and table readers with it, and the layout
-  detector besides. It is now a role in `image_analysis.disabled_roles` like the
-  other two: with it off, the specialists still read the areas the detector
-  marks out for them, and what only the page reader read — charts, embedded
-  rasters, and a kind whose own reader is missing — is not read rather than read
-  worse. Those detections are dropped before their crops are rendered, and the
-  stage log still counts them as detected and not read. The one configuration
-  refused is the empty one: every reader off, which would report as a library
-  whose pictures hold no text. `enabled` keeps its own meaning and the panel's
-  top toggle keeps driving it.
-
-  This changes the extraction recipe, so a library read with the page reader
-  switched off is re-read if it is switched back on, exactly as the other two
-  roles behave.
-
-- The Activity page is now Workers, and the worker rows are always on screen.
-  They were behind a "Worker Diagnostics" disclosure beneath the job, which is a
-  click away from the question the page is opened to answer once a document has
-  stopped moving.
-
-- Switching roots no longer starts an index build. The detection behind it is
-  unchanged and now feeds the root strip's coverage marks instead: moving
-  between roots to look at a file used to commit the machine to hours of
-  inference on the strength of noticing that the root was not indexed, with the
-  only way to stop it being to find the build and cancel it. The reading is what
-  the interface needs in order to say a root is not indexed; starting the build
-  is the user's, from Settings → Semantic.
-
-- `catalogue/search` returns the `terms` each query reduced to alongside its
-  hits. An empty result had two causes a caller could not tell apart — nothing
-  matched, or nothing in the query survived stopword and length filtering, as
-  happens to any single-letter term — and only the store knew which. The UI now
-  says "nothing in that could be searched for" where it used to imply the
-  catalogues were empty.
-
-- The Data settings page names two paths where it named one. What it labelled
-  the application's data directory was the active workspace's directory inside
-  it, so the installation root — which holds `workspaces/`, the model cache and
-  the catalogue mirror — could not be seen from the page at all, and the
-  workspace path was shown under a name that belonged to its parent.
-  `DataPaths.app_data` is now that root and `DataPaths.workspace` is the
-  workspace, each with its own button.
-
-- The catalogue mirror is one per installation, in `shared_data_dir/catalogue`
-  beside the model cache, rather than one per workspace. Its rows are what four
-  public catalogues publish, which is the same answer whichever workspace asks:
-  per-workspace, an installation paid for a sync once per workspace, and a
-  consumer that synced under one workspace found an empty mirror under the
-  next. Existing per-workspace `catalogue.db` files are not migrated or read —
-  the mirror is refetchable by definition, so the first `/api/catalogue/sync`
-  refills the shared one — and they can be deleted.
-
-- `catalogue_records.grain` no longer carries a CHECK constraint listing the
-  grains this build knows. SQLite cannot drop a CHECK in place, so the three
-  variants in the schema were three variants no existing database could be
-  talked out of: a fourth grain would have needed the table rebuilt anyway.
-  Opening a v1 database rebuilds it once, carrying the rowids across because
-  the FTS index is keyed by them. The column's domain is the Rust type's to
-  state, and a `grain` no variant covers is now an error naming the value
-  rather than a row served as a textbook.
-
-- A pre-workspace ("alpha") installation is migrated into its Default workspace
-  by the application, on the start that finds it. The library, its databases'
-  companion files and the roots the settings file had open move into one
-  workspace; the roots and semantic block that the manifest now owns are
-  dropped from global settings, so nothing answers "what is open" twice. The
-  migration is resumable: the workspace it commits to is recorded before the
-  first file moves, and the registry — what makes the workspace real — is
-  written only after the last one lands. It refuses, having moved nothing, when
-  the same library file exists in both the data and the config directory, since
-  only the user knows which one is theirs.
-
-  The startup screen that used to ask for this, and `scripts/migrate_workspace.py`
-  that it told the user to run, are gone. The migration is mechanical — the
-  whole library becomes one workspace and there is nothing to decide — so
-  asking cost every alpha user a manual step to reach a state the app could
-  reach itself, and left an install able to answer the question twice: run the
-  script, or start a build that would create a fresh empty registry beside the
-  library. The startup gate itself stays, with no feature contributing a
-  blocker today; an unexpected startup failure is still reported through it.
-
-- An application-managed workspace — Underdog's semantic corpus — is now listed,
-  activatable and searchable by the user instead of being hidden from the
-  workspace listing. Hiding it protected the corpus by making it unreachable,
-  which cost the reads as well as the writes: its documents sit on the user's
-  own disk and there was no way to look at them. The listing reports
-  `read_only` and `managed_by` (also on the MCP `list_context` workspaces), and
-  the protection is stated on the writes instead — rename, import, save,
-  directory create/move/trash, index build and index delete, `/api/upload` and
-  the `download` MCP tool are all refused. The managed import API keeps its own
-  path and remains the corpus's only writer.
-- The downloader behind the `download` MCP tool moved to `wilkes-core` so the
-  catalogue acquisition route shares it. One set of answers to may-this-be-
-  fetched, where-may-it-land and is-this-already-here.
-- PDF extraction produces one canonical reading of a document instead of a
-  transcription of its layout: words the typesetter broke across a line are
-  joined on the document's own vocabulary, repeating page numbers and running
-  heads are removed, and margin boxes are moved after the page they annotate
-  rather than left in the middle of the sentence they interrupt. Search,
-  embeddings, `get_document_text`, grep context and the managed corpus export
-  all read that text.
-- PDF outline entries carry a byte offset into that reading, resolved from the
-  bookmark's own destination coordinate where the document has one, and report
-  which rung of the resolution ladder answered.
-- `PdfSearchProjection` no longer repairs line-wrap hyphenation: the reading it
-  matches against no longer contains any. A query pasted out of a PDF viewer
-  still matches across the break the viewer showed.
-- `EXTRACTOR_RECIPE_VERSION` is `wilkes-extractors-v2`. Every managed document
-  re-extracts and re-embeds; legacy indexed files re-index on their normal path.
+- Ollama models using its MLX runner work for generation tasks even when the runner ignores output constraints. Replies are still validated.
+- Ollama output constraints handle multiline text and quotation marks correctly.
+- Cancelling an index build completes within three seconds. Completed documents are saved in the background and remain available for continuation.
+- Searching an unindexed root reports that it needs indexing instead of starting a build automatically.
+- MCP `search` returns within sixty seconds, with partial matches and `complete: false` if an exact scan reaches its time limit.
+- Combined search reports unavailable semantic search in `notes` instead of counting it as an error when exact search succeeds.
+- Embedding batch size is configurable under Workers and defaults to 16 to reduce memory pressure. Lower it if indexing causes swapping, or raise it when more memory is available.
+- Workspaces share a limit of one worker per kind, preventing duplicate model loads when several workspaces are read at once.
+- The topic cloud displays cached names when generation is off. Unnamed topics show passage counts and remain clickable, with an explanation of missing names instead of endless loading placeholders.
+- The topic cloud keeps build errors visible and explains when no folder is selected.
+- Reading outlines, summaries, citation labels or document text no longer starts recognition. These reads use indexed text where available or the document's own text; text inside images requires indexing.
+- Documents indexed by the file watcher receive the same stable passage identities as documents indexed by a build.
+- Downloading identical content to an existing filename reports it as already present. Different content is still refused without overwriting the file.
+- Downloads whose URLs lack an extension are named using the server's content type. Unrecognized types are reported.
+- Missing citation counts no longer appear as "0 citations". Previously cached zeros remain until the document is refreshed.
+- Confirmation dialogs work again when clearing logs, deleting an index or switching workspaces with unsaved edits.
+- Literature results remain available across MCP requests, so a download following a search can find the selected result.
+- Provider rate limits beyond the retry budget are reported promptly instead of leaving requests to time out.
+- Provider requests work with TLS-1.3-only services on macOS.
+- Provider-supplied download filenames are sanitized and validated before saving.
+- Custom-provider validation, health-check and request errors are visible, with bounded retries for transient request failures.
+- Exact search reuses indexed text where available, and filename, title and content matches appear together in search results.
+- PDF text selection is smoother in WebKit, scanned PDF pages render correctly, and comic and other non-PDF documents open in the appropriate reader.
+- The maximum file size setting can be edited normally and saves on blur or Enter.
 
 ## 0.9.5 - 2026-04-20
 
 ### Added
 
-- Metadata extraction for documents (DOI, author, date).
-- External links (Google Scholar) in viewer metadata.
+- Document metadata extraction (title, DOI, author and date), with titles and PDF creation dates shown in the viewer.
+- Open and copy a document’s DOI, or look it up on Google Scholar, from viewer metadata.
 - Context menus for file and directory rows.
+
+## 0.9.4 - 2026-04-15
+
+### Changed
+
+- Search consistently follows the supported extensions configured in Settings. The separate search extension filter is removed.
+
+### Fixed
+
+- Corrected the Docker container port and improved image publishing reliability.
+
+## 0.9.3 - 2026-04-11
+
+### Added
+
+- Automated publishing of Docker images to GitHub Container Registry.
+
+## 0.9.2 - 2026-04-11
+
+### Fixed
+
+- Workers shut down reliably, including on Windows, and no longer leave requests blocked during shutdown.
+
+## 0.9.1 - 2026-04-11
+
+### Added
+
+- The file list shows omitted files and explains unsupported extensions or size limits.
+
+### Changed
+
+- Candle’s default embedding model is MiniLM-L6 instead of MiniLM-L12.
+- Improved PDF page sizing and virtualization.
+
+### Fixed
+
+- Python environment setup no longer opens unwanted console windows on Windows.
+
+## 0.9.0 - 2026-04-10
+
+### Added
+
+- Exact and local semantic search across PDFs and text files, with regex, case-sensitive matching and highlighted results.
+- PDF and code viewers with match navigation, plus PDF page controls, zoom and in-document search.
+- Fastembed, Sentence Transformers and Candle embedding engines, with custom models, model downloads, configurable chunking and CPU/device selection.
+- Library settings, configurable text extensions and file-size limits, logs and worker controls.
+- Desktop support for macOS, Windows and Linux, plus a web server and Docker packaging.

@@ -32,8 +32,9 @@ use url::Url;
 use self::expr::{Evaluator, Projected};
 use self::manifest::{
     lookup_field_type, search_field_type, Bases, BrowseCapability, FieldSpec, FieldType,
-    LookupCapability, Manifest, ParamValue, ReferencesCapability, ResolverStep, ResponseFormat,
-    SearchCapability, SecretSlot, ValueRule, MAX_FILTER_VALUES, MAX_SUGGESTIONS, MIN_SUGGEST_CHARS,
+    LookupCapability, Manifest, Missing, ParamValue, ReferencesCapability, ResolverStep,
+    ResponseFormat, SearchCapability, SecretSlot, ValueRule, MAX_FILTER_VALUES, MAX_SUGGESTIONS,
+    MIN_SUGGEST_CHARS,
 };
 use crate::integrations::{LiteratureSource, ProviderCapabilities};
 use crate::metadata::doi::normalize_doi;
@@ -279,16 +280,18 @@ impl CustomSource {
                 let issues_empty = projection.issues.is_empty();
                 let resolver_error = if self.manifest.capabilities.resolve_download.is_some() {
                     match projection.results.first() {
-                        Some(result) => {
-                            self.resolve_manifest_download(result)
-                                .await
-                                .err()
-                                .map(|error| {
-                                    self.redact_error(format!(
-                                        "resolve_download probe failed: {error:#}"
-                                    ))
-                                })
-                        }
+                        Some(result) => match self.resolve_manifest_download(result).await {
+                            Ok(Some(_)) => None,
+                            // Not a fault in the manifest, and not evidence
+                            // for it either: no step was seen through to a URL.
+                            Ok(None) => Some(format!(
+                                "resolve_download was not checked: the service has no file for the first result ('{}'). Choose an example query whose first result has one.",
+                                result.id
+                            )),
+                            Err(error) => Some(self.redact_error(format!(
+                                "resolve_download probe failed: {error:#}"
+                            ))),
+                        },
                         None => Some(
                             "resolve_download probe needs one successfully projected result"
                                 .to_string(),
@@ -1136,8 +1139,20 @@ impl CustomSource {
                 .map_err(|error| {
                     anyhow::anyhow!("resolver step {} response: {error}", index + 1)
                 })?;
-            for (name, value) in extracted {
-                values.insert(name, value);
+            match extracted {
+                Extracted::Values(extracted) => values.extend(extracted),
+                // The manifest said this absence is the service holding no
+                // file, so it is the answer and not a failure to read one.
+                Extracted::Unavailable { field } => {
+                    tracing::info!(
+                        integration = %self.id,
+                        result = %result.id,
+                        step = index + 1,
+                        field = %field,
+                        "no file for this result: the field matched nothing and its manifest calls that unavailable"
+                    );
+                    return Ok(None);
+                }
             }
         }
 
@@ -1178,38 +1193,28 @@ impl CustomSource {
         step: &ResolverStep,
         body: &[u8],
         base_url: &Url,
-    ) -> anyhow::Result<HashMap<String, String>> {
+    ) -> anyhow::Result<Extracted> {
         // `absolute_url` resolves against the step's own base: a relative URL
         // in a response from another origin means *that* origin.
         let evaluator = Evaluator::new(base_url);
-        let mut out = HashMap::new();
         match step.response_format {
             ResponseFormat::Json => {
                 let value: Value = serde_json::from_slice(body)
                     .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
-                for (name, spec) in &step.fields {
-                    let projected = self
-                        .select_json(spec, &value, FieldType::Text, &evaluator)
-                        .map_err(|error| anyhow::anyhow!("field '{name}': {error}"))?
-                        .ok_or_else(|| anyhow::anyhow!("field '{name}' matched nothing"))?;
-                    out.insert(name.clone(), projected_string(projected));
-                }
+                step_values(step, |spec| {
+                    self.select_json(spec, &value, FieldType::Text, &evaluator)
+                })
             }
             ResponseFormat::Html => {
                 let html = std::str::from_utf8(body)
                     .map_err(|error| anyhow::anyhow!("response is not UTF-8 HTML: {error}"))?;
                 let document = Document::from(html);
                 let root = Selection::from(document.root());
-                for (name, spec) in &step.fields {
-                    let projected = self
-                        .select_html(spec, &root, FieldType::Text, &evaluator)
-                        .map_err(|error| anyhow::anyhow!("field '{name}': {error}"))?
-                        .ok_or_else(|| anyhow::anyhow!("field '{name}' matched nothing"))?;
-                    out.insert(name.clone(), projected_string(projected));
-                }
+                step_values(step, |spec| {
+                    self.select_html(spec, &root, FieldType::Text, &evaluator)
+                })
             }
         }
-        Ok(out)
     }
 
     // ── Requests ─────────────────────────────────────────────────────────────
@@ -1357,6 +1362,46 @@ impl CustomSource {
 }
 
 static EMPTY_PARAMS: BTreeMap<String, ParamValue> = BTreeMap::new();
+
+/// What one resolver step's response came to.
+enum Extracted {
+    Values(HashMap<String, String>),
+    /// A field the manifest marks `missing = "unavailable"` matched nothing:
+    /// the service has no file for this result.
+    Unavailable {
+        field: String,
+    },
+}
+
+/// Every field of a step, read by `select`. Each must match. One that does not
+/// is an error naming it — unless the manifest says its absence means the
+/// result has no file, which only a selector finding nothing can mean: a value
+/// that is found and does not fit has already failed in `select`.
+///
+/// Every field is read before an absence is believed, so a response that is
+/// also wrong about another field is reported as wrong rather than as empty.
+fn step_values(
+    step: &ResolverStep,
+    mut select: impl FnMut(&FieldSpec) -> Result<Option<Projected>, String>,
+) -> anyhow::Result<Extracted> {
+    let mut values = HashMap::new();
+    let mut unavailable = None;
+    for (name, spec) in &step.fields {
+        match select(spec).map_err(|error| anyhow::anyhow!("field '{name}': {error}"))? {
+            Some(projected) => {
+                values.insert(name.clone(), projected_string(projected));
+            }
+            None if spec.missing() == Missing::Unavailable => {
+                unavailable.get_or_insert_with(|| name.clone());
+            }
+            None => anyhow::bail!("field '{name}' matched nothing"),
+        }
+    }
+    Ok(match unavailable {
+        Some(field) => Extracted::Unavailable { field },
+        None => Extracted::Values(values),
+    })
+}
 
 /// The records a response holds: the array `expression` selects, or the body
 /// itself when it is the array.
@@ -3257,6 +3302,126 @@ doi = "doi"
         assert_eq!(download.filename.as_deref(), Some("Graph_ Networks.PDF"));
         search.assert_async().await;
         resolve.assert_async().await;
+    }
+
+    /// Anna, resolving through a page that links the file when there is one.
+    fn page_resolver(md5_field: &str) -> String {
+        let start = ANNA_MANIFEST
+            .find("[capabilities.resolve_download]")
+            .unwrap();
+        format!(
+            "{}[capabilities.resolve_download]\nurl = \"/get/{{md5}}\"\nsteps = [\n  {{ path = \"/scidb?id={{id}}\", response_format = \"html\", fields = {{ md5 = {md5_field} }} }},\n]\n",
+            &ANNA_MANIFEST[..start]
+        )
+    }
+
+    const MD5_OR_UNAVAILABLE: &str = r#"{ path = "a[href*='md5=']", attribute = "href", capture = "(?i)md5=([a-f0-9]{32})", missing = "unavailable" }"#;
+
+    /// One Anna result, and what its resolver makes of the page it is served.
+    async fn resolve_through_page(
+        md5_field: &str,
+        page: &str,
+    ) -> anyhow::Result<Option<ResolvedLiteratureDownload>> {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/search")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(ANNA_BODY)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/scidb")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(page)
+            .create_async()
+            .await;
+        let anna = source(&page_resolver(md5_field), &server.url(), &[]);
+        let book = anna.search("graph networks", 1, 1).await.unwrap().remove(0);
+        anna.resolve_download(&book).await
+    }
+
+    const PAGE_WITH_FILE: &str =
+        r#"<a href="/dl?md5=0123456789abcdef0123456789ABCDEF&x=1">Download</a>"#;
+    const PAGE_WITHOUT_FILE: &str = r#"<p>Not held.</p><a href="/about">About</a>"#;
+
+    #[tokio::test]
+    async fn a_field_the_manifest_calls_unavailable_when_missing_is_no_file_not_a_failure() {
+        let held = resolve_through_page(MD5_OR_UNAVAILABLE, PAGE_WITH_FILE)
+            .await
+            .unwrap()
+            .expect("the page links a file");
+        assert!(
+            held.url.ends_with("/get/0123456789abcdef0123456789ABCDEF"),
+            "{}",
+            held.url
+        );
+
+        let absent = resolve_through_page(MD5_OR_UNAVAILABLE, PAGE_WITHOUT_FILE)
+            .await
+            .unwrap();
+        assert_eq!(absent, None);
+    }
+
+    /// Only the manifest can say an absence is an answer. Unsaid, a selector
+    /// that finds nothing is a manifest that no longer describes the page.
+    #[tokio::test]
+    async fn a_missing_field_is_an_error_unless_the_manifest_says_otherwise() {
+        let unsaid = MD5_OR_UNAVAILABLE.replace(r#", missing = "unavailable""#, "");
+        let error = resolve_through_page(&unsaid, PAGE_WITHOUT_FILE)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "resolver step 1 response: field 'md5' matched nothing"
+        );
+    }
+
+    /// The link is there and is not what the manifest says a link looks like:
+    /// that is the manifest being wrong about the page, whatever it says about
+    /// a link that is absent.
+    #[tokio::test]
+    async fn a_value_that_is_found_and_does_not_fit_is_an_error_even_where_missing_is_unavailable()
+    {
+        let error = resolve_through_page(
+            MD5_OR_UNAVAILABLE,
+            r#"<a href="/dl?md5=renamed-scheme">Download</a>"#,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("field 'md5'"), "{error}");
+        assert!(error.contains("capture group 1 matched nothing"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_probe_whose_example_has_no_file_says_the_resolver_was_not_checked() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/search")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(ANNA_BODY)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/scidb")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(PAGE_WITHOUT_FILE)
+            .create_async()
+            .await;
+        let report = source(&page_resolver(MD5_OR_UNAVAILABLE), &server.url(), &[])
+            .probe("graph networks")
+            .await;
+        // Not clean — no step reached a URL — and not called a failure either.
+        assert!(!report.ok);
+        let said = report.error.unwrap();
+        assert!(said.contains("was not checked"), "{said}");
+        assert!(said.contains("has no file for the first result"), "{said}");
+        assert!(!said.contains("failed"), "{said}");
     }
 
     #[tokio::test]

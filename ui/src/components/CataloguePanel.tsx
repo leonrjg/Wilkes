@@ -69,7 +69,7 @@ function formatSyncedAt(syncedAtMs: number | null): string {
  * What one sync did, in the terms the store reports it.
  *
  * `offered` and `stored` are both shown when they differ, because they do
- * differ — LibreTexts and MIT OpenCourseWare repeat ids across a paged fetch —
+ * differ — LibreTexts and MIT OCW repeat ids across a paged fetch —
  * and a panel that showed only the stored count would make a provider whose
  * pagination has changed under us look like one that simply shrank.
  */

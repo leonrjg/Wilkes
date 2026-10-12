@@ -253,6 +253,29 @@ declared origin. The final URL and optional filename are handed to the existing
 catalogue downloader. The manifest never writes a file and search never spends
 one authenticated request per displayed result.
 
+**An absence that is an answer.** Every field of a step must match: a
+selector that finds nothing is a manifest that no longer describes the page,
+and is an error naming the step and the field. But a page that links a file
+when the service holds one, and links none when it does not, answers "no file"
+with exactly that absence, and the engine cannot tell the two apart. The author
+can, so the field says so:
+
+```toml
+fields = { md5 = { path = "a[href*='md5=']", attribute = "href", capture = "(?i)md5=([a-f0-9]{32})", missing = "unavailable" } }
+```
+
+`missing` is `error` (the default) or `unavailable`. With `unavailable`, the
+selector finding nothing ends resolution with no download — the outcome
+`resolve_download` already had for a result with no file, logged at info with
+the step and the field. It covers only the selector finding nothing. A value
+that is found and does not fit — the capture does not match, the type is wrong
+— is the manifest being wrong about the page and is an error whatever
+`missing` says; so is every other field of the step, which is read before the
+absence is believed. It is refused on a search or lookup field, where a field
+that matches nothing is already left empty. A probe whose example result has
+no file says the resolver was not checked: no step reached a URL, which is
+neither a fault nor evidence.
+
 An Anna-style provider is therefore expressible without code:
 
 ```toml

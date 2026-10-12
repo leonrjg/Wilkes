@@ -414,7 +414,7 @@ impl CatalogueFetch for OpenStax {
     }
 }
 
-// ── MIT OpenCourseWare ───────────────────────────────────────────────────────
+// ── MIT OCW ───────────────────────────────────────────────────────
 
 /// Courses, not books: this is the catalogue that answers *in what order*,
 /// which is the question a subject with no existing coverage actually asks.
@@ -437,7 +437,7 @@ impl MitOpenCourseWare {
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            http: ProviderHttpClient::new("MIT OpenCourseWare"),
+            http: ProviderHttpClient::new("MIT OCW"),
         }
     }
 }
@@ -484,7 +484,7 @@ impl CatalogueFetch for MitOpenCourseWare {
     }
 
     fn name(&self) -> &'static str {
-        "MIT OpenCourseWare"
+        "MIT OCW"
     }
 
     fn base_url(&self) -> &str {
@@ -530,7 +530,7 @@ impl CatalogueFetch for MitOpenCourseWare {
                     tracing::warn!(
                         course = course.id,
                         license_cc = ?course.license_cc,
-                        "MIT OpenCourseWare record refused: not stated as openly licensed"
+                        "MIT OCW record refused: not stated as openly licensed"
                     );
                     continue;
                 }
@@ -573,7 +573,7 @@ impl CatalogueFetch for MitOpenCourseWare {
             tracing::warn!(
                 refused,
                 stored = out.len(),
-                "MIT OpenCourseWare records refused for want of a stated open licence"
+                "MIT OCW records refused for want of a stated open licence"
             );
         }
         Ok(out)

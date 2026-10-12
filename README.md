@@ -80,99 +80,13 @@ The app supports multiple engines to maximize model availability:
 - **Candle**
   - Default model: `all-miniLM-L6-v2`
 
-### Generation backends
-
-- **Candle** downloads a supported generation model into Wilkes and runs it in
-  an isolated local worker.
-- **Ollama** connects to an Ollama HTTP service and lists the models installed
-  there. Start Ollama and pull a model with `ollama pull <model>`, then select
-  **Settings → Generation → Models → Ollama**. The default endpoint is
-  `http://127.0.0.1:11434`, and can be changed for a remote Ollama service.
-
-Wilkes applies the same sampling, cancellation, stop, and constrained-output
-validation contract to both generation backends.
-
 ## Q&A
 - What model should I use?
   - You can use those marked as "Recommended", try multiple, or just use the default model. You can check the [MTEB ranking](https://huggingface.co/spaces/mteb/leaderboard) and use any model from that list (through specific engines). Note that the top 10 of the ranking are too large to run on consumer hardware.
 
 ## External MCP
 
-The desktop app can expose Wilkes' document and literature tools to regular
-Claude Code and Codex sessions. In **Settings → Chat → External MCP**, enable
-the server, choose its bind address and port, and use the copy buttons for the
-client you want to configure. The bind address defaults to `127.0.0.1`; use a
-specific LAN address or a wildcard such as `0.0.0.0`/`::` only when remote
-clients need access. Bearer authentication is optional and disabled by default.
-
-The endpoint:
-
-- listens on the configured IPv4 or IPv6 address;
-- can require a persistent bearer token stored separately from `settings.json`;
-- stays available while Wilkes is running, even when its chat pane is closed;
-- reports the document and PDF page currently visible in Wilkes through
-  `list_context`, even when its chat pane is closed;
-- reads only documents inside the current, favorite, or recent Wilkes library
-  roots.
-
-The endpoint is workspace-aware. `list_context` reports every workspace with
-its id, roots and current root, and marks the active one. Tools read the active
-workspace by default; passing `workspace: "<id>"` reads that workspace's
-library instead — its roots, its access boundary and its index — without
-switching the app to it. Switching workspaces in Wilkes therefore does not
-restart the listener or drop connected clients.
-
-The active document reported by `list_context` is informational. External
-clients must continue to pass an explicit document path to `get_document_text`,
-`get_related_documents`, and `get_file_metadata`. A call that names a workspace
-must always pass the path explicitly, since the visible document belongs to the
-workspace open in Wilkes.
-
-Binding beyond loopback makes the endpoint reachable from the corresponding
-network interfaces. Without token authentication, anyone who can reach the
-endpoint can use its tools. Enable the token or restrict access with host
-firewall rules where appropriate. When using `0.0.0.0` or `::`, remote clients
-must replace the wildcard in the copied endpoint with the Wilkes machine's
-reachable address. Disabling authentication keeps an existing token file so it
-can be reused if authentication is enabled again.
-
-The in-app chat continues to use its own private, session-scoped MCP server.
-Changing the external bind address or port, or rotating its token, does not
-affect open Wilkes chat sessions.
- 
-## Deep links
-
-Other applications can send a reader straight to a document in Wilkes with a
-`wilkes://` link — a "Read on Wilkes" button, the same way an `obsidian://`
-link reaches a note.
-
-```
-wilkes://open?path=<absolute path>
-             [&workspace=<workspace id or name>]
-             [&page=<1-based page>]
-             [&line=<1-based line>[&col=<1-based column>]]
-```
-
-`workspace` decides which window opens:
-
-- **Without it**, the link names a file and nothing else, and it opens in the
-  standalone reader — the same window a file opened from Finder or Explorer
-  lands in. No workspace is switched and nothing about the running session
-  changes. This is the right form for an application that knows where a
-  document is on disk but not which library holds it.
-- **With it**, the link names a document *in a library*. Wilkes switches to
-  that workspace, makes the root containing the document the visible one, and
-  opens it in the main window exactly as a click in the file list would. The
-  workspace may be given by id or by name. A path outside every root of that
-  workspace is refused: the main window can only show what its library serves.
-
-`page` addresses a PDF and `line` a text document; naming both, or naming a
-page of something that is not a PDF, is refused rather than silently opened at
-the top. Every value must be percent-encoded — a path most of all.
-
-Wilkes is a single instance: a link clicked while it is already running is
-handled by the running application, and one clicked while it is not launches
-it and is honoured once the workspace has loaded.
+The desktop app can expose Wilkes' document and literature tools to regular Claude Code and Codex sessions.
 
 ## Interface
 <img width="1312" height="903" alt="image" src="https://github.com/user-attachments/assets/d2018970-5270-467d-9cc5-49a00ad5fa53" />
@@ -183,25 +97,11 @@ it and is honoured once the workspace has loaded.
 <img width="1312" height="903" alt="SCR-20260410-slzb" src="https://github.com/user-attachments/assets/9e71a66c-04cc-4b19-98b5-c491089febc1" />
 <img width="1268" height="859" alt="SCR-20260410-sllg" src="https://github.com/user-attachments/assets/9c91e67d-654d-4f1d-aaf0-5a735546b3dc" />
 
-
-## Roadmap
-- Workspaces (virtual folders) rather than 1:1 folder mapping
-  - Drag-and-drop files  
-- Support for EPUB, MOBI, FB2, XPS, CBZ
-- Support for images
-- HTML viewer
-- Office documents
-
 If you have feature requests, feel free to open an issue (or a PR).
 
 ## Changelog
-### 0.9.5 - 2026-04-20
 
-#### Added
-
-- Document metadata extraction (DOI, author, date).
-- External links (Google Scholar) on viewer.
-- Context menu.
+See [CHANGELOG.md](CHANGELOG.md) for release history and unreleased changes.
 
 ## Contributing
 <img alt="Coverage" src="https://img.shields.io/badge/coverage-82%25-green" />

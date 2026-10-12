@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use super::manifest::{
-    Capabilities, FieldSpec, HealthCapability, HttpSpec, Manifest, ParamValue,
+    Capabilities, FieldSpec, HealthCapability, HttpSpec, Manifest, Missing, ParamValue,
     ResolveDownloadCapability, ResolverStep, ResponseFormat, SearchCapability, SecretRef,
     MANIFEST_VERSION,
 };
@@ -359,6 +359,7 @@ fn convert_field(field: V1Field, format: ResponseFormat) -> anyhow::Result<Field
             then: mapped.coerce.map(|coerce| coerce.apply("@")),
             capture: mapped.capture,
             capture_group: mapped.capture_group,
+            missing: Missing::Error,
         });
     }
 
@@ -389,6 +390,7 @@ fn convert_field(field: V1Field, format: ResponseFormat) -> anyhow::Result<Field
                 then: None,
                 capture: mapped.capture,
                 capture_group: mapped.capture_group,
+                missing: Missing::Error,
             })
         }
         ResponseFormat::Html => {
@@ -402,6 +404,7 @@ fn convert_field(field: V1Field, format: ResponseFormat) -> anyhow::Result<Field
                 then: mapped.coerce.map(|coerce| coerce.apply("@")),
                 capture: mapped.capture,
                 capture_group: mapped.capture_group,
+                missing: Missing::Error,
             })
         }
     }
@@ -616,6 +619,7 @@ authors = { path = "author", coerce = "join" }
                 then: None,
                 capture: None,
                 capture_group: None,
+                missing: Missing::Error,
             }
         );
         // `first_of` was "first present"; `not_null` says exactly that.

@@ -123,7 +123,7 @@ pub struct CatalogueSyncOutcome {
     /// as partial rather than collapsed into one failure.
     pub records: Option<usize>,
     /// What the provider handed over, before deduplication. Both LibreTexts
-    /// and MIT OpenCourseWare repeat ids across a paged fetch, so `offered`
+    /// and MIT OCW repeat ids across a paged fetch, so `offered`
     /// runs well ahead of `records`; a provider whose gap suddenly widens is
     /// one whose pagination has changed under us.
     pub offered: Option<usize>,
@@ -436,7 +436,7 @@ pub async fn acquire(
         })
 }
 
-/// Fetches one MIT OpenCourseWare course: its documents, and a generated
+/// Fetches one MIT OCW course: its documents, and a generated
 /// Markdown file describing them.
 ///
 /// A course record has no `pdf_url` because a course is not a file, so this is
@@ -457,7 +457,7 @@ pub async fn acquire_course(
     course_progress: Option<mpsc::Sender<CatalogueCourseProgress>>,
     download_progress: Option<mpsc::Sender<DownloadProgress>>,
 ) -> Result<CatalogueCourseResponse, CatalogueError> {
-    let http = ProviderHttpClient::new("MIT OpenCourseWare");
+    let http = ProviderHttpClient::new("MIT OCW");
     let manifest = ocw::read_course(&http, &course_url, course_progress.as_ref())
         .await
         .map_err(|error| {

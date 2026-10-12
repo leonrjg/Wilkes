@@ -56,7 +56,7 @@ const OPENALEX = provider("openalex", "OpenAlex", null);
 
 const UNSYNCED: LiteratureProviderInfo[] = [
   provider("libretexts", "LibreTexts", unfetched("textbook")),
-  provider("mit_ocw", "MIT OpenCourseWare", unfetched("course")),
+  provider("mit_ocw", "MIT OCW", unfetched("course")),
   OPENALEX,
 ];
 
@@ -66,7 +66,7 @@ const SYNCED: LiteratureProviderInfo[] = [
     records: 2_219,
     synced_at_ms: Date.now() - 3 * 86_400_000,
   }),
-  provider("mit_ocw", "MIT OpenCourseWare", unfetched("course")),
+  provider("mit_ocw", "MIT OCW", unfetched("course")),
   OPENALEX,
 ];
 
@@ -133,7 +133,7 @@ describe("CataloguePanel", () => {
   it("names a provider that has never synced", async () => {
     render(<CataloguePanel api={api} />);
     await screen.findByText("LibreTexts");
-    expect(screen.getByText("MIT OpenCourseWare")).toBeTruthy();
+    expect(screen.getByText("MIT OCW")).toBeTruthy();
     expect(screen.getAllByText("Never synced").length).toBe(2);
   });
 
@@ -179,7 +179,7 @@ describe("CataloguePanel", () => {
     await screen.findByText("LibreTexts");
     fireEvent.click(screen.getByLabelText("Sync LibreTexts"));
     expect(await screen.findByText("429 Too Many Requests")).toBeTruthy();
-    expect(screen.getByText("MIT OpenCourseWare")).toBeTruthy();
+    expect(screen.getByText("MIT OCW")).toBeTruthy();
   });
 
   it("shows what each provider holds and when it last said so", async () => {
@@ -196,8 +196,8 @@ describe("CataloguePanel", () => {
     withStatus(SYNCED);
     render(<CataloguePanel api={api} />);
     await screen.findByText("LibreTexts");
-    // Nothing was fetched from MIT OpenCourseWare, so there is nothing to drop.
-    expect(screen.queryByLabelText("Remove MIT OpenCourseWare")).toBeNull();
+    // Nothing was fetched from MIT OCW, so there is nothing to drop.
+    expect(screen.queryByLabelText("Remove MIT OCW")).toBeNull();
 
     fireEvent.click(screen.getByLabelText("Remove LibreTexts"));
     expect(remove).not.toHaveBeenCalled();

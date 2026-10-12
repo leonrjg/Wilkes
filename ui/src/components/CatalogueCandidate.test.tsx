@@ -52,7 +52,7 @@ const HIT: LiteratureSearchResult = {
   acquisition: "direct",
 };
 
-/// An MIT OpenCourseWare course: no `pdf_url`, because a course is not served
+/// An MIT OCW course: no `pdf_url`, because a course is not served
 /// whole at any URL, and `acquisition: "course"` saying so explicitly rather
 /// than leaving the row to infer it from the provider id.
 const COURSE: LiteratureSearchResult = {

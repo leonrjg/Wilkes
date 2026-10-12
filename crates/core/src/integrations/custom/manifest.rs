@@ -917,7 +917,45 @@ pub enum FieldSpec {
         capture: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         capture_group: Option<usize>,
+        /// Resolver steps only: what it means when the selector matches
+        /// nothing. See [`Missing`].
+        #[serde(default, skip_serializing_if = "Missing::is_error")]
+        missing: Missing,
     },
+}
+
+/// What a resolver step's field matching nothing says about the result.
+///
+/// The author knows the page; the engine does not. A link that is absent
+/// because the service holds no file for this work and a link that is absent
+/// because the page was redesigned look the same from here, so the manifest
+/// says which absence is an answer. Only the selector finding nothing is
+/// covered: a value that is found and does not fit — a capture that does not
+/// match, the wrong type — is the manifest being wrong about the page, and
+/// stays an error whatever this says.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Missing {
+    /// The manifest no longer describes the response.
+    #[default]
+    Error,
+    /// The service has no file for this result.
+    Unavailable,
+}
+
+impl Missing {
+    const ALL: &'static [Self] = &[Self::Error, Self::Unavailable];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    fn is_error(&self) -> bool {
+        *self == Self::Error
+    }
 }
 
 impl FieldSpec {
@@ -965,6 +1003,13 @@ impl FieldSpec {
         match self {
             Self::Path(_) => None,
             Self::Mapped { then, .. } => then.as_deref(),
+        }
+    }
+
+    pub fn missing(&self) -> Missing {
+        match self {
+            Self::Path(_) => Missing::Error,
+            Self::Mapped { missing, .. } => *missing,
         }
     }
 
@@ -1320,6 +1365,11 @@ pub fn authoring_prompt() -> String {
         .map(|format| format.name())
         .collect::<Vec<_>>()
         .join(", ");
+    let missing = Missing::ALL
+        .iter()
+        .map(|missing| missing.name())
+        .collect::<Vec<_>>()
+        .join(", ");
     let secret_kinds = SecretKind::ALL
         .iter()
         .map(|kind| kind.name())
@@ -1444,7 +1494,9 @@ filename = "{title}.{file_format}"   # optional; sanitized before download
 steps = [                             # optional; one inline table per step, in order; never a header per step
   # base_url: optional literal HTTP(S) base, defaults to http.base_url. path: result values plus outputs from earlier steps.
   # response_format: optional, "json" or "html". query and/or headers: this step only. fields: each a required scalar string
-  # (the full field-spec object form is also allowed).
+  # (the full field-spec object form is also allowed). A step field that matches nothing is an error, unless its object form
+  # says missing = "unavailable": then the service has no file for that result, which is an answer and not a failure. Set it
+  # only on the field whose absence means exactly that. A value that is found and does not fit is always an error.
   { base_url = "https://other-origin.test", path = "/resolve?id={id}", response_format = "json", query = { param = { secret = "symbolic_secret_name" } }, fields = { new_value = "expression" } },
 ]
 
@@ -1464,7 +1516,7 @@ JMESPath selects keys (`a.b`), indices (`a[0]`, `a[-1]`), projections (`a[*].b`)
     writeln!(prompt, "\nLookup record fields:\n{lookup_fields}").unwrap();
     writeln!(
         prompt,
-        "\nClosed enum values: response_format = {response_formats}; secret kind = {secret_kinds}."
+        "\nClosed enum values: response_format = {response_formats}; secret kind = {secret_kinds}; step field missing = {missing}."
     )
     .unwrap();
     writeln!(
@@ -1775,7 +1827,7 @@ impl Manifest {
                 &format!("search.fields.{field}"),
                 search.response_format,
                 spec,
-                true,
+                FieldOf::Search,
             ));
         }
 
@@ -1830,7 +1882,7 @@ impl Manifest {
                         &format!("{label}.fields.{name}"),
                         step.response_format,
                         spec,
-                        false,
+                        FieldOf::ResolverStep,
                     ));
                 }
                 available.push(name.clone());
@@ -2001,17 +2053,32 @@ fn selector_problem(format: ResponseFormat, selector: &str) -> Result<(), String
     }
 }
 
+/// Which capability a field specification belongs to, for the two things that
+/// depend on it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldOf {
+    /// The only place a typed input exists to be carried.
+    Search,
+    Lookup,
+    /// The only place a field must match, and so the only place that can say
+    /// what it means when it does not.
+    ResolverStep,
+}
+
 /// Problems with one field's specification, in a response of `format`.
-///
-/// `allow_input` is true only for search fields: a typed input has nothing to
-/// carry in a lookup or resolver step.
 fn field_spec_problems(
     label: &str,
     format: ResponseFormat,
     spec: &FieldSpec,
-    allow_input: bool,
+    field_of: FieldOf,
 ) -> Vec<String> {
+    let allow_input = field_of == FieldOf::Search;
     let mut problems = Vec::new();
+    if spec.missing() != Missing::Error && field_of != FieldOf::ResolverStep {
+        problems.push(format!(
+            "{label}.missing is only for resolve_download step fields; a field that matches nothing here is already left empty"
+        ));
+    }
     let paths = spec.paths();
     let input = spec.input();
 
@@ -2355,7 +2422,7 @@ fn lookup_problems(lookup: &LookupCapability) -> Vec<String> {
             &format!("lookup.fields.{field}"),
             ResponseFormat::Json,
             spec,
-            false,
+            FieldOf::Lookup,
         ));
     }
     problems
@@ -3000,6 +3067,43 @@ url = "{id}"
         assert!(Manifest::parse(&source).is_err());
     }
 
+    #[test]
+    fn only_a_resolver_step_field_may_say_what_its_absence_means() {
+        let step = r#"fields = { download_url = { path = "absolute_url(url)", missing = "unavailable" } }"#;
+        let source = AUTHORING_HTML_EXAMPLE
+            .replace(r#"fields = { download_url = "absolute_url(url)" }"#, step);
+        assert!(source.contains(step), "the step was not rewritten");
+        let manifest = Manifest::parse(&source).unwrap();
+        let resolve = manifest.capabilities.resolve_download.unwrap();
+        assert_eq!(
+            resolve.steps[0].fields["download_url"].missing(),
+            Missing::Unavailable
+        );
+
+        // A search or lookup field that matches nothing is already left empty.
+        for (from, to, label) in [
+            (
+                "title = \"name\"\ndoi",
+                "title = { path = \"name\", missing = \"unavailable\" }\ndoi",
+                "search.fields.title.missing is only for resolve_download step fields",
+            ),
+            (
+                "year = \"year\"",
+                "year = { path = \"year\", missing = \"unavailable\" }",
+                "lookup.fields.year.missing is only for resolve_download step fields",
+            ),
+        ] {
+            assert!(AUTHORING_FULL_EXAMPLE.contains(from), "{from}");
+            let error = Manifest::parse(&AUTHORING_FULL_EXAMPLE.replace(from, to))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(label), "{error}");
+        }
+
+        // There is no third thing an absence can mean.
+        assert!(Manifest::parse(&source.replace("\"unavailable\"", "\"skip\"")).is_err());
+    }
+
     /// What the prompt teaches is what gets written. It shows one line per
     /// entry, and says so, because a model copies the layout it is shown.
     #[test]
@@ -3060,6 +3164,9 @@ url = "{id}"
         }
         for kind in SecretKind::ALL {
             assert!(prompt.contains(kind.name()));
+        }
+        for missing in Missing::ALL {
+            assert!(prompt.contains(missing.name()));
         }
         for required in REQUIRED_SEARCH_FIELDS {
             let field_type = search_field_type(required).unwrap();
