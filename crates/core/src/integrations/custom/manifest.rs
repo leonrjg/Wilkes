@@ -375,19 +375,20 @@ impl SearchCapability {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BrowseCapability {
-    /// Path and query, relative to `base_url`. May use `{limit}` and `{page}`
-    /// (1-based). The engine appends the declared controls to it.
+    /// Path and query, relative to `base_url`, and the one place that says
+    /// where each thing a caller may vary is written. It may use `{limit}` and
+    /// `{page}` (1-based) or `{offset}` (`(page - 1) * limit`) anywhere, and in
+    /// its query string `{query}` (the keyword), `{sort}`, the name of any
+    /// filter, and `{filters}` for every filter it does not name. A query
+    /// parameter none of whose placeholders has a value is left off the
+    /// request. A path without `{query}` is a listing that takes no keyword.
     pub path: String,
-    /// The query parameter that carries a keyword, appended only when the
-    /// caller gave one. Omitted means this service's listing takes none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub query_param: Option<String>,
+    /// The listing cannot be asked without a keyword.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub query_required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort: Option<SortSpec>,
-    /// The query parameter that carries every active filter clause, joined by
-    /// `filter_separator`. Required when `filters` is non-empty.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filter_param: Option<String>,
+    /// What joins the clauses written to `{filters}`.
     #[serde(default = "default_filter_separator")]
     pub filter_separator: String,
     /// JMESPath over the response body yielding how many records match in
@@ -415,7 +416,9 @@ fn default_filter_separator() -> String {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SortSpec {
-    pub param: String,
+    #[serde(default)]
+    pub equivalent_to: BTreeMap<String, String>,
+
     /// The option used when the caller names none.
     pub default: String,
     /// The option used instead when the caller names none *and* gave a
@@ -458,6 +461,7 @@ pub struct ModeSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join: Option<String>,
     /// The clause is written once per value; the filter separator joins them.
+    /// Only for a filter written to `{filters}`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub repeat: bool,
     /// How each value is written before it is combined. Carries `{value}`.
@@ -496,6 +500,11 @@ pub enum ValueType {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FilterSpec {
+    #[serde(default)]
+    pub equivalent_to: Option<String>,
+    #[serde(default)]
+    pub equivalent_values: BTreeMap<String, String>,
+
     pub label: String,
     /// Added to the request when the filter is set. `{value}` is the value,
     /// or several combined as the chosen mode says.
@@ -672,6 +681,9 @@ fn free_value(value: &str, reserved: &Reserved) -> Result<String, String> {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BrowseControls {
     pub keyword: bool,
+    /// The listing cannot be asked without a keyword.
+    #[serde(default)]
+    pub keyword_required: bool,
     /// Whether a listing says how many records match in all.
     pub total: bool,
     pub sort: Option<SortControl>,
@@ -682,6 +694,9 @@ pub struct BrowseControls {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SortControl {
+    #[serde(default)]
+    pub equivalent_to: BTreeMap<String, String>,
+
     pub default: String,
     pub keyword_default: Option<String>,
     pub options: Vec<ControlOption>,
@@ -695,6 +710,11 @@ pub struct ControlOption {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FilterControl {
+    #[serde(default)]
+    pub equivalent_to: Option<String>,
+    #[serde(default)]
+    pub equivalent_values: BTreeMap<String, String>,
+
     pub name: String,
     pub label: String,
     pub group: Option<String>,
@@ -711,9 +731,11 @@ pub struct FilterControl {
 impl BrowseCapability {
     pub fn controls(&self) -> BrowseControls {
         BrowseControls {
-            keyword: self.query_param.is_some(),
+            keyword: self.names("query"),
+            keyword_required: self.query_required,
             total: self.total.is_some(),
             sort: self.sort.as_ref().map(|sort| SortControl {
+                equivalent_to: sort.equivalent_to.clone(),
                 default: sort.default.clone(),
                 keyword_default: sort.keyword_default.clone(),
                 options: options_view(&sort.options),
@@ -730,6 +752,8 @@ impl BrowseCapability {
                 .filters
                 .iter()
                 .map(|(name, spec)| FilterControl {
+                    equivalent_to: spec.equivalent_to.clone(),
+                    equivalent_values: spec.equivalent_values.clone(),
                     name: name.clone(),
                     label: spec.label.clone(),
                     group: spec.group.clone(),
@@ -742,10 +766,20 @@ impl BrowseCapability {
         }
     }
 
-    /// The strings this service's filter syntax is made of.
-    pub fn reserved(&self) -> Reserved {
+    /// Whether the path says where `placeholder` is written.
+    pub fn names(&self, placeholder: &str) -> bool {
+        self.path.contains(&format!("{{{placeholder}}}"))
+    }
+
+    /// The strings a value of `filter` may not carry: what this service's
+    /// filter syntax is made of, where that filter is written.
+    pub fn reserved(&self, filter: &str) -> Reserved {
         let mut reserved = Reserved {
-            within: vec![self.filter_separator.clone()],
+            // The separator is syntax only among the clauses it separates.
+            within: match self.names(filter) {
+                true => Vec::new(),
+                false => vec![self.filter_separator.clone()],
+            },
             leading: Vec::new(),
         };
         for mode in self.modes.values() {
@@ -1144,7 +1178,13 @@ pub fn lookup_field_type(field: &str) -> Option<FieldType> {
 const SEARCH_PLACEHOLDERS: &[&str] = &["query", "limit"];
 /// What a search path may name: the inputs, and where in the results to start.
 const SEARCH_PATH_PLACEHOLDERS: &[&str] = &["query", "limit", "page", "offset"];
-const BROWSE_PLACEHOLDERS: &[&str] = &["limit", "page"];
+/// Where in a listing to start. Always known, so allowed anywhere in the path.
+const BROWSE_PAGING_PLACEHOLDERS: &[&str] = &["limit", "page", "offset"];
+/// What a caller may leave unset, beside the filters by name. Written in the
+/// query string only, where a parameter with nothing to say can be left off.
+pub const BROWSE_QUERY: &str = "query";
+pub const BROWSE_SORT: &str = "sort";
+pub const BROWSE_FILTERS: &str = "filters";
 const SUGGEST_PLACEHOLDERS: &[&str] = &["query", "limit"];
 const HEALTH_PLACEHOLDERS: &[&str] = &[];
 const LOOKUP_PLACEHOLDERS: &[&str] = &["doi"];
@@ -1291,14 +1331,11 @@ is_open_access = "oa.is_oa || best.is_oa"
 
 # Browse: the same records, listed by filter and sort, keyword optional.
 [capabilities.browse]
-path = "/works?per-page={limit}&page={page}"
-query_param = "search"
-filter_param = "filter"
+path = "/works?search={query}&filter={filters}&sort={sort}&per-page={limit}&page={page}"
 filter_separator = ","
 total = "meta.count"
 
 [capabilities.browse.sort]
-param = "sort"
 default = "cited_by_count:desc"
 keyword_default = "relevance_score:desc"
 options = [["cited_by_count:desc", "Most cited"], ["publication_date:desc", "Newest"], ["relevance_score:desc", "Most relevant"]]
@@ -1348,6 +1385,43 @@ join = "|"
 chunk = 50
 items = "results"
 doi = "doi"
+"#;
+
+const AUTHORING_PARAMETERS_EXAMPLE: &str = r#"manifest_version = 2
+id = "example-parameters"
+name = "Example service with a parameter per filter"
+
+[http]
+base_url = "https://api.papers.test"
+
+[capabilities.search]
+path = "/search?q={query}&num={limit}&start={offset}"
+items = "results"
+
+[capabilities.search.fields]
+id = "id"
+title = "title"
+# A value held inside a longer string: "A Author, B Author - Journal, 2019 - publisher".
+year = { path = "summary", capture = '''\b((?:19|20)\d{2})\b''' }
+
+# Browse: each filter is written where the path names it. One that is not set
+# sends nothing; a range in one parameter is written with the unset end empty.
+[capabilities.browse]
+path = "/search?q={query}&year={year_from}-{year_to}&lang={language}&{reviews}&order={sort}&num={limit}&start={offset}"
+query_required = true
+
+[capabilities.browse.sort]
+default = "relevance"
+options = [["relevance", "Most relevant"], ["date", "Newest"]]
+
+[capabilities.browse.modes]
+any = { label = "Any of", join = "|" }
+
+[capabilities.browse.filters]
+year_from = { label = "From", group = "Year", clause = "{value}", value = "integer" }
+year_to   = { label = "To", group = "Year", clause = "{value}", value = "integer" }
+language  = { label = "Language", clause = "{value}", modes = ["any"], options = [["lang_en", "English"], ["lang_fr", "French"]] }
+reviews   = { label = "Reviews only", clause = "reviews_only" }
 "#;
 
 const AUTHORING_EXTENDS_EXAMPLE: &str = r#"manifest_version = 2
@@ -1421,9 +1495,15 @@ pub fn authoring_prompt() -> String {
     .unwrap();
     prompt.push_str(
         r#"
-Read all supplied source material before writing the manifest. Preserve the service's selectors, request paths, metadata parsing, headers, and authentication semantics. Do not invent endpoints or silently omit required behavior.
+Read all supplied source material before writing the manifest. Preserve the service's selectors, request paths, metadata parsing, headers, and authentication semantics. Do not invent endpoints.
 
-Return exactly one TOML manifest and no Markdown fence or commentary. If the service cannot be represented by the bounded schema below, return `UNSUPPORTED: ` followed by the exact missing capability instead of producing a partial manifest.
+Cover everything the service offers that the schema below can express. A manifest that only searches, for a service that does more, is incomplete. Before writing, go through every capability in the schema (health, search, browse, lookup, references, resolve_download) and every field in the lists below, and declare each one the source material supports:
+- Every capability the service documents, including one served by another documented endpoint of the same service: an account or status endpoint is a health check.
+- Paging, when the service pages.
+- Every result field the response carries. A value held inside a longer string (a year or a venue inside a citation line) is still carried: take it with `capture` or the functions below.
+- Every filter and sort the service documents, under browse.
+
+Return exactly one TOML manifest and no Markdown fence or commentary outside it. Return `UNSUPPORTED: ` followed by the exact missing capability, and no manifest, only when search itself cannot be represented by the bounded schema below. When search fits and something else the service offers does not, write the manifest with everything that does fit and open it with one `# NOT REPRESENTED: ` comment line per thing left out, naming it and the schema limit that stops it. Nothing the service offers is left out silently.
 
 Safety and fidelity rules:
 - Use only HTTP(S) GET requests. Search is one request. Download resolution is on demand after selection and may use only the finite steps declared below.
@@ -1470,14 +1550,21 @@ field = { input = "query", then = "expression over @" }   # input is "query" or 
 # `attribute`, `all` and `first_of = ["css", ...]` (CSS selectors tried in order) are HTML-only. `then` is a JMESPath expression whose `@` is the extracted value; it is for HTML and typed inputs, since JSON fields compose in `path`. Regex capture defaults to group 1.
 
 [capabilities.browse]                 # optional; the same records as search, listed by filter and sort
-path = "/list?limit={limit}&page={page}"   # {limit}, {page} (1-based)
-query_param = "q"                     # optional; appended only when the caller gave a keyword
-filter_param = "filter"               # required when there are filters; one parameter carries every active clause
-filter_separator = ","                # optional, defaults to ","
+# The path says where everything the user may vary is written. {limit} and {page} (1-based) or {offset} go anywhere.
+# In the query string: {query} is the keyword, {sort} the chosen sort, {a_filter_name} that filter's clause, and
+# {filters} every filter the path does not name, joined by filter_separator.
+# A query parameter none of whose placeholders has a value is left off the request; one where some have a value is
+# written with the others empty, so "year={year_from}-{year_to}" sends "year=2016-" when only the first is set.
+# A service with one filter parameter writes "filter={filters}"; a service with a parameter per filter names each:
+path = "/list?q={query}&filter={filters}&sort={sort}&limit={limit}&page={page}"
+query_required = true                 # optional; the listing cannot be asked without a keyword. Needs {query}
+filter_separator = ","                # optional, defaults to ","; joins the clauses written to {filters}
 total = "expression"                  # optional; JMESPath over the response yielding how many records match in all
+# No {query} means the listing takes no keyword. {sort} stands exactly when [capabilities.browse.sort] does. Every
+# filter is named in the path or goes to {filters}, whose parameter holds nothing else. A parameter may be a bare
+# word: "&{flag}" with clause = "onlyOpen" sends "&onlyOpen" when the filter is on.
 
-[capabilities.browse.sort]            # optional
-param = "sort"
+[capabilities.browse.sort]            # optional; written to {sort}
 default = "value-of-the-default-option"
 keyword_default = "value-used-instead-when-a-keyword-is-given"   # optional
 options = [["value", "Label"], ["value2", "Label 2"]]
@@ -1490,12 +1577,14 @@ hint = "expression"                   # optional; a second line that tells two e
 
 [capabilities.browse.modes]           # optional; the ways several values of one filter combine, in the order offered
 any = { label = "Any of", join = "|" }                         # join: the values go in one clause, joined by this
-all = { label = "All of", repeat = true }                      # repeat: the clause is written once per value
+all = { label = "All of", repeat = true }                      # repeat: the clause is written once per value; only for filters in {filters}
 none = { label = "None of", repeat = true, value = "!{value}" } # value: how each value is written first
 
 [capabilities.browse.filters]         # one line per filter, shown in this order; a name is a-z, 0-9, _
 # A filter is a label, a clause, and where its value comes from. Write each as one inline table under this one
-# header; never a header per filter. A long options array may span lines. There are no kinds:
+# header; never a header per filter. A long options array may span lines. The clause is what is written where the
+# path puts the filter: "field:{value}" among {filters}, or just "{value}" under the filter's own parameter.
+# A filter cannot be called limit, page, offset, query, sort or filters. There are no kinds:
 on_off = { label = "Shown to the user", clause = "field:true" }                                                  # no {value}: on or off
 choice = { label = "Shown to the user", clause = "field:{value}", options = [["value", "Label"]] }             # one of a closed list
 typed = { label = "Shown to the user", clause = "field:>{value}", value = "integer" }                          # integer | number | date (YYYY-MM-DD) | text
@@ -1504,6 +1593,16 @@ from_row = { label = "Works citing", clause = "cites:{value}", from_result = "id
 # Exactly one of options, value and suggest, or from_result, when the clause has {value}. Optional on any filter:
 #   group = "Year"            filters sharing a group are drawn together, which is how a range is written (two filters)
 #   modes = ["any", "none"]   which browse.modes may combine several values, the first being the default; omitted means one value
+#   equivalent_to = "type"   optional shared identity for composing once across providers
+# Shared identities and required inputs: year_from/year_to/cited_more_than/cited_fewer_than (integer),
+# published_from/published_to (date), open_access (on/off), type/language/country (options),
+# author/institution (suggest or text). Result-only filters cannot be tagged; one identity per provider.
+#   equivalent_values = { dissertation = "thesis" }  own option -> shared value; unlisted options keep their value
+# Use ISO 639-1 languages, ISO 3166 alpha-2 countries, and OpenAlex type names as shared value conventions.
+# Core owns no value lists. Maps must name existing options and remain one-to-one, including unlisted values.
+# Sort's equivalent_to maps own options to most_cited/newest/oldest/most_relevant, e.g.
+# equivalent_to = { "cited_by_count:desc" = "most_cited" }. Capabilities inherited with extends retain tags.
+# Untagged filters remain available under their own names; conflicting declarations are provider-prefixed.
 # Text and suggested values are refused if they contain the filter separator or a mode's join, so they cannot add a clause.
 
 [capabilities.lookup]                 # optional; DOI to one bibliographic record, for metadata enrichment
@@ -1569,6 +1668,8 @@ JMESPath selects keys (`a.b`), indices (`a[0]`, `a[-1]`), projections (`a[*].b`)
     prompt.push_str(AUTHORING_HTML_EXAMPLE);
     prompt.push_str("\nValid example using browse, lookup and references:\n\n");
     prompt.push_str(AUTHORING_FULL_EXAMPLE);
+    prompt.push_str("\nValid example with a parameter per filter and a required keyword:\n\n");
+    prompt.push_str(AUTHORING_PARAMETERS_EXAMPLE);
     prompt.push_str("\nValid example extending a provider to add a download step:\n\n");
     prompt.push_str(AUTHORING_EXTENDS_EXAMPLE);
     prompt.push_str(
@@ -2213,20 +2314,101 @@ fn field_spec_problems(
     problems
 }
 
-fn browse_problems(browse: &BrowseCapability) -> Vec<String> {
-    let mut problems = template_problems("browse.path", &browse.path, BROWSE_PLACEHOLDERS);
+/// The placeholders a template names, in order. An unclosed brace ends the
+/// list: validation reports it, and nothing is written from such a template.
+pub fn placeholders(template: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut rest = template;
+    while let Some((_, after)) = rest.split_once('{') {
+        let Some((name, tail)) = after.split_once('}') else {
+            break;
+        };
+        names.push(name);
+        rest = tail;
+    }
+    names
+}
 
-    for (label, param) in [
-        ("query_param", browse.query_param.as_deref()),
-        ("filter_param", browse.filter_param.as_deref()),
-        (
-            "sort.param",
-            browse.sort.as_ref().map(|sort| sort.param.as_str()),
+/// A path as what precedes its query string and that string's parameters,
+/// each as written (`name=value`, or a bare word).
+pub fn query_parts(path: &str) -> (&str, Vec<&str>) {
+    match path.split_once('?') {
+        Some((before, query)) => (
+            before,
+            query.split('&').filter(|part| !part.is_empty()).collect(),
         ),
-    ] {
-        if param.is_some_and(|name| name.trim().is_empty() || name.contains(['&', '=', '#'])) {
-            problems.push(format!("browse.{label} must be a plain parameter name"));
+        None => (path, Vec::new()),
+    }
+}
+
+fn browse_problems(browse: &BrowseCapability) -> Vec<String> {
+    let mut allowed: Vec<String> = BROWSE_PAGING_PLACEHOLDERS
+        .iter()
+        .chain(&[BROWSE_QUERY, BROWSE_SORT, BROWSE_FILTERS])
+        .map(|name| name.to_string())
+        .collect();
+    allowed.extend(browse.filters.keys().cloned());
+    let mut problems = template_problems_owned("browse.path", &browse.path, &allowed, true);
+
+    if browse.names("page") && browse.names("offset") {
+        problems.push(
+            "browse.path names both {page} and {offset}; a listing starts in one place".to_string(),
+        );
+    }
+    // What a caller may leave unset is written where it can be left off.
+    let (before_query, parameters) = query_parts(&browse.path);
+    for name in placeholders(before_query) {
+        if !BROWSE_PAGING_PLACEHOLDERS.contains(&name) && allowed.iter().any(|a| a == name) {
+            problems.push(format!(
+                "browse.path: '{{{name}}}' belongs in the query string, where it is left off when unset"
+            ));
         }
+    }
+    // A fixed clause beside the joined ones would be lost with them when no
+    // filter is set, so the parameter holds the joined clauses and no more.
+    let joined = format!("{{{BROWSE_FILTERS}}}");
+    for parameter in &parameters {
+        let value = parameter
+            .split_once('=')
+            .map_or(*parameter, |(_, value)| value);
+        if parameter.contains(&joined) && value != joined {
+            problems.push(format!(
+                "browse.path: '{parameter}' must be a parameter whose whole value is {joined}"
+            ));
+        }
+    }
+    if browse.query_required && !browse.names(BROWSE_QUERY) {
+        problems.push(
+            "browse.query_required needs {query} in browse.path to say where the keyword goes"
+                .to_string(),
+        );
+    }
+    match (&browse.sort, browse.names(BROWSE_SORT)) {
+        (Some(_), false) => problems.push(
+            "browse.sort is declared but browse.path has no {sort} to write it to".to_string(),
+        ),
+        (None, true) => problems
+            .push("browse.path names {sort} but browse.sort declares no options".to_string()),
+        _ => {}
+    }
+    let unnamed = browse
+        .filters
+        .keys()
+        .filter(|name| !browse.names(name))
+        .count();
+    match (unnamed, browse.names(BROWSE_FILTERS)) {
+        (0, true) => problems.push(
+            "browse.path names {filters} but every filter is written by name, so nothing goes there"
+                .to_string(),
+        ),
+        (1.., false) => {
+            for name in browse.filters.keys().filter(|name| !browse.names(name)) {
+                problems.push(format!(
+                    "browse.filters.{name} is written nowhere: browse.path names neither {{{name}}} nor {{filters}}"
+                ));
+            }
+        }
+        _ => {}
     }
 
     if let Some(sort) = &browse.sort {
@@ -2250,12 +2432,24 @@ fn browse_problems(browse: &BrowseCapability) -> Vec<String> {
                 ));
             }
         }
+        for (own, shared) in &sort.equivalent_to {
+            if !sort.options.iter().any(|(value, _)| value == own) {
+                problems.push(format!(
+                    "browse.sort.equivalent_to: '{own}' is not an option"
+                ));
+            }
+            if !matches!(
+                shared.as_str(),
+                "most_cited" | "newest" | "oldest" | "most_relevant"
+            ) {
+                problems.push(format!(
+                    "browse.sort.equivalent_to: unknown equivalence '{shared}'"
+                ));
+            }
+        }
         problems.extend(option_problems("browse.sort", &sort.options));
     }
 
-    if !browse.filters.is_empty() && browse.filter_param.is_none() {
-        problems.push("browse.filter_param is required when there are filters".to_string());
-    }
     if browse.filter_separator.is_empty() {
         problems.push("browse.filter_separator cannot be empty".to_string());
     }
@@ -2306,11 +2500,74 @@ fn browse_problems(browse: &BrowseCapability) -> Vec<String> {
         }
     }
 
+    let mut equivalents = std::collections::BTreeSet::new();
     for (name, spec) in &browse.filters {
         let label = format!("browse.filters.{name}");
+        if let Some(shared) = &spec.equivalent_to {
+            let shapes: &[&str] = match shared.as_str() {
+                "year_from" | "year_to" | "cited_more_than" | "cited_fewer_than" => &["integer"],
+                "published_from" | "published_to" => &["date"],
+                "open_access" => &["toggle"],
+                "type" | "language" | "country" => &["options"],
+                "author" | "institution" => &["suggest", "text"],
+                _ => &[],
+            };
+            if shapes.is_empty() {
+                problems.push(format!(
+                    "{label}.equivalent_to: unknown equivalence '{shared}'"
+                ));
+            } else if !shapes.contains(&spec.input()) {
+                problems.push(format!(
+                    "{label}.equivalent_to: '{shared}' needs {}, not {}",
+                    shapes.join(" or "),
+                    spec.input()
+                ));
+            }
+            if !equivalents.insert(shared) {
+                problems.push(format!(
+                    "{label}.equivalent_to: duplicate equivalence '{shared}'"
+                ));
+            }
+            if spec.input() == "result" {
+                problems.push(format!(
+                    "{label}.equivalent_to: a result-only filter cannot be tagged"
+                ));
+            }
+        }
+        if !spec.equivalent_values.is_empty() {
+            if spec.equivalent_to.is_none() || spec.options.is_none() {
+                problems.push(format!(
+                    "{label}.equivalent_values requires a tagged options filter"
+                ));
+            }
+            let options = spec.options.as_deref().unwrap_or(&[]);
+            for own in spec.equivalent_values.keys() {
+                if !options.iter().any(|(value, _)| value == own) {
+                    problems.push(format!(
+                        "{label}.equivalent_values: '{own}' is not an option"
+                    ));
+                }
+            }
+            let mut values = std::collections::BTreeSet::new();
+            for (own, _) in options {
+                let shared = spec.equivalent_values.get(own).unwrap_or(own);
+                if !values.insert(shared) {
+                    problems.push(format!(
+                        "{label}.equivalent_values maps two options to '{shared}'"
+                    ));
+                }
+            }
+        }
         if !is_variable(name) {
             problems.push(format!(
                 "{label}: the filter name must be a-z, 0-9 or '_', starting with a letter"
+            ));
+        }
+        if BROWSE_PAGING_PLACEHOLDERS.contains(&name.as_str())
+            || [BROWSE_QUERY, BROWSE_SORT, BROWSE_FILTERS].contains(&name.as_str())
+        {
+            problems.push(format!(
+                "{label}: '{name}' is a name browse.path already gives a meaning; call the filter something else"
             ));
         }
         if spec.label.trim().is_empty() {
@@ -2390,6 +2647,13 @@ fn browse_problems(browse: &BrowseCapability) -> Vec<String> {
             }
             if spec.modes[..index].contains(mode) {
                 problems.push(format!("{label}.modes repeats '{mode}'"));
+            }
+            // Written by name, a filter is one value in one parameter: there
+            // is no separator there for a repeated clause to be joined by.
+            if browse.names(name) && browse.modes.get(mode).is_some_and(|mode| mode.repeat) {
+                problems.push(format!(
+                    "{label}.modes names '{mode}', which repeats the clause; a filter browse.path writes by name takes only modes that join"
+                ));
             }
         }
     }
@@ -2911,6 +3175,119 @@ url = "{id}"
     }
 
     #[test]
+    fn equivalences_validate_names_shapes_uniqueness_and_option_maps() {
+        let base = Manifest::parse(include_str!("../builtin/openalex.toml")).unwrap();
+        assert!(base.problems().is_empty());
+        for (case, expected) in [
+            (0, "unknown equivalence"),
+            (1, "needs integer"),
+            (2, "duplicate equivalence"),
+            (3, "result-only"),
+            (4, "is not an option"),
+            (5, "maps two options"),
+            (6, "maps two options"),
+            (7, "unknown equivalence"),
+            (8, "is not an option"),
+            (9, "requires a tagged options filter"),
+        ] {
+            let mut manifest = base.clone();
+            let browse = manifest.capabilities.browse.as_mut().unwrap();
+            match case {
+                0 => {
+                    browse.filters.get_mut("year_from").unwrap().equivalent_to =
+                        Some("bogus".into())
+                }
+                1 => {
+                    browse.filters.get_mut("type").unwrap().equivalent_to = Some("year_from".into())
+                }
+                2 => {
+                    browse.filters.get_mut("year_to").unwrap().equivalent_to =
+                        Some("year_from".into())
+                }
+                3 => {
+                    let f = browse.filters.get_mut("cites").unwrap();
+                    f.suggest = None;
+                    f.equivalent_to = Some("author".into());
+                }
+                4 => {
+                    browse
+                        .filters
+                        .get_mut("type")
+                        .unwrap()
+                        .equivalent_values
+                        .insert("absent".into(), "thesis".into());
+                }
+                5 => {
+                    let f = browse.filters.get_mut("type").unwrap();
+                    f.equivalent_values
+                        .insert("article".into(), "shared".into());
+                    f.equivalent_values.insert("review".into(), "shared".into());
+                }
+                6 => {
+                    browse
+                        .filters
+                        .get_mut("type")
+                        .unwrap()
+                        .equivalent_values
+                        .insert("article".into(), "review".into());
+                }
+                7 => {
+                    browse
+                        .sort
+                        .as_mut()
+                        .unwrap()
+                        .equivalent_to
+                        .insert("cited_by_count:desc".into(), "bogus".into());
+                }
+                8 => {
+                    browse
+                        .sort
+                        .as_mut()
+                        .unwrap()
+                        .equivalent_to
+                        .insert("absent".into(), "newest".into());
+                }
+                9 => {
+                    let f = browse.filters.get_mut("type").unwrap();
+                    f.equivalent_to = None;
+                    f.equivalent_values.insert("article".into(), "paper".into());
+                }
+                _ => unreachable!(),
+            }
+            let problems = manifest.problems();
+            assert!(
+                problems.iter().any(|p| p.contains(expected)),
+                "case {case}: {problems:?}"
+            );
+        }
+        let mut manifest = base;
+        let f = manifest
+            .capabilities
+            .browse
+            .as_mut()
+            .unwrap()
+            .filters
+            .get_mut("type")
+            .unwrap();
+        f.equivalent_values
+            .insert("dissertation".into(), "thesis".into());
+        assert!(manifest.problems().is_empty());
+        assert_eq!(
+            manifest
+                .capabilities
+                .browse
+                .unwrap()
+                .controls()
+                .filters
+                .iter()
+                .find(|f| f.name == "type")
+                .unwrap()
+                .equivalent_values["dissertation"],
+            "thesis"
+        );
+    }
+
+    #[test]
     fn browse_declares_controls_the_interface_can_render() {
         let manifest = Manifest::parse(AUTHORING_FULL_EXAMPLE).unwrap();
         let controls = manifest.capabilities.browse.unwrap().controls();
@@ -2957,9 +3334,101 @@ url = "{id}"
 
     #[test]
     fn browse_is_refused_when_it_cannot_say_where_its_filters_go() {
-        let source = AUTHORING_FULL_EXAMPLE.replace("filter_param = \"filter\"\n", "");
+        let source = AUTHORING_FULL_EXAMPLE.replace("&filter={filters}", "");
         let error = Manifest::parse(&source).unwrap_err().to_string();
-        assert!(error.contains("browse.filter_param is required"), "{error}");
+        assert!(
+            error.contains("browse.filters.year_from is written nowhere"),
+            "{error}"
+        );
+    }
+
+    /// The path is the one place that says where each thing goes, so what it
+    /// says and what is declared have to agree.
+    #[test]
+    fn a_browse_path_agrees_with_what_is_declared() {
+        for (source, from, to, expected) in [
+            (
+                AUTHORING_FULL_EXAMPLE,
+                "&sort={sort}",
+                "",
+                "browse.sort is declared but browse.path has no {sort}",
+            ),
+            (
+                AUTHORING_FULL_EXAMPLE,
+                "&filter={filters}",
+                "&filter=type:article,{filters}",
+                "must be a parameter whose whole value is {filters}",
+            ),
+            (
+                AUTHORING_FULL_EXAMPLE,
+                "/works?search={query}&filter",
+                "/works/{query}?filter",
+                "'{query}' belongs in the query string",
+            ),
+            (
+                AUTHORING_FULL_EXAMPLE,
+                "&page={page}\"\nfilter_separator",
+                "&page={page}&from={offset}\"\nfilter_separator",
+                "names both {page} and {offset}",
+            ),
+            (
+                AUTHORING_FULL_EXAMPLE,
+                "&page={page}\"\nfilter_separator",
+                "&page={page}&x={nope}\"\nfilter_separator",
+                "'{nope}' is not available here",
+            ),
+            (
+                AUTHORING_FULL_EXAMPLE,
+                "title       = {",
+                "sort        = {",
+                "'sort' is a name browse.path already gives a meaning",
+            ),
+            (
+                AUTHORING_PARAMETERS_EXAMPLE,
+                "/search?q={query}&year=",
+                "/search?year=",
+                "browse.query_required needs {query}",
+            ),
+            (
+                AUTHORING_PARAMETERS_EXAMPLE,
+                "&order={sort}",
+                "&order={sort}&f={filters}",
+                "every filter is written by name",
+            ),
+            (
+                AUTHORING_PARAMETERS_EXAMPLE,
+                r#"any = { label = "Any of", join = "|" }"#,
+                r#"any = { label = "Any of", repeat = true }"#,
+                "takes only modes that join",
+            ),
+        ] {
+            assert!(source.contains(from), "{from}");
+            let error = Manifest::parse(&source.replace(from, to))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_keyword_is_offered_when_the_path_names_it_and_needed_when_declared() {
+        let controls = |source: &str| {
+            Manifest::parse(source)
+                .unwrap()
+                .capabilities
+                .browse
+                .unwrap()
+                .controls()
+        };
+        let optional = controls(AUTHORING_FULL_EXAMPLE);
+        assert!(optional.keyword && !optional.keyword_required);
+        let required = controls(AUTHORING_PARAMETERS_EXAMPLE);
+        assert!(required.keyword && required.keyword_required);
+        let none = controls(&AUTHORING_FULL_EXAMPLE.replace(
+            "/works?search={query}&filter={filters}&sort={sort}",
+            "/works?filter={filters}&sort={sort}",
+        ));
+        assert!(!none.keyword);
     }
 
     #[test]
@@ -3076,9 +3545,14 @@ url = "{id}"
     #[test]
     fn the_reserved_strings_are_the_declared_syntax() {
         let manifest = Manifest::parse(AUTHORING_FULL_EXAMPLE).unwrap();
-        let reserved = manifest.capabilities.browse.unwrap().reserved();
+        let reserved = manifest.capabilities.browse.unwrap().reserved("title");
         assert_eq!(reserved.within, vec![",", "|"]);
         assert_eq!(reserved.leading, vec!["!"]);
+        // The separator is syntax only among the clauses it separates: a
+        // filter written under its own parameter is not one of them.
+        let manifest = Manifest::parse(AUTHORING_PARAMETERS_EXAMPLE).unwrap();
+        let reserved = manifest.capabilities.browse.unwrap().reserved("language");
+        assert_eq!(reserved.within, vec!["|"]);
     }
 
     #[test]
@@ -3215,6 +3689,7 @@ url = "{id}"
         Manifest::parse(AUTHORING_JSON_EXAMPLE).unwrap();
         Manifest::parse(AUTHORING_HTML_EXAMPLE).unwrap();
         Manifest::parse(AUTHORING_FULL_EXAMPLE).unwrap();
+        Manifest::parse(AUTHORING_PARAMETERS_EXAMPLE).unwrap();
         // The one that extends is read where there is something to extend.
         let resolved = Manifest::resolve(
             AUTHORING_EXTENDS_EXAMPLE,

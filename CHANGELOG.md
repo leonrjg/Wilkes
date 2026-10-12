@@ -4,6 +4,13 @@
 
 ### Added
 
+- Literature requests are decoded once against the selected providers' merged
+  controls, then translated and checked in each provider's own terms. Manifests
+  can tag shared filters and sort orders with `equivalent_to` and translate
+  option values with `equivalent_values`; OpenAlex declares the shared tags.
+  Unsupported parts are reported per provider; a decode failure fails the
+  whole request.
+
 - A manifest can list where a file may be, in order of preference:
   `url = ["{pdf_url}", "{download_url}"]` under `resolve_download`. The first
   template whose values are all known is the URL, and the steps run only while
@@ -56,6 +63,23 @@
 
 ### Changed
 
+- A manifest's `browse.path` now says where everything the user may vary is
+  written: `{query}`, `{sort}`, any filter by name, and `{filters}` for the
+  rest, beside `{limit}` and `{page}` or `{offset}`. A query parameter with
+  nothing set is left off, so a service with one parameter per filter can be
+  described, including a range in one parameter (`year={year_from}-{year_to}`).
+  `query_required = true` declares a listing that needs a keyword. This replaces
+  `query_param`, `filter_param` and `sort.param`, which are no longer read: a
+  manifest written against this development branch's earlier browse needs those
+  three folded into its path.
+- Semantic Scholar offers filters: year range, publication type, field of
+  study, venue, minimum citations and public PDF, beside a keyword.
+- The manifest authoring prompt asks for everything the service offers that the
+  schema can express: every capability, paging, every result field (including a
+  value held inside a longer string) and every filter and sort. `UNSUPPORTED:`
+  is now returned only when search itself cannot be expressed; anything else
+  that does not fit is named in `# NOT REPRESENTED:` comment lines at the top of
+  the manifest instead of being dropped silently.
 - OpenAlex and Semantic Scholar use the same manifest engine as custom integrations. Custom providers with DOI lookup can enrich document metadata. Existing settings and manifests migrate automatically to format version 2; stored manifest comments are lost, and conversion failures are reported.
 - Document extraction names now cover paged formats beyond PDF. Serialized file types and saved collection filters remain compatible.
 - Right-clicking empty space in the sidebar creates a folder at that location, with an inline name field.

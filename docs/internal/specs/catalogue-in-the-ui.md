@@ -358,9 +358,9 @@ their own. The trait no longer stands in its way.
 
 ## 10. Filters from a request in words
 
-**Invariant: the model emits filter names and values from the provider's own
-declaration, never a request; what it emits becomes the same refinements a
-person sets by hand.**
+**Invariant: one decode emits names and values from the selected providers'
+merged declaration. Projection restores each provider's own terms, checked
+by its own rules, before setting the refinements a person sets by hand.**
 
 A provider like OpenAlex declares some fifty filters. Finding the six a
 sentence describes is the kind of translation a small local model does well,
@@ -410,10 +410,15 @@ what may be asked.
   `LiteratureSource::check_browse` runs the validation `browse` runs, without
   sending. Each filter is added to what has stood so far and checked, so one
   refused value costs that filter and a note saying why, not the composition.
-- **One composition per provider**, sequentially: each has its own filters and
-  there is one model. A provider-neutral "intent" mapped onto every provider
-  would need filters tagged with what they mean, which is the kinds the
-  manifest format was just rid of.
+- **One decode across selected providers.** Controls merge by declared
+  `equivalent_to` identities; untagged identical declarations also merge,
+  while conflicting names are provider-prefixed. Shared options are unioned
+  and translated by `equivalent_values`. Projection restores each provider's
+  names, values and sort orders before suggestions and validation. Years can
+  project to date boundaries where a provider has only date filters. Missing
+  filters, options, orders and excess single-filter values become notes;
+  nothing applicable becomes a listing error. A decode failure fails the
+  entire composition. Inherited capabilities retain their equivalence tags.
 - **Set as refinements, not shown as an answer.**
   `literature_compose` (`POST /api/literature/compose`) returns, per provider,
   `filters`, `labels` and `sort` in the shape the pane's `Refinement` holds.

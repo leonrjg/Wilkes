@@ -1114,6 +1114,8 @@ export type FilterInput =
  *  from. There are no kinds of filter; a range is two filters sharing a
  *  `group`. */
 export interface FilterControl {
+  equivalent_to?: string | null;
+  equivalent_values?: Record<string, string>;
   name: string;
   label: string;
   /** Filters sharing a group are drawn together under its name. */
@@ -1140,9 +1142,12 @@ export interface FilterSuggestion {
 export interface BrowseControls {
   /** Whether the listing takes a keyword beside the filters. */
   keyword: boolean;
+  /** Whether the listing cannot be asked without one. */
+  keyword_required: boolean;
   /** Whether a listing says how many records match in all. */
   total: boolean;
   sort: {
+    equivalent_to?: Record<string, string>;
     default: string;
     /** Used instead of `default` when a keyword is given. */
     keyword_default: string | null;
@@ -1169,7 +1174,7 @@ export interface ProviderCapabilities {
 
 /** What a request in words came to for one provider: the filters and the sort
  *  to set on it, in the shape the filter panel holds them. A provider that
- *  could not be composed for carries `error` and nothing else. */
+ *  unable to apply it carries `error` and notes explaining omitted parts. */
 export interface ComposedListing {
   provider: string;
   name: string;

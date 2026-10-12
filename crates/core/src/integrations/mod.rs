@@ -35,6 +35,7 @@ use crate::types::{
 
 pub mod builtin;
 pub mod custom;
+pub mod merged;
 pub mod zotero;
 
 use custom::manifest::{Base, Bases, BrowseControls, Manifest, SecretSlot};
@@ -701,7 +702,8 @@ title = "t"
             .capabilities();
         assert!(s2.lookup);
         assert!(!s2.references);
-        assert!(s2.browse.is_none());
+        // Its listing is its search, so it takes a keyword and needs one.
+        assert!(s2.browse.is_some_and(|browse| browse.keyword_required));
     }
 
     /// What a user writes to add a download step to OpenAlex and nothing else.
@@ -952,10 +954,12 @@ path = "/ping"
             assert!(error.contains(expected), "{expected}: {error}");
         }
 
-        let semantic = OPENALEX_WITH_DOWNLOADS.replace("\"openalex\"", "\"semantic_scholar\"");
+        let semantic = OPENALEX_WITH_DOWNLOADS
+            .replace("\"openalex\"", "\"semantic_scholar\"")
+            .replace("\"search\", \"browse\"", "\"search\", \"references\"");
         let error = resolve_error(&settings, &semantic);
         assert!(
-            error.contains("'semantic_scholar' declares no browse to take"),
+            error.contains("'semantic_scholar' declares no references to take"),
             "{error}"
         );
     }

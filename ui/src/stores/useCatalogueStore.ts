@@ -920,6 +920,9 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       const failures: ComposeOutcome["failures"] = [];
       const several = composition.providers.length > 1;
       for (const listing of composition.providers) {
+        for (const note of listing.notes) {
+          notes.push(several ? `${listing.name}: ${note}` : note);
+        }
         if (listing.error !== null) {
           // What was set on it by hand stays: nothing was composed to replace it.
           failures.push({ name: listing.name, error: listing.error });
@@ -931,9 +934,6 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
           labels: listing.labels,
           sort: listing.sort,
         };
-        for (const note of listing.notes) {
-          notes.push(several ? `${listing.name}: ${note}` : note);
-        }
       }
       set({
         composing: false,

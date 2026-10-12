@@ -848,8 +848,8 @@ struct LiteratureComposeBody {
 
 /// Turns a request written in ordinary words into filters on each named
 /// provider. A request that could not be composed at all — no model, an
-/// unknown provider, a cancellation — is a 400 with the reason; a provider
-/// that could not be composed for is reported in its own entry.
+/// unknown provider, a failed decode, a cancellation — is a 400 with the reason;
+/// a provider unable to apply the composition is reported in its own entry.
 async fn literature_compose_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<LiteratureComposeBody>,

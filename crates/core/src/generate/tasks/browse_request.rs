@@ -602,6 +602,8 @@ mod tests {
             options: Vec::new(),
             modes: Vec::new(),
             from_result: None,
+            equivalent_to: None,
+            equivalent_values: BTreeMap::new(),
         }
     }
 
@@ -611,8 +613,10 @@ mod tests {
             .collect();
         BrowseControls {
             keyword: true,
+            keyword_required: false,
             total: true,
             sort: Some(SortControl {
+                equivalent_to: BTreeMap::new(),
                 default: "cited_by_count:desc".into(),
                 keyword_default: None,
                 options: vec![
@@ -745,6 +749,7 @@ mod tests {
     fn a_provider_with_one_kind_of_part_gets_no_example() {
         let only_keyword = BrowseControls {
             keyword: true,
+            keyword_required: false,
             total: false,
             sort: None,
             modes: Vec::new(),
@@ -770,6 +775,7 @@ mod tests {
     fn a_provider_with_nothing_to_compose_is_refused_before_any_decode() {
         let nothing = BrowseControls {
             keyword: false,
+            keyword_required: false,
             total: false,
             sort: None,
             modes: Vec::new(),

@@ -46,14 +46,12 @@ authors = "join(', ', authorships[:8].author.display_name || `[]`) || `null`"
 # ── Browse: the same works, listed by filter and sort ─────────────────────────
 
 [capabilities.browse]
-path = "/works?per-page={limit}&page={page}&select=id,doi,display_name,publication_year,publication_date,cited_by_count,ids,primary_location,best_oa_location,open_access,authorships"
-query_param = "search"
-filter_param = "filter"
+path = "/works?search={query}&filter={filters}&sort={sort}&per-page={limit}&page={page}&select=id,doi,display_name,publication_year,publication_date,cited_by_count,ids,primary_location,best_oa_location,open_access,authorships"
 filter_separator = ","
 total = "meta.count"
 
 [capabilities.browse.sort]
-param = "sort"
+equivalent_to = { "cited_by_count:desc" = "most_cited", "publication_date:desc" = "newest", "publication_date:asc" = "oldest", "relevance_score:desc" = "most_relevant" }
 default = "cited_by_count:desc"
 keyword_default = "relevance_score:desc"
 options = [
@@ -80,11 +78,11 @@ none = { label = "None of", repeat = true, value = "!{value}" }
 # One line per filter, in the order the pane offers them. A clause with no
 # {value} is on or off; a range is two filters sharing a group.
 [capabilities.browse.filters]
-year_from      = { label = "From", group = "Year", clause = "from_publication_date:{value}-01-01", value = "integer" }
-year_to        = { label = "To", group = "Year", clause = "to_publication_date:{value}-12-31", value = "integer" }
-published_from = { label = "From", group = "Published", clause = "from_publication_date:{value}", value = "date" }
-published_to   = { label = "To", group = "Published", clause = "to_publication_date:{value}", value = "date" }
-type           = { label = "Type", clause = "type:{value}", modes = ["any", "none"], options = [
+year_from      = { equivalent_to = "year_from", label = "From", group = "Year", clause = "from_publication_date:{value}-01-01", value = "integer" }
+year_to        = { equivalent_to = "year_to", label = "To", group = "Year", clause = "to_publication_date:{value}-12-31", value = "integer" }
+published_from = { equivalent_to = "published_from", label = "From", group = "Published", clause = "from_publication_date:{value}", value = "date" }
+published_to   = { equivalent_to = "published_to", label = "To", group = "Published", clause = "to_publication_date:{value}", value = "date" }
+type           = { equivalent_to = "type", label = "Type", clause = "type:{value}", modes = ["any", "none"], options = [
   ["article", "Article"],
   ["review", "Review"],
   ["preprint", "Preprint"],
@@ -106,7 +104,7 @@ type           = { label = "Type", clause = "type:{value}", modes = ["any", "non
   ["retraction", "Retraction notice"],
   ["other", "Other"],
 ] }
-language       = { label = "Language", clause = "language:{value}", modes = ["any", "none"], options = [
+language       = { equivalent_to = "language", label = "Language", clause = "language:{value}", modes = ["any", "none"], options = [
   ["en", "English"],
   ["es", "Spanish"],
   ["de", "German"],
@@ -129,13 +127,13 @@ language       = { label = "Language", clause = "language:{value}", modes = ["an
   ["ca", "Catalan"],
 ] }
 
-open_access    = { label = "Open access only", group = "Access", clause = "open_access.is_oa:true" }
+open_access    = { equivalent_to = "open_access", label = "Open access only", group = "Access", clause = "open_access.is_oa:true" }
 fulltext       = { label = "Full text available", group = "Access", clause = "has_fulltext:true" }
 oa_status      = { label = "Open-access status", clause = "open_access.oa_status:{value}", modes = ["any", "none"], options = [["gold", "Gold"], ["diamond", "Diamond"], ["green", "Green"], ["hybrid", "Hybrid"], ["bronze", "Bronze"], ["closed", "Closed"]] }
 license        = { label = "Licence", clause = "best_oa_location.license:{value}", modes = ["any", "none"], options = [["cc-by", "CC BY"], ["cc-by-sa", "CC BY-SA"], ["cc-by-nc", "CC BY-NC"], ["cc-by-nc-sa", "CC BY-NC-SA"], ["cc-by-nd", "CC BY-ND"], ["cc-by-nc-nd", "CC BY-NC-ND"], ["public-domain", "Public domain"], ["other-oa", "Other open licence"]] }
 
-cited_min      = { label = "More than", group = "Citations", clause = "cited_by_count:>{value}", value = "integer" }
-cited_max      = { label = "Fewer than", group = "Citations", clause = "cited_by_count:<{value}", value = "integer" }
+cited_min      = { equivalent_to = "cited_more_than", label = "More than", group = "Citations", clause = "cited_by_count:>{value}", value = "integer" }
+cited_max      = { equivalent_to = "cited_fewer_than", label = "Fewer than", group = "Citations", clause = "cited_by_count:<{value}", value = "integer" }
 impact_min     = { label = "Field-weighted impact above", clause = "fwci:>{value}", value = "number" }
 top_10_percent = { label = "Top 10% cited in its field and year", group = "Standing", clause = "citation_normalized_percentile.is_in_top_10_percent:true" }
 top_1_percent  = { label = "Top 1% cited in its field and year", group = "Standing", clause = "citation_normalized_percentile.is_in_top_1_percent:true" }
@@ -172,11 +170,11 @@ field          = { label = "Field", clause = "primary_topic.field.id:{value}", m
 topic          = { label = "Topic", clause = "topics.id:{value}", modes = ["any", "all", "none"], suggest = "/autocomplete/topics?q={query}" }
 keyword        = { label = "Keyword", clause = "keywords.id:{value}", modes = ["any", "all", "none"], suggest = "/autocomplete/keywords?q={query}" }
 
-author         = { label = "Author", clause = "authorships.author.id:{value}", modes = ["any", "all", "none"], suggest = "/autocomplete/authors?q={query}" }
-institution    = { label = "Institution", clause = "authorships.institutions.lineage:{value}", modes = ["any", "all", "none"], suggest = "/autocomplete/institutions?q={query}" }
+author         = { equivalent_to = "author", label = "Author", clause = "authorships.author.id:{value}", modes = ["any", "all", "none"], suggest = "/autocomplete/authors?q={query}" }
+institution    = { equivalent_to = "institution", label = "Institution", clause = "authorships.institutions.lineage:{value}", modes = ["any", "all", "none"], suggest = "/autocomplete/institutions?q={query}" }
 institution_type = { label = "Institution type", clause = "authorships.institutions.type:{value}", modes = ["any", "none"], options = [["education", "Education"], ["healthcare", "Healthcare"], ["company", "Company"], ["government", "Government"], ["nonprofit", "Nonprofit"], ["facility", "Facility"], ["archive", "Archive"], ["other", "Other"]] }
 continent      = { label = "Continent", clause = "authorships.institutions.continent:{value}", modes = ["any", "all", "none"], options = [["Q15", "Africa"], ["Q48", "Asia"], ["Q46", "Europe"], ["Q49", "North America"], ["Q55643", "Oceania"], ["Q18", "South America"]] }
-country        = { label = "Country", clause = "authorships.countries:{value}", modes = ["any", "all", "none"], options = [
+country        = { equivalent_to = "country", label = "Country", clause = "authorships.countries:{value}", modes = ["any", "all", "none"], options = [
   ["AR", "Argentina"],
   ["AU", "Australia"],
   ["AT", "Austria"],

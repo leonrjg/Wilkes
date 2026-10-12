@@ -31,9 +31,10 @@ use url::Url;
 
 use self::expr::{Evaluator, Projected};
 use self::manifest::{
-    lookup_field_type, search_field_type, Bases, BrowseCapability, FieldSpec, FieldType,
-    LookupCapability, Manifest, Missing, ParamValue, ReferencesCapability, ResolverStep,
-    ResponseFormat, SearchCapability, SecretSlot, ValueRule, MAX_FILTER_VALUES, MAX_SUGGESTIONS,
+    lookup_field_type, placeholders, query_parts, search_field_type, Bases, BrowseCapability,
+    FieldSpec, FieldType, FilterSpec, LookupCapability, Manifest, Missing, ParamValue,
+    ReferencesCapability, ResolverStep, ResponseFormat, SearchCapability, SecretSlot, ValueRule,
+    BROWSE_FILTERS, BROWSE_QUERY, BROWSE_SORT, MAX_FILTER_VALUES, MAX_SUGGESTIONS,
     MIN_SUGGEST_CHARS,
 };
 use crate::integrations::{LiteratureSource, ProviderCapabilities};
@@ -236,18 +237,15 @@ impl CustomSource {
             );
         };
 
-        let request = match self.request(
-            &substitute(
-                &search.path,
-                &[
-                    ("query", query),
-                    ("limit", &PROBE_LIMIT.to_string()),
-                    ("page", "1"),
-                    ("offset", "0"),
-                ],
-            ),
-            &[],
-        ) {
+        let request = match self.request(&substitute(
+            &search.path,
+            &[
+                ("query", query),
+                ("limit", &PROBE_LIMIT.to_string()),
+                ("page", "1"),
+                ("offset", "0"),
+            ],
+        )) {
             Ok(request) => request,
             Err(error) => {
                 return ProbeReport::failed(
@@ -726,18 +724,15 @@ impl CustomSource {
         );
         let offset = (page - 1) * limit;
 
-        let request = self.request(
-            &substitute(
-                &search.path,
-                &[
-                    ("query", query),
-                    ("limit", &limit.to_string()),
-                    ("page", &page.to_string()),
-                    ("offset", &offset.to_string()),
-                ],
-            ),
-            &[],
-        )?;
+        let request = self.request(&substitute(
+            &search.path,
+            &[
+                ("query", query),
+                ("limit", &limit.to_string()),
+                ("page", &page.to_string()),
+                ("offset", &offset.to_string()),
+            ],
+        ))?;
         let body = self.fetch(request).await?;
         let projection = self.project_response(search, &body, query, limit)?;
         self.warn_unmapped(&projection);
@@ -766,15 +761,9 @@ impl CustomSource {
             .map(str::trim)
             .filter(|query| !query.is_empty());
 
-        let extra = browse_parameters(browse, request, query)
+        let written = browse_parameters(browse, request, query)
             .map_err(|problem| anyhow::anyhow!("{name} browse: {problem}"))?;
-        let prepared = self.request(
-            &substitute(
-                &browse.path,
-                &[("limit", &limit.to_string()), ("page", &page.to_string())],
-            ),
-            &extra,
-        )?;
+        let prepared = self.request(&browse_path(&browse.path, limit, page, &written))?;
         let body = self.fetch(prepared).await?;
         let projection = self.project_response(search, &body, query.unwrap_or(""), limit)?;
         self.warn_unmapped(&projection);
@@ -841,13 +830,10 @@ impl CustomSource {
             "a suggestion needs at least {MIN_SUGGEST_CHARS} characters"
         );
 
-        let prepared = self.request(
-            &substitute(
-                path,
-                &[("query", text), ("limit", &MAX_SUGGESTIONS.to_string())],
-            ),
-            &[],
-        )?;
+        let prepared = self.request(&substitute(
+            path,
+            &[("query", text), ("limit", &MAX_SUGGESTIONS.to_string())],
+        ))?;
         let body = self.fetch(prepared).await?;
         let value: Value = serde_json::from_slice(&body)
             .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
@@ -859,7 +845,7 @@ impl CustomSource {
             "suggest.items",
         )?;
 
-        let reserved = browse.reserved();
+        let reserved = browse.reserved(filter);
         let text_of = |expression: &str, item: &Value| -> anyhow::Result<Option<String>> {
             Ok(
                 match evaluator
@@ -915,7 +901,7 @@ impl CustomSource {
         let evaluator = Evaluator::new(&self.base_url);
 
         for path in &lookup.paths {
-            let request = self.request(&substitute(path, &[("doi", &doi)]), &[])?;
+            let request = self.request(&substitute(path, &[("doi", &doi)]))?;
             let body = match self.http.get_bytes(request.url, &request.headers).await {
                 Ok(body) => body,
                 // "No record under this key" — the next request may know the
@@ -1010,7 +996,7 @@ impl CustomSource {
         let evaluator = Evaluator::new(&self.base_url);
 
         let work = self
-            .request(&substitute(&references.path, &[("doi", &doi)]), &[])
+            .request(&substitute(&references.path, &[("doi", &doi)]))
             .map(|request| (request.url, request.headers))?;
         let body = self.fetch_raw(work.0, &work.1).await?;
         let value: Value = serde_json::from_slice(&body)
@@ -1050,7 +1036,7 @@ impl CustomSource {
                 .path
                 .replace("{ids}", &joined)
                 .replace("{count}", &chunk.len().to_string());
-            let request = self.request(&path, &[]).map(|r| (r.url, r.headers))?;
+            let request = self.request(&path).map(|r| (r.url, r.headers))?;
             let body = self.fetch_raw(request.0, &request.1).await?;
             let value: Value = serde_json::from_slice(&body)
                 .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
@@ -1137,7 +1123,6 @@ impl CustomSource {
                 &path,
                 &step.headers,
                 &step.query,
-                &[],
             )?;
             let body = self.http.get_bytes(request.url, &request.headers).await?;
             let extracted = self
@@ -1237,13 +1222,8 @@ impl CustomSource {
 
     /// Assemble one request against the primary origin: the URL with its
     /// declared query parameters, the headers, and a copy of the URL with
-    /// secrets removed for display. `extra` are query pairs the caller
-    /// composed (a browse's filters), encoded here.
-    fn request<'a>(
-        &'a self,
-        path: &str,
-        extra: &[(String, String)],
-    ) -> anyhow::Result<PreparedRequest<'a>> {
+    /// secrets removed for display.
+    fn request<'a>(&'a self, path: &str) -> anyhow::Result<PreparedRequest<'a>> {
         self.request_against(
             &self.base,
             &self.base_url,
@@ -1251,7 +1231,6 @@ impl CustomSource {
             path,
             &EMPTY_PARAMS,
             &EMPTY_PARAMS,
-            extra,
         )
     }
 
@@ -1296,7 +1275,6 @@ impl CustomSource {
         path: &str,
         step_headers: &'a BTreeMap<String, ParamValue>,
         step_query: &'a BTreeMap<String, ParamValue>,
-        extra: &[(String, String)],
     ) -> anyhow::Result<PreparedRequest<'a>> {
         let mut url = Url::parse(&format!("{base}{path}"))?;
         anyhow::ensure!(
@@ -1305,10 +1283,6 @@ impl CustomSource {
             url.origin().ascii_serialization(),
             base_url.origin().ascii_serialization()
         );
-
-        for (name, value) in extra {
-            url.query_pairs_mut().append_pair(name, value);
-        }
 
         let (global_headers, global_query) = match inherit_global {
             true => (&self.manifest.http.headers, &self.manifest.http.query),
@@ -1445,7 +1419,9 @@ fn records_in(
     }
 }
 
-/// The query pairs a browse request adds to its path: filters, sort, keyword.
+/// What a browse request writes into its path: each placeholder that has a
+/// value, and that value. A filter the path names is written under its own
+/// name; the rest are joined under `{filters}`.
 ///
 /// Everything a caller may vary was declared by the manifest, so everything
 /// else is refused by name — a filter that is not declared, an option that is
@@ -1455,13 +1431,8 @@ fn browse_parameters(
     request: &BrowseRequest,
     query: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
-    let mut extra = Vec::new();
+    let mut written = Vec::new();
 
-    // One path for every filter: admit each value by the filter's rule,
-    // combine them as its mode says, write the clause. Filters differ only in
-    // `ValueRule::admit`.
-    let reserved = browse.reserved();
-    let mut clauses = Vec::new();
     if let Some(unknown) = request
         .filters
         .keys()
@@ -1472,71 +1443,25 @@ fn browse_parameters(
     }
     // Declaration order, so the request a set of filters makes does not depend
     // on the order they were set in.
+    let mut joined = Vec::new();
     for (name, spec) in &browse.filters {
-        let Some(value) = request.filters.get(name) else {
-            continue;
-        };
-        let rule = spec.rule();
-        let raw = value.values();
-        if rule == ValueRule::Toggle {
-            match raw.as_slice() {
-                [] | ["false"] => {}
-                [one] => {
-                    rule.admit(one, &reserved)
-                        .map_err(|problem| format!("filter '{name}' {problem}"))?;
-                    clauses.push(spec.clause.clone());
-                }
-                _ => return Err(format!("filter '{name}' is on or off")),
-            }
+        let clauses = filter_clauses(browse, name, spec, request)?;
+        if !browse.names(name) {
+            joined.extend(clauses);
             continue;
         }
-        if raw.is_empty() {
-            continue;
-        }
-        if raw.len() > MAX_FILTER_VALUES {
-            return Err(format!(
-                "filter '{name}' takes at most {MAX_FILTER_VALUES} values; got {}",
-                raw.len()
-            ));
-        }
-        let admitted = raw
-            .iter()
-            .map(|one| rule.admit(one, &reserved))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|problem| format!("filter '{name}' {problem}"))?;
-
-        let chosen = request.modes.get(name).or_else(|| spec.modes.first());
-        let Some(chosen) = chosen else {
-            // No modes: the filter takes one value, written as it is.
-            if admitted.len() > 1 {
-                return Err(format!("filter '{name}' takes one value"));
-            }
-            clauses.push(spec.clause.replace("{value}", &admitted[0]));
-            continue;
-        };
-        if !spec.modes.contains(chosen) {
-            return Err(format!("'{chosen}' is not a mode of filter '{name}'"));
-        }
-        let mode = browse
-            .modes
-            .get(chosen)
-            .ok_or_else(|| format!("mode '{chosen}' is not declared"))?;
-        let written: Vec<String> = admitted.iter().map(|one| mode.write(one)).collect();
-        match &mode.join {
-            Some(join) => clauses.push(spec.clause.replace("{value}", &written.join(join))),
-            None => clauses.extend(
-                written
-                    .iter()
-                    .map(|one| spec.clause.replace("{value}", one)),
-            ),
+        match clauses.as_slice() {
+            [] => {}
+            [one] => written.push((name.clone(), one.clone())),
+            // Validation refuses a repeating mode on such a filter.
+            _ => return Err(format!("filter '{name}' is written as one value")),
         }
     }
-    if !clauses.is_empty() {
-        let param = browse
-            .filter_param
-            .as_deref()
-            .ok_or_else(|| "no filter_param declared".to_string())?;
-        extra.push((param.to_string(), clauses.join(&browse.filter_separator)));
+    if !joined.is_empty() {
+        written.push((
+            BROWSE_FILTERS.to_string(),
+            joined.join(&browse.filter_separator),
+        ));
     }
 
     match (
@@ -1552,20 +1477,151 @@ fn browse_parameters(
             if !sort.options.iter().any(|(value, _)| value == chosen) {
                 return Err(format!("'{chosen}' is not a sort option"));
             }
-            extra.push((sort.param.clone(), chosen.to_string()));
+            written.push((BROWSE_SORT.to_string(), chosen.to_string()));
         }
         (None, Some(_)) => return Err("this provider does not offer a sort".to_string()),
         (None, None) => {}
     }
 
-    if let Some(query) = query {
-        let param = browse
-            .query_param
-            .as_deref()
-            .ok_or_else(|| "this provider's listing takes no keyword".to_string())?;
-        extra.push((param.to_string(), query.to_string()));
+    match query {
+        Some(_) if !browse.names(BROWSE_QUERY) => {
+            return Err("this provider's listing takes no keyword".to_string())
+        }
+        Some(query) => written.push((BROWSE_QUERY.to_string(), query.to_string())),
+        None if browse.query_required => {
+            return Err("this provider's listing needs a keyword".to_string())
+        }
+        None => {}
     }
-    Ok(extra)
+    Ok(written)
+}
+
+/// The clauses one filter writes for a request: none when it is not set.
+///
+/// One path for every filter: admit each value by the filter's rule, combine
+/// them as its mode says, write the clause. Filters differ only in
+/// `ValueRule::admit`.
+fn filter_clauses(
+    browse: &BrowseCapability,
+    name: &str,
+    spec: &FilterSpec,
+    request: &BrowseRequest,
+) -> Result<Vec<String>, String> {
+    let Some(value) = request.filters.get(name) else {
+        return Ok(Vec::new());
+    };
+    let reserved = browse.reserved(name);
+    let rule = spec.rule();
+    let raw = value.values();
+    if rule == ValueRule::Toggle {
+        return match raw.as_slice() {
+            [] | ["false"] => Ok(Vec::new()),
+            [one] => {
+                rule.admit(one, &reserved)
+                    .map_err(|problem| format!("filter '{name}' {problem}"))?;
+                Ok(vec![spec.clause.clone()])
+            }
+            _ => Err(format!("filter '{name}' is on or off")),
+        };
+    }
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    if raw.len() > MAX_FILTER_VALUES {
+        return Err(format!(
+            "filter '{name}' takes at most {MAX_FILTER_VALUES} values; got {}",
+            raw.len()
+        ));
+    }
+    let admitted = raw
+        .iter()
+        .map(|one| rule.admit(one, &reserved))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|problem| format!("filter '{name}' {problem}"))?;
+
+    let chosen = request.modes.get(name).or_else(|| spec.modes.first());
+    let Some(chosen) = chosen else {
+        // No modes: the filter takes one value, written as it is.
+        if admitted.len() > 1 {
+            return Err(format!("filter '{name}' takes one value"));
+        }
+        return Ok(vec![spec.clause.replace("{value}", &admitted[0])]);
+    };
+    if !spec.modes.contains(chosen) {
+        return Err(format!("'{chosen}' is not a mode of filter '{name}'"));
+    }
+    let mode = browse
+        .modes
+        .get(chosen)
+        .ok_or_else(|| format!("mode '{chosen}' is not declared"))?;
+    let values: Vec<String> = admitted.iter().map(|one| mode.write(one)).collect();
+    Ok(match &mode.join {
+        Some(join) => vec![spec.clause.replace("{value}", &values.join(join))],
+        None => values
+            .iter()
+            .map(|one| spec.clause.replace("{value}", one))
+            .collect(),
+    })
+}
+
+/// The path of one listing request: the template with what the request set.
+///
+/// A query parameter none of whose placeholders has a value is left off, so a
+/// filter that is not set sends nothing; one where some have a value is
+/// written with the others empty, which is how a range in one parameter reads
+/// when only one end is given (`year=2016-`). Values are percent-encoded here,
+/// as in [`substitute`].
+fn browse_path(template: &str, limit: usize, page: usize, written: &[(String, String)]) -> String {
+    let paging = [
+        ("limit", limit.to_string()),
+        ("page", page.to_string()),
+        ("offset", ((page - 1) * limit).to_string()),
+    ];
+    let value_of = |name: &str| {
+        paging
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|(_, value)| value.as_str())
+            .or_else(|| {
+                written
+                    .iter()
+                    .find(|(known, _)| known == name)
+                    .map(|(_, value)| value.as_str())
+            })
+    };
+    let fill = |part: &str| {
+        let mut out = String::new();
+        let mut rest = part;
+        while let Some((before, after)) = rest.split_once('{') {
+            out.push_str(before);
+            let Some((name, tail)) = after.split_once('}') else {
+                // Validation refuses an unclosed brace; write it as it is.
+                out.push('{');
+                rest = after;
+                continue;
+            };
+            out.push_str(&urlencoding::encode(value_of(name).unwrap_or_default()));
+            rest = tail;
+        }
+        out.push_str(rest);
+        out
+    };
+
+    let (before_query, parameters) = query_parts(template);
+    let kept: Vec<String> = parameters
+        .into_iter()
+        .filter(|parameter| {
+            let names = placeholders(parameter);
+            names.is_empty() || names.iter().any(|name| value_of(name).is_some())
+        })
+        .map(fill)
+        .collect();
+    let mut path = fill(before_query);
+    if !kept.is_empty() {
+        path.push('?');
+        path.push_str(&kept.join("&"));
+    }
+    path
 }
 
 fn note_missing_id(index: usize, issues: &mut Vec<ProjectionIssue>) {
@@ -1913,7 +1969,7 @@ impl LiteratureSource for CustomSource {
         // Probed whether or not the integration is enabled: the settings form
         // asks this *before* enabling, so a short-circuit on `enabled` would
         // answer "disabled" and the integration could never be switched on.
-        let request = self.request(&health.path, &[])?;
+        let request = self.request(&health.path)?;
         match self.http.get_status(request.url, &request.headers).await {
             Ok(_) => Ok(status_of(
                 IntegrationState::Ready,
@@ -2904,7 +2960,7 @@ doi = "doi"
         browse_parameters(&openalex_browse(), request, None)
             .unwrap()
             .into_iter()
-            .find(|(param, _)| param == "filter")
+            .find(|(name, _)| name == "filters")
             .map(|(_, value)| value)
             .unwrap_or_default()
     }
@@ -2926,7 +2982,7 @@ doi = "doi"
             extra,
             vec![
                 (
-                    "filter".to_string(),
+                    "filters".to_string(),
                     "from_publication_date:2020-01-01,to_publication_date:2024-12-31,\
                      open_access.is_oa:true,cited_by_count:>100,primary_topic.field.id:17"
                         .to_string()
@@ -3026,9 +3082,14 @@ doi = "doi"
             .to_string()
             .contains("'novel' is not one of its options"));
         // A provider with nothing to browse says so rather than passing.
-        assert!(shipped("semantic_scholar", "http://127.0.0.1:9", &[])
-            .check_browse(&BrowseRequest::default())
-            .is_err());
+        let searches_only =
+            Manifest::parse(&KEYED_MANIFEST.replace("BASE_URL", "http://127.0.0.1:9"));
+        assert!(
+            CustomSource::new(searches_only.unwrap(), secret_map(&[("api_key", "k")]))
+                .unwrap()
+                .check_browse(&BrowseRequest::default())
+                .is_err()
+        );
     }
 
     /// A value nobody declared in advance cannot carry the service's own
@@ -3102,7 +3163,7 @@ doi = "doi"
             extra,
             vec![
                 ("sort".to_string(), "relevance_score:desc".to_string()),
-                ("search".to_string(), "graph".to_string()),
+                ("query".to_string(), "graph".to_string()),
             ]
         );
         // An explicit sort beats the default of either kind.
@@ -3252,6 +3313,146 @@ doi = "doi"
         mock.assert_async().await;
     }
 
+    fn semantic_scholar_browse() -> BrowseCapability {
+        builtin::manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "semantic_scholar")
+            .unwrap()
+            .capabilities
+            .browse
+            .unwrap()
+    }
+
+    /// The query string of the listing request a set of filters makes, with
+    /// the fixed `fields` parameter left out.
+    fn semantic_scholar_query(request: &BrowseRequest, query: Option<&str>) -> String {
+        let browse = semantic_scholar_browse();
+        let written = browse_parameters(&browse, request, query).unwrap();
+        let path = browse_path(&browse.path, 10, 3, &written);
+        let (_, query) = path.split_once('?').unwrap();
+        query
+            .split('&')
+            .filter(|parameter| !parameter.starts_with("fields="))
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
+    /// A filter is written where the path names it, and one that is not set
+    /// sends nothing at all.
+    #[test]
+    fn a_filter_the_path_names_is_written_under_its_own_parameter() {
+        assert_eq!(
+            semantic_scholar_query(&browse_request(&[]), Some("crispr")),
+            "query=crispr&limit=10&offset=20"
+        );
+        assert_eq!(
+            semantic_scholar_query(
+                &browse_request(&[("cited_at_least", "200"), ("open_access", "true")]),
+                Some("gene editing"),
+            ),
+            "query=gene%20editing&minCitationCount=200&openAccessPdf&limit=10&offset=20"
+        );
+        assert_eq!(
+            semantic_scholar_query(
+                &many("type", &["Review", "JournalArticle"], None),
+                Some("crispr"),
+            ),
+            "query=crispr&publicationTypes=Review%2CJournalArticle&limit=10&offset=20"
+        );
+    }
+
+    /// Two filters in one parameter are a range, and it reads right with
+    /// either end left open.
+    #[test]
+    fn a_range_in_one_parameter_is_written_with_the_unset_end_empty() {
+        for (filters, expected) in [
+            (vec![("year_from", "2016")], "year=2016-"),
+            (vec![("year_to", "2020")], "year=-2020"),
+            (
+                vec![("year_from", "2016"), ("year_to", "2020")],
+                "year=2016-2020",
+            ),
+        ] {
+            assert_eq!(
+                semantic_scholar_query(&browse_request(&filters), Some("crispr")),
+                format!("query=crispr&{expected}&limit=10&offset=20"),
+                "{filters:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listing_that_needs_a_keyword_is_refused_without_one() {
+        let browse = semantic_scholar_browse();
+        let error = browse_parameters(&browse, &browse_request(&[("year_from", "2016")]), None)
+            .unwrap_err();
+        assert!(error.contains("needs a keyword"), "{error}");
+    }
+
+    /// The separator joins the clauses of `{filters}` and is syntax nowhere
+    /// else; what a mode joins values by is syntax wherever the filter is.
+    #[test]
+    fn a_named_filter_refuses_only_the_syntax_of_where_it_is_written() {
+        let browse = semantic_scholar_browse();
+        let error = browse_parameters(
+            &browse,
+            &browse_request(&[("venue", "Nature,Radiology")]),
+            Some("crispr"),
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot contain ','"), "{error}");
+        assert_eq!(
+            semantic_scholar_query(&browse_request(&[("venue", "N. Engl. J. Med.")]), Some("x")),
+            "query=x&venue=N.%20Engl.%20J.%20Med.&limit=10&offset=20"
+        );
+    }
+
+    #[test]
+    fn a_path_with_nothing_left_in_its_query_string_has_none() {
+        assert_eq!(
+            browse_path("/list?q={query}&f={filters}", 10, 1, &[]),
+            "/list"
+        );
+        assert_eq!(
+            browse_path("/list/{page}?q={query}&fixed=1", 10, 2, &[]),
+            "/list/2?fixed=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_with_a_parameter_per_filter_sends_each_where_it_is_named() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/graph/v1/paper/search")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("query".into(), "crispr".into()),
+                Matcher::UrlEncoded("year".into(), "2016-".into()),
+                Matcher::UrlEncoded("fieldsOfStudy".into(), "Biology,Medicine".into()),
+                Matcher::UrlEncoded("limit".into(), "5".into()),
+                Matcher::UrlEncoded("offset".into(), "5".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"total": 42, "data": [{"paperId": "p1", "title": "One"}]}"#)
+            .create_async()
+            .await;
+
+        let mut request = many("field", &["Biology", "Medicine"], None);
+        request
+            .filters
+            .insert("year_from".into(), FilterValue::One("2016".into()));
+        request.query = Some("crispr".into());
+        request.page = Some(2);
+        request.limit = Some(5);
+        let page = shipped("semantic_scholar", &server.url(), &[])
+            .browse(&request)
+            .await
+            .unwrap();
+
+        assert_eq!(page.total, Some(42));
+        assert_eq!(page.results.len(), 1);
+        mock.assert_async().await;
+    }
+
     #[tokio::test]
     async fn browse_without_a_keyword_sends_no_search_parameter() {
         let mut server = mockito::Server::new_async().await;
@@ -3279,7 +3480,7 @@ doi = "doi"
 
     #[tokio::test]
     async fn a_provider_that_declares_no_browse_refuses_by_name() {
-        let error = shipped("semantic_scholar", "https://example.test", &[])
+        let error = source(KEYED_MANIFEST, "https://example.test", &[("api_key", "k")])
             .browse(&BrowseRequest::default())
             .await
             .unwrap_err()
@@ -3679,7 +3880,7 @@ doi = "doi"
             "path = \"//evil.test/graph/v1/paper/search?query={query}",
         );
         let pinned = source(&doubled, "https://api.example.test", &[("api_key", "k")]);
-        let request = pinned.request("//evil.test/works", &[]).unwrap();
+        let request = pinned.request("//evil.test/works").unwrap();
         assert!(
             request
                 .url

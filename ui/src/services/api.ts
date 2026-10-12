@@ -231,8 +231,8 @@ export interface SearchApi {
   /** Turns a request written in ordinary words into filters on each named
    *  provider, using the generation model. What comes back has been checked
    *  against each provider's own declaration, so it can be set as it is; a
-   *  provider that could not be composed for says so in its own entry. Rejects
-   *  when nothing could be composed at all: no model, an unknown provider, or
+   *  provider unable to apply the composition says so in its own entry. Rejects
+   *  when the whole decode fails, no model is available, a provider is unknown, or
    *  `literatureComposeCancel` on the same `requestId`. */
   literatureCompose(
     requestId: string,

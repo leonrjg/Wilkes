@@ -104,6 +104,7 @@ const control = (
  *  backend reports it. */
 const OPENALEX_BROWSE: BrowseControls = {
   keyword: true,
+  keyword_required: false,
   total: true,
   sort: {
     default: "cited_by_count:desc",
@@ -896,6 +897,31 @@ describe("CataloguePane", () => {
     expect(browse.mock.calls[1][1].filters).toEqual({ type: ["article"] });
   });
 
+  /// A listing that is the provider's search cannot be asked without a
+  /// keyword, and the panel says so rather than offering "with or without".
+  it("says a listing needs a keyword when its provider declares so", async () => {
+    providers.mockResolvedValue([
+      provider("custom:scholar", "Scholar", {
+        keyword: true,
+        keyword_required: true,
+        sort: {
+          default: "relevance",
+          keyword_default: null,
+          options: [
+            { value: "relevance", label: "Most relevant" },
+            { value: "date", label: "Newest" },
+          ],
+        },
+        filters: [],
+      }),
+    ]);
+    render(<CataloguePane />);
+    const panel = await openFilters();
+    const scholar = within(panel).getByRole("group", { name: "Scholar filters" });
+    expect(within(scholar).getByText(/to list Scholar works, with a keyword\s*\./)).toBeTruthy();
+    expect(within(scholar).queryByText(/with or without a keyword/)).toBeNull();
+  });
+
   /// Filters belong to the provider that declared them. Two providers that
   /// declare some each get a set, and each is filtered on its own.
   it("gives every filterable provider its own filters, applied independently", async () => {
@@ -904,6 +930,7 @@ describe("CataloguePane", () => {
       provider("openalex", "OpenAlex", OPENALEX_BROWSE),
       provider("custom:crossref", "Crossref", {
         keyword: false,
+        keyword_required: false,
         sort: {
           default: "issued",
           keyword_default: null,
@@ -957,6 +984,7 @@ describe("CataloguePane", () => {
     providers.mockResolvedValue([
       provider("custom:crossref", "Crossref", {
         keyword: false,
+        keyword_required: false,
         sort: {
           default: "issued",
           keyword_default: null,
@@ -1412,18 +1440,19 @@ describe("CataloguePane", () => {
   it("reports a provider it could not compose for and searches for nothing", async () => {
     useGenerationStore.setState({ ready: true });
     composeCall.mockResolvedValue(
-      composition({ filters: {}, sort: null, error: "nothing in the request could be turned into a search" }, null),
+      composition({ filters: {}, sort: null, notes: ["No option for review"], error: "nothing in the request could be turned into a search" }, null),
     );
     render(<CataloguePane />);
     typeRequest("hello there");
     await composeSubmit();
     expect(
-      await screen.findByText(/OpenAlex could not be composed for: nothing in the request/),
+      await screen.findByText(/OpenAlex could not apply the request: nothing in the request/),
     ).toBeTruthy();
     expect(browse).not.toHaveBeenCalled();
     expect(literature).not.toHaveBeenCalled();
     // What was typed is still there to be searched for, if that was meant.
     expect(searchBox()).toHaveProperty("value", "hello there");
+    expect(screen.getByText("No option for review")).toBeTruthy();
   });
 
   it("says why nothing could be composed and leaves the filters as they were", async () => {

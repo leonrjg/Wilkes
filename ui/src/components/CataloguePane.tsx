@@ -376,7 +376,7 @@ function ComposeStatus() {
             ))}
             {composed.failures.map((failure) => (
               <p key={failure.name} className="text-red-400">
-                {failure.name} could not be composed for: {failure.error}
+                {failure.name} could not apply the request: {failure.error}
               </p>
             ))}
           </>
@@ -661,7 +661,17 @@ function ProviderFilters({
       {count === 0 && (
         <p className="text-[10px] leading-snug text-[var(--text-muted)]">
           Set a filter or a sort to list {info.name} works
-          {controls.keyword ? ", with or without a keyword" : ""}.
+          {controls.keyword_required
+            ? ", with a keyword"
+            : controls.keyword
+              ? ", with or without a keyword"
+              : ""}
+          .
+        </p>
+      )}
+      {count > 0 && !typed && controls.keyword_required && (
+        <p className="text-[10px] leading-snug text-[var(--text-muted)]">
+          {info.name} lists only with a keyword: type one to see these filters applied.
         </p>
       )}
     </div>

@@ -19,9 +19,11 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 
 use wilkes_core::catalogue::{mirrored_sources, CatalogueStore};
-use wilkes_core::generate::tasks::browse_request::compose_browse_request;
+use wilkes_core::generate::tasks::browse_request::{compose_browse_request, BrowseComposition};
 use wilkes_core::generate::Generator;
-use wilkes_core::integrations::custom::manifest::{Bases, SecretSlot, MIN_SUGGEST_CHARS};
+use wilkes_core::integrations::custom::manifest::{
+    Bases, BrowseControls, SecretSlot, MIN_SUGGEST_CHARS,
+};
 use wilkes_core::integrations::{builtin, IntegrationRegistry, ProviderCapabilities};
 use wilkes_core::metadata::cache::MetadataCache;
 use wilkes_core::metadata::doi::normalize_doi;
@@ -417,8 +419,7 @@ pub struct ComposedListing {
 pub struct LiteratureComposition {
     /// The request as it was composed from.
     pub text: String,
-    /// The words to search for beside the filters: the first provider's, since
-    /// the pane has one search box and every listing shares it.
+    /// The single composed keyword shared by the pane's search box and listings.
     pub keyword: Option<String>,
     pub providers: Vec<ComposedListing>,
 }
@@ -427,15 +428,15 @@ pub struct LiteratureComposition {
 /// provider.
 ///
 /// The model writes filter names and values in a grammar built from the
-/// provider's own declaration, never a request; what it wrote is then settled
-/// here — a name the provider must be asked about is looked up through
+/// selected providers' merged declaration, never a request. What it wrote is
+/// projected and settled here — a name the provider must be asked about is looked up through
 /// [`LiteratureSource::suggest`], and every filter is put to
 /// [`LiteratureSource::check_browse`] before it is returned, so nothing comes
 /// back that the listing would refuse. A filter that fails either is dropped
 /// with a note saying so; the rest stand.
 ///
-/// One provider at a time, because each has its own filters and there is one
-/// model. `cancel` is read at every decoded token and between providers.
+/// One decode for the whole request, followed by settlement per provider.
+/// `cancel` is read at every decoded token and between providers.
 ///
 /// [`LiteratureSource::suggest`]: wilkes_core::integrations::LiteratureSource::suggest
 /// [`LiteratureSource::check_browse`]: wilkes_core::integrations::LiteratureSource::check_browse
@@ -466,26 +467,66 @@ pub async fn compose(
         let source = registry
             .literature_for_search(&provider)
             .map_err(|error| LiteratureRequestError(error.to_string()))?;
-        sources.push((provider, Arc::clone(source)));
+        sources.push((provider, Arc::clone(source), source.capabilities().browse));
     }
 
     let cancelled = || LiteratureRequestError("Composing the search was cancelled.".into());
-    let mut keyword = None;
+    if cancel.load(Ordering::Relaxed) {
+        return Err(cancelled());
+    }
+    let declared: Vec<_> = sources
+        .iter()
+        .filter_map(|(id, source, controls)| {
+            controls
+                .as_ref()
+                .map(|controls| (id.as_str(), source.name(), controls))
+        })
+        .collect();
+    let merged = wilkes_core::integrations::merged::merge(&declared);
+    let composition = {
+        let controls = merged.controls.clone();
+        let text = text.clone();
+        let today = today.to_string();
+        let cancel = Arc::clone(&cancel);
+        tokio::task::spawn_blocking(move || {
+            compose_browse_request(generator.as_ref(), &controls, &text, &today, &mut |_| {
+                if cancel.load(Ordering::Relaxed) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+        })
+        .await
+        .map_err(|error| LiteratureRequestError(format!("composing task failed: {error}")))?
+        .map_err(|error| LiteratureRequestError(format!("{error:#}")))?
+    };
+    let keyword = composition.keyword.clone();
     let mut listings = Vec::with_capacity(sources.len());
-    for (provider, source) in sources {
+    for (provider, source, controls) in sources {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
         }
         let name = source.name().to_string();
-        let composed = compose_for(&source, &generator, &text, today, &cancel).await;
+        let composed = match controls {
+            Some(controls) => {
+                settle(
+                    &source,
+                    &controls,
+                    merged.project(&provider, &composition),
+                    &cancel,
+                )
+                .await
+            }
+            None => Err(anyhow::anyhow!(
+                "{name} declares nothing to filter or sort by"
+            )),
+        };
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
         }
         listings.push(match composed {
-            Ok((words, mut listing)) => {
-                if keyword.is_none() {
-                    keyword = words;
-                }
+            Ok(mut listing) => {
                 listing.provider = provider;
                 listing
             }
@@ -510,39 +551,14 @@ pub async fn compose(
     })
 }
 
-/// One provider's composition: its keyword, and the filters that stood.
-async fn compose_for(
+/// Settle a projection with the provider's own suggestions and validation.
+async fn settle(
     source: &Arc<dyn wilkes_core::integrations::LiteratureSource>,
-    generator: &Arc<dyn Generator>,
-    text: &str,
-    today: &str,
+    controls: &BrowseControls,
+    composition: BrowseComposition,
     cancel: &Arc<AtomicBool>,
-) -> anyhow::Result<(Option<String>, ComposedListing)> {
+) -> anyhow::Result<ComposedListing> {
     let name = source.name().to_string();
-    let controls = source
-        .capabilities()
-        .browse
-        .ok_or_else(|| anyhow::anyhow!("{name} declares nothing to filter or sort by"))?;
-
-    let composition = {
-        let generator = Arc::clone(generator);
-        let controls = controls.clone();
-        let text = text.to_string();
-        let today = today.to_string();
-        let cancel = Arc::clone(cancel);
-        tokio::task::spawn_blocking(move || {
-            compose_browse_request(generator.as_ref(), &controls, &text, &today, &mut |_| {
-                if cancel.load(Ordering::Relaxed) {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            })
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("composing task failed: {error}"))??
-    };
-
     let mut listing = ComposedListing {
         provider: String::new(),
         name: name.clone(),
@@ -559,6 +575,11 @@ async fn compose_for(
         query: composition.keyword.clone().filter(|_| controls.keyword),
         ..BrowseRequest::default()
     };
+    // Said once, rather than as the reason every filter in turn was left out.
+    if controls.keyword_required && standing.query.is_none() {
+        listing.error = Some(format!("{name} lists only with a keyword"));
+        return Ok(listing);
+    }
     for (filter, raw) in composition.filters {
         let control = controls
             .filters
@@ -634,7 +655,10 @@ async fn compose_for(
                 .push(format!("The order was left out: {error:#}")),
         }
     }
-    Ok((standing.query, listing))
+    if standing.query.is_none() && listing.filters.is_empty() && listing.sort.is_none() {
+        listing.error = Some("nothing in the request applies to this provider".into());
+    }
+    Ok(listing)
 }
 
 /// Whether a provider is reachable and usable now.
@@ -996,7 +1020,10 @@ mod tests {
             .find(|p| p.provider == "semantic_scholar")
             .unwrap();
         assert_eq!(semantic.secrets[0].name, "api_key");
-        assert!(semantic.capabilities.browse.is_none());
+        // Its listing is its search: the interface is told it needs a keyword.
+        let browse = semantic.capabilities.browse.as_ref().unwrap();
+        assert!(browse.keyword && browse.keyword_required);
+        assert!(browse.sort.is_none());
     }
 
     #[test]
@@ -1157,7 +1184,7 @@ mod tests {
             .create_async()
             .await;
         let generator = Arc::new(MockGenerator::scripted([
-            "search: crispr; type: review; open_access: on; year_from: 2020; author: Jennifer Doudna; sort: cited_by_count:desc; ",
+            "search: crispr; type: review; open_access: on; year_from: 2020; author: Jennifer Doudna; sort: most_cited; ",
         ]));
 
         let composition = composed(&openalex_at(&server.url()), &generator, &["openalex"])
@@ -1232,6 +1259,30 @@ mod tests {
     #[tokio::test]
     async fn a_provider_that_declares_no_filters_is_reported_and_not_composed_for() {
         let generator = Arc::new(MockGenerator::scripted(["type: review; "]));
+        let mut settings = openalex_at("http://127.0.0.1:9");
+        settings.custom.push(wilkes_core::types::CustomIntegrationConfig {
+            id: "plain".into(), name: None, enabled: true, secrets: Default::default(),
+            manifest: "manifest_version = 2\nid = 'plain'\nname = 'Plain'\n[http]\nbase_url = 'https://plain.test'\n[capabilities.search]\npath = '/s?q={query}'\n[capabilities.search.fields]\nid = 'id'\ntitle = 'title'\n".into(),
+        });
+        let composition = composed(&settings, &generator, &["custom:plain", "openalex"])
+            .await
+            .unwrap();
+        assert_eq!(generator.request_count(), 1);
+        let unfilterable = &composition.providers[0];
+        assert_eq!(unfilterable.provider, "custom:plain");
+        assert!(unfilterable
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("declares nothing to filter"));
+        assert_eq!(composition.providers[1].filters["type"], vec!["review"]);
+    }
+
+    /// A listing that needs a keyword says so once when the request has none,
+    /// rather than leaving each filter out in turn for that reason.
+    #[tokio::test]
+    async fn a_provider_that_needs_a_keyword_says_so_when_there_is_none() {
+        let generator = Arc::new(MockGenerator::scripted(["type: review; "]));
         let composition = composed(
             &openalex_at("http://127.0.0.1:9"),
             &generator,
@@ -1239,15 +1290,95 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(generator.request_count(), 1);
-        let unfilterable = &composition.providers[0];
-        assert_eq!(unfilterable.provider, "semantic_scholar");
-        assert!(unfilterable
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("declares nothing to filter"));
+        let semantic = &composition.providers[0];
+        assert_eq!(semantic.provider, "semantic_scholar");
+        assert_eq!(
+            semantic.error.as_deref(),
+            Some("Semantic Scholar lists only with a keyword")
+        );
+        assert!(semantic.filters.is_empty());
         assert_eq!(composition.providers[1].filters["type"], vec!["review"]);
+    }
+
+    fn with_derived_provider() -> IntegrationsSettings {
+        let mut settings = openalex_at("http://127.0.0.1:9");
+        settings.custom.push(wilkes_core::types::CustomIntegrationConfig {
+            id: "derived".into(), name: None, enabled: true, secrets: Default::default(),
+            manifest: "manifest_version = 2\nid = 'derived'\nname = 'Derived'\nextends = { provider = 'openalex', capabilities = ['search', 'browse'] }\n".into(),
+        });
+        settings
+    }
+
+    #[tokio::test]
+    async fn two_filterable_providers_share_one_decode_and_project_their_own_sort() {
+        let generator = Arc::new(MockGenerator::scripted([
+            "type: review; sort: most_cited; ",
+        ]));
+        let composition = composed(
+            &with_derived_provider(),
+            &generator,
+            &["openalex", "custom:derived"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(generator.request_count(), 1);
+        assert_eq!(composition.providers.len(), 2);
+        for listing in composition.providers {
+            assert_eq!(listing.error, None);
+            assert_eq!(listing.filters["type"], ["review"]);
+            assert_eq!(listing.sort.as_deref(), Some("cited_by_count:desc"));
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_failure_fails_the_whole_request() {
+        let generator = Arc::new(MockGenerator::scripted(["invented_filter: invalid; "]));
+        let result = composed(
+            &with_derived_provider(),
+            &generator,
+            &["openalex", "custom:derived"],
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(generator.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn unsupported_parts_are_notes_and_an_empty_projection_is_a_listing_error() {
+        let mut settings = with_derived_provider();
+        // A second provider with only a differently named tagged type filter.
+        let mut manifest = wilkes_core::integrations::custom::manifest::Manifest::parse(
+            include_str!("../../../../core/src/integrations/builtin/openalex.toml"),
+        )
+        .unwrap();
+        manifest.id = "derived".into();
+        manifest.name = "Derived".into();
+        let browse = manifest.capabilities.browse.as_mut().unwrap();
+        browse.path = "/works?filter={filters}&per-page={limit}&page={page}".into();
+        browse.sort = None;
+        let mut kind = browse.filters.shift_remove("type").unwrap();
+        kind.modes.clear();
+        kind.options = Some(vec![("article".into(), "Article".into())]);
+        browse.filters.clear();
+        browse.filters.insert("kind".into(), kind);
+        settings.custom[0].manifest = serde_json::to_string(&manifest).unwrap();
+        let generator = Arc::new(MockGenerator::scripted([
+            "type: review; year_from: 2020; sort: most_cited; ",
+        ]));
+        let composition = composed(&settings, &generator, &["openalex", "custom:derived"])
+            .await
+            .unwrap();
+        assert_eq!(generator.request_count(), 1);
+        assert!(composition.providers[0].notes.is_empty());
+        let listing = &composition.providers[1];
+        assert_eq!(
+            listing.error.as_deref(),
+            Some("nothing in the request applies to this provider")
+        );
+        assert_eq!(listing.notes.len(), 3);
+        assert!(listing.notes.iter().any(|n| n.contains("review")));
+        assert!(listing.notes.iter().any(|n| n.contains("year_from")));
+        assert!(listing.notes.iter().any(|n| n.contains("order")));
     }
 
     #[tokio::test]

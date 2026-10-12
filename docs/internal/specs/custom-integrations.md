@@ -178,7 +178,8 @@ and `{limit}` are the placeholders `search` supplies, with `{page}` (1-based)
 or `{offset}` (`(page - 1) * limit`) when the service can be read past its
 first page — a search path naming neither is asked for one page, and a second
 is refused (`health` supplies none);
-`browse` supplies `{limit}` and `{page}`, `lookup` and `references` supply
+`browse` supplies `{limit}` and `{page}` or `{offset}`, and in its query string
+`{query}`, `{sort}`, each filter by name and `{filters}` (§14), `lookup` and `references` supply
 `{doi}`, and download-resolution steps receive the selected result plus values
 declared by earlier steps. The engine owns percent-encoding. An unknown
 placeholder, or one the capability does not yet supply, is a save-time error.
@@ -485,11 +486,16 @@ ids so the agent is told what it may actually name.
   dotted-path grammar could not. The test that pinned the divergence
   (`divergence_on_a_disjunction`) is now
   `openalex_open_access_is_a_disjunction_of_the_work_and_its_best_location`.
-- **Browse paging by cursor.** `browse` pages by a 1-based `{page}` and
-  `{limit}`. A service that pages by an opaque token (Semantic Scholar's bulk
-  search) cannot say so, and declares no `browse`. Keyword `search` pages by
-  `{page}` or `{offset}`, which is how Semantic Scholar's relevance search is
-  read on.
+- **Browse paging by cursor.** `browse` pages by `{limit}` and a 1-based
+  `{page}` or an `{offset}`. A service that pages by an opaque token (Semantic
+  Scholar's bulk search, the only one of its endpoints that sorts) cannot say
+  so. Semantic Scholar's `browse` is therefore its relevance search narrowed by
+  filter: it needs a keyword and offers no sort.
+- **Repeated parameters and two joined lists.** A filter written by name is
+  one value in one parameter, so `type=a&type=b` cannot be written, and a path
+  has one `{filters}`. No service met so far needs either.
+- **A keyword needed unless a filter is set.** `query_required` is a plain
+  flag; Google Scholar's "a keyword, unless `cites` is given" cannot be said.
 - **Semantic Scholar `references`.** Its endpoint lists the cited papers'
   external ids in one request, which the two-stage `references` shape does not
   describe; it never fed the citation graph and still does not.
@@ -583,14 +589,47 @@ capabilities (§14), after which nothing was left that a manifest could not say.
 
 **`browse`** is a filtered, sorted, paged listing of the records `search`
 returns (it reuses `search`'s projection: a service lists answers in the shape
-it searches in). The manifest declares what may be varied — a `path` with
-`{limit}` and `{page}`, an optional `query_param` for a keyword, a `sort`
-(options as `[value, label]` pairs, a `default`, and an optional
-`keyword_default` for when a keyword is given), and `filters`, each a `choice`,
-a `flag` or a `range` with a clause template carrying `{value}`. The engine
-composes the request from those pieces, so a control can only produce a clause
-the author wrote; anything else — an undeclared filter, a value outside the
-options, a non-integer bound — is refused by name. The interface renders its
+it searches in). The manifest declares what may be varied — a `sort` (options
+as `[value, label]` pairs, a `default`, and an optional `keyword_default` for
+when a keyword is given) and `filters`, each a clause template carrying
+`{value}` — and its `path` is the one place that says where each is written,
+as a search path says where `{query}` goes. Beside `{limit}` and `{page}` or
+`{offset}`, the path's query string may name `{query}` (the keyword), `{sort}`,
+any filter, and `{filters}` for every filter it does not name, joined by
+`filter_separator`:
+
+```toml
+# One filter parameter (OpenAlex):
+path = "/works?search={query}&filter={filters}&sort={sort}&per-page={limit}&page={page}"
+# A parameter per filter (Semantic Scholar):
+path = "/paper/search?query={query}&year={year_from}-{year_to}&publicationTypes={type}&{open_access}&limit={limit}&offset={offset}"
+```
+
+Two rules do the rest. A filter the path names is written there and the others
+go to `{filters}`; and a query parameter none of whose placeholders has a value
+is left off the request, while one where some have a value is written with the
+others empty — so `year={year_from}-{year_to}` sends `year=2016-` with only the
+first set, and a filter that is not set sends nothing. A parameter may be a
+bare word (`&{open_access}` with `clause = "openAccessPdf"`). A path without
+`{query}` is a listing that takes no keyword; `query_required = true` is one
+that cannot be asked without it, which the pane is told as `keyword_required`.
+
+Validation holds the path and the declaration to each other: `{sort}` stands
+exactly when `sort` does; every filter is named or `{filters}` is, and
+`{filters}` is the whole value of its parameter (a fixed clause beside it would
+be lost with it); what may be unset is in the query string, not the path
+before it; a filter written by name takes only modes that join, there being no
+separator for a repeated clause; and no filter is called `limit`, `page`,
+`offset`, `query`, `sort` or `filters`. The engine composes the request from
+those pieces, so a control can only produce a clause the author wrote; anything
+else — an undeclared filter, a value outside the options, a non-integer bound —
+is refused by name.
+
+This replaced three fields that each named a query parameter (`query_param`,
+`filter_param`, `sort.param`), which could say only "one parameter carries
+every clause" and so could not describe a service with a parameter per filter.
+There is no migration: `browse` has not been in a release, so the fields are
+refused as unknown. The interface renders its
 filter panel from `ProviderCapabilities.browse` and knows nothing about which
 service it is talking to. Filter order is declaration order (the `toml` crate
 reads maps in document order; `indexmap` keeps it).
@@ -734,7 +773,8 @@ filter:
 - an `options` value is one of the options; an `integer`, `number` or `date`
   parses as one;
 - a `text`, suggested or row value is free data, so it may not contain the
-  filter separator or any mode's `join`, may not start with what a mode writes
+  filter separator (when the filter is written to `{filters}`; the separator is
+  syntax nowhere else) or any mode's `join`, may not start with what a mode writes
   before a value (`!`), may not hold a control character, and is at most 200
   characters — refused by name rather than escaped, because a silently
   rewritten search is a different search;
