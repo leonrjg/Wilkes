@@ -33,7 +33,7 @@ use self::expr::{Evaluator, Projected};
 use self::manifest::{
     lookup_field_type, search_field_type, Bases, BrowseCapability, FieldSpec, FieldType,
     LookupCapability, Manifest, ParamValue, ReferencesCapability, ResolverStep, ResponseFormat,
-    SearchCapability, ValueRule, MAX_FILTER_VALUES, MAX_SUGGESTIONS, MIN_SUGGEST_CHARS,
+    SearchCapability, SecretSlot, ValueRule, MAX_FILTER_VALUES, MAX_SUGGESTIONS, MIN_SUGGEST_CHARS,
 };
 use crate::integrations::{LiteratureSource, ProviderCapabilities};
 use crate::metadata::doi::normalize_doi;
@@ -81,6 +81,10 @@ pub struct CustomSource {
     /// `absolute_url` to resolve against.
     base_url: Url,
     secrets: HashMap<String, String>,
+    /// The secrets this provider asks its own settings for. For one that
+    /// extends another, the manifest names more than these: the rest are set
+    /// on the provider it extends.
+    secret_slots: Vec<SecretSlot>,
     http: ProviderHttpClient,
 }
 
@@ -117,11 +121,14 @@ impl CustomSource {
         bases: &dyn Bases,
     ) -> anyhow::Result<Self> {
         let resolved = Manifest::resolve(manifest, bases)?;
+        let own = resolved.own_secret_slots();
         if let Some(inherited) = resolved.inherited {
             secrets.retain(|name, _| !inherited.secrets_named.contains(name));
             secrets.extend(inherited.secrets);
         }
-        Self::build(resolved.manifest, secrets, name, Standing::Custom)
+        let mut source = Self::build(resolved.manifest, secrets, name, Standing::Custom)?;
+        source.secret_slots = own;
+        Ok(source)
     }
 
     pub fn new(manifest: Manifest, secrets: HashMap<String, String>) -> anyhow::Result<Self> {
@@ -158,6 +165,7 @@ impl CustomSource {
                 Standing::Custom => format!("custom:{}", manifest.id),
             },
             http: ProviderHttpClient::new_origin_pinned(display_name.clone()),
+            secret_slots: manifest.secret_slots(),
             display_name,
             manifest,
             base,
@@ -1730,6 +1738,10 @@ impl LiteratureSource for CustomSource {
 
     fn manifest(&self) -> Option<&Manifest> {
         Some(&self.manifest)
+    }
+
+    fn secret_slots(&self) -> Vec<SecretSlot> {
+        self.secret_slots.clone()
     }
 
     fn base_url(&self) -> &str {

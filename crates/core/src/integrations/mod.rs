@@ -37,7 +37,7 @@ pub mod builtin;
 pub mod custom;
 pub mod zotero;
 
-use custom::manifest::{Base, Bases, BrowseControls, Manifest};
+use custom::manifest::{Base, Bases, BrowseControls, Manifest, SecretSlot};
 use custom::{CustomSource, Standing};
 
 /// What a provider can do beyond keyword search, for a caller that has to offer
@@ -72,6 +72,13 @@ pub trait LiteratureSource: Send + Sync {
     /// The description this provider was built from, for one that was built
     /// from a description.
     fn manifest(&self) -> Option<&Manifest>;
+
+    /// The values this provider asks the user for (an email address, an API
+    /// key). A provider that extends another asks only for its own: the
+    /// other's are set on it.
+    fn secret_slots(&self) -> Vec<SecretSlot> {
+        Vec::new()
+    }
 
     /// The origin the provider's records come from.
     fn base_url(&self) -> &str;
@@ -772,6 +779,15 @@ title = "t"
             "the filters are the base's, not a copy of them"
         );
         assert!(capabilities.resolve_download);
+        // It asks for its own secret; OpenAlex's email is asked for on OpenAlex.
+        let asked: Vec<String> = derived
+            .source()
+            .secret_slots()
+            .into_iter()
+            .map(|slot| slot.name)
+            .collect();
+        assert_eq!(asked, vec!["files_key"]);
+        assert_eq!(shipped.source().secret_slots()[0].name, "email");
         // Not asked for, so not taken: the base goes on being the one provider
         // that enriches metadata and feeds the citation graph.
         assert!(!capabilities.lookup && !capabilities.references);

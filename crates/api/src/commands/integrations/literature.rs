@@ -125,10 +125,7 @@ pub fn providers(
                     .map(|manifest| manifest.http.base_url.clone())
             }),
             capabilities: entry.source().capabilities(),
-            secrets: entry
-                .manifest()
-                .map(|manifest| manifest.secret_slots())
-                .unwrap_or_default(),
+            secrets: entry.source().secret_slots(),
             mirror: mirror
                 .iter()
                 .find(|(id, _)| id == entry.id())
