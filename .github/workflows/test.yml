@@ -86,6 +86,13 @@ jobs:
 
       - name: Write Rust coverage reports
         run: |
+          # Tauri copies the shell placeholder beside the instrumented binaries.
+          # Remove only that copy: llvm-cov requires native object files, and the
+          # worker's compiled test binary in debug/deps still supplies its coverage.
+          target_triple="$(rustc -vV | awk '/^host: / { print $2 }')"
+          cmp "crates/desktop/sidecars/wilkes-rust-worker-${target_triple}" \
+            target/llvm-cov-target/debug/wilkes-rust-worker
+          rm target/llvm-cov-target/debug/wilkes-rust-worker
           cargo llvm-cov report --json --summary-only --output-path rust-coverage.json
           cargo llvm-cov report --cobertura --output-path rust-cobertura.xml
 
