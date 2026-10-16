@@ -1,6 +1,43 @@
 # Changelog
 
-## Unreleased
+## 1.0.0-rc.1 - 2026-10-15
+
+First release candidate for Wilkes 1.0. This candidate expands the document reader
+and local search app into a workspace-based research library, with literature
+search, OCR, local generation and agent tools. It is prepared for validation;
+installation and upgrade acceptance are still required before a stable release.
+
+### Highlights
+
+- Read PDFs, ebooks, comic archives and text documents with saved reading
+  positions, tabs, bookmarks and highlights.
+- Organize multiple library folders in separate workspaces, with tags, smart
+  collections, topic exploration and citation tools.
+- Combine exact and semantic search, recognize scanned content with dedicated
+  readers, and generate summaries and completions using local models.
+- Search literature providers and learning catalogues, and connect applications
+  through HTTP, MCP and desktop agent chat.
+
+### Breaking changes
+
+- **Desktop IPC:** `catalogue_status` and `catalogue_search` are removed; HTTP routes are unchanged.
+- **Integration manifests:** `browse` filters using `kind` must be updated; ranges use two filters sharing a `group`.
+- **API change:** managed-corpus routes move from `/api/integrations/underdog/` to `/api/corpora/*`. Ensure requests include `owner`.
+- **API change:** passage operations use `/api/chunks/{resolve,accumulate,similarity,search}`, a shared `scope` and stable `ChunkRef`s. `/api/embed/centroid`, `/api/embed/similarity` and `/api/export/chunk-text` are removed; embedding and export routes use `scope`. Chunk exports include `chunk_ref` and `text_sha256`; older indexes require a rebuild. `accumulate` returns a sum and count, and `resolve` accepts 512 refs.
+- **API change:** `GET /api/embed/capabilities` replaces `/api/embed/engines` and `/api/embed/models`, including default and recommended model flags.
+- **API change:** catalogue routes move to `/api/catalogue/*`.
+- **API changes:** document metadata uses a `providers` map. Desktop provider commands are replaced by `literature_provider_status`, `literature_provider_lookup` and `literature_browse`; HTTP clients use `/api/literature/status`, `/api/literature/lookup` and `/api/literature/browse`.
+- **Breaking MCP change:** literature downloads use `provider` and `result_id`, with file URLs resolved by Wilkes. Search results report `downloadable` instead of direct file URLs, and `literature_resolve_download` is removed. User-supplied URLs remain supported by `download`.
+- A manifest's `browse.path` now says where everything the user may vary is
+  written: `{query}`, `{sort}`, any filter by name, and `{filters}` for the
+  rest, beside `{limit}` and `{page}` or `{offset}`. A query parameter with
+  nothing set is left off, so a service with one parameter per filter can be
+  described, including a range in one parameter (`year={year_from}-{year_to}`).
+  `query_required = true` declares a listing that needs a keyword. This replaces
+  `query_param`, `filter_param` and `sort.param`, which are no longer read: a
+  manifest written against this development branch's earlier browse needs those
+  three folded into its path.
+- Extraction recipe `wilkes-extractors-v2` re-extracts and re-embeds managed documents. Legacy indexed files update through their normal reindexing path.
 
 ### Added
 
@@ -32,14 +69,14 @@
   the resolver was not checked rather than that it failed.
 - Custom integrations can extend a built-in or custom provider's capabilities and declare only what they add. Use the "Extend" button on a provider's tab or row to get started.
 - With a generation model ready, describe a literature search in a sentence and press the lightning button to set filters, sort order and keywords. Anything the selected providers cannot apply is reported.
-- LibreTexts, OpenStax, MIT OCW and DevDocs can be synced locally, searched in the literature pane and added to the workspace. Manage them in Settings › Integrations › Catalogues; records without a full download offer their landing page. Library searches also suggest catalogue matches. **Breaking for desktop IPC:** `catalogue_status` and `catalogue_search` are removed; HTTP routes are unchanged.
+- LibreTexts, OpenStax, MIT OCW and DevDocs can be synced locally, searched in the literature pane and added to the workspace. Manage them in Settings › Integrations › Catalogues; records without a full download offer their landing page. Library searches also suggest catalogue matches.
 - The sidebar remembers closed folders per workspace across root switches and restarts. New folders open by default.
 - Learning catalogues can be removed in Settings › Integrations › Catalogues and restored by syncing again. Refresh updates only installed catalogues.
-- Literature providers can declare more filter types and combine values with "Any of", "All of" or "None of". OpenAlex now offers 48 filters, including author and institution suggestions, citation relationships and exclusions. An "Add a filter" menu keeps large filter sets manageable. **Breaking for manifests:** `browse` filters using `kind` must be updated; ranges use two filters sharing a `group`.
+- Literature providers can declare more filter types and combine values with "Any of", "All of" or "None of". OpenAlex now offers 48 filters, including author and institution suggestions, citation relationships and exclusions. An "Add a filter" menu keeps large filter sets manageable.
 - Keyword searches in the literature pane have a "Load more" button per provider. Custom providers can enable pagination with `{page}` or `{offset}` in `search.path`.
 - The literature pane supports browsing by filters and sort order, with or without keywords. Each selected provider has its own controls and removable filter chips. Manifests can also declare DOI lookup and reference retrieval.
 - Readers remember page, scroll position, zoom and source/rendered mode across restarts, for up to 500 documents per workspace. Moved or renamed documents start at the beginning; standalone windows do not save reading positions.
-- EPUB, MOBI, AZW3 and FB2 books, plus CBZ/CBT comic archives, can be read, searched and indexed alongside PDFs, with bookmarks, highlights and tables of contents where supported. Comic text requires a configured recognizer. AZW3 layout is approximate and internal Kindle links are unavailable; incomplete text extraction is reported. Existing PDFs do not need reindexing.
+- EPUB, MOBI, AZW3 and FB2 books, plus CBZ/CBT comic archives, can be read, searched and indexed alongside PDFs, with bookmarks, highlights and tables of contents where supported. Comic text requires a configured recognizer. AZW3 layout is approximate and internal Kindle links are unavailable; incomplete text extraction is reported. Ebook support alone does not invalidate PDF indexes; see Breaking changes for extraction-recipe updates.
 - Workspaces keep separate library roots, indexes, research data and saved sessions. Create, rename and switch workspaces from the workspace picker.
 - Libraries can include multiple roots, with whole-library and global search across them.
 - Save document selections as bookmarks with notes, revisit highlighted passages and copy quotes as Markdown. Related bookmarks can be grouped by meaning.
@@ -63,15 +100,26 @@
 
 ### Changed
 
-- A manifest's `browse.path` now says where everything the user may vary is
-  written: `{query}`, `{sort}`, any filter by name, and `{filters}` for the
-  rest, beside `{limit}` and `{page}` or `{offset}`. A query parameter with
-  nothing set is left off, so a service with one parameter per filter can be
-  described, including a range in one parameter (`year={year_from}-{year_to}`).
-  `query_required = true` declares a listing that needs a keyword. This replaces
-  `query_param`, `filter_param` and `sort.param`, which are no longer read: a
-  manifest written against this development branch's earlier browse needs those
-  three folded into its path.
+- OCR defaults to off, with **Use general reader** also off by default.
+  PP-FormulaNet_plus-S replaces Texify as the formula default when no formula
+  model is saved. Explicit saved reader choices are preserved; installations
+  without these fields use the new defaults.
+
+- Release builds validate the exact source commit before publishing desktop and
+  container artifacts. Candidates remain prereleases and do not update stable
+  container tags. Signing is explicit, required package outputs are checked,
+  and releases include artifact checksums. Docker and CI share a pinned Rust
+  toolchain, and Docker builds exclude local caches and generated artifacts.
+
+- UI help text focuses on actions, setting tradeoffs and consequences, with
+  shorter guidance across settings, catalogues, topics and research.
+
+- OCR settings show layout detection as the shared prerequisite for page
+  regions, with effective readers beside formulas, tables and embedded images.
+  Dedicated readers can run without a general reader, missing dependencies
+  can be installed together, and model selections apply after installation.
+  Technical model details and optional image descriptions are expandable.
+
 - Semantic Scholar offers filters: year range, publication type, field of
   study, venue, minimum citations and public PDF, beside a keyword.
 - The manifest authoring prompt asks for everything the service offers that the
@@ -96,10 +144,6 @@
 - Viewer tab context menus offer "Close" and "Close All".
 - HTML files open rendered, with a source toggle, find, zoom, bookmarks and highlights. Local images and document links work; scripts, author styles and remote images are blocked.
 - Catalogue syncs show page and record counts; downloads show byte progress. Downloads exceeding 100 MiB are stopped while being received.
-- **API change:** managed-corpus routes move from `/api/integrations/underdog/` to `/api/corpora/*`. Ensure requests include `owner`.
-- **API change:** passage operations use `/api/chunks/{resolve,accumulate,similarity,search}`, a shared `scope` and stable `ChunkRef`s. `/api/embed/centroid`, `/api/embed/similarity` and `/api/export/chunk-text` are removed; embedding and export routes use `scope`. Chunk exports include `chunk_ref` and `text_sha256`; older indexes require a rebuild. `accumulate` returns a sum and count, and `resolve` accepts 512 refs.
-- **API change:** `GET /api/embed/capabilities` replaces `/api/embed/engines` and `/api/embed/models`, including default and recommended model flags.
-- **API change:** catalogue routes move to `/api/catalogue/*`.
 - Managed corpora can use multiple embedding models without duplicating source documents or extraction. Add a space with `PUT /api/corpora/spaces`; unavailable or outdated spaces must catch up before serving results.
 - Catalogue searches accept multiple source grains through `grains`, allowing courses, textbooks and other kinds of material in one query.
 - MCP tools can read a specific `workspace` without switching the app. `list_context` lists workspaces and marks the active one; switching no longer restarts the external listener.
@@ -111,19 +155,22 @@
 - The catalogue mirror is shared across workspaces. Existing workspace mirrors are not migrated; sync once to populate the shared mirror.
 - Catalogue databases accept new source grains without a schema constraint update. Existing databases migrate automatically; unknown grains are reported.
 - Pre-workspace installations migrate automatically into the Default workspace on startup. Migration can resume after interruption; conflicting library files are reported before anything moves. The manual migration script is removed.
+- Workspace migration relocates saved upload roots and stored document references with the uploads directory, including bookmarks and indexed paths. Relocation resumes after interruption without changing index schemas or vectors.
+- HTTP uploads register their directory in the owning workspace so the returned root can be searched without a settings update. Existing uploads are registered when searched; the active directory is preserved.
 - Application-managed workspaces are visible and searchable. Their contents remain read-only to users, and listings include `read_only` and `managed_by`.
 - Catalogue acquisition and MCP `download` share the same download handling.
 - PDF extraction joins words split across lines, removes repeated headers and page numbers, and places margin notes after the page text. Search, embeddings and document exports use the cleaned text; queries copied from PDF viewers still match across line-wrap hyphenation.
 - PDF outlines include offsets into the extracted text and report how each destination was resolved.
-- Extraction recipe `wilkes-extractors-v2` re-extracts and re-embeds managed documents. Legacy indexed files update through their normal reindexing path.
 - Shipped and generated manifests use one line per entry. Existing custom manifests do not need to change their layout.
 - Literature results show year, citations and open-access status before authors and venue, keeping key facts visible with long author lists.
-- **API changes:** document metadata uses a `providers` map. Desktop provider commands are replaced by `literature_provider_status`, `literature_provider_lookup` and `literature_browse`; HTTP clients use `/api/literature/status`, `/api/literature/lookup` and `/api/literature/browse`.
-- **Breaking MCP change:** literature downloads use `provider` and `result_id`, with file URLs resolved by Wilkes. Search results report `downloadable` instead of direct file URLs, and `literature_resolve_download` is removed. User-supplied URLs remain supported by `download`.
 - Supported document formats are always enabled. Extension settings configure text formats separately.
 - Window and browser-tab titles identify the active document, root and workspace.
 
 ### Fixed
+
+- Web/server builds enable layout-detector downloads alongside the OCR readers they offer.
+
+- Scrollable settings pages retain bottom spacing after their last control.
 
 - Ollama models using its MLX runner work for generation tasks even when the runner ignores output constraints. Replies are still validated.
 - Ollama output constraints handle multiline text and quotation marks correctly.

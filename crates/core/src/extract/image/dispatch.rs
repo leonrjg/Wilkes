@@ -272,7 +272,7 @@ pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
                       reader cannot read."
             .to_string(),
         is_default: false,
-        is_role_default: true,
+        is_role_default: false,
         is_engine_default: false,
         is_cached: super::texify::is_installed(model_dir),
         footprint_bytes: super::texify::footprint_bytes(),
@@ -314,7 +314,7 @@ pub fn list_models(model_dir: &Path) -> Vec<RecognizerDescriptor> {
         description: "Reads cropped formulas as LaTeX using PP-FormulaNet_plus-S. Runs on CPU."
             .to_string(),
         is_default: false,
-        is_role_default: false,
+        is_role_default: true,
         is_engine_default: false,
         is_cached: super::pp_formulanet::is_installed(model_dir),
         footprint_bytes: super::pp_formulanet::footprint_bytes(),
@@ -968,7 +968,7 @@ mod tests {
         );
         assert_eq!(
             formula_model(dir.path(), None).unwrap().unwrap().model_id,
-            super::super::texify::MODEL_ID
+            super::super::pp_formulanet::MODEL_ID
         );
         assert!(formula_model(dir.path(), Some("unknown")).is_err());
         assert!(formula_model(dir.path(), Some(super::super::granite_docling::MODEL_ID)).is_err());

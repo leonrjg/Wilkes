@@ -261,9 +261,7 @@ export function TopicCloudTags({
     <>
       {!namesExpected && unnamed && (
         <p className="mb-2 text-[10px] leading-snug text-[var(--text-dim)]">
-          These topics have no names: naming them runs the text generator, which
-          is off. The grouping below is unaffected — each tag is a cluster of
-          passages, sized by how many it holds.
+          Enable generation to name topics.
         </p>
       )}
       <div

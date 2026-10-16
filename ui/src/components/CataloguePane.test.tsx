@@ -532,7 +532,7 @@ describe("CataloguePane", () => {
     literature.mockResolvedValue({ query: "python lists", providers: [] });
     render(<CataloguePane />);
     submit("python lists");
-    expect(await screen.findByText(/No source is on/)).toBeTruthy();
+    expect(await screen.findByText(/No sources enabled/)).toBeTruthy();
   });
 
   // ── Reading on in a keyword search ───────────────────────────────────────

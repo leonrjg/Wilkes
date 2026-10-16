@@ -329,7 +329,7 @@ describe("TopicCloudPane", () => {
       "false",
     );
     expect(
-      screen.getByText(/runs the text generator, which is off/),
+      screen.getByText(/Enable generation to name topics/),
     ).toBeInTheDocument();
 
     // The tag is still a handle on the passages it groups.

@@ -10,85 +10,102 @@
     </td>
     <td valign="top">
       <h1>Wilkes</h1>
-      <p>Perform exact or semantic search across multiple PDFs and text files, with highlights.</p>
-      <p>This project aims to provide a <strong>plug-and-play</strong>, cross-platform solution for local semantic search.</p>
+      <p>Read, organize and search your document library, with exact and local semantic search.</p>
+      <p>Work with PDFs, ebooks and text files in separate workspaces on desktop or the web.</p>
     </td>
   </tr>
 </table>
 
+**Development version: 1.0.0-rc.1.** See [GitHub Releases](https://github.com/leonrjg/Wilkes/releases) for published builds and [the changelog](CHANGELOG.md) for candidate highlights and breaking changes.
+
 ## Features
-- Document viewer with match highlighting
-- **Local semantic search**: uses open-source embedding models; no cloud
-  - You can choose from a set of predefined models or any HuggingFace model
-- **Local text generation** for summaries, cited search synthesis, cluster
-  labels, related-document explanations, and HyDE retrieval
-  - Run built-in Candle models or use models already installed in Ollama
-- **Grounded document completion** with inline ghost text, library provenance,
-  pinned-source steering, feedback-aware retrieval, and an inspectable context
-  budget. Open a text document and choose **Edit document** to use it.
-- Fully configurable: adjust embedding chunk size and overlap, or just use the default settings
-- Cross-platform: works on Windows, Linux, and macOS
-- Web version
+
+- **Search your library:** exact search with regular expressions and case-sensitive matching, local semantic search, or combined results with evidence labels and passage highlights.
+- **Read documents:** PDF and ebook readers, Markdown and HTML views, text and code viewers, multiple tabs, saved reading positions, bookmarks, notes and highlights.
+- **Organize your research:** separate workspaces with multiple library folders, tags, smart collections, search history, related passages, topic clouds and a citation graph.
+- **Recognize scanned content:** optional OCR with layout detection and separate readers for page regions, formulas and tables.
+- **Find literature:** search OpenAlex and Semantic Scholar, add custom providers, sync learning catalogues, download available documents and work with Zotero.
+- **Use local models:** run embeddings locally and generate summaries, cited search answers and topic labels with Candle or a configured Ollama server. Text documents also support library-grounded inline completions.
+- **Connect an agent:** desktop chat can use the active document and attached files. HTTP and MCP interfaces expose document, search and research tools to other applications.
+- **Choose desktop or web:** desktop packages for macOS, Windows and Linux, plus a web server distributed through Docker.
 
 ## Installation
+
 ### Desktop
-- macOS: [wilkes-aarch64-apple-darwin](https://github.com/leonrjg/Wilkes/releases)
-- Windows: [wilkes-x86_64-pc-windows-msvc](https://github.com/leonrjg/Wilkes/releases)
-- Linux: [wilkes-x86_64-unknown-linux-gnu](https://github.com/leonrjg/Wilkes/releases)
+
+Download the package for your platform from [GitHub Releases](https://github.com/leonrjg/Wilkes/releases).
+
+| Platform | Supported architecture | Packages |
+| --- | --- | --- |
+| macOS | Apple Silicon (ARM64) | DMG |
+| Windows | x86-64 | EXE installer, MSI, portable ZIP |
+| Linux | x86-64 | DEB, AppImage |
+
+Signing status is recorded in each release. Candidate builds appear as prereleases.
 
 ### Docker
-Docker allows you to run software in isolation from your system.
 
-```shell
-docker run --rm -p 2000:2000 -v wilkes-data:/data ghcr.io/leonrjg/wilkes:latest
-# Now you can visit localhost:2000
+The server image supports Linux amd64 and arm64. To run the published stable image:
+
+```sh
+docker run --rm -p 127.0.0.1:2000:2000 -v wilkes-data:/data ghcr.io/leonrjg/wilkes:latest
 ```
 
-If you want to build locally instead:
+Open [localhost:2000](http://localhost:2000). The named volume keeps application data between runs. For a published candidate, replace `latest` with its full version tag, such as `1.0.0-rc.1`.
 
-```shell
+To build from the checked-out source:
+
+```sh
 git clone https://github.com/leonrjg/Wilkes
 cd Wilkes
-docker compose up
-# Now you can visit localhost:2000
+docker compose up --build
 ```
 
-### Demo
-You can visit https://demo.wilkes.app to use the app online with your own sample files.
-The demo is reset every hour.
+## First run
 
-## Why? | Similar software
-- [Recoll](https://www.recoll.org/) is complex and has no first-party PDF support
-- [Clapgrep](https://github.com/luleyleo/clapgrep) is good but only for Linux
-- [Docfetcher](https://docfetcher.sourceforge.io/) (Free) doesn't show highlights
-- [Baloo](https://github.com/kde/baloo) is only for Linux
-- [Open Notebook](https://github.com/lfnovo/open-notebook) requires setting up Ollama and has no exact search
-- [Semantra](https://github.com/freedmand/semantra) has no exact search and is unmaintained
-- [Semantic](https://github.com/Bklieger/Semantic) is single-file and unmaintained
-- [File-Brain](https://github.com/Hamza5/file-brain) looks pretty good, actually - I found this later :)
-- Most others are terminal-based
+1. On desktop, add a folder to the current workspace or drop it onto the window. In the web app, upload documents into the workspace.
+2. Start with exact search. Searching text already present in documents does not require an embedding or generation model. Scanned pages need OCR before their text can be searched.
+3. For semantic search, open **Settings → Semantic → Models**, choose an engine and model, download it if needed, and select **Build semantic index** for the current library folder. Adding or switching folders does not start a build automatically.
+4. Once indexing finishes, use semantic or combined search. Repeat the index build for additional library folders you want to search semantically.
+5. If you need scanned text, formulas or tables, configure **Settings → Extraction → OCR** before indexing. Install the required models, enable OCR, and rebuild affected documents. Track progress, failures and interrupted work under **Settings → Workers**.
 
-## Engines
-<img height="500" alt="Engine selection" src="https://github.com/user-attachments/assets/e61e5260-ff16-49a3-95fe-4fecf4e6ff5a" />
+Workspaces keep their library folders, indexes, research data and saved sessions separate. Use the workspace picker to create or switch workspaces.
 
-The app supports multiple engines to maximize model availability:
-- **Fastembed** (Default)
-  - Default model: `all-miniLM-L6-v2-onnx` 
-- [**Sentence Transformers**](https://www.sbert.net/) (SBERT) via Python
-  - Default model: `e5-small-v2`
-  - This has the widest variety of models, but you need to have Python installed. The environment is automatically set up by the app.
-- **Candle**
-  - Default model: `all-miniLM-L6-v2`
+## Document formats
 
-## Q&A
-- What model should I use?
-  - You can use those marked as "Recommended", try multiple, or just use the default model. You can check the [MTEB ranking](https://huggingface.co/spaces/mteb/leaderboard) and use any model from that list (through specific engines). Note that the top 10 of the ranking are too large to run on consumer hardware.
+Wilkes reads PDF, EPUB, MOBI, AZW3, FB2, CBZ and CBT documents, along with configured text formats such as plain text, Markdown, HTML, source code, CSV and JSON. Supported paged document formats are always enabled; **Settings → File extensions** controls text formats.
 
-## External MCP
+AZW3 layout is approximate and internal Kindle links are unavailable. Comic archives and image-only pages require OCR for text search. Markdown and HTML have rendered and source views.
 
-The desktop app can expose Wilkes' document and literature tools to regular Claude Code and Codex sessions.
+## Models and optional dependencies
+
+Exact search and document reading work without model downloads. Models are downloaded when you choose to install them; their download sizes are shown in settings.
+
+| Feature | What you need |
+| --- | --- |
+| Semantic search with Fastembed (default) | A downloaded embedding model; no separate Python installation |
+| Semantic search with Candle | A downloaded supported embedding model; no separate Python installation |
+| Semantic search with Sentence Transformers (SBERT) | Python installed; Wilkes sets up its worker environment |
+| OCR | A configured reader; download any required recognizer and layout models |
+| Generation with Candle | A downloaded supported generation model |
+| Generation with Ollama | A running, reachable Ollama server with the chosen model installed |
+| Desktop chat | A separately installed and configured supported agent CLI; tool access depends on the backend |
+| Literature, catalogues and Zotero | The selected service or local application, plus credentials where required |
+
+Fastembed and Candle default to MiniLM-L6; SBERT defaults to `intfloat/e5-small-v2`. Choose a listed model first; custom model support depends on the engine and architecture.
+
+OCR is off by default. **Use general reader** also defaults to off, and **PP-FormulaNet_plus-S** is the default formula reader when no formula model is saved. Existing explicit reader choices are preserved. Settings show the effective readers and any missing setup.
+
+Embedding models and built-in Candle generation run locally. Literature services, a configured Ollama endpoint, and chat backends connect to the services you choose.
+
+## HTTP and MCP
+
+On desktop, **Settings → Servers** controls the HTTP API and external MCP listener. The standalone web server also provides MCP at `/mcp`. Clients can search documents, read passages and manage research data through these interfaces.
+
+Desktop chat supports Claude Code, Codex and Nanocoder backends. Wilkes currently attaches its MCP tools to Claude Code and Codex; Nanocoder chat does not receive those tools through ACP.
 
 ## Interface
+
 <img width="1312" height="903" alt="image" src="https://github.com/user-attachments/assets/d2018970-5270-467d-9cc5-49a00ad5fa53" />
 <img width="1263" height="845" alt="SCR-20260410-sbcv" src="https://github.com/user-attachments/assets/8967b389-ad7b-4c2b-8724-c3cd4959b8be" />
 <img width="1263" height="845" alt="SCR-20260410-sjcn" src="https://github.com/user-attachments/assets/bd843c52-45c7-4559-bfa9-8adc0849d9b3" />
@@ -101,11 +118,14 @@ If you have feature requests, feel free to open an issue (or a PR).
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for release history and unreleased changes.
+See [CHANGELOG.md](CHANGELOG.md) for release history, candidate notes and breaking changes.
 
 ## Contributing
-<img alt="Coverage" src="https://img.shields.io/badge/coverage-82%25-green" />
+
 Contributions are welcome! Please fork the repository and submit a pull request with your changes.
 
+For release builds, supported artifacts, signing configuration and candidate tags, see [Releasing](docs/releasing.md).
+
 ## License
+
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.

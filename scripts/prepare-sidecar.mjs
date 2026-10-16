@@ -44,6 +44,7 @@ const profile = isRelease ? "release" : "debug";
 
 const cargoArgs = [
   "build",
+  "--locked",
   "--package",
   "wilkes-rust-worker",
   "--bin",

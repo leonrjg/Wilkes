@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::http::errors::{consumer_anyhow_err, consumer_err, err, server_err, ErrorBody};
-use crate::http::search::forward_search_results;
 #[cfg(test)]
 use crate::http::state::BroadcastEmitter;
 use crate::http::state::{
@@ -86,22 +85,9 @@ const MAX_UPLOAD_BYTES: u64 = 500 * 1024 * 1024;
 
 async fn search_handler(
     State(state): State<Arc<AppState>>,
-    Json(mut query): Json<SearchQuery>,
+    Json(query): Json<SearchQuery>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, (StatusCode, Json<ErrorBody>)> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
-    let (ctx, uploads_dir) = state.workspace_snapshot();
-    query.root = crate::http::state::confined_root_for_search(
-        &query.root.to_string_lossy(),
-        &uploads_dir,
-        &TokioServerFs,
-    )
-    .await?;
-
-    tokio::spawn(async move {
-        forward_search_results(ctx, query, tx).await;
-    });
-
-    Ok(Sse::new(ReceiverStream::new(rx)))
+    crate::http::search::search_handler(state, query).await
 }
 
 async fn related_documents_handler(
@@ -2132,6 +2118,11 @@ async fn upload_handler(
         file_count += 1;
     }
 
+    if file_count > 0 {
+        ctx.register_library_root(&uploads_dir)
+            .await
+            .map_err(consumer_anyhow_err)?;
+    }
     Ok(Json(UploadResponse {
         root: uploads_dir.to_string_lossy().into_owned(),
         file_count,
@@ -2942,6 +2933,102 @@ mod tests {
             events_tx,
         });
         (dir, state)
+    }
+
+    #[tokio::test]
+    async fn upload_then_search_needs_no_settings_patch_and_preserves_active_root() {
+        use axum::extract::FromRequest;
+        let (_dir, state) = handler_state();
+        let active = state.uploads_dir.parent().unwrap().join("external-library");
+        std::fs::create_dir_all(&active).unwrap();
+        state
+            .context()
+            .update_settings(serde_json::json!({"last_directory": &active}))
+            .await
+            .unwrap();
+        let body = "--upload-test\r\nContent-Disposition: form-data; name=\"file\"; filename=\"nested/note.txt\"\r\nContent-Type: text/plain\r\n\r\nunique-upload-needle\r\n--upload-test--\r\n";
+        let request = axum::http::Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                "multipart/form-data; boundary=upload-test",
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let multipart = Multipart::from_request(request, &()).await.unwrap();
+        let upload = upload_handler(State(state.clone()), multipart)
+            .await
+            .unwrap_or_else(|error| panic!("upload failed: {}", error.1 .0.error))
+            .into_response();
+        let bytes = axum::body::to_bytes(upload.into_body(), 4096)
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["file_count"], 1);
+        let root = PathBuf::from(response["root"].as_str().unwrap());
+        let query: SearchQuery = serde_json::from_value(serde_json::json!({
+            "pattern": "unique-upload-needle", "is_regex": false,
+            "case_sensitive": false, "root": root.join("nested"), "max_results": 10
+        }))
+        .unwrap();
+        let search = search_handler(State(state.clone()), Json(query))
+            .await
+            .unwrap_or_else(|error| panic!("search failed: {}", error.1 .0.error))
+            .into_response();
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(3),
+            axum::body::to_bytes(search.into_body(), 65536),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let events = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(events.contains("event: result"), "{events}");
+        assert!(events.contains("unique-upload-needle"), "{events}");
+        assert!(!events.contains("event: error"), "{events}");
+        let settings = state.context().get_settings().await;
+        assert_eq!(
+            settings.last_directory,
+            Some(active.canonicalize().unwrap())
+        );
+        assert_eq!(settings.recent_dirs, vec![root.canonicalize().unwrap()]);
+        state.context().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn search_registers_existing_uploads_but_rejects_external_roots() {
+        let (_dir, state) = handler_state();
+        std::fs::write(state.uploads_dir.join("note.txt"), "existing-upload-needle").unwrap();
+        let query = |root: PathBuf| {
+            serde_json::from_value::<SearchQuery>(serde_json::json!({
+                "pattern": "existing-upload-needle", "is_regex": false,
+                "case_sensitive": false, "root": root, "max_results": 10
+            }))
+            .unwrap()
+        };
+        let outside = state.uploads_dir.parent().unwrap().to_path_buf();
+        assert!(search_handler(State(state.clone()), Json(query(outside)))
+            .await
+            .is_err());
+        assert!(state.context().get_settings().await.recent_dirs.is_empty());
+        let search = search_handler(State(state.clone()), Json(query(state.uploads_dir.clone())))
+            .await
+            .unwrap_or_else(|error| panic!("search failed: {}", error.1 .0.error))
+            .into_response();
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(3),
+            axum::body::to_bytes(search.into_body(), 65536),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let events = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(events.contains("existing-upload-needle"), "{events}");
+        assert!(!events.contains("event: error"), "{events}");
+        assert_eq!(
+            state.context().get_settings().await.recent_dirs,
+            vec![state.uploads_dir.canonicalize().unwrap()]
+        );
+        state.context().shutdown().await;
     }
 
     #[tokio::test]
@@ -4017,10 +4104,8 @@ mod tests {
 
     #[test]
     fn managed_contract_fixture_matches_the_server_wire_schema() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../docs/internal/specs/fixtures/consumer-api-v2.json"
-        ))
-        .unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/consumer-api-v2.json")).unwrap();
         assert_eq!(fixture["schema_version"], 2);
 
         let ensure: EnsureManagedWorkspace =

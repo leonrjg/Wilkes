@@ -18,6 +18,9 @@ use crate::context::{AppContext, EventEmitter, IndexSpace, ManagedCorpusBackup};
 const REGISTRY_VERSION: u32 = 1;
 const MANIFEST_VERSION: u32 = 1;
 
+mod relocation;
+use relocation::UploadRelocation;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceSummary {
     pub id: String,
@@ -391,6 +394,8 @@ const LEGACY_LIBRARY_ENTRIES: &[&str] = &[
 struct MigrationPlan {
     workspace_id: String,
     manifest: WorkspaceManifest,
+    #[serde(default)]
+    upload_relocations: Vec<UploadRelocation>,
 }
 
 fn migration_plan_path(app_data_dir: &Path) -> PathBuf {
@@ -526,13 +531,13 @@ fn plan_legacy_moves(
 /// that makes the workspace real — is written only once every file has landed.
 fn migrate_legacy_library(app_data_dir: &Path, settings_path: &Path) -> anyhow::Result<String> {
     let plan_path = migration_plan_path(app_data_dir);
-    let (id, manifest) = if plan_path.exists() {
+    let (id, mut manifest, mut upload_relocations) = if plan_path.exists() {
         let plan: MigrationPlan = serde_json::from_slice(&std::fs::read(&plan_path)?)?;
         anyhow::ensure!(
             plan.manifest.id == plan.workspace_id,
             "interrupted workspace migration records a manifest for a different workspace"
         );
-        (plan.workspace_id, plan.manifest)
+        (plan.workspace_id, plan.manifest, plan.upload_relocations)
     } else {
         let id = uuid::Uuid::new_v4().to_string();
         let legacy = read_legacy_roots(settings_path)?;
@@ -541,11 +546,17 @@ fn migrate_legacy_library(app_data_dir: &Path, settings_path: &Path) -> anyhow::
         manifest.recent_roots = legacy.recent_roots;
         manifest.active_root = legacy.active_root;
         manifest.semantic = legacy.semantic;
-        (id, manifest)
+        (id, manifest, Vec::new())
     };
 
     let workspace_dir = workspace_root(app_data_dir, &id);
     let moves = plan_legacy_moves(app_data_dir, settings_path, &workspace_dir)?;
+    // Also recover plans written by older builds, including after uploads
+    // have already moved. New plans retain canonical aliases before moving.
+    if upload_relocations.is_empty() {
+        upload_relocations = relocation::plan(app_data_dir, settings_path, &workspace_dir)?;
+    }
+    relocation::remap_manifest(&mut manifest, &upload_relocations);
     tracing::info!(
         workspace = %id,
         entries = moves.len(),
@@ -558,6 +569,7 @@ fn migrate_legacy_library(app_data_dir: &Path, settings_path: &Path) -> anyhow::
         &MigrationPlan {
             workspace_id: id.clone(),
             manifest: manifest.clone(),
+            upload_relocations: upload_relocations.clone(),
         },
     )?;
     std::fs::create_dir_all(&workspace_dir)?;
@@ -576,6 +588,7 @@ fn migrate_legacy_library(app_data_dir: &Path, settings_path: &Path) -> anyhow::
         })?;
     }
 
+    relocation::remap_stores(&workspace_dir, &upload_relocations)?;
     write_manifest(&workspace_manifest_path(app_data_dir, &id), &manifest)?;
     clear_legacy_roots(settings_path)?;
     atomic_write_json(
@@ -2103,6 +2116,41 @@ mod tests {
 
     struct RecordingEmitter(Arc<StdMutex<Vec<String>>>);
 
+    #[tokio::test]
+    async fn concurrent_root_registration_persists_in_the_owning_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        let (manager, _events, _worker_loop) = WorkspaceManager::new(
+            dir.path().to_path_buf(),
+            settings.clone(),
+            Arc::new(NoopEmitter),
+        )
+        .unwrap();
+        let ctx = manager.active();
+        let a = ctx.data_dir.join("uploads-a");
+        let b = ctx.data_dir.join("uploads-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let (first, second) =
+            tokio::join!(ctx.register_library_root(&a), ctx.register_library_root(&b));
+        first.unwrap();
+        second.unwrap();
+        ctx.register_library_root(&a).await.unwrap();
+        let stored = ctx.get_settings().await;
+        assert_eq!(stored.recent_dirs.len(), 2);
+        assert!(stored.recent_dirs.contains(&a.canonicalize().unwrap()));
+        assert!(stored.recent_dirs.contains(&b.canonicalize().unwrap()));
+        assert!(stored.last_directory.is_none());
+        assert!(stored.favorites.is_empty());
+        let manifest = read_manifest(&ctx.workspace_path).unwrap();
+        assert_eq!(manifest.recent_roots, stored.recent_dirs);
+        assert!(
+            !settings.exists(),
+            "root registration must only write the workspace manifest"
+        );
+        manager.shutdown_all().await;
+    }
+
     impl EventEmitter for RecordingEmitter {
         fn emit(&self, name: &str, _payload: serde_json::Value) {
             self.0.lock().unwrap().push(name.to_string());
@@ -3063,8 +3111,11 @@ mod tests {
         let library = dir.path().join("library");
         std::fs::create_dir_all(&library).unwrap();
         let library = library.canonicalize().unwrap();
-        for entry in ["research.db", "research.db-wal", "semantic_index.db"] {
-            std::fs::write(dir.path().join(entry), b"legacy").unwrap();
+        for entry in ["research.db", "semantic_index.db"] {
+            rusqlite::Connection::open(dir.path().join(entry))
+                .unwrap()
+                .execute_batch("CREATE TABLE fixture (id INTEGER PRIMARY KEY);")
+                .unwrap();
         }
         std::fs::create_dir_all(dir.path().join("uploads")).unwrap();
         std::fs::write(dir.path().join("uploads").join("paper.pdf"), b"pdf").unwrap();
@@ -3083,7 +3134,7 @@ mod tests {
         let id = initialize_workspace_registry(dir.path(), &settings_path).unwrap();
 
         let workspace_dir = workspace_root(dir.path(), &id);
-        for entry in ["research.db", "research.db-wal", "semantic_index.db"] {
+        for entry in ["research.db", "semantic_index.db"] {
             assert!(workspace_dir.join(entry).exists(), "{entry} did not move");
             assert!(!dir.path().join(entry).exists(), "{entry} was left behind");
         }
@@ -3126,10 +3177,8 @@ mod tests {
         std::fs::write(dir.path().join("semantic_index.db"), b"legacy").unwrap();
         atomic_write_json(
             &migration_plan_path(dir.path()),
-            &MigrationPlan {
-                workspace_id: id.clone(),
-                manifest,
-            },
+            // The journal shape written before upload relocation was added.
+            &serde_json::json!({ "workspace_id": &id, "manifest": manifest }),
         )
         .unwrap();
 

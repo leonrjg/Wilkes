@@ -336,8 +336,7 @@ export default function CustomIntegrations({
     <div className="space-y-3">
       <div className="flex items-start justify-between gap-3">
         <p className="text-xs text-[var(--text-muted)]">
-          Ask an LLM to translate service documentation or an existing script
-          into a manifest using the exact schema this build accepts.
+          Copy the prompt to generate a provider manifest from service documentation.
         </p>
         <CopyButton
           copy={copyAuthoringPrompt}
@@ -652,8 +651,8 @@ export default function CustomIntegrations({
               {!probeIsClean && (
                 <p className="text-[10px] text-[var(--text-dim)]">
                   {report === null
-                    ? "Not probed. A selector can only be checked against a response that has arrived — probing first is worth it, but saving does not wait for one."
-                    : "The last probe did not come back clean. You can save anyway; the report below says what it found."}
+                    ? "Not tested. You can save without testing."
+                    : "Test found issues. You can still save."}
                 </p>
               )}
             </div>

@@ -231,7 +231,7 @@ export default function WorkersPanel({ api, settings, onUpdateSettings }: Worker
               </button>
             </div>
             <p className="text-[10px] text-[var(--text-dim)] italic">
-              Worker processes will be shut down after this duration of inactivity to free system resources.
+              Release worker memory after this much idle time.
             </p>
           </div>
 
@@ -255,10 +255,7 @@ export default function WorkersPanel({ api, settings, onUpdateSettings }: Worker
               </button>
             </div>
             <p className="text-[10px] text-[var(--text-dim)] italic">
-              How many texts the embedding worker puts through the model at once. This
-              sets its peak memory, and nothing else does: the largest single batch
-              decides it, not the size of a document. Raise it for speed on a machine
-              with memory to spare; lower it if indexing makes the machine swap.
+              Larger batches can be faster but use more memory.
             </p>
           </div>
         </div>

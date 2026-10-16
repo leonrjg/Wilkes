@@ -264,11 +264,8 @@ export default function CataloguePanel({ api, onChanged }: Props) {
             Learning catalogues
           </h3>
           <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">
-            Open textbook, course and documentation catalogues, searched from a
-            copy kept on this machine: fetching one is what switches it on, and
-            asking it sends your query nowhere. A search your library cannot
-            answer can then suggest something that would. Shared by every
-            workspace on this machine, and refreshed only when you ask.
+            Textbooks, courses and documentation. Searched locally and shared
+            across workspaces.
           </p>
         </div>
 
@@ -293,8 +290,7 @@ export default function CataloguePanel({ api, onChanged }: Props) {
 
           {empty && !busy && (
             <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">
-              This mirror is empty. Syncing fetches each catalogue in full, which
-              takes a few minutes and a few megabytes.
+              Sync catalogues to enable search. This may take a few minutes.
             </p>
           )}
 

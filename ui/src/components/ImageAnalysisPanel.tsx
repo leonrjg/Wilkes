@@ -1,20 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Tooltip } from "@leonrjg/wilkes-reader";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { SearchApi } from "../services/api";
-import {
-  ALL_RECOGNITION_ENGINES,
-  type ImageAnalysisSettings,
-  type EmbedProgress,
-  type ImageScope,
-  type InstallableModelStatus,
-  type RecognitionEngine,
-  type RecognizerDescriptor,
-  type RecognizerInventory,
-  type RecognizerRole,
-  type Settings,
+import type {
+  ImageAnalysisSettings, RecognizerCatalogue, RecognizerDescriptor,
+  RecognizerInventory, RecognizerRole, Settings,
 } from "../lib/types";
-import ModelCatalog, { formatModelBytes } from "./ModelCatalog";
-import RecognizerVenn, { PAGE_REGION, type VennModel } from "./RecognizerVenn";
+import { ocrConfiguration } from "../lib/ocrConfiguration";
+import { formatModelBytes } from "./ModelCatalog";
 
 interface Props {
   api: SearchApi;
@@ -22,1034 +13,353 @@ interface Props {
   onUpdateSettings: (patch: Partial<Settings>) => Promise<void>;
 }
 
-interface DownloadProgress {
-  received: number;
-  total: number;
+const DEFAULTS: ImageAnalysisSettings = {
+  enabled: false, engine: "Onnx", model: null, device: null,
+  describer_model: "", scope: "typeset_only", disabled_roles: ["page"],
+};
+const ENGINE_LABELS = { Onnx: "ONNX", Candle: "Candle", Vision: "Apple Vision" };
+const modelKey = (model: RecognizerDescriptor) => `${model.engine}:${model.model_id}`;
+const box = "rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3";
+const button = "rounded border border-[var(--border-main)] px-2.5 py-1.5 text-xs text-[var(--text-main)] disabled:opacity-50";
+const select = "w-full rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2 py-1.5 text-xs text-[var(--text-main)] disabled:opacity-50";
+
+function Badge({ children }: { children: React.ReactNode }) {
+  return <span className="rounded bg-[var(--bg-active)] px-2 py-1 text-[10px] text-[var(--text-muted)]">{children}</span>;
 }
 
-const DEFAULTS: ImageAnalysisSettings = {
-  enabled: false,
-  engine: "Onnx",
-  model: null,
-  device: null,
-  describer_model: "",
-  scope: "typeset_only",
-  // Empty, which is every reader spent — the reading a settings file written
-  // before this field existed was already producing. De-selection is a thing
-  // you do, never a thing an upgrade does to you: the other default would
-  // re-read every library that had a formula reader installed.
-  disabled_roles: [],
-};
+function ModelDetails({ model, inventory }: { model?: RecognizerDescriptor; inventory: RecognizerInventory }) {
+  return <details className="text-[10px] text-[var(--text-dim)]">
+    <summary className="cursor-pointer">Model details</summary>
+    <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 break-all">
+      {model && <><dt>Engine</dt><dd>{ENGINE_LABELS[model.engine]}</dd>
+        <dt>Outputs</dt><dd>{model.emits.join(", ")}</dd>
+        <dt>Admission threshold</dt><dd>{model.admission_threshold.toFixed(2)}</dd></>}
+      <dt>Repository</dt><dd>{inventory.repo}</dd>
+      <dt>Revision</dt><dd className="font-mono">{inventory.revision}</dd>
+      <dt>Sources</dt><dd>{inventory.derived_from.join(", ")}</dd>
+    </dl>
+    <ul className="mt-2 space-y-1 font-mono">
+      {inventory.artifacts.map((artifact) => <li key={artifact.filename}>
+        {artifact.filename} · {formatModelBytes(artifact.size_bytes)} · SHA256 {artifact.sha256}
+      </li>)}
+    </ul>
+  </details>;
+}
 
-/** What each scope reads. The label is the whole of the choice; the cost it
- *  carries is stated once, by the re-index warning below. */
-const SCOPE_OPTIONS: Array<{ value: ImageScope; label: string }> = [
-  { value: "typeset_only", label: "Formulas and tables only" },
-  { value: "typeset_and_embedded", label: "Those, and every picture" },
-];
+function ModelInfo({ model, inventory, retry }: {
+  model: RecognizerDescriptor; inventory?: RecognizerInventory; retry: () => void;
+}) {
+  return <div className="space-y-2">
+    <div className="flex flex-wrap items-center gap-2 text-[10px] text-[var(--text-dim)]">
+      <span>{formatModelBytes(model.footprint_bytes)}</span>
+      {inventory ? <a href={inventory.license_url} target="_blank" rel="noreferrer"
+        className="text-[var(--accent-blue)] underline">{inventory.license}</a>
+        : <button type="button" onClick={retry} className="underline">Load model details</button>}
+      <Badge>{model.is_cached ? "Installed" : "Download required"}</Badge>
+    </div>
+    {inventory && <ModelDetails model={model} inventory={inventory} />}
+  </div>;
+}
 
-const ENGINE_LABELS: Record<RecognitionEngine, string> = {
-  Onnx: "ONNX",
-  Candle: "Candle",
-  Vision: "Apple Vision",
-};
-
-/** The readers that are not the page recognizer, in the order they are shown.
- *
- *  Each is a card rather than a row in the picker below, because none of them
- *  is an *alternative* to the page reader — they run alongside one, on the
- *  areas the detector marked out for them. Which model fills each card is the
- *  `role` the backend declares on its catalogue row, never a list of ids kept
- *  here: a second copy of which-is-which is how a formula reader eventually
- *  gets offered as the page recognizer.
- *
- *  One table rather than one hand-written section apiece, so a third role is a
- *  row here and the card stays a single piece of markup. */
-const HELPER_READERS: Array<{
-  role: RecognizerRole;
-  /** The name of this reader's box in the diagram. The kind itself, not the
-   *  model — the box is a piece of the page, and it exists whether or not a
-   *  model claims it. */
-  label: string;
-  button: string;
-  /** What is lost while it is not installed. Said where the download is
-   *  offered, because it cannot be inferred from the reading afterwards. */
-  absent: string;
-  /** The same, for a configuration with the page reader switched off. Two
-   *  sentences rather than one with a clause, because they are two different
-   *  outcomes: falling through to a worse reader, and not being read. */
-  absentWithNoPageReader: string;
-}> = [
-  {
-    role: "formula",
-    label: "Formulas",
-    button: "Download formula reader",
-    absent:
-      "Not installed — formulas will go to the page reader instead, which on measurement reads almost none of them. Reading still works, and installing this later re-reads the documents that have formulas in them.",
-    absentWithNoPageReader:
-      "Not installed, and the page reader is switched off — so formulas are not read at all. Installing this later re-reads the documents that have formulas in them.",
-  },
-  {
-    role: "table",
-    label: "Tables",
-    button: "Download table reader",
-    absent:
-      "Not installed — ruled tables will go to the page reader instead, which on measurement re-typed a third of them correctly and returned prose for the rest. Reading still works, and installing this later re-reads the documents that have tables in them.",
-    absentWithNoPageReader:
-      "Not installed, and the page reader is switched off — so ruled tables are not read at all. Installing this later re-reads the documents that have tables in them.",
-  },
-];
-
-/** What ModelCatalog needs, said in the recognizer's own terms. The footprint
- *  *is* the download, and the engine's own default is the recommendation when
- *  it is not the catalogue-wide one. */
-type RecognizerCatalogEntry = RecognizerDescriptor & {
-  size_bytes: number;
-  is_recommended: boolean;
-};
-
-/**
- * The one surface allowed to render image-enrichment UI while the recognizer
- * is not installed — it is what installs it.
- *
- * The panel is deliberately blunt about the cost of the toggle. Enrichment is
- * part of the extraction recipe, so turning it on or off, or changing the
- * recognizer, is not a display preference: it changes what every document in
- * the library reads as, and every document with a picture in it is re-read and
- * re-embedded.
- *
- * The engine and model are picked the way embedding's are, and for the same
- * reason: the backend has dispatched recognition by engine and model id since
- * there were two of them, and an interface that offers only one of them makes
- * the other unreachable rather than absent.
- */
+/** One configuration surface. Catalogue-backed readiness always uses saved
+ * settings; model pickers remain drafts until their installation completes. */
 export default function ImageAnalysisPanel({ api, settings, onUpdateSettings }: Props) {
   const analysis = settings.image_analysis ?? DEFAULTS;
-  /** The roles switched off. A settings file older than the field has none,
-   *  which is every reader spent — the same reading it was already getting.
-   *  Memoized so the absent case is one array rather than a fresh one per
-   *  render, which is what the diagram's own memo is keyed on. */
-  const disabledRoles = useMemo(
-    () => analysis.disabled_roles ?? [],
-    [analysis.disabled_roles],
-  );
-  const [supportedEngines, setSupportedEngines] = useState<RecognitionEngine[]>([]);
-  const [detector, setDetector] = useState<InstallableModelStatus | null>(null);
-  const [recognizers, setRecognizers] = useState<RecognizerDescriptor[]>([]);
-  const [modelFilter, setModelFilter] = useState("");
-  const [draftEngine, setDraftEngine] = useState<RecognitionEngine>(analysis.engine);
-  const [draftModel, setDraftModel] = useState<string | null>(analysis.model);
-  const [inventory, setInventory] = useState<RecognizerInventory | null>(null);
-  const [helperInventory, setHelperInventory] = useState<
-    Partial<Record<RecognizerRole, RecognizerInventory>>
-  >({});
+  const [catalogue, setCatalogue] = useState<RecognizerCatalogue | null>(null);
+  const [catalogueLoading, setCatalogueLoading] = useState(true);
+  const catalogueRequest = useRef(0);
+  const [draftPage, setDraftPage] = useState<string | null>(null);
+  const [draftFormula, setDraftFormula] = useState<string | null>(null);
+  const [inventories, setInventories] = useState<Record<string, RecognizerInventory>>({});
+  const [inventoryRevision, setInventoryRevision] = useState(0);
   const [busy, setBusy] = useState(false);
-  const [progress, setProgress] = useState<DownloadProgress | null>(null);
+  const operation = useRef(false);
+  const [progress, setProgress] = useState<{ received: number; total: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [describerModel, setDescriberModel] = useState(analysis.describer_model ?? "");
-  // Which box of the diagram is being read about. The page reader's box to
-  // begin with, because it is the one choice that is always already made.
-  const [region, setRegion] = useState<string>(PAGE_REGION);
-
-  useEffect(() => {
-    setDescriberModel(analysis.describer_model ?? "");
-  }, [analysis.describer_model]);
-
-  // The catalogue holds both roles in one list. Split by the role the backend
-  // declares rather than by a list of ids kept here: the engine picker below
-  // must never offer a formula reader as the page recognizer, and a second
-  // copy of which-is-which is how it eventually would.
-  const pageReaders = useMemo(
-    () => recognizers.filter((model) => model.role === "page"),
-    [recognizers],
-  );
-  // Which model reads formulas is a setting rather than the role's only row,
-  // so it is resolved once, here: the card, the picker and the download all
-  // have to name the same reader, and asking three times is how they would
-  // eventually name three. An absent setting takes the row that declares
-  // itself the role default, never whichever formula row is listed first — a
-  // newly installed alternative must not change what a library was read with.
-  // A named row this build does not ship resolves to nothing, which is the
-  // same refusal `dispatch::formula_model` answers with.
-  const formulaReaders = useMemo(
-    () => recognizers.filter((model) => model.role === "formula"),
-    [recognizers],
-  );
-  const formulaChoice = useMemo(
-    () =>
-      analysis.formula_model
-        ? formulaReaders.find((model) => model.model_id === analysis.formula_model)
-        : formulaReaders.find((model) => model.is_role_default),
-    [formulaReaders, analysis.formula_model],
-  );
-  // The cards above the picker, one per role in HELPER_READERS that this build
-  // actually ships. A role with no catalogue row is a build that cannot read
-  // that kind at all, and it is simply absent rather than shown as broken.
-  const helpers = useMemo(
-    () =>
-      HELPER_READERS.flatMap((copy) => {
-        const model =
-          copy.role === "formula"
-            ? formulaChoice
-            : recognizers.find(
-                (entry) => entry.role === copy.role && entry.is_role_default,
-              );
-        return model ? [{ copy, model }] : [];
-      }),
-    [recognizers, formulaChoice],
-  );
-
-  /** One box per role reader, and the kind each box stands for taken from the
-   *  reader's own `emits` rather than from its role name. The role says which
-   *  card it is; `emits` says which part of a page it takes, and that is what
-   *  the diagram is drawing. A row that declares no kind is a catalogue that
-   *  cannot say what the model reads — it is dropped from the diagram and said
-   *  out loud, rather than shown as an unfillable box. */
-  const helperBoxes = useMemo(
-    () =>
-      helpers.flatMap(({ copy, model }) => {
-        const kind = model.emits[0];
-        if (!kind) {
-          console.error(
-            `recognizer ${model.model_id} has role ${model.role} but declares no emitted kind; omitting its box`,
-          );
-          return [];
-        }
-        return [
-          {
-            kind,
-            label: copy.label,
-            // Absent from the list is chosen. Said here rather than in the
-            // diagram, so the diagram never has to know what a role is.
-            model: { ...model, selected: !disabledRoles.includes(model.role) },
-          },
-        ];
-      }),
-    [helpers, disabledRoles],
-  );
-
-  /** The role reader whose box is being read about, or null while the page
-   *  reader's own box is. */
-  const focused = useMemo(
-    () =>
-      helpers.find(({ model }) => model.emits[0] === region) ?? null,
-    [helpers, region],
-  );
+  const [descriptionRequested, setDescriptionRequested] = useState(!!analysis.describer_model);
 
   const refreshCatalogue = useCallback(async () => {
-    const catalogue = await api.imageRecognizerCatalogue();
-    setSupportedEngines(catalogue.engines);
-    setRecognizers(catalogue.models);
-    setDetector(catalogue.detector);
-    return catalogue;
+    const request = ++catalogueRequest.current;
+    const next = await api.imageRecognizerCatalogue();
+    if (request === catalogueRequest.current) setCatalogue(next);
+    return next;
   }, [api]);
 
   useEffect(() => {
     let mounted = true;
-    api
-      .imageRecognizerCatalogue()
-      .then((catalogue) => {
-        if (!mounted) return;
-        setSupportedEngines(catalogue.engines);
-        setRecognizers(catalogue.models);
-        setDetector(catalogue.detector);
-      })
-      .catch((cause) => {
-        if (mounted) setError(String(cause));
-      });
-    return () => {
-      mounted = false;
-    };
+    const request = ++catalogueRequest.current;
+    setCatalogue(null);
+    setCatalogueLoading(true);
+    api.imageRecognizerCatalogue().then((next) => {
+      if (mounted && request === catalogueRequest.current) setCatalogue(next);
+    }).catch((cause) => {
+      if (mounted) setError(String(cause));
+    }).finally(() => { if (mounted) setCatalogueLoading(false); });
+    return () => { mounted = false; };
   }, [api]);
 
-  // The settings are the commitment; the draft is what is being considered.
-  // A settings edit — this panel's own, or one from elsewhere — resets it,
-  // the way the generation panel's does.
+  useEffect(() => { setDraftPage(null); }, [analysis.engine, analysis.model]);
+  useEffect(() => { setDraftFormula(null); }, [analysis.formula_model]);
   useEffect(() => {
-    setDraftEngine(analysis.engine);
-    setDraftModel(analysis.model);
-  }, [analysis.engine, analysis.model]);
+    setDescriberModel(analysis.describer_model ?? "");
+    setDescriptionRequested(!!analysis.describer_model);
+  }, [analysis.describer_model]);
 
-  /** The model an engine reads with when nothing names one. Answered by the
-   *  catalogue rather than by a table kept here: a second copy of it is how a
-   *  library ends up read under a recognizer nobody chose. */
-  const engineDefault = useCallback(
-    (engine: RecognitionEngine) =>
-      pageReaders.find((model) => model.engine === engine && model.is_engine_default)
-        ?.model_id ?? null,
-    [pageReaders],
-  );
-
-  const configuredModel = analysis.model ?? engineDefault(analysis.engine);
-
-  const effectiveDraftModel = draftModel ?? engineDefault(draftEngine);
-
-  const catalogModels: RecognizerCatalogEntry[] = pageReaders
-    .filter((model) => model.engine === draftEngine)
-    .map((model) => ({
-      ...model,
-      size_bytes: model.footprint_bytes,
-      is_recommended: model.is_engine_default && !model.is_default,
-    }));
-
-  const selected =
-    catalogModels.find((model) => model.model_id === effectiveDraftModel) ?? null;
-  const configured = pageReaders.find(
-    (model) => model.engine === analysis.engine && model.model_id === configuredModel,
-  );
-  const configuredInstalled = configured?.is_cached ?? false;
-  const isConfigured =
-    draftEngine === analysis.engine && effectiveDraftModel === configuredModel;
-
-  /** Whether the page reader is one of the roles switched off. What it costs
-   *  is said in several places below, and it is a different sentence from the
-   *  one a specialist's absence carries — with no page reader there is nothing
-   *  for an unread area to fall through to. */
-  const pageOff = !!selected && disabledRoles.includes(selected.role);
-
-  /** The roles this installation could read with: on disk, and therefore
-   *  attachable. A role with no weights already contributes nothing, so it is
-   *  the last *installed* one that must not be switched off — the backend
-   *  refuses an analyzer with no reader left. */
-  const readableRoles = useMemo(() => {
-    const roles: RecognizerRole[] = [];
-    if (selected?.is_cached) roles.push(selected.role);
-    for (const { model } of helpers) {
-      if (model.is_cached) roles.push(model.role);
-    }
-    return roles;
-  }, [selected, helpers]);
-
-  // The inventory describes the recipe rather than this machine, so it is read
-  // for whatever is *selected* and whether or not it is installed: it is what
-  // the download is disclosed by, and disclosing it afterwards would be no
-  // disclosure at all.
-  useEffect(() => {
-    if (!effectiveDraftModel) {
-      setInventory(null);
-      return;
-    }
-    let mounted = true;
-    api
-      .imageRecognizerInventory(draftEngine, effectiveDraftModel)
-      .then((next) => {
-        if (mounted) setInventory(next);
-      })
-      .catch((cause) => {
-        if (!mounted) return;
-        setInventory(null);
-        console.error("imageRecognizerInventory failed:", cause);
-      });
-    return () => {
-      mounted = false;
-    };
-  }, [api, draftEngine, effectiveDraftModel]);
-
-  // Fetched, not read off the descriptor: the catalogue row says what a model
-  // is and what it costs, and the inventory says under what terms and which
-  // files. The licence is disclosed beside the download button, so it is
-  // fetched whether or not the model is installed.
+  // Disclosure is fetched before installation. An absent inventory cannot
+  // authorize a download; retry remains available beside that model.
   useEffect(() => {
     let mounted = true;
-    setHelperInventory({});
-    for (const { copy, model } of helpers) {
-      api
-        .imageRecognizerInventory(model.engine, model.model_id)
-        .then((next) => {
-          if (mounted) setHelperInventory((prev) => ({ ...prev, [copy.role]: next }));
-        })
-        .catch((cause) => {
-          if (!mounted) return;
-          console.error(
-            `imageRecognizerInventory failed for the ${copy.role} reader:`,
-            cause,
-          );
-        });
+    setInventories({});
+    if (catalogue) {
+      void Promise.all(catalogue.models.map(async (model) => {
+        try {
+          const inventory = await api.imageRecognizerInventory(model.engine, model.model_id);
+          if (mounted) setInventories((previous) => ({ ...previous, [modelKey(model)]: inventory }));
+        } catch (cause) {
+          console.error(`Model inventory unavailable: ${model.model_id}`, cause);
+        }
+      }));
     }
-    return () => {
-      mounted = false;
-    };
-  }, [api, helpers]);
+    return () => { mounted = false; };
+  }, [api, catalogue, inventoryRevision]);
 
-  // The install has its own event stream, and a settings change can start one
-  // too, so the panel listens for backend truth rather than assuming the
-  // button it rendered owns the operation.
   useEffect(() => {
     let mounted = true;
     const unlisteners: Array<() => void> = [];
-    const track = (subscribe: Promise<() => void>, label: string) => {
-      subscribe
-        .then((unlisten) => {
-          if (mounted) unlisteners.push(unlisten);
-          else unlisten();
-        })
-        .catch((cause) => console.error(`${label} subscription failed:`, cause));
+    const track = (subscription: Promise<() => void>) => {
+      subscription.then((unlisten) => {
+        if (mounted) unlisteners.push(unlisten); else unlisten();
+      }).catch((cause) => { if (mounted) setError(String(cause)); });
     };
-
-    track(
-      api.onImageAnalysisProgress((next: EmbedProgress) => {
-        if (!mounted || !("Download" in next)) return;
-        setBusy(true);
-        setProgress({
-          received: next.Download.bytes_received,
-          total: next.Download.total_bytes,
-        });
-      }),
-      "onImageAnalysisProgress",
-    );
-    track(
-      api.onImageAnalysisDone(() => {
-        if (!mounted) return;
-        setBusy(false);
-        setProgress(null);
-        refreshCatalogue().catch((cause) => setError(String(cause)));
-      }),
-      "onImageAnalysisDone",
-    );
-    track(
-      api.onImageAnalysisError((failure) => {
-        if (!mounted) return;
-        setBusy(false);
-        setProgress(null);
-        setError(failure.message);
-        refreshCatalogue().catch(() => {});
-      }),
-      "onImageAnalysisError",
-    );
-
-    return () => {
-      mounted = false;
-      unlisteners.forEach((unlisten) => unlisten());
+    track(api.onImageAnalysisProgress((next) => {
+      if (!mounted || !("Download" in next)) return;
+      setBusy(true);
+      setProgress({ received: next.Download.bytes_received, total: next.Download.total_bytes });
+    }));
+    const settled = () => {
+      if (!mounted) return;
+      // A setup action may download multiple components. A terminal event for
+      // one component must not unlock the controls for the remaining steps.
+      if (!operation.current) { setBusy(false); setProgress(null); }
+      refreshCatalogue().catch((cause) => { if (mounted) setError(String(cause)); });
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api]);
+    track(api.onImageAnalysisDone(settled));
+    track(api.onImageAnalysisError((failure) => {
+      if (mounted) setError(failure.message);
+      settled();
+    }));
+    return () => { mounted = false; unlisteners.forEach((unlisten) => unlisten()); };
+  }, [api, refreshCatalogue]);
 
-  /** Select or de-select one region's reader.
-   *
-   *  Every region is one role in the same list, the page reader included. The
-   *  weights are left alone either way — what changes is whether the reader is
-   *  attached, and therefore what the extraction recipe is and which documents
-   *  are re-read. Switching the page reader off leaves the specialists reading
-   *  the areas the detector marks out for them, and everything else in a
-   *  picture unread.
-   *
-   *  The feature switch is a different question and stays where it is: `enabled`
-   *  says whether pictures are looked at at all, and this list says who reads
-   *  what once they are.
-   *
-   *  A region with no reader in the catalogue cannot be toggled; the caller
-   *  never offers one, and a call for one is a bug rather than a no-op, so it
-   *  is logged rather than swallowed. */
-  const handleToggleRegion = async (region: string, next: boolean) => {
-    const role =
-      region === PAGE_REGION
-        ? selected?.role
-        : helpers.find(({ model }) => model.emits[0] === region)?.model.role;
-    if (!role) {
-      console.error(`no reader owns the '${region}' region; nothing to select`);
-      return;
-    }
-    // The backend refuses an analyzer with nothing left to read with, because
-    // that configuration reports as a library whose pictures hold no text.
-    // Said here too, before the write, so the refusal is not the first the
-    // user hears of it.
-    const after = next
-      ? disabledRoles.filter((off) => off !== role)
-      : [...disabledRoles.filter((off) => off !== role), role];
-    if (!next && readableRoles.every((each) => after.includes(each))) {
-      setError(
-        "That would switch off every reader. Turn off \u201cread the text drawn inside " +
-          "pictures\u201d above instead — it is the same reading, said once.",
-      );
-      return;
-    }
-    setBusy(true);
-    try {
-      await patch({ disabled_roles: after });
-    } catch (cause) {
-      setError(String(cause));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const patch = async (next: Partial<Settings["image_analysis"]>) => {
-    setError(null);
-    await onUpdateSettings({ image_analysis: { ...analysis, ...next } });
-  };
-
-  const handleEngineChange = (engine: RecognitionEngine) => {
-    if (engine === draftEngine) return;
-    setError(null);
-    setDraftEngine(engine);
-    setDraftModel(engineDefault(engine));
-  };
-
-  /**
-   * Install first, commit second.
-   *
-   * `build_analyzer` refuses a recognizer that is enabled but not on disk, so
-   * writing the choice into the settings before the weights exist would put
-   * the app into exactly the state the recipe exists to prevent — and would
-   * announce it as a failure the user did not cause.
-   */
-  const handleAction = async () => {
-    if (!selected) return;
+  const run = async (action: () => Promise<void>) => {
+    if (operation.current) return;
+    operation.current = true;
     setBusy(true);
     setError(null);
-    try {
-      if (!selected.is_cached) {
-        await api.installImageRecognizer(draftEngine, selected.model_id);
-      }
-      if (!isConfigured) {
-        await patch({ engine: draftEngine, model: selected.model_id });
-      }
-      await refreshCatalogue();
-    } catch (cause) {
-      setError(String(cause));
-    } finally {
-      setBusy(false);
-      setProgress(null);
+    try { await action(); }
+    catch (cause) { setError(String(cause)); }
+    finally { operation.current = false; setBusy(false); setProgress(null); }
+  };
+  const patch = async (next: Partial<ImageAnalysisSettings>, readinessCatalogue = catalogue) => {
+    const updated = { ...analysis, ...next };
+    if (updated.enabled && readinessCatalogue && !ocrConfiguration(updated, readinessCatalogue).canEnable) {
+      throw new Error("Complete OCR setup before applying this configuration.");
     }
+    await onUpdateSettings({ image_analysis: updated });
   };
 
-  const handleToggle = async (enabled: boolean) => {
-    setBusy(true);
-    try {
-      await patch({ enabled });
-    } catch (cause) {
-      setError(String(cause));
-    } finally {
-      setBusy(false);
+  if (!catalogue) return <div className="space-y-3 p-1">
+    <h3 className="text-xs text-[var(--text-main)]">OCR</h3>
+    {catalogueLoading ? <p role="status" className="text-xs text-[var(--text-dim)]">Loading OCR components…</p>
+      : <button className={button} onClick={() => void run(async () => { await refreshCatalogue(); })}
+        disabled={busy}>Retry loading OCR components</button>}
+    {error && <p role="alert" className="text-xs text-[var(--accent-red)]">{error}</p>}
+  </div>;
+
+  const config = ocrConfiguration(analysis, catalogue);
+  const pageReaders = catalogue.models.filter((model) => model.role === "page");
+  const formulaReaders = catalogue.models.filter((model) => model.role === "formula");
+  const pageChoice = draftPage === null ? config.page : pageReaders.find((model) => modelKey(model) === draftPage);
+  const formulaChoice = draftFormula === null ? config.formula : formulaReaders.find((model) => model.model_id === draftFormula);
+  const pageChanged = !!pageChoice && modelKey(pageChoice) !== (config.page && modelKey(config.page));
+  const formulaChanged = !!formulaChoice && formulaChoice.model_id !== config.formula?.model_id;
+  const retryInventory = () => setInventoryRevision((previous) => previous + 1);
+  const detector = catalogue.detector;
+  const toggleRole = (role: RecognizerRole, enabled: boolean) => void run(async () => {
+    const disabled_roles = (analysis.disabled_roles ?? []).filter((entry) => entry !== role);
+    if (!enabled) disabled_roles.push(role);
+    await patch({ disabled_roles });
+  });
+
+  const installAndApply = (model: RecognizerDescriptor, needsLayout: boolean, changed: boolean) => void run(async () => {
+    if (!model.is_cached) await api.installImageRecognizer(model.engine, model.model_id);
+    if (needsLayout && detector && !detector.is_installed) await api.installLayoutDetector();
+    const nextCatalogue = await refreshCatalogue();
+    if (changed) {
+      await patch(model.role === "page"
+        ? { engine: model.engine, model: model.model_id }
+        : { formula_model: model.model_id }, nextCatalogue);
+      if (model.role === "page") setDraftPage(null); else setDraftFormula(null);
     }
+  });
+
+  const setupAction = (model: RecognizerDescriptor, needsLayout: boolean, changed: boolean, label: string) => {
+    const missingLayout = needsLayout && !!detector && !detector.is_installed;
+    const missingModel = !model.is_cached;
+    if (!missingModel && !missingLayout && !changed) return null;
+    const size = (missingModel ? model.footprint_bytes : 0)
+      + (missingLayout ? detector!.inventory.footprint_bytes : 0);
+    return <div className="flex flex-wrap items-center gap-2">
+      <button type="button" className={button}
+        disabled={busy || (missingModel && !inventories[modelKey(model)])}
+        onClick={() => installAndApply(model, needsLayout, changed)}>
+        {missingLayout ? `Install required models for ${label}`
+          : missingModel ? `Install ${label} reader${changed ? " and use it" : ""}` : `Use selected ${label} reader`}
+      </button>
+      {size > 0 && <span className="text-[10px] text-[var(--text-dim)]">{formatModelBytes(size)} download</span>}
+    </div>;
   };
 
-  const handleInstallDetector = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await api.installLayoutDetector();
-      await refreshCatalogue();
-    } catch (cause) {
-      setError(String(cause));
-    } finally {
-      setBusy(false);
-      setProgress(null);
-    }
-  };
+  const percent = progress && progress.total > 0 ? Math.round(100 * progress.received / progress.total) : 0;
+  return <div className="flex flex-col gap-4 p-1">
+    <section className={box}>
+      <div className="flex items-center justify-between gap-3">
+        <label className="flex items-center gap-2.5 text-sm font-medium text-[var(--text-main)]">
+          <input type="checkbox" aria-label="Enable OCR" checked={analysis.enabled}
+            disabled={busy || (!analysis.enabled && !config.canEnable)}
+            onChange={(event) => void run(() => patch({ enabled: event.target.checked }))}
+            className="accent-[var(--accent-blue)]" />OCR
+        </label>
+        <span role="status"><Badge>{config.status}</Badge></span>
+      </div>
+      {!analysis.enabled && !config.canEnable && <div className="mt-2 text-xs text-[var(--text-dim)]">Setup required</div>}
+    </section>
 
-  // The same call the recognizer picker makes. There is no second install
-  // path: a formula reader and a table reader are catalogue rows, and
-  // installing one is installing a recognizer.
-  const handleInstallHelper = async (model: RecognizerDescriptor) => {
-    setBusy(true);
-    setError(null);
-    try {
-      await api.installImageRecognizer(model.engine, model.model_id);
-      await refreshCatalogue();
-    } catch (cause) {
-      setError(String(cause));
-    } finally {
-      setBusy(false);
-      setProgress(null);
-    }
-  };
-
-  const handleScope = async (scope: ImageScope) => {
-    if (scope === (analysis.scope ?? DEFAULTS.scope)) return;
-    setBusy(true);
-    try {
-      await patch({ scope });
-    } catch (cause) {
-      setError(String(cause));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  /** The page reader's box. De-selected like any other reader: what it holds
-   *  is whatever no specialist claimed — charts, embedded rasters, and a kind
-   *  whose own reader is absent — and switching it off leaves those unread
-   *  rather than switching the feature off. */
-  const pageBox: VennModel | null = selected
-    ? { ...selected, selected: !disabledRoles.includes(selected.role) }
-    : null;
-
-  const actionLabel = (() => {
-    if (busy) return "Working…";
-    if (!selected) return "Select a recognizer";
-    if (!selected.is_cached) {
-      return isConfigured ? "Download recognizer" : "Download recognizer and use it";
-    }
-    return isConfigured ? "In use" : "Use this recognizer";
-  })();
-
-  const progressPercent =
-    progress && progress.total > 0
-      ? Math.round((progress.received / progress.total) * 100)
-      : 0;
-
-  return (
-    <div className="flex flex-col gap-4 p-1">
-      <section>
-        <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-          Text in pictures
-        </h3>
-        <div className="space-y-3 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
-          <label className="flex cursor-pointer items-center gap-2.5">
-            <input
-              type="checkbox"
-              checked={analysis.enabled}
-              disabled={busy || !configuredInstalled}
-              onChange={(event) => void handleToggle(event.target.checked)}
-              className="h-3.5 w-3.5 accent-[var(--accent-blue)]"
-            />
-            <span className="text-xs text-[var(--text-main)]">
-              Read the text a page draws rather than sets — formulas, ruled
-              tables, diagrams and scanned figures
-            </span>
-          </label>
-          {!configuredInstalled && (
-            <p className="text-[10px] text-[var(--text-dim)]">
-              Nothing to read with yet — install a recognizer below first.
-            </p>
-          )}
+    <section aria-label="Page regions" className="space-y-3">
+      <h3 className="text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">Page regions</h3>
+      <div className={`${box} space-y-2`}>
+        <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--text-main)]">
+          <span className="font-medium">Layout detection</span><Badge>Required for page regions</Badge>
+          <span className="ml-auto"><Badge>{detector ? detector.is_installed ? "Installed" : "Download required" : "Unavailable in this build"}</Badge></span>
         </div>
-      </section>
+        {detector && <>
+          <div className="flex flex-wrap items-center gap-2 text-[10px] text-[var(--text-dim)]">
+            <span>{detector.inventory.name}</span><span>{formatModelBytes(detector.inventory.footprint_bytes)}</span>
+            <a href={detector.inventory.license_url} target="_blank" rel="noreferrer" className="text-[var(--accent-blue)] underline">{detector.inventory.license}</a>
+            {!detector.is_installed && <button type="button" className={`${button} ml-auto`} disabled={busy}
+              onClick={() => void run(async () => { await api.installLayoutDetector(); await refreshCatalogue(); })}>Install layout detection</button>}
+          </div>
+          <ModelDetails inventory={detector.inventory} />
+        </>}
+      </div>
 
-      {/* What marks the areas out. Above the engine picker on purpose: a
-          recognizer with nothing to point it at reads no mathematics, and the
-          order of the sections is the order of the decisions. */}
-      {detector && (
-        <section>
-          <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-            Layout detection
-          </h3>
-          <div className="space-y-2 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
-            <div className="flex items-center gap-2 pt-1">
-              <span className="font-mono text-[10px] text-[var(--text-muted)]">
-                {detector.inventory.name}
-              </span>
-              <span className="text-[9px] text-[var(--text-dim)]">
-                {formatModelBytes(detector.inventory.footprint_bytes)}
-              </span>
-              <a
-                href={detector.inventory.license_url}
-                target="_blank"
-                rel="noreferrer"
-                className="text-[9px] text-[var(--accent-blue)] underline"
-              >
-                {detector.inventory.license}
-              </a>
-              {detector.is_installed ? (
-                <span className="ml-auto rounded bg-[var(--bg-active)] px-1.5 py-0.5 text-[9px] uppercase tracking-tighter text-[var(--text-dim)]">
-                  Installed
-                </span>
-              ) : (
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => void handleInstallDetector()}
-                  className="ml-auto rounded border border-[var(--border-main)] px-2 py-1 text-[10px] text-[var(--text-main)] disabled:opacity-50"
-                >
-                  {busy ? "Working…" : "Download detector"}
-                </button>
-              )}
+      <div className="ml-3 space-y-3 border-l-2 border-[var(--border-main)] pl-3">
+        {(["formula", "table"] as const).map((role) => {
+          const label = role === "formula" ? "Formulas" : "Tables";
+          const model = role === "formula" ? formulaChoice : config.table;
+          const saved = role === "formula" ? config.formula : config.table;
+          return <section key={role} aria-label={label} className={`${box} space-y-3`}>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h4 className="text-xs font-medium text-[var(--text-main)]">{label}</h4>
+              <Badge>{!config.layoutReady ? detector ? "Requires layout detection" : "Unavailable in this build"
+                : !analysis.enabled ? "OCR off" : "Layout ready"}</Badge>
             </div>
-            {!detector.is_installed && (
-              <p className="text-[10px] text-[var(--text-dim)]">
-                Not installed — nothing a page typesets will be marked out, so
-                no formula or ruled table is read. Installing it later re-reads
-                the documents that have them.
-              </p>
-            )}
+            <div className="text-[11px] text-[var(--text-muted)]">Effective reader: {analysis.enabled ? config.effectiveReader(role) : "OCR off"}</div>
+            <label className="flex items-center gap-2 text-xs text-[var(--text-main)]">
+              <input type="checkbox" checked={config.selected(role)} disabled={busy || !saved?.is_cached}
+                onChange={(event) => toggleRole(role, event.target.checked)} className="accent-[var(--accent-blue)]" />
+              Use dedicated {role} reader
+            </label>
+            {role === "formula" && <select aria-label="Formula model" className={select}
+              disabled={busy || formulaReaders.length === 0}
+              value={formulaChoice?.model_id ?? analysis.formula_model ?? ""}
+              onChange={(event) => setDraftFormula(event.target.value)}>
+              {!config.formula && <option value={analysis.formula_model ?? ""}>{analysis.formula_model ? `Unavailable: ${analysis.formula_model}` : "Unavailable in this build"}</option>}
+              {formulaReaders.map((entry) => <option key={entry.model_id} value={entry.model_id}>{entry.display_name}</option>)}
+            </select>}
+            {model ? <>
+              {role === "table" && <div className="text-xs text-[var(--text-main)]">{model.display_name}</div>}
+              {role === "formula" && formulaChanged && <Badge>Selected model · not applied</Badge>}
+              <ModelInfo model={model} inventory={inventories[modelKey(model)]} retry={retryInventory} />
+              {setupAction(model, true, role === "formula" && formulaChanged, role)}
+            </> : <Badge>{role === "formula" && analysis.formula_model ? "Unavailable saved model" : "Dedicated reader unavailable in this build"}</Badge>}
+          </section>;
+        })}
+
+        <section aria-label="General reader" className={`${box} space-y-3`}>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <label className="flex items-center gap-2 text-xs font-medium text-[var(--text-main)]">
+              <input type="checkbox" checked={config.selected("page")} disabled={busy || (!config.selected("page") && !config.page?.is_cached)}
+                onChange={(event) => toggleRole("page", event.target.checked)} className="accent-[var(--accent-blue)]" />Use general reader
+            </label><Badge>Optional with dedicated readers</Badge>
           </div>
-        </section>
-      )}
-
-      {/* What reads what, drawn as the containment it is rather than listed as
-          three unrelated downloads. The two role readers used to have a
-          section each; a user could read both and still not know that
-          installing one *takes formulas away* from the page reader they had
-          chosen. The boxes say it in one look, which is the whole of the
-          explanation this page offers. */}
-      {helperBoxes.length > 0 && (
-        <section>
-          <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-            Model coverage
-          </h3>
-          <div className="space-y-3 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
-            <RecognizerVenn
-              page={pageBox}
-              specialists={helperBoxes}
-              active={analysis.enabled}
-              focus={region}
-              onFocus={setRegion}
-              onToggle={(target, next) => void handleToggleRegion(target, next)}
-              disabled={busy}
-            />
-
-            {focused && !focused.model.is_cached && (
-              <p className="text-[10px] text-[var(--text-dim)]">
-                {pageOff ? focused.copy.absentWithNoPageReader : focused.copy.absent}
-              </p>
-            )}
-
-            {focused && focused.model.is_cached && disabledRoles.includes(focused.model.role) && (
-              <p className="text-[10px] text-[var(--text-dim)]">
-                {pageOff
-                  ? "Switched off, and still downloaded — and the page reader is off too, so these areas are not read at all."
-                  : "Switched off, and still downloaded — these areas go to the page reader."}
-              </p>
-            )}
-
-            {pageOff && analysis.enabled && (
-              <p className="text-[10px] text-[var(--text-dim)]">
-                The page reader is switched off: only the areas the detector
-                marks out for a reader above are read. Charts, scanned figures
-                and the text drawn inside a diagram are not.
-              </p>
-            )}
-
-            {!analysis.enabled && (
-              <p className="text-[10px] text-[var(--text-dim)]">
-                Nothing is painted because nothing is read: image analysis is
-                off.
-              </p>
-            )}
-
-            {/* One row per role reader, always shown. The diagram says whether
-                a kind is covered; this says what covering it costs and under
-                what licence, which is the half a colour cannot carry. */}
-            <div className="space-y-1.5 border-t border-[var(--border-main)] pt-2">
-              {/* Only this role has more than one row to choose between; the
-                  others are shown by the cards below and picked by nothing.
-                  A setting naming a reader this build no longer ships is held
-                  and named rather than quietly replaced, because replacing it
-                  would re-read the library under a model nobody chose. */}
-              {formulaReaders.length > 0 && (
-                <label className="flex items-center gap-2 text-[10px] text-[var(--text-main)]">
-                  Formula model
-                  <select
-                    aria-label="Formula model"
-                    className="min-w-0 rounded border border-[var(--border-main)] bg-[var(--bg-input)] px-2 py-1"
-                    disabled={busy}
-                    value={analysis.formula_model ?? formulaChoice?.model_id ?? ""}
-                    onChange={(event) => {
-                      const formula_model = event.target.value;
-                      setBusy(true);
-                      patch({ formula_model })
-                        .catch((cause) => setError(String(cause)))
-                        .finally(() => setBusy(false));
-                    }}
-                  >
-                    {analysis.formula_model && !formulaChoice && (
-                      <option value={analysis.formula_model}>
-                        Unavailable: {analysis.formula_model}
-                      </option>
-                    )}
-                    {formulaReaders.map((entry) => (
-                      <option key={entry.model_id} value={entry.model_id}>
-                        {entry.display_name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              )}
-              {helpers.map(({ copy, model }) => (
-                <div key={copy.role} className="flex items-center gap-2">
-                  <span className="font-mono text-[10px] text-[var(--text-muted)]">
-                    {model.display_name}
-                  </span>
-                  <span className="text-[9px] text-[var(--text-dim)]">
-                    {formatModelBytes(model.footprint_bytes)}
-                  </span>
-                  {helperInventory[copy.role] && (
-                    <a
-                      href={helperInventory[copy.role]!.license_url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-[9px] text-[var(--accent-blue)] underline"
-                    >
-                      {helperInventory[copy.role]!.license}
-                    </a>
-                  )}
-                  {model.is_cached ? (
-                    <span className="ml-auto rounded bg-[var(--bg-active)] px-1.5 py-0.5 text-[9px] uppercase tracking-tighter text-[var(--text-dim)]">
-                      Installed
-                    </span>
-                  ) : (
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => void handleInstallHelper(model)}
-                      className="ml-auto rounded border border-[var(--border-main)] px-2 py-1 text-[10px] text-[var(--text-main)] disabled:opacity-50"
-                    >
-                      {busy ? "Working…" : copy.button}
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
-        </section>
-      )}
-
-      {/* Which pictures. Hidden while the feature is off, because it is a
-          question about work that is not being done. It is the setting that
-          decides whether this feature costs seconds or an overnight run, so
-          it sits directly under the toggle rather than among the model
-          options. */}
-      {analysis.enabled && (
-        <section>
-          <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-            Scope
-          </h3>
-          <div className="space-y-2 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
-            {SCOPE_OPTIONS.map((option) => (
-              <label
-                key={option.value}
-                className="flex cursor-pointer items-center gap-2.5"
-              >
-                <input
-                  type="radio"
-                  name="image-scope"
-                  value={option.value}
-                  checked={(analysis.scope ?? DEFAULTS.scope) === option.value}
-                  disabled={busy}
-                  onChange={() => void handleScope(option.value)}
-                  className="h-3.5 w-3.5 accent-[var(--accent-blue)]"
-                />
-                <span className="text-xs text-[var(--text-main)]">
-                  {option.label}
-                </span>
-              </label>
-            ))}
-            {pageOff && (
-              <p className="text-[10px] text-[var(--text-dim)]">
-                The page reader is switched off, and it is the only reader a
-                raster goes to — so the second choice reads nothing the first
-                does not, and the pictures are found and counted rather than
-                decoded.
-              </p>
-            )}
-          </div>
-        </section>
-      )}
-
-      {/* Engine selection */}
-      <section>
-        <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-          Engine
-        </h3>
-        <div className="flex w-full rounded-lg bg-[var(--bg-active)] p-0.5">
-          {ALL_RECOGNITION_ENGINES.map((engine) => {
-            const isSupported = supportedEngines.includes(engine);
-            return (
-              <Tooltip
-                key={engine}
-                content={!isSupported ? "Feature disabled in this build" : undefined}
-              >
-                <button
-                  type="button"
-                  disabled={busy || !isSupported}
-                  onClick={() => handleEngineChange(engine)}
-                  className={`flex-1 rounded-md px-3 py-1 text-xs transition-all ${
-                    draftEngine === engine
-                      ? "bg-[var(--bg-app)] text-[var(--text-main)] shadow-sm"
-                      : !isSupported
-                        ? "cursor-not-allowed text-[var(--text-muted)]/50 opacity-50"
-                        : "text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50"
-                  }`}
-                >
-                  {ENGINE_LABELS[engine]}
-                </button>
-              </Tooltip>
-            );
-          })}
-        </div>
-      </section>
-
-      {/* Model list */}
-      <ModelCatalog
-        title="Recognition Model"
-        catalogKey={`recognition:${draftEngine}`}
-        models={catalogModels}
-        filter={modelFilter}
-        selectedModelId={effectiveDraftModel}
-        activeModelId={analysis.enabled ? configuredModel : null}
-        disabled={busy}
-        emptyMessage="No recognizers found for this engine"
-        onFilterChange={setModelFilter}
-        onSelect={(model) => setDraftModel(model.model_id)}
-      />
-
-      {/* What choosing it would mean, and what it would download */}
-      <section className="flex flex-col gap-3 rounded-xl border border-[var(--border-main)] bg-[var(--bg-active)]/30 p-3">
-        {analysis.enabled && !isConfigured && (
-          <div className="rounded-lg border border-[var(--accent-amber-border)] bg-[var(--accent-amber-muted)] p-1">
-            <p className="text-center text-[10px] leading-relaxed text-[var(--accent-amber)]">
-              Changing the recognizer re-reads and re-embeds every document with
-              a picture in it.
-            </p>
-          </div>
-        )}
-
-        {selected && (
-          <div className="flex flex-wrap items-center gap-1 px-1">
-            {selected.emits.map((kind) => (
-              <span
-                key={kind}
-                className="rounded bg-[var(--bg-active)] px-1.5 py-0.5 text-[9px] uppercase tracking-tighter text-[var(--text-dim)]"
-              >
-                {kind}
-              </span>
-            ))}
-            <span className="ml-auto text-[9px] text-[var(--text-dim)]">
-              admits at {selected.admission_threshold.toFixed(2)}
-            </span>
-          </div>
-        )}
-
-        {inventory && (
-          <div className="space-y-1.5 px-1">
-            <p className="text-[10px] text-[var(--text-dim)]">
-              {selected?.is_cached ? "Running " : "Downloading it fetches "}
-              <span className="text-[var(--text-muted)]">{inventory.name}</span>,{" "}
-              {formatModelBytes(inventory.footprint_bytes)} from{" "}
-              <span className="text-[var(--text-muted)]">{inventory.repo}</span> at{" "}
-              <span className="font-mono">{inventory.revision.slice(0, 12)}</span>,
-              under{" "}
-              <a
-                href={inventory.license_url}
-                target="_blank"
-                rel="noreferrer"
-                className="text-[var(--accent-blue)] underline"
-              >
-                {inventory.license}
-              </a>
-              .
-            </p>
-            <details className="text-[10px] text-[var(--text-dim)]">
-              <summary className="cursor-pointer">What it is made of</summary>
-              <ul className="mt-1 list-disc pl-4">
-                {inventory.derived_from.map((component) => (
-                  <li key={component}>{component}</li>
-                ))}
-              </ul>
-              <ul className="mt-1.5 space-y-0.5">
-                {inventory.artifacts.map((artifact) => (
-                  <li key={artifact.filename} className="font-mono">
-                    {artifact.filename} · {formatModelBytes(artifact.size_bytes)} ·
-                    sha256 {artifact.sha256.slice(0, 12)}…
-                  </li>
-                ))}
-              </ul>
-              <p className="mt-1.5">
-                Each file is checked against the size and digest above after it
-                downloads; one that does not match is deleted rather than used.
-              </p>
-            </details>
-          </div>
-        )}
-
-        {progress && (
-          <div className="relative h-5 overflow-hidden rounded-full border border-[var(--border-main)]/60 bg-[var(--bg-app)]">
-            <div
-              className="h-full rounded-full bg-[var(--accent-blue)] transition-all duration-300 ease-out"
-              style={{ width: `${progressPercent}%` }}
-            />
-            <div className="pointer-events-none absolute inset-0 flex items-center justify-between px-2">
-              <span className="text-[9px] font-medium uppercase tracking-[0.14em] text-[var(--text-dim)]">
-                {progress.total > 0
-                  ? `Downloading ${formatModelBytes(progress.received)} of ${formatModelBytes(progress.total)}`
-                  : `${formatModelBytes(progress.received)} downloaded`}
-              </span>
-              <span className="rounded-full bg-black/20 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-white backdrop-blur-sm">
-                {progressPercent}%
-              </span>
-            </div>
-          </div>
-        )}
-
-        <button
-          type="button"
-          disabled={busy || !selected || (isConfigured && selected.is_cached)}
-          onClick={() => void handleAction()}
-          className="w-full rounded-lg bg-[var(--accent-blue)] py-2 text-xs font-semibold text-white shadow-sm transition-all hover:bg-[var(--accent-blue-hover)] active:scale-[0.98] disabled:opacity-50"
-        >
-          {actionLabel}
-        </button>
-
-        {/* ONNX Runtime is told how many threads to use rather than which
-            device, so offering it a device here would be a setting that reads
-            as a promise. */}
-        {draftEngine === "Candle" && (
-          <label className="flex flex-col gap-1 px-1">
-            <span className="text-xs text-[var(--text-muted)]">Device</span>
-            <select
-              aria-label="Recognition device"
-              value={analysis.device ?? "auto"}
-              disabled={busy}
-              onChange={(event) =>
-                void patch({
-                  device: event.target.value === "auto" ? null : event.target.value,
-                })
-              }
-              className="w-full rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2.5 py-1.5 text-xs text-[var(--text-main)]"
-            >
-              <option value="auto">Auto (Metal preferred)</option>
-              <option value="metal">Require Metal</option>
-              <option value="cpu">CPU</option>
+          <div className="text-[11px] text-[var(--text-muted)]">Saved reader: {config.page?.display_name ?? `Unavailable: ${analysis.model ?? ENGINE_LABELS[analysis.engine]}`}</div>
+          <div className="flex flex-wrap gap-2"><Badge>Other page regions · {!analysis.enabled ? "OCR off" : !config.layoutReady ? "Requires layout detection" : config.pageReady && config.validReaders ? "General reader" : "None"}</Badge><Badge>Embedded images</Badge></div>
+          <select aria-label="General reader model" className={select} disabled={busy || pageReaders.length === 0}
+            value={pageChoice ? modelKey(pageChoice) : `${analysis.engine}:${analysis.model ?? ""}`}
+            onChange={(event) => setDraftPage(event.target.value)}>
+            {!config.page && <option value={`${analysis.engine}:${analysis.model ?? ""}`}>Unavailable: {analysis.model ?? ENGINE_LABELS[analysis.engine]}</option>}
+            {pageReaders.map((model) => <option key={modelKey(model)} value={modelKey(model)}>
+              {model.display_name} · {ENGINE_LABELS[model.engine]}{model.is_default ? " · Default" : ""}
+            </option>)}
+          </select>
+          {pageChoice && <>
+            {pageChanged && <Badge>Selected model · not applied</Badge>}
+            <ModelInfo model={pageChoice} inventory={inventories[modelKey(pageChoice)]} retry={retryInventory} />
+            {setupAction(pageChoice, analysis.scope !== "typeset_and_embedded", pageChanged, "general")}
+          </>}
+          {(config.page?.engine === "Candle" || config.formula?.engine === "Candle") && <details className="text-[10px] text-[var(--text-dim)]">
+            <summary className="cursor-pointer">Device settings</summary>
+            <select aria-label="Recognition device" className={`${select} mt-2`} value={analysis.device ?? "auto"} disabled={busy}
+              onChange={(event) => void run(() => patch({ device: event.target.value === "auto" ? null : event.target.value }))}>
+              <option value="auto">Auto (Metal preferred)</option><option value="metal">Require Metal</option><option value="cpu">CPU</option>
             </select>
-          </label>
-        )}
-      </section>
+          </details>}
+        </section>
+      </div>
+    </section>
 
-      <section>
-        <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-[var(--text-dim)]">
-          Descriptions
-        </h3>
-        <div className="space-y-3 rounded-lg border border-[var(--border-main)] bg-[var(--bg-input)] p-3">
-          <label className="flex flex-col gap-1">
-            <span className="text-xs text-[var(--text-muted)]">
-              Ollama model, or empty for transcription only
-            </span>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={describerModel}
-                placeholder="qwen3-vl:2b"
-                disabled={busy}
-                onChange={(event) => setDescriberModel(event.target.value)}
-                className="flex-1 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2.5 py-1.5 text-xs text-[var(--text-main)]"
-              />
-              <button
-                type="button"
-                disabled={busy || describerModel === (analysis.describer_model ?? "")}
-                onClick={() => void patch({ describer_model: describerModel.trim() })}
-                className="rounded border border-[var(--border-main)] px-3 py-1.5 text-xs text-[var(--text-main)] disabled:opacity-50"
-              >
-                Save
-              </button>
-            </div>
-          </label>
-          <p className="text-[10px] italic text-[var(--text-dim)]">
-            Served by the Ollama server configured under Generation
-            {settings.generation?.ollama_url
-              ? ` (${settings.generation.ollama_url})`
-              : ""}
-            . A server that is not on this machine means the pictures in your
-            documents are sent to it.
-          </p>
-        </div>
-      </section>
+    <section aria-label="Embedded images" className={`${box} space-y-2`}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <label className="flex items-center gap-2 text-xs text-[var(--text-main)]">
+          <input type="checkbox" checked={analysis.scope === "typeset_and_embedded"} disabled={busy || (analysis.scope !== "typeset_and_embedded" && !config.pageReady)}
+            onChange={(event) => void run(() => patch({ scope: event.target.checked ? "typeset_and_embedded" : "typeset_only" }))}
+            className="accent-[var(--accent-blue)]" />Include embedded images
+        </label><Badge>Requires general reader</Badge>
+      </div>
+      <div className="text-[11px] text-[var(--text-muted)]">Effective reader: {analysis.enabled ? config.imageReader : "OCR off"}</div>
+    </section>
 
-      {error && (
-        <p className="rounded border border-[var(--accent-red)] bg-[var(--bg-input)] p-2 text-[10px] text-[var(--accent-red)]">
-          {error}
-        </p>
-      )}
-    </div>
-  );
+    <details className={box} open={descriptionRequested || undefined}>
+      <summary className="cursor-pointer text-xs text-[var(--text-main)]">Image descriptions <span className="ml-2 text-[10px] text-[var(--text-dim)]">Optional</span></summary>
+      <div className="mt-3 space-y-3">
+        <label className="flex items-center gap-2 text-xs text-[var(--text-main)]">
+          <input type="checkbox" checked={descriptionRequested} disabled={busy}
+            onChange={(event) => {
+              const enabled = event.target.checked;
+              if (enabled) setDescriptionRequested(true);
+              else if (analysis.describer_model) void run(async () => { await patch({ describer_model: "" }); setDescriptionRequested(false); });
+              else setDescriptionRequested(false);
+            }} className="accent-[var(--accent-blue)]" />Enable image descriptions
+        </label>
+        {descriptionRequested && <div className="flex gap-2">
+          <input aria-label="Ollama description model" className={select} placeholder="qwen3-vl:2b" value={describerModel} disabled={busy}
+            onChange={(event) => setDescriberModel(event.target.value)} />
+          <button type="button" className={button} disabled={busy || !describerModel.trim() || describerModel.trim() === analysis.describer_model}
+            onClick={() => void run(() => patch({ describer_model: describerModel.trim() }))}>Save</button>
+        </div>}
+        <div className="text-[10px] text-[var(--text-dim)]">Image destination: <span className="font-mono">{settings.generation?.ollama_url}</span></div>
+        <Badge>{!analysis.describer_model ? "Off" : analysis.enabled && config.pageReady && analysis.scope === "typeset_and_embedded" ? "Configured" : "Paused · requires OCR and embedded images"}</Badge>
+      </div>
+    </details>
+
+    <div className="text-[10px] text-[var(--text-dim)]">OCR changes reprocess affected documents.</div>
+    {progress && <div className="space-y-1 text-[10px] text-[var(--text-muted)]" role="status">
+      <div>Downloading · {formatModelBytes(progress.received)}{progress.total > 0 ? ` / ${formatModelBytes(progress.total)} · ${percent}%` : ""}</div>
+      <progress aria-label="Model download" className="w-full accent-[var(--accent-blue)]" value={progress.total > 0 ? progress.received : undefined} max={progress.total || undefined} />
+    </div>}
+    {busy && !progress && <div role="status" className="text-xs text-[var(--text-dim)]">Working…</div>}
+    {error && <p role="alert" className="rounded border border-[var(--accent-red)] p-2 text-xs text-[var(--accent-red)]">{error}</p>}
+  </div>;
 }

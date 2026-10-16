@@ -534,9 +534,11 @@ export default function SettingsModal({
             </div>
           </div>
 
-          {/* Content */}
+          {/* Flowing tabs grow with their content so the scroll container's
+              bottom padding follows the last control. Logs and the editor
+              fill the viewport and manage their own internal scrolling. */}
           <div className="flex-1 overflow-y-auto p-4 pb-12 bg-[var(--bg-app)] relative">
-            <div className={activeTab === "general" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "general" ? "block min-h-full" : "hidden"}>
               {settings && (
                 <div className="space-y-4">
                   <section>
@@ -561,7 +563,7 @@ export default function SettingsModal({
                         />
                         <span className="flex flex-col">
                           <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Use index for exact search</span>
-                          <span className="text-[10px] text-[var(--text-dim)] italic">Reads PDF text from the semantic index instead of re-extracting; falls back to reading files directly when a file isn't indexed</span>
+                          <span className="text-[10px] text-[var(--text-dim)] italic">Search cached text when available.</span>
                         </span>
                       </label>
 
@@ -836,7 +838,7 @@ export default function SettingsModal({
               )}
             </div>
 
-            <div className={activeTab === "generation-chat" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "generation-chat" ? "block min-h-full" : "hidden"}>
               {settings && isTauri && (
                 <div className="space-y-4">
                   <section>
@@ -884,19 +886,19 @@ export default function SettingsModal({
               )}
             </div>
 
-            <div className={activeTab === "extensions" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "extensions" ? "block min-h-full" : "hidden"}>
               {settings && (
                 <ExtensionsPanel settings={settings} onUpdate={handleUpdateSettings} />
               )}
             </div>
 
-            <div className={activeTab === "integrations" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "integrations" ? "block min-h-full" : "hidden"}>
               {settings && (
                 <IntegrationsPanel api={api} settings={settings} onUpdate={handleUpdateSettings} />
               )}
             </div>
 
-            <div className={activeTab === "semantic-models" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "semantic-models" ? "block min-h-full" : "hidden"}>
               <SemanticPanel
                 api={api}
                 directory={directory}
@@ -904,7 +906,7 @@ export default function SettingsModal({
               />
             </div>
 
-            <div className={activeTab === "generation-models" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "generation-models" ? "block min-h-full" : "hidden"}>
               {settings && (
                 <GenerationPanel
                   api={api}
@@ -916,7 +918,7 @@ export default function SettingsModal({
 
             {/* Both listeners serve Wilkes to other programs; neither is a
                 property of the chat agent they used to be filed under. */}
-            <div className={activeTab === "servers" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "servers" ? "block min-h-full" : "hidden"}>
               {settings && isTauri && (
                 <div className="space-y-4">
                   <section>
@@ -1107,10 +1109,7 @@ export default function SettingsModal({
                           HTTP API
                         </h3>
                         <p className="text-[10px] text-[var(--text-dim)] mt-1">
-                          The same API <code>wilkes-server</code> serves, over the library this
-                          window has open. Lets another program read it without opening the
-                          workspace itself — two processes on one workspace overwrite each
-                          other&apos;s settings and index.
+                          Let other applications access the current library.
                         </p>
                       </div>
                       <span className={`text-[10px] font-medium ${
@@ -1218,7 +1217,7 @@ export default function SettingsModal({
               )}
             </div>
 
-            <div className={activeTab === "extraction-ocr" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "extraction-ocr" ? "block min-h-full" : "hidden"}>
               {settings && (
                 <ImageAnalysisPanel
                   api={api}
@@ -1228,17 +1227,17 @@ export default function SettingsModal({
               )}
             </div>
 
-            <div className={activeTab === "semantic-chunking" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "semantic-chunking" ? "block min-h-full" : "hidden"}>
               {settings && (
                 <ChunkingPanel api={api} settings={settings} onUpdate={setSettings} />
               )}
             </div>
 
-            <div className={activeTab === "data" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "data" ? "block min-h-full" : "hidden"}>
               <DataPanel api={api} isActive={activeTab === "data"} />
             </div>
 
-            <div className={activeTab === "workers" ? "block h-full" : "hidden"}>
+            <div className={activeTab === "workers" ? "block min-h-full" : "hidden"}>
               {settings && (
                 <IndexActivityPanel
                   api={api}

@@ -1,96 +1,110 @@
-name: Docker Publish
+name: Docker Build and Publish
 
+# Build is the only release entry point. It validates the same SHA before calling us.
 on:
-  push:
-    tags: ["v*"]
-  workflow_dispatch:
+  workflow_call:
     inputs:
       ref:
-        description: Git ref to build from
-        required: false
-        default: main
-      version:
-        description: Image version to publish
+        description: Validated immutable commit SHA
         required: true
+        type: string
+      version:
+        required: true
+        type: string
+      prerelease:
+        required: true
+        type: boolean
+      publish:
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/wilkes
 
 jobs:
-  build-amd64:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
       packages: write
-
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          ref: ${{ inputs.ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Build and load native image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          platforms: linux/${{ matrix.arch }}
+          tags: wilkes-smoke:${{ matrix.arch }}
+          cache-from: type=gha,scope=wilkes-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=wilkes-${{ matrix.arch }}
+
+      - name: Smoke-test packaged server and worker
+        env:
+          IMAGE: wilkes-smoke:${{ matrix.arch }}
+        run: bash scripts/smoke-container.sh "$IMAGE"
+
       - name: Log in to GHCR
+        if: inputs.publish
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push amd64 image
-        uses: docker/build-push-action@v6
+      - name: Push validated native image
+        if: inputs.publish
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          image="$IMAGE_NAME:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ARCH"
+          docker tag "wilkes-smoke:$ARCH" "$image"
+          docker push "$image"
+          # Merge immutable digests, never mutable tags from another run.
+          mkdir -p digests
+          docker image inspect "$image" --format '{{index .RepoDigests 0}}' > "digests/$ARCH"
+
+      - name: Upload image digest
+        if: inputs.publish
+        uses: actions/upload-artifact@v4
         with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          platforms: linux/amd64
-          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  build-arm64:
-    runs-on: ubuntu-24.04-arm
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push arm64 image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          platforms: linux/arm64
-          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          name: docker-digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          if-no-files-found: error
 
   publish:
-    needs:
-      - build-amd64
-      - build-arm64
+    if: inputs.publish
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-
     steps:
+      - name: Download validated image digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: docker-digest-*
+          path: digests
+          merge-multiple: true
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -101,37 +115,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
-
-      - name: Extract manual Docker metadata
-        id: manual_meta
-        if: github.event_name == 'workflow_dispatch'
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ inputs.version }}
-            type=raw,value=latest
-
       - name: Create multi-arch manifest
-        shell: bash
         env:
-          TAGS: ${{ github.event_name == 'workflow_dispatch' && steps.manual_meta.outputs.tags || steps.meta.outputs.tags }}
-          IMAGE_AMD64: ${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
-          IMAGE_ARM64: ${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64
+          VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
         run: |
-          args=()
-          while IFS= read -r tag; do
-            [[ -z "$tag" ]] && continue
-            args+=(-t "$tag")
-          done <<< "$TAGS"
-
-          docker buildx imagetools create "${args[@]}" "$IMAGE_AMD64" "$IMAGE_ARM64"
+          args=(-t "$IMAGE_NAME:$VERSION")
+          if [[ "$PRERELEASE" == false ]]; then
+            args+=(-t "$IMAGE_NAME:${VERSION%.*}" -t "$IMAGE_NAME:latest")
+          fi
+          amd64="$(cat digests/amd64)"
+          arm64="$(cat digests/arm64)"
+          for digest in "$amd64" "$arm64"; do
+            if [[ ! "$digest" =~ ^$IMAGE_NAME@sha256:[0-9a-f]{64}$ ]]; then
+              echo '::error::Missing or invalid native-image digest'
+              exit 1
+            fi
+          done
+          docker buildx imagetools create "${args[@]}" "$amd64" "$arm64"
+          docker buildx imagetools inspect "$IMAGE_NAME:$VERSION"

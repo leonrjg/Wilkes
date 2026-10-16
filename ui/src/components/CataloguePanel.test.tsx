@@ -137,10 +137,10 @@ describe("CataloguePanel", () => {
     expect(screen.getAllByText("Never synced").length).toBe(2);
   });
 
-  it("says the mirror is empty and what filling it costs", async () => {
+  it("offers catalogue setup and a sync time estimate", async () => {
     render(<CataloguePanel api={api} />);
-    expect(await screen.findByText(/This mirror is empty/i)).toBeTruthy();
-    expect(screen.getByText(/takes a few minutes/i)).toBeTruthy();
+    expect(await screen.findByText(/Sync catalogues to enable search/i)).toBeTruthy();
+    expect(screen.getByText(/may take a few minutes/i)).toBeTruthy();
   });
 
   /// Fetching all four at once is minutes with nothing to show; the route takes
@@ -264,7 +264,7 @@ describe("CataloguePanel", () => {
   /// would imply these numbers change when the workspace does.
   it("says the mirror is shared across workspaces", async () => {
     render(<CataloguePanel api={api} />);
-    expect(await screen.findByText(/Shared by every workspace/i)).toBeTruthy();
+    expect(await screen.findByText(/shared across workspaces/i)).toBeTruthy();
   });
 
   /// A five-minute fetch that says only "Fetching…" is indistinguishable from

@@ -5,8 +5,49 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# One release owner; never let two versions race to move stable aliases.
+concurrency:
+  group: wilkes-release
+  cancel-in-progress: false
+
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.metadata.outputs.sha }}
+      publish: ${{ steps.metadata.outputs.publish }}
+      version: ${{ steps.metadata.outputs.version }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+      signing: ${{ steps.metadata.outputs.signing }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Validate release identity and signing policy
+        id: metadata
+        env:
+          RELEASE_EVENT: ${{ github.event_name }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_SIGNING: ${{ vars.RELEASE_SIGNING }}
+        run: >-
+          python3 scripts/release_metadata.py
+          --event "$RELEASE_EVENT" --ref "$RELEASE_REF"
+          --signing "$RELEASE_SIGNING" --output "$GITHUB_OUTPUT"
+
+  validate:
+    needs: prepare
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+
   build:
+    needs: [prepare, validate]
     strategy:
       fail-fast: false
       matrix:
@@ -25,11 +66,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Install pinned Rust toolchain and build target
+        shell: bash
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -56,7 +100,7 @@ jobs:
           path: |
             ~/.cache/ort
             ~/Library/Caches/ort
-            ${{ env.LOCALAPPDATA }}\ort
+            ~/AppData/Local/ort
           key: ${{ runner.os }}-ort-${{ hashFiles('Cargo.lock') }}
 
       - name: Cache node modules
@@ -78,23 +122,81 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci --prefix ui
 
-      - name: Clean Linux bundle outputs
-        if: runner.os == 'Linux'
-        run: |
-          rm -rf \
-            target/${{ matrix.target }}/release/bundle/deb \
-            target/${{ matrix.target }}/release/bundle/appimage
+      - name: Clean cached bundle outputs
+        shell: bash
+        run: rm -rf target/${{ matrix.target }}/release/bundle
 
-      - name: Build
-        if: runner.os != 'Windows'
+      - name: Configure macOS signing
+        if: runner.os == 'macOS'
+        env:
+          SIGNING_MODE: ${{ needs.prepare.outputs.signing }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [[ "$SIGNING_MODE" == unsigned ]]; then
+            echo 'APPLE_SIGNING_IDENTITY=-' >> "$GITHUB_ENV"
+            exit 0
+          fi
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Signed releases require $name"
+              exit 1
+            fi
+          done
+          certificate="$RUNNER_TEMP/wilkes-signing.p12"
+          keychain="$RUNNER_TEMP/wilkes-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          echo "::add-mask::$keychain_password"
+          trap 'rm -f "$certificate"' EXIT
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
         working-directory: crates/desktop
-        run: ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }} ${{ matrix.extra_args }}
+        env:
+          APPLE_ID: ${{ needs.prepare.outputs.signing == 'signed' && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ needs.prepare.outputs.signing == 'signed' && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ needs.prepare.outputs.signing == 'signed' && secrets.APPLE_TEAM_ID || '' }}
+        run: ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }} ${{ matrix.extra_args }} -- --locked
+
+      - name: Verify macOS signature and notarization
+        if: runner.os == 'macOS' && needs.prepare.outputs.signing == 'signed'
+        run: |
+          app="target/${{ matrix.target }}/release/bundle/macos/Wilkes.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+
+      - name: Clean up macOS signing keychain
+        if: always() && runner.os == 'macOS' && needs.prepare.outputs.signing == 'signed'
+        run: |
+          keychain="$RUNNER_TEMP/wilkes-signing.keychain-db"
+          if [[ -f "$keychain" ]]; then
+            security delete-keychain "$keychain"
+          fi
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        working-directory: crates/desktop
+        run: ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }} -- --locked
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         working-directory: crates/desktop
         env:
+          SIGNING_MODE: ${{ needs.prepare.outputs.signing }}
           CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE }}
           CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
           THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
@@ -110,17 +212,45 @@ jobs:
             }
           }
 
-          if ($env:CERTIFICATE_BASE64) {
+          if ($env:SIGNING_MODE -eq "signed") {
+            foreach ($name in @("CERTIFICATE_BASE64", "CERTIFICATE_PASSWORD", "THUMBPRINT")) {
+              if (-not [Environment]::GetEnvironmentVariable($name)) {
+                throw "Signed releases require $name"
+              }
+            }
             $bytes = [Convert]::FromBase64String($env:CERTIFICATE_BASE64)
             $pfxPath = Join-Path $env:TEMP certificate.pfx
             [IO.File]::WriteAllBytes($pfxPath, $bytes)
-            Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My `
-              -Password (ConvertTo-SecureString $env:CERTIFICATE_PASSWORD -AsPlainText -Force)
-            Remove-Item $pfxPath
+            try {
+              Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My `
+                -Password (ConvertTo-SecureString $env:CERTIFICATE_PASSWORD -AsPlainText -Force)
+            } finally {
+              Remove-Item $pfxPath -ErrorAction SilentlyContinue
+            }
             $configJson = '{"bundle":{"windows":{"certificateThumbprint":"' + $env:THUMBPRINT + '","timestampUrl":"http://timestamp.digicert.com"}}}'
-            ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }} --config $configJson
+            ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }} --config $configJson -- --locked
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            # Sign both loose executables too: these are shipped in the portable ZIP.
+            $signTool = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/signtool.exe" |
+              Sort-Object FullName -Descending | Select-Object -First 1
+            if (-not $signTool) { throw "signtool.exe was not found" }
+            foreach ($binary in @("wilkes-desktop.exe", "wilkes-rust-worker.exe")) {
+              & $signTool.FullName sign /sha1 $env:THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 (Join-Path $releaseDir $binary)
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            $signedFiles = @(
+              (Join-Path $releaseDir "wilkes-desktop.exe"),
+              (Join-Path $releaseDir "wilkes-rust-worker.exe")
+            ) + @(Get-ChildItem $bundleDir -Recurse -File | Where-Object { $_.Extension -in @(".msi", ".exe") } | ForEach-Object FullName)
+            foreach ($file in $signedFiles) {
+              $signature = Get-AuthenticodeSignature $file
+              if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Thumbprint -ne $env:THUMBPRINT) {
+                throw "Invalid or unexpected signing certificate: $file"
+              }
+            }
           } else {
-            ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }}
+            ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }} -- --locked
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
       - name: Create portable Windows bundle
@@ -153,11 +283,16 @@ jobs:
 
           Compress-Archive -Path (Join-Path $portableRoot "*") -DestinationPath $zipPath
 
+      - name: Verify expected desktop bundles
+        shell: bash
+        run: python scripts/verify_release_bundles.py ${{ matrix.target }}
+
       - name: Upload macOS artifact
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: wilkes-${{ matrix.target }}
+          if-no-files-found: error
           path: target/${{ matrix.target }}/release/bundle/dmg/*.dmg
 
       - name: Upload Linux artifact
@@ -165,6 +300,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wilkes-${{ matrix.target }}
+          if-no-files-found: error
           path: |
             target/${{ matrix.target }}/release/bundle/deb/*.deb
             target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
@@ -174,14 +310,27 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wilkes-${{ matrix.target }}
+          if-no-files-found: error
           path: |
             target/${{ matrix.target }}/release/bundle/nsis/*.exe
             target/${{ matrix.target }}/release/bundle/msi/*.msi
             target/${{ matrix.target }}/release/bundle/portable/*.zip
 
+  docker:
+    needs: [prepare, validate, build]
+    uses: ./.github/workflows/docker-publish.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+      version: ${{ needs.prepare.outputs.version }}
+      prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+      publish: ${{ needs.prepare.outputs.publish == 'true' }}
+
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    if: needs.prepare.outputs.publish == 'true'
+    needs: [prepare, validate, build, docker]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -190,9 +339,25 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: wilkes-*
+
+      - name: Record artifact checksums
+        run: |
+          cd artifacts
+          find . -type f -print0 | sort -z | xargs -0 sha256sum > ../SHA256SUMS
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
+          files: |
+            artifacts/**/*
+            SHA256SUMS
+          fail_on_unmatched_files: true
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.prepare.outputs.prerelease == 'true' && 'false' || 'true' }}
+          body: |
+            Built and validated from commit `${{ needs.prepare.outputs.sha }}`.
+            Desktop signing policy: **${{ needs.prepare.outputs.signing }}**.
+            Supported desktop targets: Apple Silicon macOS, x86-64 Windows, and x86-64 Linux.
+            Container platforms: linux/amd64 and linux/arm64.
           generate_release_notes: true

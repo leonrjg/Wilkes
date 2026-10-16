@@ -359,7 +359,7 @@ describe("CustomIntegrations", () => {
 
     // Before any probe: available, and the row says a probe is worth running.
     expect(screen.getByText("Save and enable")).not.toBeDisabled();
-    expect(screen.getByText(/Not probed/)).toBeInTheDocument();
+    expect(screen.getByText(/Not tested/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByText("Probe"));
     await waitFor(() => {
@@ -370,7 +370,7 @@ describe("CustomIntegrations", () => {
     // After a probe that found unmapped values: still available, and what the
     // probe found is said rather than enforced.
     expect(screen.getByText("Save and enable")).not.toBeDisabled();
-    expect(screen.getByText(/did not come back clean/)).toBeInTheDocument();
+    expect(screen.getByText(/Test found issues/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByText("Save and enable"));
     await waitFor(() => {

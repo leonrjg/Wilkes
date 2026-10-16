@@ -54,8 +54,7 @@ export default function ExtensionsPanel({ settings, onUpdate }: ExtensionsPanelP
           Documents
         </h3>
         <p className="text-[10px] text-[var(--text-dim)] mb-3 italic">
-          Always read, and not a setting: every document in a library is indexed and
-          searchable whatever the text extensions below say.
+          These document formats are always enabled.
         </p>
         <div className="grid grid-cols-4 gap-2 mb-6">
           {ALWAYS_ENABLED_DOCUMENT_EXTENSIONS.map((ext) => (

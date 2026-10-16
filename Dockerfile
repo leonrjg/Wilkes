@@ -13,25 +13,29 @@ RUN apt-get update && apt-get install -y \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh && \
+    sh /tmp/rustup-init.sh -y --default-toolchain none --profile minimal && \
+    rm /tmp/rustup-init.sh
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-RUN cargo install cargo-chef sccache --locked
+WORKDIR /build
+COPY rust-toolchain.toml ./
+RUN rustup show && cargo install cargo-chef sccache --locked
 ENV RUSTC_WRAPPER=sccache
 ENV SCCACHE_DIR=/sccache
 
-WORKDIR /build
-
-# Stage 1: Compute dependency recipe (manifests only — source changes must not invalidate this)
+# Stage 1: Compute the dependency recipe, including example targets Cargo discovers.
 FROM rust-base AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates/core/Cargo.toml crates/core/Cargo.toml
 COPY crates/api/Cargo.toml crates/api/Cargo.toml
+COPY crates/agent/Cargo.toml crates/agent/Cargo.toml
 COPY crates/server/Cargo.toml crates/server/Cargo.toml
 COPY crates/worker/Cargo.toml crates/worker/Cargo.toml
 COPY crates/desktop/Cargo.toml crates/desktop/Cargo.toml
-RUN mkdir -p crates/core/src crates/api/src crates/server/src crates/worker/src crates/desktop/src && \
-    touch crates/core/src/lib.rs crates/api/src/lib.rs crates/desktop/src/lib.rs && \
+COPY crates/core/examples/*.rs crates/core/examples/
+RUN mkdir -p crates/agent/src crates/core/src crates/api/src crates/server/src crates/worker/src crates/desktop/src && \
+    touch crates/agent/src/lib.rs crates/core/src/lib.rs crates/api/src/lib.rs crates/desktop/src/lib.rs && \
     echo "fn main() {}" > crates/server/src/main.rs && \
     echo "fn main() {}" > crates/worker/src/main.rs && \
     echo "fn main() {}" > crates/desktop/src/main.rs && \
@@ -45,7 +49,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/root/.cache/dfbin \
     --mount=type=cache,target=/sccache \
-    cargo chef cook --release --bin wilkes-server --bin wilkes-rust-worker --recipe-path recipe.json
+    cargo chef cook --release --locked --bin wilkes-server --bin wilkes-rust-worker --recipe-path recipe.json
 
 # Stage 3: Build binaries
 FROM rust-base AS rust-builder
@@ -56,7 +60,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/root/.cache/dfbin \
     --mount=type=cache,target=/sccache \
-    cargo build --release --bin wilkes-server --bin wilkes-rust-worker && \
+    cargo build --release --locked --bin wilkes-server --bin wilkes-rust-worker && \
     cp target/release/wilkes-server /wilkes-server && \
     cp target/release/wilkes-rust-worker /wilkes-rust-worker
 

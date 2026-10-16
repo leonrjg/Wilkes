@@ -6016,6 +6016,34 @@ impl AppContext {
         });
     }
 
+    /// Admit a directory through the same persisted roots search validates.
+    /// The read/append/write is serialized with settings edits, so concurrent
+    /// uploads cannot overwrite another request's root registration.
+    pub async fn register_library_root(self: &Arc<Self>, root: &Path) -> anyhow::Result<()> {
+        self.ensure_writable()?;
+        let root = root.canonicalize()?;
+        anyhow::ensure!(root.is_dir(), "Library root is not a directory");
+        let (before, updated) = {
+            let _lock = self.settings_lock.lock().await;
+            let before = get_scoped_settings(&self.settings_path, &self.workspace_path).await?;
+            let (roots, _) = library_roots(&before);
+            if roots.iter().any(|registered| root.starts_with(registered)) {
+                return Ok(());
+            }
+            let mut recent_dirs = before.recent_dirs.clone();
+            recent_dirs.push(root);
+            let updated = update_scoped_settings(
+                &self.settings_path,
+                &self.workspace_path,
+                serde_json::json!({ "recent_dirs": recent_dirs }),
+            )
+            .await?;
+            (before, updated)
+        };
+        self.on_directory_setting_maybe_changed(&before, &updated);
+        Ok(())
+    }
+
     pub async fn update_settings(
         self: &Arc<Self>,
         patch: serde_json::Value,

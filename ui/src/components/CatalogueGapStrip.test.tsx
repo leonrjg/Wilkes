@@ -101,7 +101,7 @@ describe("CatalogueGapStrip", () => {
   it("offers what the catalogues hold on the question the library could not answer", async () => {
     render(<CatalogueGapStrip query="confidence intervals" />);
     expect(await screen.findByText("Introductory Statistics")).toBeTruthy();
-    expect(screen.getByText("Nothing here teaches this")).toBeTruthy();
+    expect(screen.getByText("Related learning resources")).toBeTruthy();
     // The strip mixes catalogues, so a row says whose it is.
     expect(screen.getByText(/^OpenStax · Mathematics/)).toBeTruthy();
   });
@@ -126,7 +126,7 @@ describe("CatalogueGapStrip", () => {
       provider("openalex", "OpenAlex", false),
     ]);
     render(<CatalogueGapStrip query="topology" />);
-    expect(await screen.findByText(/have not been fetched yet/i)).toBeTruthy();
+    expect(await screen.findByText(/Sync catalogues in Settings/i)).toBeTruthy();
     expect(search).not.toHaveBeenCalled();
   });
 
@@ -164,9 +164,9 @@ describe("CatalogueGapStrip", () => {
 
   /// Recall is not a ranking, and the strip is the one place a user could
   /// mistake it for one.
-  it("says the order is a text match rather than a recommendation", async () => {
+  it("identifies the ranking as text relevance", async () => {
     render(<CatalogueGapStrip query="confidence" />);
-    expect(await screen.findByText(/not by which is the better place to start/i)).toBeTruthy();
+    expect(await screen.findByText(/Ranked by text relevance/i)).toBeTruthy();
   });
 
   /// A query that reduced to nothing was never looked for, and each catalogue
@@ -195,7 +195,7 @@ describe("CatalogueGapStrip", () => {
   it("distinguishes an unfetched mirror from a genuine absence", async () => {
     providers.mockResolvedValue([provider("openstax", "OpenStax", true, false)]);
     render(<CatalogueGapStrip query="topology" />);
-    expect(await screen.findByText(/have not been fetched yet/i)).toBeTruthy();
+    expect(await screen.findByText(/Sync catalogues in Settings/i)).toBeTruthy();
   });
 
   it("stays silent when the catalogues are held and simply hold nothing", async () => {
@@ -222,14 +222,14 @@ describe("CatalogueGapStrip", () => {
   /// the catalogues until the offer is taken.
   it("offers the catalogues on a non-empty search without querying them", () => {
     render(<CatalogueGapPrompt query="confidence intervals" />);
-    expect(screen.getByText(/Nothing here teaches this\?/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Search learning catalogues" })).toBeTruthy();
     expect(search).not.toHaveBeenCalled();
     expect(providers).not.toHaveBeenCalled();
   });
 
   it("opens the pane on that query when the offer is taken", async () => {
     render(<CatalogueGapPrompt query="confidence intervals" />);
-    fireEvent.click(screen.getByText(/Nothing here teaches this\?/));
+    fireEvent.click(screen.getByRole("button", { name: "Search learning catalogues" }));
     await waitFor(() => {
       expect(useCatalogueStore.getState().paneOpen).toBe(true);
       expect(search).toHaveBeenCalledWith("confidence intervals", 10, undefined);

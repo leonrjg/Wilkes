@@ -32,8 +32,7 @@ export default function ChunkingPanel({ api, settings, onUpdate }: Props) {
         <div className="flex flex-col gap-1.5 mb-4">
           <h3 className="text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Chunking Strategy</h3>
           <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">
-            Configure how files are split into smaller segments before embedding. 
-            Smaller chunks provide more granular search results but less context per match.
+            Smaller chunks give more precise matches with less context.
           </p>
         </div>
 
@@ -88,8 +87,7 @@ export default function ChunkingPanel({ api, settings, onUpdate }: Props) {
         <div className="flex flex-col gap-1">
           <span className="text-[11px] font-bold text-amber-600 uppercase tracking-tight">Rebuild Required</span>
           <p className="text-[10px] text-[var(--text-muted)] leading-relaxed">
-            Changing chunking parameters only affects new files or a full index rebuild. 
-            Existing embeddings will not be updated automatically.
+            Rebuild the index to apply changes to existing files.
           </p>
         </div>
       </div>

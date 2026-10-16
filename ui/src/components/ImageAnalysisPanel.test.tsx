@@ -1,4 +1,5 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useState } from "react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { RecognizerCatalogue, Settings } from "../lib/types";
 import ImageAnalysisPanel from "./ImageAnalysisPanel";
@@ -123,646 +124,325 @@ const INVENTORY = {
   footprint_bytes: 1_928_447_087,
 };
 
-/// The venn paints the reading that happens, so a test about what it paints
-/// needs a configuration that is actually reading: the feature on, and the
-/// page reader on disk.
 const READING = {
   ...SETTINGS,
-  image_analysis: { ...SETTINGS.image_analysis, enabled: true, model: GRANITE.model_id },
+  image_analysis: { ...SETTINGS.image_analysis, enabled: true, model: GRANITE.model_id, disabled_roles: [] },
 } as unknown as Settings;
 
-describe("ImageAnalysisPanel", () => {
+const configured = (patch: Partial<Settings["image_analysis"]> = {}, enabled = true): Settings => ({
+  ...READING, image_analysis: { ...READING.image_analysis, enabled, ...patch },
+});
+const installed = (ids = [GRANITE.model_id, TEXIFY.model_id, SLANET.model_id], layout = true): RecognizerCatalogue => ({
+  ...CATALOGUE,
+  models: CATALOGUE.models.map((model) => ({ ...model, is_cached: ids.includes(model.model_id) })),
+  detector: { ...DETECTOR, is_installed: layout },
+});
+
+describe("OCR configuration", () => {
+  let catalogue: RecognizerCatalogue;
+  const listeners: Record<string, (...args: any[]) => void> = {};
   const api = {
-    imageRecognizerCatalogue: vi.fn(() => Promise.resolve(CATALOGUE)),
-    imageRecognizerInventory: vi.fn(() => Promise.resolve(INVENTORY)),
-    installImageRecognizer: vi.fn(() => Promise.resolve()),
-    onImageAnalysisProgress: vi.fn(() => Promise.resolve(() => {})),
-    onImageAnalysisDone: vi.fn(() => Promise.resolve(() => {})),
-    onImageAnalysisError: vi.fn(() => Promise.resolve(() => {})),
-  } as never;
-
-  const withCatalogue = (catalogue: RecognizerCatalogue) => {
-    (api as unknown as {
-      imageRecognizerCatalogue: () => Promise<RecognizerCatalogue>;
-    }).imageRecognizerCatalogue = vi.fn(() => Promise.resolve(catalogue));
+    imageRecognizerCatalogue: vi.fn(async () => catalogue),
+    imageRecognizerInventory: vi.fn(async () => INVENTORY),
+    installLayoutDetector: vi.fn(async () => {}),
+    installImageRecognizer: vi.fn(async (_engine: string, _id: string) => {}),
+    onImageAnalysisProgress: vi.fn(async (callback: (...args: any[]) => void) => { listeners.progress = callback; return vi.fn(); }),
+    onImageAnalysisDone: vi.fn(async (callback: (...args: any[]) => void) => { listeners.done = callback; return vi.fn(); }),
+    onImageAnalysisError: vi.fn(async (callback: (...args: any[]) => void) => { listeners.error = callback; return vi.fn(); }),
   };
-
   beforeEach(() => {
     vi.clearAllMocks();
-    withCatalogue(CATALOGUE);
-    (api as unknown as { installImageRecognizer: unknown }).installImageRecognizer = vi.fn(
-      () => Promise.resolve(),
-    );
-    (api as unknown as { installLayoutDetector: unknown }).installLayoutDetector = vi.fn(
-      () => Promise.resolve(),
-    );
-  });
-
-  /// The catalogue with one model replaced, addressed by id. Models live in
-  /// one list now, so a test that wants an installed formula reader edits a
-  /// row rather than a field.
-  const withModel = (modelId: string, patch: Record<string, unknown>) =>
-    withCatalogue({
-      ...CATALOGUE,
-      models: CATALOGUE.models.map((model) =>
-        model.model_id === modelId ? { ...model, ...patch } : model,
-      ),
+    catalogue = installed();
+    api.imageRecognizerCatalogue.mockImplementation(async () => catalogue);
+    api.imageRecognizerInventory.mockImplementation(async () => INVENTORY);
+    api.installImageRecognizer.mockImplementation(async (_engine, id) => {
+      catalogue = { ...catalogue, models: catalogue.models.map((model) => model.model_id === id ? { ...model, is_cached: true } : model) };
+      listeners.done?.();
     });
-
-  const panel = (settings: Settings, onUpdateSettings = vi.fn(() => Promise.resolve())) => {
-    render(
-      <ImageAnalysisPanel
-        api={api}
-        settings={settings}
-        onUpdateSettings={onUpdateSettings}
-      />,
-    );
-    return onUpdateSettings;
+    api.installLayoutDetector.mockImplementation(async () => {
+      catalogue = { ...catalogue, detector: { ...DETECTOR, is_installed: true } };
+      listeners.done?.();
+    });
+  });
+  const panel = (initial = READING, update = vi.fn()) => {
+    function Harness() {
+      const [settings, setSettings] = useState(initial);
+      return <ImageAnalysisPanel api={api as never} settings={settings}
+        onUpdateSettings={async (patch) => { update(patch); setSettings((previous) => ({ ...previous, ...patch })); }} />;
+    }
+    render(<Harness />);
+    return update;
+  };
+  const region = (name: string) => within(screen.getByRole("region", { name }));
+  const loaded = () => screen.findByRole("checkbox", { name: "Enable OCR" });
+  const clickReady = async (name: string) => {
+    const action = await screen.findByRole("button", { name });
+    await waitFor(() => expect(action).toBeEnabled());
+    fireEvent.click(action);
   };
 
-  /// The page states machine state and nothing else. What a recognizer is
-  /// for, what it costs and why a formula needs its own reader used to be
-  /// said here in paragraphs; the cost is now raised once, by the warning on
-  /// an enabled-but-unconfigured recognizer, and the rest is not said at all.
-  it("carries no explanatory prose", async () => {
-    panel(SETTINGS);
-    await screen.findByRole("checkbox", { name: /read the text a page draws/i });
-    expect(screen.queryByText(/re-reads and re-embeds/i)).toBeNull();
-    expect(screen.queryByText(/four\s+minutes for a full-width one/i)).toBeNull();
-    expect(screen.queryByText(/an equation a page typesets/i)).toBeNull();
-    expect(screen.queryByText(/ONNX Runtime, in the recognition worker/i)).toBeNull();
+  it("blocks typeset coverage without layout even with all readers installed, and permits disabling", async () => {
+    catalogue = installed(undefined, false);
+    panel();
+    expect(await loaded()).toBeEnabled();
+    expect(region("Formulas").getByText("Effective reader: Requires layout detection")).toBeInTheDocument();
+    expect(region("Tables").getByText("Effective reader: Requires layout detection")).toBeInTheDocument();
+    expect(screen.getAllByText("Setup required").length).toBeGreaterThan(0);
   });
 
-  it("offers the download when the recognizer is missing, and no toggle to enable without it", async () => {
-    panel(SETTINGS);
-
-    const download = await screen.findByRole("button", { name: /download recognizer/i });
-    const toggle = screen.getByRole("checkbox", { name: /read the text a page draws/i });
-    expect((toggle as HTMLInputElement).disabled).toBe(true);
-
-    fireEvent.click(download);
-    await waitFor(() =>
-      expect(
-        (api as unknown as { installImageRecognizer: { mock: { calls: unknown[][] } } })
-          .installImageRecognizer.mock.calls[0],
-      ).toEqual(["Onnx", GRANITE.model_id]),
-    );
+  it("cannot enable default scope with no layout", async () => {
+    catalogue = installed(undefined, false);
+    panel(configured({}, false));
+    expect(await loaded()).toBeDisabled();
   });
 
-  /// FIGURE.md requires the redistributed checkpoint to carry a license and
-  /// provenance inventory. This is where a person meets it, and it has to be
-  /// readable *before* the weights are fetched onto their disk — so it is
-  /// rendered on the uninstalled panel, beside the button that would fetch it.
-  it("discloses the licence, the size and the pinned revision before the download", async () => {
-    panel(SETTINGS);
-
-    await screen.findByRole("button", { name: /download recognizer/i });
-    // The detector is disclosed under the same licence and renders first, so
-    // the recognizer's link is waited for by where it points — not merely for
-    // *a* link saying Apache-2.0, which is already on screen.
-    await waitFor(() =>
-      expect(
-        screen
-          .getAllByRole("link", { name: /apache-2\.0/i })
-          .some((link) => link.getAttribute("href") === INVENTORY.license_url),
-      ).toBe(true),
-    );
-    expect(screen.getByText(/PaddlePaddle\/PaddleOCR-VL-1\.6/)).toBeTruthy();
-    expect(screen.getByText(/c5630abae1d9/)).toBeTruthy();
-    expect(screen.getAllByText(/1\.8 GB/).length).toBeGreaterThan(0);
+  it("allows specialist-only OCR without an installed general reader", async () => {
+    catalogue = installed([TEXIFY.model_id, SLANET.model_id]);
+    const update = panel(configured({ disabled_roles: ["page"] }, false));
+    const toggle = await loaded();
+    expect(toggle).toBeEnabled();
+    fireEvent.click(toggle);
+    await waitFor(() => expect(update).toHaveBeenCalledWith({ image_analysis: expect.objectContaining({ enabled: true, disabled_roles: ["page"] }) }));
+    expect(region("Formulas").getByText(`Effective reader: ${TEXIFY.display_name}`)).toBeInTheDocument();
+    expect(region("Tables").getByText(`Effective reader: ${SLANET.display_name}`)).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Include embedded images" })).toBeDisabled();
   });
 
-  /// Switching engine is not a model choice by itself: the engine's own
-  /// default is what it reads with, and the disclosure follows the selection
-  /// rather than the commitment.
-  it("selects the engine's default recognizer and discloses that one", async () => {
-    panel(SETTINGS);
-    await screen.findByRole("button", { name: /download recognizer/i });
-
-    fireEvent.click(screen.getByRole("button", { name: "Candle" }));
-
-    await waitFor(() =>
-      expect(
-        (api as unknown as {
-          imageRecognizerInventory: { mock: { calls: unknown[][] } };
-        }).imageRecognizerInventory.mock.calls.at(-1),
-      ).toEqual(["Candle", PADDLE.model_id]),
-    );
-    expect(screen.getByText(PADDLE.display_name)).toBeTruthy();
+  it("shows general routing for missing specialists", async () => {
+    catalogue = installed([GRANITE.model_id]);
+    panel(); await loaded();
+    expect(region("Formulas").getByText(`Effective reader: General reader: ${GRANITE.display_name}`)).toBeInTheDocument();
+    expect(region("Tables").getByText(`Effective reader: General reader: ${GRANITE.display_name}`)).toBeInTheDocument();
   });
 
-  /// `build_analyzer` refuses a recognizer that is named but not on disk, so
-  /// the weights have to arrive before the choice is written down. The order
-  /// is the assertion.
-  it("installs a recognizer before committing it to the settings", async () => {
-    const order: string[] = [];
-    (api as unknown as { installImageRecognizer: unknown }).installImageRecognizer = vi.fn(
-      () => {
-        order.push("install");
-        return Promise.resolve();
-      },
-    );
-    const onUpdate = vi.fn(() => {
-      order.push("settings");
-      return Promise.resolve();
-    });
-    panel(SETTINGS, onUpdate);
-    await screen.findByRole("button", { name: /download recognizer/i });
-
-    fireEvent.click(screen.getByRole("button", { name: "Candle" }));
-    fireEvent.click(
-      await screen.findByRole("button", { name: /download recognizer and use it/i }),
-    );
-
-    await waitFor(() => expect(order).toEqual(["install", "settings"]));
-    expect(onUpdate).toHaveBeenCalledWith({
-      image_analysis: {
-        enabled: false,
-        engine: "Candle",
-        model: PADDLE.model_id,
-        device: null,
-        describer_model: "",
-        scope: "typeset_only",
-      },
-    });
+  it("discloses unsupported general output", async () => {
+    catalogue = installed([PADDLE.model_id]);
+    panel(configured({ engine: "Candle", model: PADDLE.model_id })); await loaded();
+    expect(region("Formulas").getByText(/formula output unsupported/)).toBeInTheDocument();
   });
 
-  /// An engine the build left out is shown rather than hidden: absent and
-  /// merely unselected are different answers, and only one of them is a
-  /// property of the build.
-  it("shows an engine this build cannot recognize with, and refuses to select it", async () => {
-    withCatalogue({ engines: ["Onnx"], models: [GRANITE] });
-    panel(SETTINGS);
-
-    // The tooltip lends the button its accessible name, so what a screen
-    // reader is told is why it cannot be chosen. More than one engine can be
-    // out of a build, so the button is picked by the engine it names.
-    const absent = await screen.findAllByRole("button", {
-      name: /feature disabled in this build/i,
-    });
-    const candle = absent.find((button) => button.textContent === "Candle");
-    expect(candle).toBeTruthy();
-    if (!candle) throw new Error("the Candle button is missing");
-    expect((candle as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(candle);
-    expect(screen.getByText(GRANITE.display_name)).toBeTruthy();
+  it("de-selects specialists without uninstalling and shows the effective general reader", async () => {
+    const update = panel(); await loaded();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Use dedicated table reader" }));
+    await waitFor(() => expect(update).toHaveBeenCalledWith({ image_analysis: expect.objectContaining({ disabled_roles: ["table"] }) }));
+    expect(region("Tables").getByText(`Effective reader: General reader: ${GRANITE.display_name}`)).toBeInTheDocument();
+    expect(api.installImageRecognizer).not.toHaveBeenCalled();
   });
 
-  it("persists the toggle as a whole image-analysis object", async () => {
-    withCatalogue({ engines: ["Onnx", "Candle"], models: [{ ...GRANITE, is_cached: true }, PADDLE] });
-    const onUpdate = panel(SETTINGS);
-
-    await waitFor(() =>
-      expect((screen.getByRole("checkbox") as HTMLInputElement).disabled).toBe(false),
-    );
-    fireEvent.click(screen.getByRole("checkbox"));
-    await waitFor(() =>
-      expect(onUpdate).toHaveBeenCalledWith({
-        image_analysis: {
-          enabled: true,
-          engine: "Onnx",
-          model: null,
-          device: null,
-          describer_model: "",
-          scope: "typeset_only",
-        },
-      }),
-    );
+  it("switches off general OCR while specialists remain active", async () => {
+    const update = panel(); await loaded();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Use general reader" }));
+    await waitFor(() => expect(update).toHaveBeenCalledWith({ image_analysis: expect.objectContaining({ enabled: true, disabled_roles: ["page"] }) }));
+    expect(region("Formulas").getByText(`Effective reader: ${TEXIFY.display_name}`)).toBeInTheDocument();
   });
 
-  /// A remote describer sends the pictures in the user's documents to another
-  /// machine. Naming the server it would go to is the disclosure.
-  it("names the server a description would be sent to", async () => {
-    panel(SETTINGS);
-    await screen.findByText(/http:\/\/127\.0\.0\.1:11434/);
-    expect(screen.getByText(/sent to it/i)).toBeTruthy();
-  });
-
-  it("saves the describer model only once it has changed", async () => {
-    const onUpdate = panel(SETTINGS);
-    const save = await screen.findByRole("button", { name: /^save$/i });
-    expect((save as HTMLButtonElement).disabled).toBe(true);
-
-    fireEvent.change(screen.getByPlaceholderText("qwen3-vl:2b"), {
-      target: { value: " qwen3-vl:4b " },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
-    await waitFor(() =>
-      expect(onUpdate).toHaveBeenCalledWith({
-        image_analysis: {
-          enabled: false,
-          engine: "Onnx",
-          model: null,
-          device: null,
-          describer_model: "qwen3-vl:4b",
-          scope: "typeset_only",
-        },
-      }),
-    );
-  });
-
-  /// Neither download is required any more — a reading runs without them —
-  /// so what the panel owes the user is what each one's absence costs, stated
-  /// where the download is offered. Without the detector nothing a page
-  /// typesets is marked out, and a document full of mathematics reads exactly
-  /// like one with none.
-  it("offers the detector and says what its absence costs", async () => {
-    // The formula reader is installed here so the only absence this test can
-    // see is the detector's. Both sections say what theirs costs.
-    withModel(TEXIFY.model_id, { is_cached: true });
-    panel(SETTINGS);
-
-    await screen.findByText(DETECTOR.inventory.name);
-    expect(
-      screen.getByText(/nothing a page typesets will be marked out/i),
-    ).toBeTruthy();
-
-    fireEvent.click(screen.getByRole("button", { name: /download detector/i }));
-    await waitFor(() =>
-      expect(
-        (api as unknown as { installLayoutDetector: () => void }).installLayoutDetector,
-      ).toHaveBeenCalled(),
-    );
-  });
-
-  /// The formula reader is a catalogue row, so installing it is installing a
-  /// recognizer — there is no second install path. It is still offered in its
-  /// own section, because it runs alongside the page reader rather than
-  /// instead of one.
-  it("installs the formula reader through the recognizer install", async () => {
-    panel(SETTINGS);
-
-    await screen.findAllByText(TEXIFY.display_name);
-    fireEvent.click(screen.getByRole("button", { name: /download formula reader/i }));
-    await waitFor(() =>
-      expect(
-        (api as unknown as { installImageRecognizer: (e: string, m: string) => void })
-          .installImageRecognizer,
-      ).toHaveBeenCalledWith(TEXIFY.engine, TEXIFY.model_id),
-    );
-  });
-
-  /// An absent `formula_model` is Texify because Texify declares itself the
-  /// role default, not because it comes first: a newly installed alternative
-  /// that reordered the catalogue would otherwise silently change what every
-  /// existing library is read with.
-  it("holds the formula default against catalogue order, and saves a choice", async () => {
-    withCatalogue({ ...CATALOGUE, models: [PP_FORMULANET, ...CATALOGUE.models] });
-    const update = panel(READING);
-
-    const selector = await screen.findByRole("combobox", { name: "Formula model" });
-    expect(selector).toHaveValue(TEXIFY.model_id);
-
-    fireEvent.change(selector, { target: { value: PP_FORMULANET.model_id } });
-    await waitFor(() =>
-      expect(update).toHaveBeenCalledWith({
-        image_analysis: expect.objectContaining({
-          formula_model: PP_FORMULANET.model_id,
-          model: GRANITE.model_id,
-        }),
-      }),
-    );
-  });
-
-  /// The section belongs to the selected reader, not to the default one, so
-  /// the download offered is the one the settings would actually load. The
-  /// role switch is by role and stays untouched by the choice.
-  it("offers the selected formula reader's download, leaving the role switch alone", async () => {
-    withCatalogue({ ...CATALOGUE, models: [...CATALOGUE.models, PP_FORMULANET] });
-    const update = panel({
-      ...READING,
-      image_analysis: {
-        ...READING.image_analysis,
-        formula_model: PP_FORMULANET.model_id,
-        disabled_roles: ["formula" as const],
-      },
-    } as unknown as Settings);
-
-    expect(await screen.findByRole("combobox", { name: "Formula model" })).toHaveValue(
-      PP_FORMULANET.model_id,
-    );
-    fireEvent.click(screen.getByRole("button", { name: /download formula reader/i }));
-    await waitFor(() =>
-      expect(
-        (api as unknown as { installImageRecognizer: (e: string, m: string) => void })
-          .installImageRecognizer,
-      ).toHaveBeenCalledWith(PP_FORMULANET.engine, PP_FORMULANET.model_id),
-    );
+  it("refuses to switch off the last usable reader while OCR is on", async () => {
+    catalogue = installed([GRANITE.model_id]);
+    const update = panel(); await loaded();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Use general reader" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Complete OCR setup");
     expect(update).not.toHaveBeenCalled();
   });
 
-  /// A settings file naming a reader this build does not ship is held and
-  /// named, not quietly resolved to the default: substituting would re-read
-  /// the whole library under a model nobody chose. The card goes with it,
-  /// because there is no reader here whose cost and licence it could state.
-  it("names a formula reader this build does not ship rather than replacing it", async () => {
-    panel({
-      ...READING,
-      image_analysis: { ...READING.image_analysis, formula_model: "gone" },
-    } as unknown as Settings);
-
-    const selector = await screen.findByRole("combobox", { name: "Formula model" });
-    expect(selector).toHaveValue("gone");
-    expect(screen.getByRole("option", { name: /unavailable: gone/i })).toBeTruthy();
-    expect(
-      screen.queryByRole("button", { name: /download formula reader/i }),
-    ).toBeNull();
+  it("shows None for uncovered content in specialist-only mode", async () => {
+    catalogue = installed([SLANET.model_id]);
+    panel(configured({ disabled_roles: ["page"] })); await loaded();
+    expect(region("Formulas").getByText("Effective reader: None")).toBeInTheDocument();
   });
 
-  /// The table reader is a catalogue row too, so the same install path serves
-  /// it. Its own section beside the formula reader's, because it runs
-  /// alongside the page reader rather than instead of one.
-  it("installs the table reader through the recognizer install", async () => {
+  it("allows embedded images without layout and labels partial coverage", async () => {
+    catalogue = installed([GRANITE.model_id], false);
+    const update = panel(configured({}, false)); await loaded();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Include embedded images" }));
+    await waitFor(() => expect(update).toHaveBeenCalledWith({ image_analysis: expect.objectContaining({ scope: "typeset_and_embedded" }) }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Enable OCR" }));
+    await screen.findByText("Partial coverage");
+    expect(region("Embedded images").getByText(`Effective reader: ${GRANITE.display_name}`)).toBeInTheDocument();
+    expect(region("Tables").getByText("Effective reader: Requires layout detection")).toBeInTheDocument();
+  });
+
+  it("names a build without layout and permits its embedded-image path", async () => {
+    catalogue = { ...installed([GRANITE.model_id]), detector: null };
+    panel(configured({ scope: "typeset_and_embedded" })); await loaded();
+    expect(region("Tables").getByText("Effective reader: Unavailable in this build")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Install layout detection" })).not.toBeInTheDocument();
+    expect(screen.getByText("Partial coverage")).toBeInTheDocument();
+  });
+
+  it("holds saved coverage until the selected general reader is installed and applied", async () => {
+    const update = panel(); await loaded();
+    fireEvent.change(screen.getByRole("combobox", { name: "General reader model" }), { target: { value: `Candle:${PADDLE.model_id}` } });
+    expect(region("General reader").getByText(`Saved reader: ${GRANITE.display_name}`)).toBeInTheDocument();
+    expect(update).not.toHaveBeenCalled();
+    await clickReady("Install general reader and use it");
+    await waitFor(() => expect(update).toHaveBeenCalledWith({ image_analysis: expect.objectContaining({ engine: "Candle", model: PADDLE.model_id }) }));
+    expect(api.installImageRecognizer).toHaveBeenCalledWith("Candle", PADDLE.model_id);
+    expect(region("General reader").getByText(`Saved reader: ${PADDLE.display_name}`)).toBeInTheDocument();
+  });
+
+  it("holds the formula default against catalogue order and installs before applying", async () => {
+    catalogue = { ...catalogue, models: [PP_FORMULANET, ...catalogue.models] };
+    const update = panel(); await loaded();
+    const selector = screen.getByRole("combobox", { name: "Formula model" });
+    expect(selector).toHaveValue(TEXIFY.model_id);
+    fireEvent.change(selector, { target: { value: PP_FORMULANET.model_id } });
+    expect(region("Formulas").getByText(`Effective reader: ${TEXIFY.display_name}`)).toBeInTheDocument();
+    expect(update).not.toHaveBeenCalled();
+    await clickReady("Install formula reader and use it");
+    await waitFor(() => expect(update).toHaveBeenCalledWith({ image_analysis: expect.objectContaining({ formula_model: PP_FORMULANET.model_id }) }));
+    expect(api.installImageRecognizer).toHaveBeenCalledWith("Onnx", PP_FORMULANET.model_id);
+  });
+
+  it("installs missing layout and formula together without changing role selection", async () => {
+    catalogue = CATALOGUE;
+    const update = panel(configured({ disabled_roles: ["page", "formula"] }, false));
+    await clickReady("Install required models for formula");
+    await waitFor(() => expect(api.installLayoutDetector).toHaveBeenCalledOnce());
+    expect(api.installImageRecognizer).toHaveBeenCalledWith("Onnx", TEXIFY.model_id);
+    expect(update).not.toHaveBeenCalled();
+    expect(screen.getByRole("checkbox", { name: "Use dedicated formula reader" })).not.toBeChecked();
+  });
+
+  it("installs tables through the recognizer API", async () => {
+    catalogue = installed([GRANITE.model_id]); panel();
+    await clickReady("Install table reader");
+    await waitFor(() => expect(api.installImageRecognizer).toHaveBeenCalledWith("Onnx", SLANET.model_id));
+  });
+
+  it("discloses licenses, provenance, and combined size before downloading", async () => {
+    catalogue = CATALOGUE; panel(SETTINGS);
+    const action = await screen.findByRole("button", { name: "Install required models for formula" });
+    await waitFor(() => expect(action).toBeEnabled());
+    expect(region("Formulas").getByRole("link", { name: INVENTORY.license })).toHaveAttribute("href", INVENTORY.license_url);
+    expect(screen.getByRole("region", { name: "Page regions" })).toHaveTextContent(DETECTOR.inventory.name);
+    expect(region("Formulas").getByText("510 MB download")).toBeInTheDocument();
+    expect(region("Formulas").getByText(INVENTORY.revision)).toBeInTheDocument();
+  });
+
+  it("does not apply a model when installation fails", async () => {
+    api.installImageRecognizer.mockRejectedValueOnce(new Error("Download failed"));
+    const update = panel(); await loaded();
+    fireEvent.change(screen.getByRole("combobox", { name: "General reader model" }), { target: { value: `Candle:${PADDLE.model_id}` } });
+    await clickReady("Install general reader and use it");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Download failed");
+    expect(update).not.toHaveBeenCalled();
+    expect(screen.getByRole("checkbox", { name: "Enable OCR" })).toBeEnabled();
+  });
+
+  it("keeps controls locked across intermediate installation completion events", async () => {
+    catalogue = CATALOGUE;
+    let finish!: () => void;
+    api.installLayoutDetector.mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    panel(SETTINGS); await clickReady("Install required models for formula");
+    await waitFor(() => expect(api.installLayoutDetector).toHaveBeenCalled());
+    expect(screen.getByRole("combobox", { name: "General reader model" })).toBeDisabled();
+    finish();
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "General reader model" })).toBeEnabled());
+  });
+
+  it("preserves an unavailable formula selection and blocks enabling", async () => {
+    const update = panel(configured({ formula_model: "gone", disabled_roles: ["formula"] }, false)); await loaded();
+    expect(screen.getByRole("combobox", { name: "Formula model" })).toHaveValue("gone");
+    expect(screen.getByRole("option", { name: "Unavailable: gone" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Enable OCR" })).toBeDisabled();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("never offers specialists or unavailable engines as general models", async () => {
+    panel(); await loaded();
+    const selector = screen.getByRole("combobox", { name: "General reader model" });
+    expect(within(selector).queryByRole("option", { name: /Texify|SLANet/ })).not.toBeInTheDocument();
+    expect(within(selector).queryByRole("option", { name: /Apple Vision/ })).not.toBeInTheDocument();
+  });
+
+  it("reveals descriptions on request, saves a trimmed model, and explicitly disables", async () => {
+    const update = panel(configured({ scope: "typeset_and_embedded" })); await loaded();
+    expect(screen.queryByRole("textbox", { name: "Ollama description model" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Enable image descriptions", hidden: true }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Ollama description model" }), { target: { value: " qwen3-vl:4b " } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(update).toHaveBeenCalledWith({ image_analysis: expect.objectContaining({ describer_model: "qwen3-vl:4b" }) }));
+    expect(screen.getByText(/Image destination:/)).toHaveTextContent("http://127.0.0.1:11434");
+    fireEvent.click(screen.getByRole("checkbox", { name: "Enable image descriptions" }));
+    await waitFor(() => expect(update).toHaveBeenLastCalledWith({ image_analysis: expect.objectContaining({ describer_model: "" }) }));
+  });
+
+  it("recovers from catalogue loading failure", async () => {
+    api.imageRecognizerCatalogue.mockRejectedValueOnce(new Error("Catalogue unavailable")); panel();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Catalogue unavailable");
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading OCR components" }));
+    await loaded();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+  it("keeps disabled roles when an alternative formula model is downloaded and applied", async () => {
+    catalogue = { ...catalogue, models: [...catalogue.models, PP_FORMULANET] };
+    const update = panel(configured({ disabled_roles: ["formula"] })); await loaded();
+    fireEvent.change(screen.getByRole("combobox", { name: "Formula model" }), { target: { value: PP_FORMULANET.model_id } });
+    await clickReady("Install formula reader and use it");
+    await waitFor(() => expect(update).toHaveBeenCalledWith({ image_analysis: expect.objectContaining({ formula_model: PP_FORMULANET.model_id, disabled_roles: ["formula"] }) }));
+    expect(region("Formulas").getByText(`Effective reader: General reader: ${GRANITE.display_name}`)).toBeInTheDocument();
+  });
+
+  it("keeps an unavailable saved general reader visible while allowing specialist-only repair", async () => {
+    const update = panel(configured({ model: "gone" }, false)); await loaded();
+    expect(screen.getByRole("option", { name: "Unavailable: gone" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Enable OCR" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Use general reader" }));
+    await waitFor(() => expect(update).toHaveBeenCalledWith({ image_analysis: expect.objectContaining({ model: "gone", disabled_roles: ["page"] }) }));
+    expect(screen.getByRole("checkbox", { name: "Enable OCR" })).toBeEnabled();
+  });
+
+  it("requires successful license disclosure before downloading and permits a retry", async () => {
+    catalogue = CATALOGUE;
+    api.imageRecognizerInventory.mockRejectedValue(new Error("Inventory unavailable"));
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
     panel(SETTINGS);
-
-    await screen.findAllByText(SLANET.display_name);
-    fireEvent.click(screen.getByRole("button", { name: /download table reader/i }));
-    await waitFor(() =>
-      expect(
-        (api as unknown as { installImageRecognizer: (e: string, m: string) => void })
-          .installImageRecognizer,
-      ).toHaveBeenCalledWith(SLANET.engine, SLANET.model_id),
-    );
+    const action = await screen.findByRole("button", { name: "Install required models for formula" });
+    await waitFor(() => expect(log).toHaveBeenCalled());
+    expect(action).toBeDisabled();
+    expect(api.installImageRecognizer).not.toHaveBeenCalled();
+    api.imageRecognizerInventory.mockResolvedValue(INVENTORY);
+    fireEvent.click(region("Formulas").getByRole("button", { name: "Load model details" }));
+    await waitFor(() => expect(action).toBeEnabled());
+    log.mockRestore();
   });
 
-  /// Offered as the page recognizer it would answer an empty grid for every
-  /// page of the library, which afterwards is indistinguishable from a library
-  /// whose pictures hold no text.
-  it("never offers the table reader as the page recognizer", async () => {
-    panel(SETTINGS);
-
-    await screen.findAllByText(SLANET.display_name);
-    expect(screen.queryByText(SLANET.description)).toBeNull();
+  it("retains successful downloads but does not apply a draft after layout installation fails", async () => {
+    catalogue = installed([GRANITE.model_id], false);
+    api.installLayoutDetector.mockRejectedValueOnce(new Error("Layout download failed"));
+    const update = panel(configured({}, false)); await loaded();
+    fireEvent.change(screen.getByRole("combobox", { name: "General reader model" }), { target: { value: `Candle:${PADDLE.model_id}` } });
+    await clickReady("Install required models for general");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Layout download failed");
+    expect(api.installImageRecognizer).toHaveBeenCalledWith("Candle", PADDLE.model_id);
+    expect(update).not.toHaveBeenCalled();
+    expect(region("General reader").getByText(`Saved reader: ${GRANITE.display_name}`)).toBeInTheDocument();
   });
 
-  it("says nothing about installing a table reader that is already here", async () => {
-    withModel(SLANET.model_id, { is_cached: true });
-    panel(SETTINGS);
-
-    await screen.findAllByText(SLANET.display_name);
-    expect(
-      screen.queryByRole("button", { name: /download table reader/i }),
-    ).toBeNull();
+  it("prevents removing the only processing scope when layout is absent", async () => {
+    catalogue = installed([GRANITE.model_id], false);
+    const update = panel(configured({ scope: "typeset_and_embedded" })); await loaded();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Include embedded images" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Complete OCR setup");
+    expect(update).not.toHaveBeenCalled();
   });
 
-  /// A formula reader reads one cropped expression and emits a single
-  /// whole-crop region. Offered as the page recognizer it would read every
-  /// page of the library as one failed expression, which afterwards is
-  /// indistinguishable from a library whose pictures hold no text.
-  it("never offers the formula reader as the page recognizer", async () => {
-    panel(SETTINGS);
-
-    await screen.findAllByText(TEXIFY.display_name);
-    expect(screen.queryByText(TEXIFY.description)).toBeNull();
+  it("ignores stale catalogue responses during installation refreshes", async () => {
+    panel(); await loaded();
+    let finish!: (value: RecognizerCatalogue) => void;
+    api.imageRecognizerCatalogue.mockImplementationOnce(() => new Promise<RecognizerCatalogue>((resolve) => { finish = resolve; }));
+    await act(async () => { listeners.done(); });
+    await act(async () => { listeners.done(); });
+    await act(async () => { finish(installed(undefined, false)); });
+    expect(region("Formulas").getByText(`Effective reader: ${TEXIFY.display_name}`)).toBeInTheDocument();
+    expect(screen.getByText("Ready")).toBeInTheDocument();
   });
 
-  it("says nothing about installing a formula reader that is already here", async () => {
-    withModel(TEXIFY.model_id, { is_cached: true });
-    panel(SETTINGS);
-
-    await screen.findAllByText(TEXIFY.display_name);
-    expect(
-      screen.queryByRole("button", { name: /download formula reader/i }),
-    ).toBeNull();
+  it("does not substitute defaults for explicit empty saved model IDs", async () => {
+    panel(configured({ model: "", formula_model: "" }, false)); await loaded();
+    expect(screen.getByRole("checkbox", { name: "Enable OCR" })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "General reader model" })).toHaveValue("Onnx:");
+    expect(screen.getByRole("combobox", { name: "Formula model" })).toHaveValue("");
   });
 
-  /// The whole claim of the diagram: a page reader that says it emits
-  /// formulas and tables owns those boxes, and owns them in its own colour,
-  /// so a user can see that installing nothing else still reads them.
-  it("paints every box in the page reader's colour when it emits every kind", async () => {
-    withModel(GRANITE.model_id, { is_cached: true });
-    panel(READING);
-
-    const outer = await screen.findByTestId("venn-page");
-    const formulas = screen.getByTestId("venn-formula");
-    const tables = screen.getByTestId("venn-table");
-
-    // A colour, and not the empty background: painted means read.
-    expect(outer.style.background).not.toBe("var(--bg-app)");
-    expect(formulas.style.background).toBe(outer.style.background);
-    expect(tables.style.background).toBe(outer.style.background);
-    expect(formulas.textContent).toContain(GRANITE.display_name);
-    expect(tables.textContent).toContain(GRANITE.display_name);
-  });
-
-  /// And the precedence: the specialists take their own boxes back the moment
-  /// they are on disk, while the page reader keeps the padding around them.
-  /// This is the reading the extraction actually performs, and the reason the
-  /// boxes are nested rather than listed.
-  it("gives each inner box back to its own reader, leaving the page reader the padding", async () => {
-    withCatalogue({
-      ...CATALOGUE,
-      models: CATALOGUE.models.map((model) =>
-        [GRANITE.model_id, TEXIFY.model_id, SLANET.model_id].includes(model.model_id)
-          ? { ...model, is_cached: true }
-          : model,
-      ),
-    });
-    panel(READING);
-
-    const outer = await screen.findByTestId("venn-page");
-    const formulas = screen.getByTestId("venn-formula");
-    const tables = screen.getByTestId("venn-table");
-
-    expect(outer.style.background).not.toBe("var(--bg-app)");
-    expect(formulas.style.background).not.toBe(outer.style.background);
-    expect(tables.style.background).not.toBe(outer.style.background);
-    expect(formulas.style.background).not.toBe(tables.style.background);
-    expect(formulas.textContent).toContain(TEXIFY.display_name);
-    expect(tables.textContent).toContain(SLANET.display_name);
-    // The padding is what is left: prose, and no kind a specialist took.
-    expect(outer.textContent).toContain("Reads text across the whole page.");
-  });
-
-  /// A page reader that cannot read a kind, and no specialist installed, is a
-  /// kind nothing reads — and the box must say so rather than inherit the
-  /// colour of a model that would return prose for it.
-  it("leaves a box unfilled when neither the page reader nor a specialist reads it", async () => {
-    const candle = {
-      ...SETTINGS,
-      image_analysis: {
-        ...SETTINGS.image_analysis,
-        enabled: true,
-        engine: "Candle",
-        model: PADDLE.model_id,
-      },
-    } as unknown as Settings;
-    withModel(PADDLE.model_id, { is_cached: true });
-    panel(candle);
-
-    const formulas = await screen.findByTestId("venn-formula");
-    expect(formulas.style.background).toBe("var(--bg-app)");
-    expect(formulas.style.borderStyle).toBe("dashed");
-  });
-
-  /// The point of de-selection: the weights stay, and the reading changes.
-  /// Before this there was no way to say "not this one" short of deleting the
-  /// download, which is a different question with a different cost.
-  it("de-selects a reader without touching its download", async () => {
-    withCatalogue({
-      ...CATALOGUE,
-      models: CATALOGUE.models.map((model) =>
-        [GRANITE.model_id, SLANET.model_id].includes(model.model_id)
-          ? { ...model, is_cached: true }
-          : model,
-      ),
-    });
-    const onUpdate = panel(READING);
-
-    fireEvent.click(
-      await screen.findByRole("checkbox", { name: /use slanet-plus for tables/i }),
-    );
-    await waitFor(() =>
-      expect(onUpdate).toHaveBeenCalledWith({
-        image_analysis: expect.objectContaining({ disabled_roles: ["table"] }),
-      }),
-    );
-    // Nothing was uninstalled to say it.
-    expect(
-      (api as unknown as { installImageRecognizer: { mock: { calls: unknown[][] } } })
-        .installImageRecognizer.mock.calls,
-    ).toHaveLength(0);
-  });
-
-  /// And what de-selecting *means* on the page: the kind falls back to the
-  /// page reader, in the page reader's colour, exactly as it does when the
-  /// specialist was never downloaded. Same reading, same recipe.
-  it("hands a de-selected reader's box back to the page reader", async () => {
-    withCatalogue({
-      ...CATALOGUE,
-      models: CATALOGUE.models.map((model) =>
-        [GRANITE.model_id, SLANET.model_id].includes(model.model_id)
-          ? { ...model, is_cached: true }
-          : model,
-      ),
-    });
-    panel({
-      ...READING,
-      image_analysis: { ...READING.image_analysis, disabled_roles: ["table"] },
-    } as unknown as Settings);
-
-    const outer = await screen.findByTestId("venn-page");
-    const tables = screen.getByTestId("venn-table");
-    expect(tables.style.background).toBe(outer.style.background);
-    expect(tables.textContent).toContain(GRANITE.display_name);
-    expect(
-      (screen.getByRole("checkbox", { name: /use slanet-plus for tables/i }) as HTMLInputElement)
-        .checked,
-    ).toBe(false);
-  });
-
-  /// Un-checking the outer box de-selects one reader among three. The feature
-  /// stays on and the specialists keep reading the areas the detector marks
-  /// out for them; what the page reader alone held — charts, scanned figures,
-  /// the text inside a diagram — stops being read.
-  it("de-selects general OCR without turning image analysis off", async () => {
-    withCatalogue({
-      ...CATALOGUE,
-      models: CATALOGUE.models.map((model) =>
-        [GRANITE.model_id, SLANET.model_id].includes(model.model_id)
-          ? { ...model, is_cached: true }
-          : model,
-      ),
-    });
-    const onUpdate = panel(READING);
-
-    fireEvent.click(await screen.findByRole("checkbox", { name: /use general ocr/i }));
-    await waitFor(() =>
-      expect(onUpdate).toHaveBeenCalledWith({
-        image_analysis: expect.objectContaining({
-          enabled: true,
-          disabled_roles: ["page"],
-        }),
-      }),
-    );
-  });
-
-  /// The one configuration the backend refuses: nothing left attached. Said
-  /// before the write rather than reported back as a failed save, because the
-  /// settings that would cause it are still on screen.
-  it("refuses to switch off the last reader that is installed", async () => {
-    withModel(GRANITE.model_id, { is_cached: true });
-    const onUpdate = panel(READING);
-
-    fireEvent.click(await screen.findByRole("checkbox", { name: /use general ocr/i }));
-    expect(await screen.findByText(/switch off every reader/i)).toBeInTheDocument();
-    expect(onUpdate).not.toHaveBeenCalled();
-  });
-
-  /// A reader that is not here cannot be de-selected, because it is not doing
-  /// anything to stop. Offering the checkbox anyway would make "off" mean two
-  /// different things in the same box.
-  it("cannot de-select a reader that is not installed", async () => {
-    panel(READING);
-
-    const box = await screen.findByRole("checkbox", { name: /use texify for formulas/i });
-    expect((box as HTMLInputElement).disabled).toBe(true);
-  });
-
-  /// What a box says now is what a colour cannot: which reader is missing
-  /// from it, and where those areas go instead. That line follows the focus.
-  it("shows the focused box's missing reader", async () => {
-    panel(SETTINGS);
-
-    fireEvent.click(await screen.findByRole("button", { name: /tables/i }));
-    expect(screen.getByText(/ruled tables will go to the page reader/i)).toBeTruthy();
-
-    fireEvent.click(screen.getByRole("button", { name: /formulas/i }));
-    expect(screen.getByText(/formulas will go to the page reader/i)).toBeTruthy();
-  });
-
-  it("says nothing about installing a detector that is already here", async () => {
-    withCatalogue({
-      ...CATALOGUE,
-      models: CATALOGUE.models.map((model) =>
-        model.model_id === TEXIFY.model_id ? { ...model, is_cached: true } : model,
-      ),
-      detector: { ...DETECTOR, is_installed: true },
-    });
-    panel(SETTINGS);
-
-    await screen.findByText(DETECTOR.inventory.name);
-    expect(screen.queryByRole("button", { name: /download detector/i })).toBeNull();
-    expect(
-      screen.queryByText(/nothing a page typesets will be marked out/i),
-    ).toBeNull();
-  });
-
-  /// The scope is what decides whether this feature costs seconds or an
-  /// overnight run, so it is offered — and it is offered only once there is
-  /// something to scope, which is why it is absent while the feature is off.
-  it("offers the scope only while image analysis is on, and persists it", async () => {
-    withCatalogue({
-      engines: ["Onnx", "Candle"],
-      models: [{ ...GRANITE, is_cached: true }, PADDLE],
-    });
-    panel(SETTINGS);
-    await waitFor(() => expect(screen.queryByRole("radio")).toBeNull());
-
-    const enabled = {
-      ...SETTINGS,
-      image_analysis: { ...SETTINGS.image_analysis, enabled: true },
-    } as unknown as Settings;
-    const onUpdate = panel(enabled);
-
-    const wider = await screen.findByRole("radio", { name: /every picture/i });
-    expect(
-      (screen.getByRole("radio", { name: /formulas and tables only/i }) as HTMLInputElement)
-        .checked,
-    ).toBe(true);
-
-    fireEvent.click(wider);
-    await waitFor(() =>
-      expect(onUpdate).toHaveBeenCalledWith({
-        image_analysis: {
-          enabled: true,
-          engine: "Onnx",
-          model: null,
-          device: null,
-          describer_model: "",
-          scope: "typeset_and_embedded",
-        },
-      }),
-    );
-  });
 });

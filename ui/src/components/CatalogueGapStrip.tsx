@@ -108,9 +108,8 @@ export default function CatalogueGapStrip({ query }: Props) {
     return (
       <div className="mx-4 mb-4 rounded-lg border border-[var(--border-main)] bg-[var(--bg-active)] px-3 py-2">
         <p className="text-[10px] leading-relaxed text-[var(--text-muted)]">
-          The learning catalogues have not been fetched yet. Settings ›
-          Integrations › Catalogues will fill them, and this search can then
-          suggest open textbooks and courses when your library has nothing.
+          Sync catalogues in Settings › Integrations › Catalogues to get
+          textbook and course suggestions.
         </p>
       </div>
     );
@@ -120,7 +119,7 @@ export default function CatalogueGapStrip({ query }: Props) {
     <div className="mx-4 mb-4 rounded-lg border border-[var(--border-main)] bg-[var(--bg-active)] px-3 py-2 text-left">
       <div className="flex items-center justify-between gap-2 pb-1">
         <h3 className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-dim)]">
-          Nothing here teaches this
+          Related learning resources
         </h3>
         <button
           type="button"
@@ -134,8 +133,7 @@ export default function CatalogueGapStrip({ query }: Props) {
         </button>
       </div>
       <p className="pb-1 text-[10px] leading-relaxed text-[var(--text-muted)]">
-        Open textbooks, courses and documentation that mention it. Ordered by a
-        text match, not by which is the better place to start.
+        Ranked by text relevance.
       </p>
       <div className="divide-y divide-[var(--border-main)]">
         {gap.offers.map(({ provider, name, work }) => (
@@ -175,7 +173,7 @@ export function CatalogueGapPrompt({ query }: Props) {
         }}
         className="text-[10px] text-[var(--text-dim)] underline transition-colors hover:text-[var(--text-main)]"
       >
-        Nothing here teaches this? Search the open catalogues
+        Search learning catalogues
       </button>
     </div>
   );

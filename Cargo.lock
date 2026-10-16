@@ -8910,7 +8910,7 @@ dependencies = [
 
 [[package]]
 name = "wilkes-agent"
-version = "0.9.5"
+version = "1.0.0-rc.1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -8937,7 +8937,7 @@ dependencies = [
 
 [[package]]
 name = "wilkes-api"
-version = "0.9.5"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8981,7 +8981,7 @@ dependencies = [
 
 [[package]]
 name = "wilkes-core"
-version = "0.9.5"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9040,7 +9040,7 @@ dependencies = [
 
 [[package]]
 name = "wilkes-desktop"
-version = "0.9.5"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "clipboard-files",
@@ -9065,7 +9065,7 @@ dependencies = [
 
 [[package]]
 name = "wilkes-rust-worker"
-version = "0.9.5"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9079,7 +9079,7 @@ dependencies = [
 
 [[package]]
 name = "wilkes-server"
-version = "0.9.5"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",

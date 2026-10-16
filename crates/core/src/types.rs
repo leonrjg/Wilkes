@@ -1996,7 +1996,7 @@ pub enum ImageScope {
 /// Off by default, and deliberately not a quiet default-on: turning it on
 /// installs a recognizer, and it changes the extraction recipe, which re-reads
 /// and re-embeds every document that has a picture in it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageAnalysisSettings {
     #[serde(default)]
     pub enabled: bool,
@@ -2012,7 +2012,7 @@ pub struct ImageAnalysisSettings {
     /// The recognizer's model id. Absent takes the engine's default.
     #[serde(default)]
     pub model: Option<String>,
-    /// Formula recognizer id. Absent preserves the catalogue default (Texify).
+    /// Formula recognizer id. Absent uses the catalogue default (PP-FormulaNet_plus-S).
     #[serde(default)]
     pub formula_model: Option<String>,
     /// "auto", "cpu", "metal". Absent takes the recognizer's default.
@@ -2062,12 +2062,29 @@ pub struct ImageAnalysisSettings {
     /// reads as a library whose pictures hold no text, so it is an error and
     /// not a build.
     ///
-    /// Empty by default, which is what every settings file written before
-    /// this field existed says: every installed reader is spent, the recipe
-    /// is the one those libraries were read under, and nothing is re-read on
-    /// upgrade.
-    #[serde(default)]
+    /// The general reader is off by default. An explicitly saved list keeps
+    /// the user's reader choices, including an empty list that enables all roles.
+    #[serde(default = "default_disabled_image_roles")]
     pub disabled_roles: Vec<crate::extract::image::dispatch::RecognizerRole>,
+}
+
+fn default_disabled_image_roles() -> Vec<crate::extract::image::dispatch::RecognizerRole> {
+    vec![crate::extract::image::dispatch::RecognizerRole::Page]
+}
+
+impl Default for ImageAnalysisSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            engine: Default::default(),
+            model: None,
+            formula_model: None,
+            device: None,
+            describer_model: String::new(),
+            scope: Default::default(),
+            disabled_roles: default_disabled_image_roles(),
+        }
+    }
 }
 
 /// Tasks whose sampling the user may override.

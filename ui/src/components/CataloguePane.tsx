@@ -205,33 +205,23 @@ export default function CataloguePane() {
         {!asked && (
           <>
             <Note>
-              Describe what you are trying to understand. Every source that is on
-              is asked: the open catalogues of textbooks, courses and
-              documentation you have fetched, and the indexes you have enabled,
-              both in Settings › Integrations.
+              Search your enabled catalogues and indexes.
             </Note>
             {browsable.length > 0 && (
               <Note>
-                No keyword needed to explore:{" "}
+                Browse without keywords:{" "}
                 <button
                   type="button"
                   onClick={() => setBrowseOpen(true)}
                   className="font-bold text-[var(--accent-blue)] hover:underline"
                 >
                   open Filters
-                </button>{" "}
-                to list{" "}
-                {browsable
-                  .map((id) => providerOptions.find((o) => o.provider === id)?.name ?? id)
-                  .join(", ")}{" "}
-                works by year, type, citations and more.
+                </button>.
               </Note>
             )}
             {browsable.length > 0 && generationReady && (
               <Note>
-                Or say it in a sentence — “open-access reviews on CRISPR since 2020,
-                most cited first” — and press the lightning button to have the
-                filters set for you.
+                Use the lightning button to turn a search description into filters.
               </Note>
             )}
           </>
@@ -1244,9 +1234,7 @@ function ProviderResults({
   if (answer !== null && answer.providers.length === 0 && listed.length === 0) {
     return (
       <Note>
-        No source is on, so nothing was searched. Settings › Integrations fetches
-        the open catalogues, and turns on the indexes that ship with Wilkes or
-        one you describe.
+        No sources enabled. Enable sources in Settings › Integrations.
       </Note>
     );
   }

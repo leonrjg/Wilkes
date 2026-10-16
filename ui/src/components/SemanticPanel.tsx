@@ -642,11 +642,9 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
           })}
         </div>
         <p className="text-[10px] text-[var(--text-dim)] mt-1.5 px-1 selectable">
-          {currentEngine === "SBERT"
-            ? "Sentence-Transformers via Python. Supports almost any model. Good performance. Uses GPU via MPS (Apple Silicon) if available."
-            : currentEngine === "Candle"
-              ? "Medium performance. Uses GPU via Metal (Apple Silicon) if available."
-              : "For ONNX models. Good performance on CPU."}
+          {currentEngine === "SBERT" || currentEngine === "Candle"
+            ? "Uses the GPU when available."
+            : "Runs on CPU."}
         </p>
         {currentEngine === "SBERT" && (
           <div className="mt-1.5 px-2 py-1.5 rounded bg-[var(--bg-active)] flex items-start gap-1.5">

@@ -217,11 +217,6 @@ export default function DataPanel({ api, isActive }: Props) {
       <section>
         <div className="flex flex-col gap-1.5 mb-4">
           <h3 className="text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Workspaces</h3>
-          <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">
-            Every library on this installation, including the corpora other
-            applications keep here. Deleting one removes its index, settings and
-            uploads from disk; the documents it indexed are left where they are.
-          </p>
         </div>
 
         <div className="p-3 bg-[var(--bg-active)] rounded-lg border border-[var(--border-main)] flex flex-col gap-2">
@@ -281,10 +276,7 @@ export default function DataPanel({ api, isActive }: Props) {
         <div className="flex flex-col gap-1.5 mb-4">
           <h3 className="text-[10px] font-bold text-[var(--text-dim)] uppercase tracking-wider">Application Data</h3>
           <p className="text-[11px] text-[var(--text-muted)] leading-relaxed">
-            Local storage for settings, logs, and cache. The installation directory
-            holds everything shared across workspaces — the model cache and the
-            catalogue mirror; the workspace directory holds this library's own
-            databases.
+            Installation data is shared across workspaces.
           </p>
         </div>
 

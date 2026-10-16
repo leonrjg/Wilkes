@@ -3,7 +3,7 @@ members = ["crates/core", "crates/api", "crates/agent", "crates/desktop", "crate
 resolver = "2"
 
 [workspace.package]
-version = "0.9.5"
+version = "1.0.0-rc.1"
 
 # The chat, pinned once. Three crates depend on it, and with a git dependency
 # the tag *is* the version -- three copies of it would be three places to miss

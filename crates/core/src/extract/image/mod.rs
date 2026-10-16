@@ -1955,12 +1955,14 @@ mod tests {
             .unwrap();
         let _entered = runtime.enter();
         let dir = tempfile::tempdir().unwrap();
-        let pp = pp_formulanet::MODEL_ID;
-        let install = pp_formulanet::install_dir(dir.path());
+        let alternative = texify::MODEL_ID;
+        let install = texify::install_dir(dir.path());
         std::fs::create_dir_all(&install).unwrap();
         // Deliberately invalid graphs: attaching must never load or infer.
-        for artifact in pp_formulanet::inventory().artifacts {
-            std::fs::File::create(install.join(artifact.filename))
+        for artifact in texify::inventory().artifacts {
+            let path = install.join(artifact.filename);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::File::create(path)
                 .unwrap()
                 .set_len(artifact.size_bytes)
                 .unwrap();
@@ -1977,16 +1979,18 @@ mod tests {
             )
         };
         assert_eq!(
-            attach(Some(pp), &[]).unwrap().unwrap().identity(),
-            pp_formulanet::identity()
+            attach(Some(alternative), &[]).unwrap().unwrap().identity(),
+            texify::identity()
         );
         assert!(
             attach(None, &[]).unwrap().is_none(),
             "an installed alternative never replaces the missing default"
         );
-        assert!(attach(Some(pp), &[dispatch::RecognizerRole::Formula])
-            .unwrap()
-            .is_none());
+        assert!(
+            attach(Some(alternative), &[dispatch::RecognizerRole::Formula])
+                .unwrap()
+                .is_none()
+        );
         assert!(attach(Some("not-a-formula-model"), &[]).is_err());
     }
 
@@ -2052,6 +2056,7 @@ mod tests {
             dir.path(),
             &crate::types::ImageAnalysisSettings {
                 enabled: true,
+                disabled_roles: Vec::new(),
                 ..Default::default()
             },
             "http://localhost:11434",

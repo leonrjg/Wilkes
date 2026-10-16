@@ -28,9 +28,9 @@ const ENGINE_LABELS: Record<GenerationEngine, string> = {
 
 const ENGINE_BLURBS: Record<GenerationEngine, string> = {
   candle:
-    "Runs entirely on this machine in a separate Wilkes process, on weights Wilkes downloads. Uses the GPU via Metal (Apple Silicon) if available.",
+    "Runs locally. Uses the GPU when available.",
   ollama:
-    "Whatever the configured Ollama service has pulled. Models and residency are managed there rather than here.",
+    "Uses models installed in Ollama.",
 };
 
 function downloadLabel(progress: DownloadProgress): string {
@@ -422,7 +422,7 @@ export default function GenerationPanel({ api, settings, onUpdateSettings }: Pro
                   className="rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2.5 py-1.5 font-mono text-xs text-[var(--text-main)]"
                 />
                 <span className="text-[10px] text-[var(--text-dim)]">
-                  Blank uses the model maximum. Large windows improve grounding context but can require several GB of KV-cache memory.
+                  Blank uses the model maximum. Larger windows use more memory.
                 </span>
               </label>
             </div>
@@ -493,12 +493,6 @@ export default function GenerationPanel({ api, settings, onUpdateSettings }: Pro
         >
           {actionLabel}
         </button>
-
-        <p className="px-1 text-[10px] italic text-[var(--text-dim)]">
-          {engine === "candle"
-            ? "Generation and embedding workers remain resident for five minutes by default. The Workers panel reports the device actually in use."
-            : "Wilkes asks Ollama to keep the selected model resident for five minutes after each request."}
-        </p>
 
         {error && (
           <div

@@ -89,7 +89,7 @@ export function ResearchManager({ open, onClose }: { open: boolean; onClose: () 
                   <button aria-label={`Delete ${tag.name}`} onClick={() => store.deleteTag(tag.id).catch((e) => setError(String(e)))}><Trash2 size={14} /></button>
                 </div>
               ))}
-              <p className="text-xs text-[var(--text-dim)]">Create and assign tags directly from a document’s context menu. This screen manages existing tag names; IDs remain stable when names change.</p>
+              <p className="text-xs text-[var(--text-dim)]">Create and assign tags from a document’s context menu.</p>
             </div>
           )}
           {tab === "collections" && (
@@ -100,13 +100,13 @@ export function ResearchManager({ open, onClose }: { open: boolean; onClose: () 
                 ))}
               </aside>
               <div className="space-y-3">
-                {!editingId && <p className="rounded border border-dashed border-[var(--border-main)] p-4 text-center text-xs text-[var(--text-dim)]">Select a saved collection to edit it. New collections are created interactively in the file sidebar.</p>}
+                {!editingId && <p className="rounded border border-dashed border-[var(--border-main)] p-4 text-center text-xs text-[var(--text-dim)]">Select a collection to edit. Create collections in the file sidebar.</p>}
                 <label className="block text-xs text-[var(--text-muted)]">Name<input disabled={!editingId} value={name} onChange={(e) => setName(e.target.value)} className="mt-1 block w-full rounded border border-[var(--border-main)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-main)] disabled:opacity-50" /></label>
                 <label className="block text-xs text-[var(--text-muted)]">CEL expression<textarea disabled={!editingId} value={expression} onChange={(e) => setExpression(e.target.value)} rows={7} spellCheck={false} className="mt-1 block w-full rounded border border-[var(--border-main)] bg-[var(--bg-input)] p-3 font-mono text-xs text-[var(--text-main)] disabled:opacity-50" /></label>
                 <div className="flex flex-wrap gap-1">
                   {store.tags.map((tag) => <button disabled={!editingId} key={tag.id} onClick={() => setExpression((value) => `${value}${value.trim() ? " && " : ""}'${tag.id}' in tags`)} className="rounded bg-[var(--accent-blue-muted)] px-2 py-1 text-[10px] text-[var(--accent-blue)] disabled:opacity-40">+ {tag.name}</button>)}
                 </div>
-                <p className="text-[11px] text-[var(--text-dim)]">Fields: tags, title, author, publication_year, citation_count, file_type, extension, root, path. The backend validates and evaluates this expression everywhere.</p>
+                <p className="text-[11px] text-[var(--text-dim)]">Fields: tags, title, author, publication_year, citation_count, file_type, extension, root, path.</p>
                 {error && <p className="rounded bg-red-500/10 p-2 text-xs text-red-400">{error}</p>}
                 <div className="flex gap-2">
                   <button disabled={!editingId || !name.trim() || !expression.trim()} onClick={save} className="rounded bg-[var(--accent-blue)] px-3 py-1.5 text-xs text-white disabled:opacity-50">Save</button>

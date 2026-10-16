@@ -20,6 +20,9 @@ pub async fn search_handler(
     query.root =
         confined_root_for_search(&query.root.to_string_lossy(), &uploads_dir, &TokioServerFs)
             .await?;
+    ctx.register_library_root(&uploads_dir)
+        .await
+        .map_err(super::errors::consumer_anyhow_err)?;
 
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
