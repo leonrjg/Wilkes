@@ -29,6 +29,8 @@ use wilkes_core::worker::manager::WorkerStatus;
 
 mod chat;
 mod platform;
+#[cfg(target_os = "macos")]
+mod shell_path;
 
 use platform::{
     build_startup_plan, validate_open_target, validate_reveal_target, DesktopPlatform,
@@ -2207,7 +2209,18 @@ async fn set_worker_timeout(secs: u64, app: AppHandle) -> Result<(), String> {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub fn run() {
+    // Restore the GUI launch environment before logging or Tauri starts threads.
+    #[cfg(target_os = "macos")]
+    let shell_path_result = shell_path::initialize();
+
     wilkes_core::logging::init_logging();
+
+    #[cfg(target_os = "macos")]
+    if let Err(error) = shell_path_result {
+        tracing::warn!(
+            "Could not initialize PATH from the login shell; keeping inherited PATH: {error:#}"
+        );
+    }
 
     let app = tauri::Builder::default()
         // This must remain the first plugin: on Windows and Linux it owns the

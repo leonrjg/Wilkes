@@ -9044,6 +9044,7 @@ version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "clipboard-files",
+ "libc",
  "serde",
  "serde_json",
  "tauri",

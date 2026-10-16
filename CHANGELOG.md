@@ -168,6 +168,12 @@ installation and upgrade acceptance are still required before a stable release.
 
 ### Fixed
 
+- macOS desktop launches restore the account's interactive login-shell PATH
+  before checking agent dependencies or starting subprocesses, so Node.js and
+  npx installed through shell configuration are visible outside development.
+  Shell initialization is bounded to two seconds and preserves the inherited
+  PATH on failure.
+
 - Web/server builds enable layout-detector downloads alongside the OCR readers they offer.
 
 - Scrollable settings pages retain bottom spacing after their last control.
