@@ -63,10 +63,8 @@ The demo is reset every hour.
 - Most others are terminal-based
 
 ## Engines
-<img height="500" alt="Engine selection" src="https://github.com/user-attachments/assets/e61e5260-ff16-49a3-95fe-4fecf4e6ff5a" />
 
-The app supports multiple engines to maximize model availability:
-- **Fastembed** (Default)
+- **FastEmbed** (Default)
   - Default model: `all-miniLM-L6-v2-onnx` 
 - [**Sentence Transformers**](https://www.sbert.net/) (SBERT) via Python
   - Default model: `e5-small-v2`
@@ -78,24 +76,26 @@ The app supports multiple engines to maximize model availability:
 - What model should I use?
   - You can use those marked as "Recommended", try multiple, or just use the default model. You can check the [MTEB ranking](https://huggingface.co/spaces/mteb/leaderboard) and use any model from that list (through specific engines). Note that the top 10 of the ranking are too large to run on consumer hardware.
 
-## External MCP
+## MCP
 
 The desktop app can expose Wilkes' document and literature tools to regular Claude Code and Codex sessions.
 
 ## Interface
-<img width="1312" height="903" alt="image" src="https://github.com/user-attachments/assets/d2018970-5270-467d-9cc5-49a00ad5fa53" />
-<img width="1263" height="845" alt="SCR-20260410-sbcv" src="https://github.com/user-attachments/assets/8967b389-ad7b-4c2b-8724-c3cd4959b8be" />
-<img width="1263" height="845" alt="SCR-20260410-sjcn" src="https://github.com/user-attachments/assets/bd843c52-45c7-4559-bfa9-8adc0849d9b3" />
-<img width="1312" height="903" alt="SCR-20260410-slfi" src="https://github.com/user-attachments/assets/c87bf249-63ba-4b07-b0dd-b6dbdf53257a" />
-<img width="1312" height="903" alt="SCR-20260410-smdp" src="https://github.com/user-attachments/assets/62178660-77c3-4708-a817-dd59166934cf" />
-<img width="1312" height="903" alt="SCR-20260410-slzb" src="https://github.com/user-attachments/assets/9e71a66c-04cc-4b19-98b5-c491089febc1" />
-<img width="1268" height="859" alt="SCR-20260410-sllg" src="https://github.com/user-attachments/assets/9c91e67d-654d-4f1d-aaf0-5a735546b3dc" />
+
+<a href="https://github.com/user-attachments/assets/bd843c52-45c7-4559-bfa9-8adc0849d9b3">
+  <img width="100%" alt="Wilkes interface" src="https://github.com/user-attachments/assets/bd843c52-45c7-4559-bfa9-8adc0849d9b3" />
+</a>
+
+<p align="center">
+  <a href="https://github.com/user-attachments/assets/d2018970-5270-467d-9cc5-49a00ad5fa53"><img width="15%" alt="Wilkes interface screenshot 1" src="https://github.com/user-attachments/assets/d2018970-5270-467d-9cc5-49a00ad5fa53" /></a>
+  <a href="https://github.com/user-attachments/assets/8967b389-ad7b-4c2b-8724-c3cd4959b8be"><img width="15%" alt="Wilkes interface screenshot 2" src="https://github.com/user-attachments/assets/8967b389-ad7b-4c2b-8724-c3cd4959b8be" /></a>
+  <a href="https://github.com/user-attachments/assets/c87bf249-63ba-4b07-b0dd-b6dbdf53257a"><img width="15%" alt="Wilkes interface screenshot 3" src="https://github.com/user-attachments/assets/c87bf249-63ba-4b07-b0dd-b6dbdf53257a" /></a>
+  <a href="https://github.com/user-attachments/assets/62178660-77c3-4708-a817-dd59166934cf"><img width="15%" alt="Wilkes interface screenshot 4" src="https://github.com/user-attachments/assets/62178660-77c3-4708-a817-dd59166934cf" /></a>
+  <a href="https://github.com/user-attachments/assets/9e71a66c-04cc-4b19-98b5-c491089febc1"><img width="15%" alt="Wilkes interface screenshot 5" src="https://github.com/user-attachments/assets/9e71a66c-04cc-4b19-98b5-c491089febc1" /></a>
+  <a href="https://github.com/user-attachments/assets/9c91e67d-654d-4f1d-aaf0-5a735546b3dc"><img width="15%" alt="Wilkes interface screenshot 6" src="https://github.com/user-attachments/assets/9c91e67d-654d-4f1d-aaf0-5a735546b3dc" /></a>
+</p>
 
 If you have feature requests, feel free to open an issue (or a PR).
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for release history and unreleased changes.
 
 ## Contributing
 <img alt="Coverage" src="https://img.shields.io/badge/coverage-82%25-green" />
