@@ -173,10 +173,18 @@ jobs:
         if: runner.os == 'macOS'
         working-directory: crates/desktop
         env:
+          SIGNING_MODE: ${{ needs.prepare.outputs.signing }}
           APPLE_ID: ${{ needs.prepare.outputs.signing == 'signed' && secrets.APPLE_ID || '' }}
           APPLE_PASSWORD: ${{ needs.prepare.outputs.signing == 'signed' && secrets.APPLE_PASSWORD || '' }}
           APPLE_TEAM_ID: ${{ needs.prepare.outputs.signing == 'signed' && secrets.APPLE_TEAM_ID || '' }}
-        run: ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }} ${{ matrix.extra_args }} -- --locked
+        run: |
+          if [[ "$SIGNING_MODE" == unsigned ]]; then
+            # Empty variables still count as credentials to Tauri. Remove both
+            # authentication methods so ad-hoc signing cannot trigger notarization.
+            unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+            unset APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH
+          fi
+          ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }} ${{ matrix.extra_args }} -- --locked
 
       - name: Verify macOS signature and notarization
         if: runner.os == 'macOS' && needs.prepare.outputs.signing == 'signed'
