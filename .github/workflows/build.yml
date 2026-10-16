@@ -244,7 +244,8 @@ jobs:
               Remove-Item $pfxPath -ErrorAction SilentlyContinue
             }
             $configJson = '{"bundle":{"windows":{"certificateThumbprint":"' + $env:THUMBPRINT + '","timestampUrl":"http://timestamp.digicert.com"}}}'
-            ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }} --config $configJson -- --locked
+            # Invoke Node directly: npm's PowerShell shim consumes the -- separator.
+            node ../../ui/node_modules/@tauri-apps/cli/tauri.js build --target ${{ matrix.target }} --config $configJson -- --locked
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             # Sign both loose executables too: these are shipped in the portable ZIP.
             $signTool = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/signtool.exe" |
@@ -265,7 +266,7 @@ jobs:
               }
             }
           } else {
-            ../../ui/node_modules/.bin/tauri build --target ${{ matrix.target }} -- --locked
+            node ../../ui/node_modules/@tauri-apps/cli/tauri.js build --target ${{ matrix.target }} -- --locked
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
