@@ -4,13 +4,18 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      windows_only:
+        description: Build only Windows packages (skip validation, other platforms, and publication)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 # One release owner; never let two versions race to move stable aliases.
 concurrency:
-  group: wilkes-release
+  group: wilkes-release${{ github.event_name == 'workflow_dispatch' && inputs.windows_only && '-windows-check' || '' }}
   cancel-in-progress: false
 
 jobs:
@@ -38,6 +43,7 @@ jobs:
           --signing "$RELEASE_SIGNING" --output "$GITHUB_OUTPUT"
 
   validate:
+    if: ${{ !inputs.windows_only }}
     needs: prepare
     uses: ./.github/workflows/test.yml
     permissions:
@@ -48,19 +54,21 @@ jobs:
 
   build:
     needs: [prepare, validate]
+    # A manual Windows check can proceed when validation was deliberately skipped.
+    # Tag builds still require the complete validation suite.
+    if: >-
+      ${{ !cancelled() && needs.prepare.result == 'success' &&
+          (needs.validate.result == 'success' ||
+           (github.event_name == 'workflow_dispatch' && inputs.windows_only && needs.validate.result == 'skipped')) }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-14
-            target: aarch64-apple-darwin
-            extra_args: --config tauri.macos.conf.json
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            extra_args: ""
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            extra_args: ""
+        include: >-
+          ${{ fromJSON(inputs.windows_only &&
+              '[{"os":"windows-latest","target":"x86_64-pc-windows-msvc","extra_args":""}]' ||
+              '[{"os":"macos-14","target":"aarch64-apple-darwin","extra_args":"--config tauri.macos.conf.json"},
+                {"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","extra_args":""},
+                {"os":"windows-latest","target":"x86_64-pc-windows-msvc","extra_args":""}]') }}
 
     runs-on: ${{ matrix.os }}
 
@@ -317,6 +325,7 @@ jobs:
             target/${{ matrix.target }}/release/bundle/portable/*.zip
 
   docker:
+    if: ${{ !inputs.windows_only }}
     needs: [prepare, validate, build]
     uses: ./.github/workflows/docker-publish.yml
     permissions:

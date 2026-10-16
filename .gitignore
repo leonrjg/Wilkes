@@ -1,4 +1,5 @@
 # General
+:memory:.ses
 **/*.log*
 **/data
 **/coverage

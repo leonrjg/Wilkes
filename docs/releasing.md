@@ -34,7 +34,18 @@ Set the GitHub repository variable `RELEASE_SIGNING` explicitly to one of:
 
 No tag can publish while this variable is unset. A manual Build run defaults to
 `unsigned` when the variable is unset and never publishes, even when run on a tag.
-It still validates and builds both the desktop packages and container images.
+By default it validates and builds both the desktop packages and container images.
+
+For a Windows packaging retry after a source fix, run the same **Build** workflow
+with `windows_only=true` on the corrected branch. This uses the existing Windows
+packaging steps and skips the test suite, macOS, Linux, and containers. It never
+publishes and can run alongside a full build without cancelling it. Its artifacts
+belong to the corrected commit; success is a packaging check, not full release
+validation. A rerun of an old failed job always uses the old commit.
+
+```sh
+gh workflow run build.yml --ref <corrected-branch> -f windows_only=true
+```
 
 For `signed`, configure these repository secrets:
 
