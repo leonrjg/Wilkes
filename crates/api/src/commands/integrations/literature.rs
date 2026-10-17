@@ -1008,7 +1008,7 @@ mod tests {
         );
         assert!(openalex.capabilities.browse.is_some());
         assert_eq!(openalex.secrets.len(), 1);
-        assert_eq!(openalex.secrets[0].name, "email");
+        assert_eq!(openalex.secrets[0].name, "api_key");
         assert!(openalex.secrets[0].optional);
         assert_eq!(
             openalex.extendable,

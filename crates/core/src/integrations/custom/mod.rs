@@ -2266,14 +2266,10 @@ filename = "{title}"
             .create_async()
             .await;
 
-        let results = shipped(
-            "openalex",
-            &server.url(),
-            &[("api_key", " team-key ")],
-        )
-        .search(" graph neural networks ", 2, 1)
-        .await
-        .unwrap();
+        let results = shipped("openalex", &server.url(), &[("api_key", " team-key ")])
+            .search(" graph neural networks ", 2, 1)
+            .await
+            .unwrap();
 
         assert_eq!(results, vec![expected_openalex_record()]);
         mock.assert_async().await;
