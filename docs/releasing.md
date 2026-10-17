@@ -78,12 +78,13 @@ Before tagging, update the Cargo workspace version, workspace entries in
 A Tauri version override, if added, must agree too. Commit those changes before
 creating the tag. Release preparation rejects mismatches.
 
-The Windows MSI has a separate numeric installer version in
-`crates/desktop/tauri.windows.conf.json` (`bundle.windows.wix.version`). The
-`1.0.0-rc.1` candidate uses `1.0.0.1` because WiX cannot derive an MSI version
-from the `rc.1` suffix. Update this override when changing the release version;
-it does not change the application's SemVer version. Test MSI upgrade behavior
-separately: Windows Installer compares only the first three version fields.
+Stable Windows MSI packages derive their numeric installer version from the
+application version. For prereleases with a suffix such as `rc.1`, WiX needs an
+explicit numeric `bundle.windows.wix.version` in a platform configuration such
+as `crates/desktop/tauri.windows.conf.json`. The `1.0.0-rc.1` candidate used
+`1.0.0.1`; that candidate override was removed for stable `1.0.0`. Remove or
+update any such override during promotion. Test MSI upgrade behavior separately:
+Windows Installer compares only the first three version fields.
 
 Use `v1.0.0-rc.1` with package versions `1.0.0-rc.1` for a candidate. Tags must be
 SemVer with a leading `v`; build metadata (`+...`) is not accepted because the

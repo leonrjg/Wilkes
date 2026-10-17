@@ -1,11 +1,11 @@
 # Changelog
 
-## 1.0.0-rc.1 - 2026-10-15
+## 1.0.0 - 2026-10-17
 
-First release candidate for Wilkes 1.0. This candidate expands the document reader
-and local search app into a workspace-based research library, with literature
-search, OCR, local generation and agent tools. It is prepared for validation;
-installation and upgrade acceptance are still required before a stable release.
+Wilkes 1.0 expands the document reader and local search app into a
+workspace-based research library, with literature search, OCR, local generation
+and agent tools. Desktop packages are distributed without a verified publisher
+signature: macOS uses ad-hoc signing and Windows packages are unsigned.
 
 ### Highlights
 
