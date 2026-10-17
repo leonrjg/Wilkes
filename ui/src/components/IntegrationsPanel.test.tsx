@@ -1,4 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import IntegrationsPanel from "./IntegrationsPanel";
 import type { LiteratureProviderInfo, Settings } from "../lib/types";
@@ -71,7 +73,7 @@ const OPENALEX: LiteratureProviderInfo = {
   base_url: "https://api.openalex.org",
   default_base_url: "https://api.openalex.org",
   capabilities: NO_BROWSE,
-  secrets: [{ name: "email", label: "Email", kind: "email", optional: true }],
+  secrets: [{ name: "api_key", label: "API key", kind: "password", optional: true }],
   mirror: null,
 };
 
@@ -303,9 +305,48 @@ describe("IntegrationsPanel", () => {
     expect(screen.getByLabelText("API URL")).toHaveValue("https://api.semanticscholar.org");
 
     fireEvent.click(screen.getByRole("tab", { name: /OpenAlex/ }));
-    expect(screen.queryByLabelText("API key")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Email")).toHaveAttribute("type", "email");
+    expect(screen.getByLabelText("API key")).toHaveAttribute("type", "password");
     expect(screen.getByLabelText("API URL")).toHaveValue("https://api.openalex.org");
+  });
+
+  it("keeps every keystroke while each one is still being saved", async () => {
+    // As the settings modal does: the form is given what the backend wrote
+    // back, which arrives a round trip after each keystroke.
+    function Host() {
+      const [config, setConfig] = useState(settings(false));
+      const onUpdate = async (patch: Partial<Settings>) => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        setConfig((current) => ({ ...current, ...patch }));
+      };
+      return <IntegrationsPanel api={apiWith()} settings={config} onUpdate={onUpdate} />;
+    }
+    render(<Host />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("tab", { name: /OpenAlex/ }));
+    const field = screen.getByLabelText("API key");
+
+    await user.type(field, "key-123");
+    expect(field).toHaveValue("key-123");
+    // And the last save is what the box goes on showing once editing ends.
+    await user.tab();
+    await waitFor(() => expect(field).toHaveValue("key-123"));
+  });
+
+  it("shows a value saved elsewhere in a field that is not being edited", async () => {
+    const { rerender } = render(
+      <IntegrationsPanel api={apiWith()} settings={settings(false)} onUpdate={vi.fn()} />,
+    );
+    fireEvent.click(await screen.findByRole("tab", { name: /OpenAlex/ }));
+    expect(screen.getByLabelText("API key")).toHaveValue("");
+
+    rerender(
+      <IntegrationsPanel
+        api={apiWith()}
+        settings={settings(false, { openalex: { enabled: false, secrets: { api_key: "from-json" } } })}
+        onUpdate={vi.fn()}
+      />,
+    );
+    expect(screen.getByLabelText("API key")).toHaveValue("from-json");
   });
 
   it("gives a provider the manifest adds a tab and fields with no change to the panel", async () => {
@@ -402,8 +443,8 @@ describe("IntegrationsPanel", () => {
     );
 
     fireEvent.click(screen.getByRole("tab", { name: /OpenAlex/ }));
-    fireEvent.change(screen.getByLabelText("Email"), {
-      target: { value: "team@example.com" },
+    fireEvent.change(screen.getByLabelText("API key"), {
+      target: { value: "team-key" },
     });
 
     expect(onUpdate).toHaveBeenCalledWith({
@@ -413,7 +454,7 @@ describe("IntegrationsPanel", () => {
           openalex: {
             enabled: true,
             base_url: "https://mirror.example.test",
-            secrets: { email: "team@example.com" },
+            secrets: { api_key: "team-key" },
           },
         },
       },

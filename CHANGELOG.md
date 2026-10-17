@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **OpenAlex:** the settings ask for an API key, sent as `api_key`, instead of an
+  email address. OpenAlex retired the `mailto` polite pool in February 2026 and
+  ignores it, so the email field had no effect. A stored OpenAlex email is
+  dropped when settings load.
+
 ## 1.0.0 - 2026-10-17
 
 Wilkes 1.0 expands the document reader and local search app into a

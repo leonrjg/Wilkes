@@ -10,11 +10,11 @@ name = "OpenAlex"
 [http]
 base_url = "https://api.openalex.org"
 
-# OpenAlex answers anonymous requests from a shared pool and requests that
-# identify a contact address from a faster one. Optional: the integration works
-# without it.
+# OpenAlex meters every request against a daily budget; a free API key raises
+# it tenfold. Optional: the integration works without it. (The `mailto`
+# "polite pool" it once offered was retired in February 2026 and is ignored.)
 [http.query]
-mailto = { secret = "email", optional = true, label = "Email", kind = "email" }
+api_key = { secret = "api_key", optional = true, label = "API key", kind = "password" }
 
 [capabilities.health]
 path = "/works?filter=doi:https://doi.org/10.1145/3801158&select=id&per-page=1"

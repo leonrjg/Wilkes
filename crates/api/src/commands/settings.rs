@@ -314,10 +314,8 @@ doi = { path = "DOI", coerce = "normalize_doi" }
             .manifest
             .contains("manifest_version = 2"));
         assert!(read.integrations.builtin["openalex"].enabled);
-        assert_eq!(
-            read.integrations.builtin["openalex"].secrets["email"],
-            "me@example.org"
-        );
+        // OpenAlex retired the `mailto` pool the address was for.
+        assert!(read.integrations.builtin["openalex"].secrets.is_empty());
         // Reading changed nothing on disk.
         assert!(tokio::fs::read_to_string(&path)
             .await

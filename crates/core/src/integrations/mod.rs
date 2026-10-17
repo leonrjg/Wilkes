@@ -595,7 +595,7 @@ mod tests {
             .get_mut("openalex")
             .unwrap()
             .secrets
-            .insert("email".into(), "me@example.org".into());
+            .insert("api_key".into(), "key-1".into());
         for changed in [toggled, with_secret] {
             let after = IntegrationRegistry::fingerprints(&changed);
             assert_ne!(same["openalex"], after["openalex"]);
@@ -781,7 +781,7 @@ title = "t"
             "the filters are the base's, not a copy of them"
         );
         assert!(capabilities.resolve_download);
-        // It asks for its own secret; OpenAlex's email is asked for on OpenAlex.
+        // It asks for its own secret; OpenAlex's API key is asked for on OpenAlex.
         let asked: Vec<String> = derived
             .source()
             .secret_slots()
@@ -789,7 +789,7 @@ title = "t"
             .map(|slot| slot.name)
             .collect();
         assert_eq!(asked, vec!["files_key"]);
-        assert_eq!(shipped.source().secret_slots()[0].name, "email");
+        assert_eq!(shipped.source().secret_slots()[0].name, "api_key");
         // Not asked for, so not taken: the base goes on being the one provider
         // that enriches metadata and feeds the citation graph.
         assert!(!capabilities.lookup && !capabilities.references);
@@ -807,7 +807,7 @@ title = "t"
             .mock("GET", "/works")
             .match_query(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::UrlEncoded("search".into(), "graphs".into()),
-                mockito::Matcher::UrlEncoded("mailto".into(), "me@example.org".into()),
+                mockito::Matcher::UrlEncoded("api_key".into(), "key-1".into()),
             ]))
             .with_status(200)
             .with_body(r#"{"results":[{"id":"https://openalex.org/W1","display_name":"A work","ids":{"doi":"https://doi.org/10.1/x"}}]}"#)
@@ -818,7 +818,7 @@ title = "t"
             .match_query(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::UrlEncoded("doi".into(), "10.1/x".into()),
                 mockito::Matcher::UrlEncoded("key".into(), "k".into()),
-                mockito::Matcher::UrlEncoded("mailto".into(), "me@example.org".into()),
+                mockito::Matcher::UrlEncoded("api_key".into(), "key-1".into()),
             ]))
             .with_status(200)
             .with_body(r#"{"url":"https://files.test/x.pdf"}"#)
@@ -830,14 +830,14 @@ title = "t"
         let mut settings = with_custom(vec![custom(
             "openalex-files",
             OPENALEX_WITH_DOWNLOADS,
-            &[("files_key", "k"), ("email", "stale@example.org")],
+            &[("files_key", "k"), ("api_key", "stale-key")],
         )]);
         settings.builtin.insert(
             "openalex".into(),
             BuiltinProviderState {
                 enabled: false,
                 base_url: Some(server.url()),
-                secrets: [("email".to_string(), "me@example.org".to_string())].into(),
+                secrets: [("api_key".to_string(), "key-1".to_string())].into(),
             },
         );
 
@@ -945,8 +945,8 @@ path = "/ping"
             ),
             (
                 "secret = \"files_key\"",
-                "secret = \"email\"",
-                "secret 'email' is one 'openalex' names",
+                "secret = \"api_key\"",
+                "secret 'api_key' is one 'openalex' names",
             ),
         ] {
             assert!(OPENALEX_WITH_DOWNLOADS.contains(from), "{from}");
@@ -991,7 +991,7 @@ path = "/ping"
             .entry("openalex".into())
             .or_default()
             .secrets
-            .insert("email".into(), "me@example.org".into());
+            .insert("api_key".into(), "key-1".into());
         for changed in [moved, keyed] {
             let after = IntegrationRegistry::fingerprints(&changed);
             assert_ne!(

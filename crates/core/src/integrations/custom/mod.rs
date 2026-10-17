@@ -2251,14 +2251,14 @@ filename = "{title}"
     }
 
     #[tokio::test]
-    async fn the_openalex_manifest_sends_query_limit_and_mailto_and_reads_the_record() {
+    async fn the_openalex_manifest_sends_query_limit_and_api_key_and_reads_the_record() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/works")
             .match_query(Matcher::AllOf(vec![
                 Matcher::UrlEncoded("search".into(), "graph neural networks".into()),
                 Matcher::UrlEncoded("per-page".into(), "2".into()),
-                Matcher::UrlEncoded("mailto".into(), "team@example.com".into()),
+                Matcher::UrlEncoded("api_key".into(), "team-key".into()),
                 Matcher::Regex("select=id".into()),
             ]))
             .with_status(200)
@@ -2269,7 +2269,7 @@ filename = "{title}"
         let results = shipped(
             "openalex",
             &server.url(),
-            &[("email", " team@example.com ")],
+            &[("api_key", " team-key ")],
         )
         .search(" graph neural networks ", 2, 1)
         .await
@@ -2353,11 +2353,11 @@ title = "title"
     #[tokio::test]
     async fn an_unset_optional_secret_is_left_off_the_request() {
         let mut server = mockito::Server::new_async().await;
-        // Mocks match in creation order, so a request that carries `mailto`
+        // Mocks match in creation order, so a request that carries `api_key`
         // lands here and fails the `expect(0)`.
-        let with_mailto = server
+        let with_key = server
             .mock("GET", "/works")
-            .match_query(Matcher::Regex("mailto".into()))
+            .match_query(Matcher::Regex("api_key".into()))
             .expect(0)
             .create_async()
             .await;
@@ -2370,15 +2370,15 @@ title = "title"
             .create_async()
             .await;
 
-        // No `email` secret at all, and a blank one: both mean "not set".
-        for secrets in [vec![], vec![("email", "   ")]] {
+        // No `api_key` secret at all, and a blank one: both mean "not set".
+        for secrets in [vec![], vec![("api_key", "   ")]] {
             let results = shipped("openalex", &server.url(), &secrets)
                 .search("graph", 1, 1)
                 .await
                 .unwrap();
             assert_eq!(results.len(), 1);
         }
-        with_mailto.assert_async().await;
+        with_key.assert_async().await;
         without.assert_async().await;
     }
 
@@ -3232,7 +3232,7 @@ doi = "doi"
             .mock("GET", "/autocomplete/authors")
             .match_query(Matcher::AllOf(vec![
                 Matcher::UrlEncoded("q".into(), "hinton".into()),
-                Matcher::UrlEncoded("mailto".into(), "team@example.com".into()),
+                Matcher::UrlEncoded("api_key".into(), "team-key".into()),
             ]))
             .with_status(200)
             .with_body(
@@ -3245,7 +3245,7 @@ doi = "doi"
             )
             .create_async()
             .await;
-        let source = shipped("openalex", &server.url(), &[("email", "team@example.com")]);
+        let source = shipped("openalex", &server.url(), &[("api_key", "team-key")]);
         let suggestions = source.suggest("author", " hinton ").await.unwrap();
         assert_eq!(
             suggestions,
@@ -3293,7 +3293,7 @@ doi = "doi"
                     "from_publication_date:2020-01-01,open_access.is_oa:true".into(),
                 ),
                 Matcher::UrlEncoded("sort".into(), "publication_date:desc".into()),
-                Matcher::UrlEncoded("mailto".into(), "team@example.com".into()),
+                Matcher::UrlEncoded("api_key".into(), "team-key".into()),
             ]))
             .with_status(200)
             .with_body(OPENALEX_BODY)
@@ -3304,7 +3304,7 @@ doi = "doi"
         request.sort = Some("publication_date:desc".into());
         request.page = Some(3);
         request.limit = Some(5);
-        let results = shipped("openalex", &server.url(), &[("email", "team@example.com")])
+        let results = shipped("openalex", &server.url(), &[("api_key", "team-key")])
             .browse(&request)
             .await
             .unwrap();

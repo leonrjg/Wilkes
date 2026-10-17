@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { IntegrationStatus, Settings } from "../lib/types";
 import type { ProviderField, ProviderRow } from "../lib/integrations/providers";
 import { isUsableProviderStatus } from "../lib/integrations/providers";
@@ -142,6 +142,15 @@ function Field({
   onChange: (value: string | null) => void;
 }) {
   const text = typeof value === "string" ? value : "";
+  // While the user types, the box shows what they typed, not what has been
+  // saved: a save is a round trip, and a box bound to the saved value is put
+  // back to it before the save lands, so every keystroke but the last is lost.
+  // When the box is not being edited, the saved value is what it shows.
+  const [draft, setDraft] = useState(text);
+  const editing = useRef(false);
+  useEffect(() => {
+    if (!editing.current) setDraft(text);
+  }, [text]);
   // A nullable field emptied by the user is `null`, not `""`: the backend's
   // `Option<String>` means "no API key" and "an API key that is the empty
   // string" are different, and only one of them is what an empty box means.
@@ -169,9 +178,18 @@ function Field({
         <input
           id={`provider-field-${field.key}`}
           type={field.kind}
-          value={text}
+          value={draft}
           placeholder={field.placeholder}
-          onChange={(e) => emit(e.target.value)}
+          onFocus={() => {
+            editing.current = true;
+          }}
+          onBlur={() => {
+            editing.current = false;
+          }}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            emit(e.target.value);
+          }}
           className={INPUT_CLASS}
         />
       )}

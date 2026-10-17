@@ -3026,8 +3026,9 @@ struct IntegrationsSettingsWire {
 }
 
 /// What `semantic_scholar` and `openalex` held before they were manifests: an
-/// enable flag, a base URL, and one optional credential under a name of its
-/// own (`api_key` or `email`).
+/// enable flag, a base URL, and one optional credential. Semantic Scholar's
+/// was an API key; OpenAlex's was a contact address for its `mailto` pool,
+/// which OpenAlex retired in February 2026, so it is not carried over.
 #[derive(Deserialize)]
 struct LegacyRemoteSettings {
     #[serde(default)]
@@ -3036,8 +3037,6 @@ struct LegacyRemoteSettings {
     base_url: Option<String>,
     #[serde(default)]
     api_key: Option<String>,
-    #[serde(default)]
-    email: Option<String>,
 }
 
 impl LegacyRemoteSettings {
@@ -3046,7 +3045,6 @@ impl LegacyRemoteSettings {
     fn into_state(self, shipped_base_url: &str, secret_name: &str) -> BuiltinProviderState {
         let credential = self
             .api_key
-            .or(self.email)
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         BuiltinProviderState {
@@ -3075,7 +3073,13 @@ impl From<IntegrationsSettingsWire> for IntegrationsSettings {
         if let Some(legacy) = wire.openalex {
             builtin
                 .entry("openalex".to_string())
-                .or_insert_with(|| legacy.into_state("https://api.openalex.org", "email"));
+                .or_insert_with(|| legacy.into_state("https://api.openalex.org", "api_key"));
+        }
+        // OpenAlex's manifest named an `email` secret for its `mailto` pool
+        // until OpenAlex retired that pool. A stored address is sent nowhere
+        // now, so it is not kept to be written back.
+        if let Some(openalex) = builtin.get_mut("openalex") {
+            openalex.secrets.remove("email");
         }
 
         let custom = wire
@@ -4376,7 +4380,8 @@ mod tests {
 
         let openalex = &settings.builtin["openalex"];
         assert!(openalex.enabled);
-        assert_eq!(openalex.secrets["email"], "me@example.org");
+        // The retired `mailto` address has nowhere to go.
+        assert!(openalex.secrets.is_empty());
         assert_eq!(
             openalex.base_url.as_deref(),
             Some("https://mirror.example.test")
@@ -4386,21 +4391,22 @@ mod tests {
 
     #[test]
     fn a_blank_legacy_credential_is_no_credential() {
-        let json = r#"{"openalex": {"enabled": false, "email": "  "}}"#;
+        let json = r#"{"semantic_scholar": {"enabled": false, "api_key": "  "}}"#;
         let settings = integrations_from(json);
-        assert!(settings.builtin["openalex"].secrets.is_empty());
+        assert!(settings.builtin["semantic_scholar"].secrets.is_empty());
     }
 
     #[test]
     fn a_value_in_todays_shape_wins_over_the_older_key_and_only_today_is_written_back() {
         let json = r#"{
-            "openalex": {"enabled": true, "email": "old@example.org"},
-            "builtin": {"openalex": {"enabled": false, "secrets": {"email": "new@example.org"}}}
+            "openalex": {"enabled": true, "base_url": "https://old.example.test"},
+            "builtin": {"openalex": {"enabled": false, "secrets": {"api_key": "new-key"}}}
         }"#;
         let settings = integrations_from(json);
         let openalex = &settings.builtin["openalex"];
         assert!(!openalex.enabled);
-        assert_eq!(openalex.secrets["email"], "new@example.org");
+        assert_eq!(openalex.base_url, None);
+        assert_eq!(openalex.secrets["api_key"], "new-key");
 
         let written = serde_json::to_value(&settings).unwrap();
         assert!(written.get("openalex").is_none());
@@ -4409,6 +4415,17 @@ mod tests {
         // And it reads back as itself.
         let again: IntegrationsSettings = serde_json::from_value(written).unwrap();
         assert_eq!(again.builtin, settings.builtin);
+    }
+
+    #[test]
+    fn an_openalex_email_stored_for_the_retired_mailto_pool_is_dropped() {
+        let json = r#"{
+            "builtin": {"openalex": {"enabled": true, "secrets": {"email": "me@example.org", "api_key": "key-1"}}}
+        }"#;
+        let settings = integrations_from(json);
+        let secrets = &settings.builtin["openalex"].secrets;
+        assert_eq!(secrets.get("email"), None);
+        assert_eq!(secrets["api_key"], "key-1");
     }
 
     #[test]
