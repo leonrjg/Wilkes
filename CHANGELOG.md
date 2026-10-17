@@ -1,8 +1,11 @@
 # Changelog
 
-## Unreleased
+## 1.0.1 - 2026-10-17
 
 ### Fixed
+
+- Provider settings retain every typed character while saves are pending,
+  including API keys and custom API URLs.
 
 - **OpenAlex:** the settings ask for an API key, sent as `api_key`, instead of an
   email address. OpenAlex retired the `mailto` polite pool in February 2026 and
