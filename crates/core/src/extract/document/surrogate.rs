@@ -40,7 +40,16 @@ use crate::types::{BoundingBox, SurrogateLink, SurrogateOutline, SurrogatePageLi
 /// Not cosmetic. MuPDF's default write options compress nothing and collect no
 /// garbage, which for a 198-page book produced a 365 MB file where these
 /// produce 4 MB, and took 8.2 seconds where these take 0.17.
-const WRITE_OPTIONS: &str = "compress,compress-fonts,compress-images,garbage=4,sanitize";
+///
+/// `compression-effort=25` is zlib level 2 rather than the default 6. A book
+/// whose pages are SVG-wrapped images (a manga EPUB) reaches the writer as
+/// rasters MuPDF has already decoded and scaled, so there is no JPEG left to
+/// pass through and every page is Flate-compressed pixels. On a 346-page,
+/// 188 MB one that took 20 s to finalize at the default and 4 s at this
+/// level, for a file 0.3% smaller; on text books it costs about 4% in size
+/// and saves about a fifth of the time.
+const WRITE_OPTIONS: &str =
+    "compress,compress-fonts,compress-images,garbage=4,sanitize,compression-effort=25";
 
 /// How much rendered book is held in memory.
 ///
