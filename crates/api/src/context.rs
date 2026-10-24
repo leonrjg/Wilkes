@@ -3288,6 +3288,11 @@ impl AppContext {
         crate::commands::preview::preview(match_ref, Some(index)).await
     }
 
+    /// One random-access comic page, without a document conversion.
+    pub async fn comic_page(&self, path: std::path::PathBuf, page: u32) -> anyhow::Result<Vec<u8>> {
+        crate::commands::preview::comic_page(path, page).await
+    }
+
     /// The pages of a book, as a PDF the reader can draw.
     ///
     /// A separate call from `preview` because these are megabytes: the preview

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- CBZ comics open and scroll by loading individual page images, avoiding full-book
+  PDF conversion and keeping only nearby images in the reader. They show the same
+  page indicator and zoom controls as other documents, and a page that cannot be
+  read is reported in its own slot instead of failing the comic.
+
 ## 1.0.1 - 2026-10-17
 
 ### Fixed

@@ -50,6 +50,8 @@ grep-searcher = "0.1"
 ignore = "0.4"
 infer = "0.16"
 mupdf = "0.6"
+flate2 = { version = "1", features = ["rust_backend"] }
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
 # Pixel buffers and resampling for native image enrichment. Not an inference
 # dependency: no runtime, no models, and already in the tree transitively.
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -142,6 +142,27 @@ async fn preview_handler(
     Ok(Json(data))
 }
 
+#[derive(Deserialize)]
+struct ComicPageQuery {
+    path: String,
+    page: u32,
+}
+
+async fn comic_page_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ComicPageQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, _) = state.workspace_snapshot();
+    let bytes = ctx
+        .comic_page(std::path::PathBuf::from(params.path), params.page)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    ))
+}
+
 /// The pages of a book, as PDF bytes.
 ///
 /// `application/pdf` because that is what the body is: the reader hands it
@@ -2498,6 +2519,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/citation-links", post(citation_links_handler))
         .route("/api/preview", post(preview_handler))
         .route("/api/surrogate", get(surrogate_handler))
+        .route("/api/comic/page", get(comic_page_handler))
         .route("/api/settings", get(get_settings_handler))
         .route("/api/settings", patch(update_settings_handler))
         .route(
@@ -3510,6 +3532,46 @@ mod tests {
         let res = delete_upload_handler(State(state), Query(query)).await;
         assert!(res.is_ok());
         assert!(!absolute_path.exists());
+    }
+
+    #[tokio::test]
+    async fn comic_page_endpoint_serves_only_the_requested_image() {
+        let (dir, state) = handler_state();
+        let path = dir.path().join("comic.cbz");
+        std::fs::write(
+            &path,
+            include_bytes!("../../core/examples/fixtures/comic-reader.cbz"),
+        )
+        .unwrap();
+        let response = comic_page_handler(
+            State(state.clone()),
+            Query(ComicPageQuery {
+                path: path.to_string_lossy().into_owned(),
+                page: 2,
+            }),
+        )
+        .await
+        .unwrap_or_else(|(status, _)| panic!("comic endpoint failed: {status}"))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..4], b"WCP1");
+        assert_eq!(f32::from_le_bytes(body[4..8].try_into().unwrap()), 36.0);
+        assert!(comic_page_handler(
+            State(state),
+            Query(ComicPageQuery {
+                path: path.to_string_lossy().into_owned(),
+                page: 0,
+            })
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

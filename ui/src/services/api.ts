@@ -1,3 +1,4 @@
+import type { ImagePage } from "@leonrjg/wilkes-reader";
 import type {
   EmbedDone,
   EmbedError,
@@ -179,6 +180,7 @@ export interface SearchApi {
    *  is nothing for `resolveAssetUrl` to point at, and the rendering comes
    *  across as bytes instead. */
   surrogateBytes(path: string): Promise<ArrayBuffer>;
+  comicPage(path: string, page: number, signal: AbortSignal): Promise<ImagePage>;
 
   resolveAssetUrl(path: string): string;
   getLogs(): Promise<string[]>;

@@ -1,3 +1,5 @@
+import { decodeComicPage } from "../lib/comicPage";
+import type { ImagePage } from "@leonrjg/wilkes-reader";
 import type {
   CatalogueDownload,
   CatalogueCourse,
@@ -473,6 +475,12 @@ export class HttpSearchApi implements SearchApi {
 
   resolveAssetUrl(path: string): string {
     return `/asset?path=${encodeURIComponent(path)}`;
+  }
+
+  async comicPage(path: string, page: number, signal: AbortSignal): Promise<ImagePage> {
+    const res = await fetch(`/api/comic/page?path=${encodeURIComponent(path)}&page=${page}`, { signal });
+    if (!res.ok) throw new Error(`Could not load comic page: ${res.status}`);
+    return decodeComicPage(await res.arrayBuffer());
   }
 
   async surrogateBytes(path: string): Promise<ArrayBuffer> {

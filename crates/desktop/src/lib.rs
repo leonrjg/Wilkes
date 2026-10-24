@@ -1307,6 +1307,20 @@ async fn preview(
         .map_err(|e| e.to_string())
 }
 
+/// One comic page as an image and its native geometry.
+#[tauri::command]
+async fn comic_page(
+    app: AppHandle,
+    path: String,
+    page: u32,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = app_context(&app)
+        .comic_page(std::path::PathBuf::from(path), page)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 /// The pages of a book, as PDF bytes.
 ///
 /// Returned as bytes rather than served over the asset protocol because there
@@ -2354,6 +2368,7 @@ pub fn run() {
             citation_links,
             preview,
             surrogate_bytes,
+            comic_page,
             list_files,
             open_file,
             rename_file,

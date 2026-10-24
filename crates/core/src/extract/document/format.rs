@@ -51,6 +51,9 @@ pub enum PagedFormat {
     Fb2,
     /// A comic archive: a zip of page images, with no text of its own.
     Cbz,
+    /// A comic archive in a tar. Read exactly as [`Self::Cbz`] is, but a tar
+    /// has no directory to seek by, so its pages are not served one at a time.
+    Cbt,
     /// A Kindle KF8 book, read by rebuilding it — see [`super::kindle`].
     Kf8,
 }
@@ -105,9 +108,19 @@ impl PagedFormat {
             "fb2" => Self::Fb2,
             // `cbz` and `cbt` only. MuPDF's comic handler also claims `.zip`
             // and `.tar`, and a corpus's archives are not documents.
-            "cbz" | "cbt" => Self::Cbz,
+            "cbz" => Self::Cbz,
+            "cbt" => Self::Cbt,
             _ => return None,
         })
+    }
+
+    /// Whether this path's pages are served one image at a time, straight from
+    /// the archive, rather than rendered into a surrogate PDF.
+    ///
+    /// The one place that says so; the reader and the surrogate both ask it.
+    /// The frontend's copy is `servesPagesOnDemand` in `documentFormats.ts`.
+    pub fn pages_on_demand(path: &Path) -> bool {
+        matches!(Self::for_path(path), Some(Self::Cbz))
     }
 
     /// Whether MuPDF must be told what page to lay this out onto.
@@ -123,7 +136,7 @@ impl PagedFormat {
             Self::Epub | Self::Mobi | Self::Fb2 | Self::Kf8 => true,
             // Each page is an image with its own size; there is nothing to
             // reflow and MuPDF reports it as such.
-            Self::Cbz => false,
+            Self::Cbz | Self::Cbt => false,
         }
     }
 
@@ -139,7 +152,10 @@ impl PagedFormat {
             Self::Epub => format!("epub-mupdf-v1+{}", reflowable_recipe_suffix()),
             Self::Mobi => format!("mobi-mupdf-v1+{}", reflowable_recipe_suffix()),
             Self::Fb2 => format!("fb2-mupdf-v1+{}", reflowable_recipe_suffix()),
-            Self::Cbz => "cbz-mupdf-v1".to_string(),
+            // One identity for both containers: the pages MuPDF reads are the
+            // same, and a different string would re-extract every comic
+            // library that was indexed before they were told apart.
+            Self::Cbz | Self::Cbt => "cbz-mupdf-v1".to_string(),
             // Its own identity because it is its own pipeline: rebuilt by
             // `kindle`, then laid out by MuPDF as HTML.
             Self::Kf8 => format!("kf8-rebuilt-v1+{}", reflowable_recipe_suffix()),
@@ -158,7 +174,8 @@ impl PagedFormat {
             Self::Epub => "epub",
             Self::Mobi => "mobi",
             Self::Fb2 => "fb2",
-            Self::Cbz => "cbz",
+            // `file_type == "cbz"` has always meant both containers.
+            Self::Cbz | Self::Cbt => "cbz",
             Self::Kf8 => "azw3",
         }
     }
@@ -170,6 +187,7 @@ impl PagedFormat {
             Self::Mobi => "application/x-mobipocket-ebook",
             Self::Fb2 => "application/x-fictionbook",
             Self::Cbz => "application/vnd.comicbook+zip",
+            Self::Cbt => "application/x-cbt",
             Self::Kf8 => "application/vnd.amazon.ebook",
         }
     }
@@ -315,7 +333,7 @@ mod tests {
             ("f.azw", PagedFormat::Kf8),
             ("g.fb2", PagedFormat::Fb2),
             ("h.cbz", PagedFormat::Cbz),
-            ("i.cbt", PagedFormat::Cbz),
+            ("i.cbt", PagedFormat::Cbt),
         ] {
             assert_eq!(
                 PagedFormat::for_path(Path::new(name)),
@@ -370,7 +388,7 @@ mod tests {
             let identity = format.recipe_identity();
             assert!(identity.contains("layout-450x600x11"), "{identity}");
         }
-        for fixed in [PagedFormat::Pdf, PagedFormat::Cbz] {
+        for fixed in [PagedFormat::Pdf, PagedFormat::Cbz, PagedFormat::Cbt] {
             assert!(!fixed.is_reflowable(), "{fixed:?}");
             assert!(!fixed.recipe_identity().contains("layout"), "{fixed:?}");
         }
@@ -385,7 +403,28 @@ mod tests {
         assert_eq!(PagedFormat::Mobi.query_name(), "mobi");
         assert_eq!(PagedFormat::Fb2.query_name(), "fb2");
         assert_eq!(PagedFormat::Cbz.query_name(), "cbz");
+        assert_eq!(PagedFormat::Cbt.query_name(), "cbz");
         assert_eq!(PagedFormat::Kf8.query_name(), "azw3");
+    }
+
+    /// Splitting the tar container out of `Cbz` must not re-extract a library
+    /// indexed while they were one.
+    #[test]
+    fn both_comic_containers_share_one_recipe() {
+        assert_eq!(
+            PagedFormat::Cbt.recipe_identity(),
+            PagedFormat::Cbz.recipe_identity()
+        );
+    }
+
+    /// Only a zip has a directory to seek by.
+    #[test]
+    fn only_a_cbz_serves_its_pages_on_demand() {
+        assert!(PagedFormat::pages_on_demand(Path::new("a.cbz")));
+        assert!(PagedFormat::pages_on_demand(Path::new("A.CBZ")));
+        for name in ["a.cbt", "a.pdf", "a.epub", "a.zip", "a.txt"] {
+            assert!(!PagedFormat::pages_on_demand(Path::new(name)), "{name}");
+        }
     }
 
     #[test]

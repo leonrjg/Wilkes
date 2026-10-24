@@ -98,20 +98,31 @@ pub(crate) fn renders_as_pdf(path: &std::path::Path) -> bool {
     )
 }
 
-/// A book, as pages the reader can draw.
+/// A book, as pages the reader can draw. ZIP comics return only their page
+/// count; their original images are requested individually through `comic_page`.
 ///
 /// The bytes are not here: they are megabytes, and the interface fetches them
 /// through [`surrogate_bytes`] against the same cache this fills. What travels
 /// with the preview is what a surrogate rendering cannot carry — the book's
 /// outline and its links — plus where to open it.
 ///
-/// Rendering is blocking and takes a few hundred milliseconds for a whole
-/// book, so it runs off the async executor.
+/// Blocking directory reads and document rendering run off the async executor.
 pub(crate) async fn preview_book(
     path: std::path::PathBuf,
     page: u32,
     highlight_bbox: Option<wilkes_core::types::BoundingBox>,
 ) -> anyhow::Result<PreviewData> {
+    if wilkes_core::extract::document::format::PagedFormat::pages_on_demand(&path) {
+        let page_count = tokio::task::spawn_blocking(move || {
+            wilkes_core::extract::document::comic::page_count(&path)
+        })
+        .await??;
+        return Ok(PreviewData::Comic {
+            page,
+            highlight_bbox,
+            page_count,
+        });
+    }
     let rendered = tokio::task::spawn_blocking({
         let path = path.clone();
         move || wilkes_core::extract::document::surrogate::surrogate(&path)
@@ -135,6 +146,11 @@ pub async fn surrogate_bytes(path: std::path::PathBuf) -> anyhow::Result<Vec<u8>
     })
     .await??;
     Ok(rendered.bytes.as_ref().clone())
+}
+
+pub async fn comic_page(path: std::path::PathBuf, page: u32) -> anyhow::Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || wilkes_core::extract::document::comic::page(&path, page))
+        .await?
 }
 
 fn char_boundary_at_or_before(content: &str, offset: usize) -> usize {
@@ -272,6 +288,30 @@ mod tests {
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn cbz_previews_and_page_reads_never_use_a_surrogate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comic.cbz");
+        std::fs::write(
+            &path,
+            include_bytes!("../../../core/examples/fixtures/comic-reader.cbz"),
+        )
+        .unwrap();
+        let data = preview_book(path.clone(), 2, None).await.unwrap();
+        assert!(matches!(
+            data,
+            PreviewData::Comic {
+                page: 2,
+                page_count: 3,
+                ..
+            }
+        ));
+        let packet = comic_page(path.clone(), 2).await.unwrap();
+        assert_eq!(&packet[..4], b"WCP1");
+        assert_eq!(f32::from_le_bytes(packet[4..8].try_into().unwrap()), 36.0);
+        assert!(surrogate_bytes(path).await.is_err());
+    }
 
     /// A comic archive with a stale text-file origin must still open.
     ///

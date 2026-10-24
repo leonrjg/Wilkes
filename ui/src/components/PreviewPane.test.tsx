@@ -36,6 +36,7 @@ const mockHtmlViewer = vi.fn(() => {
   capturedReaderHost = useReaderHost();
   return <div data-testid="html-viewer">HtmlViewer</div>;
 });
+const mockImagePageViewer = vi.fn(() => <div data-testid="image-page-viewer">ImagePageViewer</div>);
 const mockPdfViewer = vi.fn(() => <div data-testid="pdf-viewer">PdfViewer</div>);
 // The readers are stood in for so this pane is tested on what it hands them.
 // Everything else the package exports stays real: the pane is built out of it.
@@ -45,6 +46,7 @@ vi.mock("@leonrjg/wilkes-reader", async (importOriginal) => ({
   MarkdownViewer: (props: any) => mockMarkdownViewer(props),
   HtmlViewer: (props: any) => mockHtmlViewer(props),
   PdfViewer: (props: any) => mockPdfViewer(props),
+  ImagePageViewer: (props: any) => mockImagePageViewer(props),
 }));
 vi.mock("./DocumentEditor", () => ({ default: () => <div data-testid="document-editor">DocumentEditor</div> }));
 vi.mock("./Toast", () => ({ useToasts: () => ({ addToast: vi.fn() }) }));
@@ -60,6 +62,7 @@ vi.mock("../services", () => ({
       return Promise.resolve();
     }),
     resolveAssetUrl: vi.fn((path: string) => path),
+    comicPage: vi.fn(),
     surrogateBytes: vi.fn(() => Promise.resolve(new Uint8Array([1, 2, 3]).buffer)),
     relatedDocuments: vi.fn(() => Promise.resolve([])),
     chunkTopics: vi.fn(() => Promise.resolve({ topics: [] })),
@@ -1131,6 +1134,53 @@ describe("PreviewPane", () => {
     expect(source.bytes.byteLength).toBe(3);
   });
 
+  it("opens CBZ through the page source without requesting a surrogate", async () => {
+    setViewerState({
+      selectedMatch: { path: "comic.cbz", origin: { PdfPage: { page: 100, bbox: null } } },
+      previewData: { Comic: { page: 100, highlight_bbox: null, page_count: 213 } },
+      previewLoading: false,
+    });
+    const calls = (api.surrogateBytes as any).mock.calls.length;
+    render(<PreviewPane />);
+    expect(screen.getByTestId("image-page-viewer")).toBeInTheDocument();
+    expect(screen.queryByTestId("pdf-viewer")).not.toBeInTheDocument();
+    expect((api.surrogateBytes as any).mock.calls.length).toBe(calls);
+    const props = mockImagePageViewer.mock.lastCall?.[0];
+    expect(props.source).toMatchObject({ key: "comic.cbz", pageCount: 213 });
+    const controller = new AbortController();
+    await props.source.loadPage(100, controller.signal);
+    expect(api.comicPage).toHaveBeenCalledWith("comic.cbz", 100, controller.signal);
+    await act(async () => props.onRenderSuccess());
+    expect(screen.queryByText("Loading document…")).not.toBeInTheDocument();
+  });
+
+  it("lays a tar comic out like any other book rather than serving its pages on demand", async () => {
+    // A cbt has no directory to seek by, so only a cbz takes the image source.
+    setViewerState({
+      selectedMatch: { path: "comic.cbt", origin: { PdfPage: { page: 1, bbox: null } } },
+      previewData: { Book: { page: 1, highlight_bbox: null, outline: [], links: [] } },
+      previewLoading: false,
+    });
+    render(<PreviewPane />);
+    await waitFor(() => expect(screen.getByTestId("pdf-viewer")).toBeInTheDocument());
+    expect(screen.queryByTestId("image-page-viewer")).not.toBeInTheDocument();
+  });
+
+  it("shows a loading state while a comic's page count is unknown", () => {
+    // Until a `Comic` preview says how many pages there are, there is no source
+    // to give the reader; the pane must say it is working, not render nothing.
+    setViewerState({
+      selectedMatch: { path: "comic.cbz", origin: { PdfPage: { page: 1, bbox: null } } },
+      previewData: null,
+      previewLoading: false,
+    });
+
+    render(<PreviewPane />);
+
+    expect(screen.getByText("Loading document…")).toBeInTheDocument();
+    expect(screen.queryByTestId("image-page-viewer")).not.toBeInTheDocument();
+  });
+
   it("shows a loading state while a book's pages are being fetched", async () => {
     // The pages arrive after the preview, so `previewLoading` is already false
     // while they are in flight. Without a state of its own the pane rendered
@@ -1141,7 +1191,7 @@ describe("PreviewPane", () => {
     );
     setViewerState({
       selectedMatch: {
-        path: "book.cbz",
+        path: "book.epub",
         origin: { PdfPage: { page: 1, bbox: null } },
       } as any,
       previewData: { Book: { page: 1, highlight_bbox: null, outline: [], links: [] } },
@@ -1171,7 +1221,7 @@ describe("PreviewPane", () => {
     // the pages it had just retrieved.
     setViewerState({
       selectedMatch: {
-        path: "book.cbz",
+        path: "book.epub",
         origin: { PdfPage: { page: 1, bbox: null } },
       } as any,
       previewData: { Book: { page: 1, highlight_bbox: null, outline: [], links: [] } },
@@ -1185,7 +1235,7 @@ describe("PreviewPane", () => {
     // A tab update that does not change which book is open.
     setViewerState({
       selectedMatch: {
-        path: "book.cbz",
+        path: "book.epub",
         origin: { PdfPage: { page: 1, bbox: null } },
       } as any,
       previewData: { Book: { page: 1, highlight_bbox: null, outline: [], links: [] } },

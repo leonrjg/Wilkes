@@ -344,6 +344,7 @@ export interface SurrogateLink {
 }
 
 export type PreviewData =
+  | { Comic: { page: number; highlight_bbox: BoundingBox | null; page_count: number } }
   | {
       Text: {
         content: string;

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { isPagedPath, isPdfPath } from "../lib/documentFormats";
+import { isPagedPath, isPdfPath, servesPagesOnDemand } from "../lib/documentFormats";
 import { readerLinks, readerOutline } from "../lib/surrogate";
 import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud, Share2, Edit3 } from "react-feather";
 import DocumentEditor from "./DocumentEditor";
@@ -11,6 +11,8 @@ import {
   HtmlViewer,
   MarkdownViewer,
   PdfViewer,
+  ImagePageViewer,
+  type ImagePageSource,
   ReaderHostProvider,
   utf8ByteRangeToUtf16Range,
   type Decoration,
@@ -197,13 +199,13 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
     setEditing(false);
   }, [selectedMatch?.path]);
 
-  // A book's pages. They are not in the file -- Wilkes lays them out and
+  // A reflowable book's pages. Wilkes lays them out and
   // renders them -- so there is nothing for the asset protocol to point at and
   // the bytes come over IPC instead. Keyed on the path, which is what the
   // reader caches the parsed document under.
   const [bookPages, setBookPages] = useState<{ key: string; bytes: ArrayBuffer } | null>(null);
   const bookPath =
-    selectedMatch && "PdfPage" in selectedMatch.origin && !isPdfPath(selectedMatch.path)
+    selectedMatch && "PdfPage" in selectedMatch.origin && !isPdfPath(selectedMatch.path) && !servesPagesOnDemand(selectedMatch.path)
       ? selectedMatch.path
       : null;
   // Keyed on the book's path and the tab's *id*, never on the tab object: that
@@ -227,6 +229,14 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
       cancelled = true;
     };
   }, [bookPath, activeTabId, reportTabLoadError]);
+
+  const comicCount = previewData && "Comic" in previewData ? previewData.Comic.page_count : 0;
+  const comicPath = selectedMatch && servesPagesOnDemand(selectedMatch.path) ? selectedMatch.path : null;
+  const comicSource = useMemo<ImagePageSource | null>(() => comicPath && comicCount > 0 ? {
+    key: comicPath,
+    pageCount: comicCount,
+    loadPage: (page, signal) => api.comicPage(comicPath, page, signal),
+  } : null, [comicPath, comicCount]);
 
   useEffect(() => {
     if (!generationReady && sidePanel === "summary") setSidePanel(null);
@@ -330,16 +340,18 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
     );
   }
 
-  // Whether this document is drawn as pages. Both a PDF and a book are: the
-  // difference is only where the pages come from. A PDF's are in the file the
-  // webview fetches; a book has none of its own, so Wilkes lays them out and
-  // renders them, and the bytes arrive over IPC.
+  // Whether this document is drawn as pages. A PDF, a book and a comic all are;
+  // they differ in where the pages come from. A PDF's are in the file the
+  // webview fetches. A comic's are the archive's own images, requested one at a
+  // time. A book has none of its own, so Wilkes lays them out and renders them,
+  // and the bytes arrive over IPC.
   //
   // Asked of the file rather than of the preview that arrived, because the
   // preview goes briefly stale when switching documents: a `Text` preview left
   // over from a text file must not turn a PDF into a code listing.
   const isPagedFile = "PdfPage" in selectedMatch.origin;
-  const isBook = isPagedFile && !isPdfPath(selectedMatch.path);
+  const isComic = isPagedFile && servesPagesOnDemand(selectedMatch.path);
+  const isBook = isPagedFile && !isComic && !isPdfPath(selectedMatch.path);
   const isMarkdownFile =
     !isPagedFile && displayData != null && "Text" in displayData && displayData.Text.language === "markdown";
   const isHtmlFile =
@@ -363,10 +375,11 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   // already the request that asks what showing it needs.
   // A book's table of contents and links, in the reader's vocabulary. Null for
   // a PDF, which has its own inside the file.
-  // A book's pages are fetched after its preview arrives, so `previewLoading`
+  // A book's pages are fetched after its preview arrives, and a comic has none
+  // to show until its preview has said how many there are, so `previewLoading`
   // is already false while they are in flight. Without this the pane renders
   // the final `null` of the chain below — blank, with nothing to say why.
-  const waitingForBookPages = isBook && bookPages == null && !previewError;
+  const waitingForPages = ((isBook && bookPages == null) || (isComic && !comicSource)) && !previewError;
   const bookOutline =
     displayData && "Book" in displayData ? readerOutline(displayData.Book.outline) : null;
   const bookLinks =
@@ -760,7 +773,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
                 onDelete={() => void handleDeleteBookmark()}
               />
             )}
-            {(previewLoading || isPdfRendering || waitingForBookPages) && (
+            {(previewLoading || isPdfRendering || waitingForPages) && (
               <div className="absolute inset-0 flex items-center justify-center bg-[var(--bg-app)] z-30 pointer-events-none">
                 <div className="flex flex-col items-center gap-3">
                   <div className="w-6 h-6 border-2 border-[var(--accent-blue)] border-t-transparent rounded-full animate-spin" />
@@ -790,7 +803,17 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
                 </div>
               </div>
             )}
-            {isPagedFile && (!isBook || bookPages) ? (
+            {isComic && comicSource ? (
+              <ImagePageViewer
+                key={`${selectedMatch.path}:${pdfLoadAttempt}`}
+                source={comicSource}
+                page={pdfPage}
+                highlight_bbox={pdfBbox}
+                decorations={readerDecorations}
+                onRenderSuccess={() => setIsPdfRendering(false)}
+                onPageChange={handleChatPageChange}
+              />
+            ) : isPagedFile && !isComic && (!isBook || bookPages) ? (
               <PdfViewer
                 key={selectedMatch.path}
                 // A PDF is fetched from the file by the webview; a book has no

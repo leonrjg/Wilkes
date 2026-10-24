@@ -1645,6 +1645,12 @@ pub struct NewBookmark {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PreviewData {
+    /// Random-access image pages; no whole-document surrogate is produced.
+    Comic {
+        page: u32,
+        highlight_bbox: Option<BoundingBox>,
+        page_count: u32,
+    },
     Text {
         content: String,
         language: Option<String>,

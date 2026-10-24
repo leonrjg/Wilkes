@@ -103,6 +103,10 @@ static CACHE: Mutex<Vec<(Key, Surrogate)>> = Mutex::new(Vec::new());
 /// perfectly well.
 pub fn surrogate(path: &Path) -> anyhow::Result<Surrogate> {
     anyhow::ensure!(
+        !super::format::PagedFormat::pages_on_demand(path),
+        "CBZ pages are served on demand, without a surrogate"
+    );
+    anyhow::ensure!(
         super::format::PagedFormat::for_path(path) != Some(super::format::PagedFormat::Pdf),
         "{} is a PDF; its pages are its own and the reader reads them from the file",
         path.display()

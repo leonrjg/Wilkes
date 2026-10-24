@@ -8994,6 +8994,7 @@ dependencies = [
  "dirs 5.0.1",
  "dom_query",
  "fastembed",
+ "flate2",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
@@ -9036,6 +9037,7 @@ dependencies = [
  "wilkes-chat",
  "wilkes-core",
  "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]
@@ -10114,6 +10116,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
 dependencies = [
  "crc32fast",
+ "flate2",
  "indexmap 2.13.0",
  "memchr",
  "typed-path",

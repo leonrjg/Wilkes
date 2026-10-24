@@ -1,3 +1,5 @@
+import { decodeComicPage } from "../lib/comicPage";
+import type { ImagePage } from "@leonrjg/wilkes-reader";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -327,6 +329,13 @@ export class TauriSearchApi implements SearchApi {
 
   resolveAssetUrl(path: string): string {
     return convertFileSrc(path);
+  }
+
+  async comicPage(path: string, page: number, signal: AbortSignal): Promise<ImagePage> {
+    signal.throwIfAborted();
+    const bytes = await invoke<ArrayBuffer | number[]>("comic_page", { path, page });
+    signal.throwIfAborted();
+    return decodeComicPage(bytes instanceof ArrayBuffer ? bytes : new Uint8Array(bytes).buffer);
   }
 
   async surrogateBytes(path: string): Promise<ArrayBuffer> {

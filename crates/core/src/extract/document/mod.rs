@@ -1,4 +1,6 @@
 mod backend;
+/// Random-access comic pages, without a whole-document PDF conversion.
+pub mod comic;
 /// Which files this backend is allowed to read, and on what terms.
 pub mod format;
 /// Kindle KF8 books, rebuilt into HTML MuPDF can read.

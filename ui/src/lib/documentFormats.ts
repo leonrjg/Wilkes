@@ -9,9 +9,8 @@
  *
  * The distinction that matters here is narrower: `PdfViewer` renders through
  * pdf.js, straight from the file's own bytes, and pdf.js opens exactly one of
- * these formats. Everything else is laid out by MuPDF inside the host, and none
- * of that layout exists in the bytes the webview would fetch — so the backend
- * sends the reading it made instead, and the pane shows that.
+ * these formats. ZIP comics use their original page images on demand. Other
+ * books are laid out by MuPDF in the host and displayed through a PDF surrogate.
  */
 
 /** Extension in lower case, without the dot. Empty when there is none. */
@@ -41,6 +40,12 @@ const PAGED_FORMATS: Readonly<Record<string, string>> = {
   cbz: "CBZ",
   cbt: "CBZ",
 };
+
+/** The extensions whose pages are served one image at a time from the archive.
+ *  The frontend's copy of the backend's `PagedFormat::pages_on_demand`. A tar
+ *  comic (`cbt`) is not among them: it has no directory to seek by, so it is
+ *  laid out like any other book. */
+const ON_DEMAND_PAGE_EXTENSIONS: ReadonlySet<string> = new Set(["cbz"]);
 
 /** The documents Wilkes always reads, in the order they are shown.
  *
@@ -81,4 +86,10 @@ export function pagedFormatLabel(path: string): string | null {
   return Object.prototype.hasOwnProperty.call(PAGED_FORMATS, extension)
     ? PAGED_FORMATS[extension]
     : null;
+}
+
+/** Whether this document's pages are requested one image at a time rather
+ *  than drawn from the file or from a surrogate rendering. */
+export function servesPagesOnDemand(path: string): boolean {
+  return ON_DEMAND_PAGE_EXTENSIONS.has(extensionOf(path));
 }
