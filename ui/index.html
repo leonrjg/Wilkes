@@ -5,6 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" href="/favicon.ico" />
     <title>Wilkes</title>
+    <!-- Painted before the bundle exists. The store applies the real theme
+         (including an explicit Light/Dark) as soon as it loads; this is the dark
+         `--bg-app`, shown only until then. Light needs no rule: it is the
+         default, and the desktop shell paints the window from the saved theme. -->
+    <style>
+      @media (prefers-color-scheme: dark) {
+        html { background: #0a0a0a; }
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>

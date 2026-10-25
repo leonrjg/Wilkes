@@ -71,6 +71,42 @@ fn native_open_ready(window: tauri::WebviewWindow, app: AppHandle) -> Vec<Native
         .mark_ready_and_drain(window.label())
 }
 
+/// Paint the main window in the saved appearance before the page has loaded.
+/// The webview is white until its first paint, which flashes in dark mode; the
+/// page's own `<style>` covers the span after that, and the settings store
+/// remains the only thing that decides the theme once the UI is running.
+fn paint_window_background(app: &tauri::App, settings_path: &std::path::Path) {
+    let Some(window) = app.get_webview_window("main") else {
+        error!("window background: no main window to paint");
+        return;
+    };
+    let settings = match tauri::async_runtime::block_on(
+        wilkes_api::commands::settings::get_settings(settings_path),
+    ) {
+        Ok(settings) => settings,
+        Err(error) => {
+            error!("window background: could not read the saved theme: {error:#}");
+            return;
+        }
+    };
+    let dark = match settings.theme {
+        wilkes_core::types::Theme::Dark => true,
+        wilkes_core::types::Theme::Light => false,
+        wilkes_core::types::Theme::System => {
+            matches!(window.theme(), Ok(tauri::Theme::Dark))
+        }
+    };
+    // `--bg-app` in ui/src/styles.css, for each palette.
+    let color = if dark {
+        tauri::window::Color(10, 10, 10, 255)
+    } else {
+        tauri::window::Color(255, 255, 255, 255)
+    };
+    if let Err(error) = window.set_background_color(Some(color)) {
+        error!("window background: could not set it: {error:#}");
+    }
+}
+
 #[tauri::command]
 async fn get_global_settings(app: AppHandle) -> Result<Settings, String> {
     wilkes_api::commands::settings::get_settings(&app.state::<GlobalSettingsPath>().0)
@@ -2268,6 +2304,7 @@ pub fn run() {
                 }
             };
             app.manage(GlobalSettingsPath(settings_path.clone()));
+            paint_window_background(app, &settings_path);
 
             let status = match collect_startup_status(&data_dir, &settings_path) {
                 Ok(status) => status,
