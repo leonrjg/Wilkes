@@ -2,6 +2,7 @@ import { decodeComicPage } from "../lib/comicPage";
 import type { ImagePage } from "@leonrjg/wilkes-reader";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import type {
@@ -84,7 +85,15 @@ import type {
   NativeOpenRequest,
 } from "../lib/types";
 import { randomId } from "../lib/types";
-import type { SearchApi, DesktopSourceApi, DataPaths, PathKind, PaneBounds } from "./api";
+import type {
+  SearchApi,
+  DesktopSourceApi,
+  DataPaths,
+  PathKind,
+  PaneBounds,
+  BrowserStep,
+  BrowserPageEvent,
+} from "./api";
 
 export class TauriSearchApi implements SearchApi {
   async getStartupStatus(): Promise<StartupStatus> {
@@ -386,8 +395,27 @@ export class TauriSearchApi implements SearchApi {
     return invoke("browser_pane_set_bounds", { bounds });
   }
 
+  async browserPaneSetVisible(visible: boolean): Promise<void> {
+    return invoke("browser_pane_set_visible", { visible });
+  }
+
+  async browserPaneStep(step: BrowserStep): Promise<void> {
+    return invoke("browser_pane_step", { step });
+  }
+
+  async browserPaneClearData(): Promise<void> {
+    return invoke("browser_pane_clear_data");
+  }
+
   async browserPaneClose(): Promise<void> {
     return invoke("browser_pane_close");
+  }
+
+  async onBrowserPanePage(handler: (event: BrowserPageEvent) => void): Promise<() => void> {
+    // Addressed to this window only: each window has its own pane.
+    return listen<BrowserPageEvent>("browser-pane:page", (event) => handler(event.payload), {
+      target: getCurrentWebview().label,
+    });
   }
 
   async writeClipboard(text: string): Promise<void> {

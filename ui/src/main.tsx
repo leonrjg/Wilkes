@@ -7,9 +7,11 @@ import GlobalErrorReporter from "./components/GlobalErrorReporter";
 import StartupGate from "./components/StartupGate";
 import DocumentApp from "./DocumentApp";
 import { useViewerStore } from "./stores/useViewerStore";
+import { routeLinkClicks } from "./lib/openLink";
 
 const documentMode = new URLSearchParams(window.location.search).get("mode") === "document";
 if (documentMode) useViewerStore.getState().enterStandaloneMode();
+routeLinkClicks();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

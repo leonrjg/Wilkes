@@ -1,0 +1,87 @@
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../services", () => ({
+  isTauri: true,
+  api: {
+    browserPaneShow: vi.fn(() => Promise.resolve()),
+    browserPaneSetBounds: vi.fn(() => Promise.resolve()),
+    browserPaneSetVisible: vi.fn(() => Promise.resolve()),
+    browserPaneStep: vi.fn(() => Promise.resolve()),
+    browserPaneClearData: vi.fn(() => Promise.resolve()),
+    browserPaneClose: vi.fn(() => Promise.resolve()),
+    onBrowserPanePage: vi.fn(() => Promise.resolve(() => {})),
+    openPath: vi.fn(() => Promise.resolve()),
+  },
+}));
+vi.mock("../lib/utils/dialog", () => ({ confirmDialog: vi.fn(() => Promise.resolve(true)) }));
+
+import { api } from "../services";
+import { useBrowserStore } from "../stores/useBrowserStore";
+import BrowserPane, { addressFrom } from "./BrowserPane";
+
+describe("BrowserPane", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useBrowserStore.setState({
+      paneOpen: true,
+      request: null,
+      url: null,
+      title: null,
+      loading: false,
+      held: false,
+    });
+  });
+
+  it("opens the requested address over its stage", async () => {
+    useBrowserStore.setState({ request: { url: "https://example.org/" } });
+    await act(async () => {
+      render(<BrowserPane />);
+    });
+    expect(api.browserPaneShow).toHaveBeenCalledWith(
+      "https://example.org/",
+      expect.objectContaining({ x: expect.any(Number), width: expect.any(Number) }),
+    );
+  });
+
+  it("navigates to what is typed in the address bar", async () => {
+    await act(async () => {
+      render(<BrowserPane />);
+    });
+    const address = screen.getByLabelText("Address");
+    fireEvent.change(address, { target: { value: "arxiv.org" } });
+    await act(async () => {
+      fireEvent.submit(address.closest("form")!);
+    });
+    expect(api.browserPaneShow).toHaveBeenCalledWith("https://arxiv.org", expect.anything());
+  });
+
+  it("steps aside while the page holds the pointer, once the webview exists", async () => {
+    useBrowserStore.setState({ request: { url: "https://example.org/" } });
+    await act(async () => {
+      render(<BrowserPane />);
+    });
+    await act(async () => {
+      useBrowserStore.getState().setHeld(true);
+    });
+    expect(api.browserPaneSetVisible).toHaveBeenLastCalledWith(false);
+    await act(async () => {
+      useBrowserStore.getState().setHeld(false);
+    });
+    expect(api.browserPaneSetVisible).toHaveBeenLastCalledWith(true);
+  });
+
+  it("closes its webview when the pane closes", async () => {
+    let view: ReturnType<typeof render>;
+    await act(async () => {
+      view = render(<BrowserPane />);
+    });
+    view!.unmount();
+    expect(api.browserPaneClose).toHaveBeenCalled();
+  });
+
+  it("reads a bare host as its https site", () => {
+    expect(addressFrom(" example.org/a ")).toBe("https://example.org/a");
+    expect(addressFrom("http://example.org")).toBe("http://example.org");
+  });
+});

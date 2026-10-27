@@ -1,18 +1,22 @@
 import { useCallback, useEffect } from "react";
 import PreviewPane from "./components/PreviewPane";
+import BrowserPane from "./components/BrowserPane";
 import { useToasts } from "./components/Toast";
 import { api } from "./services";
 import { useNativeOpen } from "./hooks/useNativeOpen";
 import { useWindowTitle } from "./hooks/useWindowTitle";
 import { useSettingsStore } from "./stores/useSettingsStore";
+import { useBrowserStore } from "./stores/useBrowserStore";
 import { activeViewerTab, useViewerStore } from "./stores/useViewerStore";
 import type { NativeOpenRequest } from "./lib/types";
 
 /** The OS-opened document shell. It intentionally has no workspace picker,
- * root, search list, or workspace-owned companion panes. */
+ * root, search list, or workspace-owned companion panes. The browser pane is
+ * none of those: a link followed here opens beside the document it was in. */
 export default function DocumentApp() {
   const { addToast } = useToasts();
   const activePath = useViewerStore((state) => activeViewerTab(state)?.path ?? null);
+  const browserPaneOpen = useBrowserStore((state) => state.paneOpen);
 
   // This window belongs to no workspace or root, so its title is only the
   // document it is showing.
@@ -54,8 +58,15 @@ export default function DocumentApp() {
   );
 
   return (
-    <main className="h-screen min-h-0 overflow-hidden bg-[var(--bg-app)] text-[var(--text-main)]">
-      <PreviewPane standalone />
+    <main className="flex h-screen min-h-0 overflow-hidden bg-[var(--bg-app)] text-[var(--text-main)]">
+      <div className="min-h-0 min-w-0 flex-1">
+        <PreviewPane standalone />
+      </div>
+      {browserPaneOpen && (
+        <div className="w-[45%] min-w-[320px] flex-shrink-0 border-l border-[var(--border-main)]">
+          <BrowserPane />
+        </div>
+      )}
     </main>
   );
 }

@@ -22,6 +22,7 @@ import { useChatStore } from "./stores/useChatStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useTopicsStore } from "./stores/useTopicsStore";
 import { useCatalogueStore } from "./stores/useCatalogueStore";
+import { useBrowserStore } from "./stores/useBrowserStore";
 import {
   useActiveWorkspaceName,
   useActiveWorkspaceReadOnly,
@@ -113,7 +114,8 @@ export default function App() {
   // Per pane: a second pane opens at the default width, and resizing one does
   // not resize the others.
   const [catalogueWidths, setCatalogueWidths] = useState<Record<string, number>>({});
-  const [browserPaneOpen, setBrowserPaneOpen] = useState(false);
+  const browserPaneOpen = useBrowserStore((s) => s.paneOpen);
+  const toggleBrowserPane = useBrowserStore((s) => s.togglePane);
   const [browserWidth, setBrowserWidth] = useState(480);
   const [chatWidths, setChatWidths] = useState<Record<string, number>>({});
   const [fileFilterText, setFileFilterText] = useState("");
@@ -391,6 +393,7 @@ export default function App() {
     document.removeEventListener("mousemove", handleMouseMove);
     document.removeEventListener("mouseup", handleMouseUp);
     document.body.style.cursor = "";
+    useBrowserStore.getState().setHeld(false);
   }, [handleMouseMove]);
 
   const startResize = useCallback(
@@ -420,6 +423,8 @@ export default function App() {
       document.addEventListener("mousemove", handleMouseMove);
       document.addEventListener("mouseup", handleMouseUp);
       document.body.style.cursor = "col-resize";
+      // The browser pane would take the pointer from the drag as it crossed it.
+      useBrowserStore.getState().setHeld(true);
     },
     [handleMouseMove, handleMouseUp],
   );
@@ -625,9 +630,9 @@ export default function App() {
         </Tooltip>
       </div>
       {isTauri && (
-        <Tooltip content="Browser pane (prototype)">
+        <Tooltip content="Browser">
           <button
-            onClick={() => setBrowserPaneOpen((open) => !open)}
+            onClick={toggleBrowserPane}
             aria-label="Browser pane"
             aria-pressed={browserPaneOpen}
             className={`w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] transition-all border border-[var(--border-main)] hover:border-[var(--border-strong)] ${
@@ -891,7 +896,7 @@ export default function App() {
             focused: false,
             marked: false,
             onFocus: () => {},
-            children: <BrowserPane onClose={() => setBrowserPaneOpen(false)} />,
+            children: <BrowserPane />,
           })}
       </div>
     </div>

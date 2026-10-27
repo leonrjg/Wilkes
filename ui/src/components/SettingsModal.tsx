@@ -951,6 +951,25 @@ export default function SettingsModal({
                       </div>
                     </div>
                   </section>
+
+                  {isTauri && (
+                    <section>
+                      <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Links</h3>
+                      <label className="flex items-start gap-2.5 cursor-pointer group">
+                        <input
+                          type="checkbox"
+                          aria-label="Open web links in Wilkes"
+                          checked={settings.open_links_in_app}
+                          onChange={(e) => handleUpdateSettings({ open_links_in_app: e.target.checked })}
+                          className="mt-0.5 w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
+                        />
+                        <span className="flex flex-col">
+                          <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Open web links in Wilkes</span>
+                          <span className="text-[10px] text-[var(--text-dim)] italic">Shows them in a browser pane beside the document instead of your system browser</span>
+                        </span>
+                      </label>
+                    </section>
+                  )}
                 </div>
               )}
             </div>

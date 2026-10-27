@@ -5,7 +5,7 @@ import type {
   CatalogueDownloadProgress,
   LiteratureSearchResult,
 } from "../lib/types";
-import { api } from "../services";
+import { openLink } from "../lib/openLink";
 import { useCatalogueAdd } from "../hooks/useCatalogueAdd";
 import {
   type AddStage,
@@ -404,18 +404,13 @@ function DownloadProgress({
 
 function OpenLink({ link, title }: { link: string; title: string }) {
   return (
-    <Tooltip content="Open in your browser">
+    <Tooltip content="Open link">
       <a
         href={link}
         rel="noreferrer noopener"
-        // The desktop webview does not open a new window for a plain
-        // anchor, so the href is here for the context menu and the click
-        // goes through the same bridge every other external link uses.
         onClick={(e) => {
           e.preventDefault();
-          api
-            .openPath(link)
-            .catch((err) => console.error("Open catalogue link failed:", err));
+          openLink(link).catch((err) => console.error("Open catalogue link failed:", err));
         }}
         aria-label={`Open ${title}`}
         className="flex h-[26px] w-[26px] items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-app)] text-[var(--text-muted)] transition-colors hover:text-[var(--text-main)]"

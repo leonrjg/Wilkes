@@ -43,6 +43,7 @@ import DocumentTopicCloudPane from "./DocumentTopicCloudPane";
 import CitationGraphPane from "./CitationGraphPane";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSearchStore } from "../stores/useSearchStore";
+import { openLink } from "../lib/openLink";
 
 type ViewerSidePanel = "related" | "citations" | "summary" | "topics" | null;
 
@@ -173,7 +174,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   const readerHost = useMemo<ReaderHostServices>(
     () => ({
       openExternal: (url) =>
-        api.openPath(url).catch((e) => console.error("Open link failed:", e)),
+        openLink(url).catch((e) => console.error("Open link failed:", e)),
       colorScheme,
       pdfAutoZoomTargetPx,
       resolveLocalAsset,
@@ -494,12 +495,12 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
 
   const handleOpenDoi = () => {
     if (!links?.doiUrl) return;
-    api.openPath(links.doiUrl).catch((e) => console.error("Open DOI failed:", e));
+    openLink(links.doiUrl).catch((e) => console.error("Open DOI failed:", e));
   };
 
   const handleOpenScholar = () => {
     if (!links) return;
-    api.openPath(links.googleScholarUrl).catch((e) => console.error("Open Google Scholar failed:", e));
+    openLink(links.googleScholarUrl).catch((e) => console.error("Open Google Scholar failed:", e));
   };
 
   const handleAddBookmark = (selection: DocumentSelection) => {

@@ -341,8 +341,9 @@ describe("CatalogueCandidate", () => {
   });
 
   /// The desktop webview ignores a plain `target="_blank"`, so the open action
-  /// has to go through the same bridge the rest of the app opens links with.
-  it("opens the landing page through the application's opener", () => {
+  /// goes where every other link does; outside the desktop app that is the
+  /// system opener.
+  it("opens the landing page through the application's link router", () => {
     render(<CatalogueCandidate provider="libretexts" work={HIT} />);
     fireEvent.click(screen.getByLabelText(/Open Combinatorial Optimization/));
     expect(api.openPath).toHaveBeenCalledWith("https://example.invalid/book");

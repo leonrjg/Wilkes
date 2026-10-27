@@ -80,13 +80,21 @@ export interface DataPaths {
   workspace: string;
 }
 
-/** A page rectangle in CSS pixels, relative to the main webview. */
+/** A page rectangle in CSS pixels, relative to the window's own webview. */
 export interface PaneBounds {
   x: number;
   y: number;
   width: number;
   height: number;
 }
+
+export type BrowserStep = "back" | "forward" | "reload";
+
+/** What the page in a window's browser pane is doing. */
+export type BrowserPageEvent =
+  | { kind: "loading"; url: string }
+  | { kind: "loaded"; url: string }
+  | { kind: "title"; title: string };
 
 // Shared across desktop and web. All methods are identical.
 export interface SearchApi {
@@ -117,10 +125,17 @@ export interface SearchApi {
   renameWorkspace(workspaceId: string, name: string): Promise<WorkspaceSummary>;
   switchWorkspace(workspaceId: string): Promise<WorkspaceState>;
   deleteWorkspace(workspaceId: string): Promise<WorkspaceState>;
-  /** PROTOTYPE: a native webview kept over the given page rectangle. */
+  /** Desktop-only docked browser: a native webview this window keeps over a
+   *  page rectangle. Opens `url` in it, creating it at `bounds` if needed. */
   browserPaneShow?(url: string, bounds: PaneBounds): Promise<void>;
   browserPaneSetBounds?(bounds: PaneBounds): Promise<void>;
+  /** Native views take the pointer from the page; a drag in the page hides
+   *  the pane until it ends. */
+  browserPaneSetVisible?(visible: boolean): Promise<void>;
+  browserPaneStep?(step: BrowserStep): Promise<void>;
+  browserPaneClearData?(): Promise<void>;
   browserPaneClose?(): Promise<void>;
+  onBrowserPanePage?(handler: (event: BrowserPageEvent) => void): Promise<() => void>;
   /** Desktop-only lifecycle controls for the opt-in external MCP endpoint. */
   getExternalMcpStatus?(): Promise<ExternalMcpStatus>;
   /** Desktop-only live viewer context exposed by the external MCP endpoint. */
