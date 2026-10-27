@@ -3,11 +3,12 @@
 // above everything the page draws -- a menu or a dialog that overlaps the pane
 // is hidden under it -- which is accepted rather than worked around.
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, ArrowRight, ExternalLink, Globe, Loader, RotateCw, Trash2, X } from "react-feather";
+import { ArrowLeft, ArrowRight, ExternalLink, Globe, Loader, Moon, RotateCw, Trash2, X } from "react-feather";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { api } from "../services";
 import type { BrowserStep, PaneBounds } from "../services/api";
 import { useBrowserStore } from "../stores/useBrowserStore";
+import { useSettingsStore } from "../stores/useSettingsStore";
 import { confirmDialog } from "../lib/utils/dialog";
 
 function boundsOf(element: HTMLElement): PaneBounds {
@@ -40,6 +41,12 @@ export default function BrowserPane() {
   const loading = useBrowserStore((s) => s.loading);
   const held = useBrowserStore((s) => s.held);
   const closePane = useBrowserStore((s) => s.closePane);
+  const invertLightPages = useBrowserStore((s) => s.invertLightPages);
+  const toggleInversion = useBrowserStore((s) => s.toggleInversion);
+  const dark = useSettingsStore((s) => s.colorScheme === "dark");
+  const inversionPercent = useSettingsStore((s) => s.settings?.dark_mode_inversion ?? 90);
+  // The reader's inversion, at the reader's strength.
+  const inversion = dark && invertLightPages ? inversionPercent / 100 : null;
   const [draft, setDraft] = useState(request?.url ?? "");
   const [editing, setEditing] = useState(false);
 
@@ -96,6 +103,12 @@ export default function BrowserPane() {
       })
       .catch((e) => console.error("browser pane: could not open", request.url, e));
   }, [request]);
+
+  // Held by the shell for every page the pane loads, so it is sent whether or
+  // not the webview exists yet.
+  useEffect(() => {
+    api.browserPaneSetInversion?.(inversion).catch((e) => console.error("browser pane: could not set inversion", e));
+  }, [inversion]);
 
   useEffect(() => {
     if (!created.current) return;
@@ -171,6 +184,19 @@ export default function BrowserPane() {
             <ExternalLink size={12} />
           </button>
         </Tooltip>
+        {dark && (
+          <Tooltip content={invertLightPages ? "Stop inverting light pages" : "Invert light pages"}>
+            <button
+              type="button"
+              aria-label="Invert light pages"
+              aria-pressed={invertLightPages}
+              onClick={toggleInversion}
+              className={`${iconButton} ${invertLightPages ? "text-[var(--accent-blue)]" : ""}`}
+            >
+              <Moon size={12} />
+            </button>
+          </Tooltip>
+        )}
         <Tooltip content="Clear cookies and site data">
           <button
             type="button"

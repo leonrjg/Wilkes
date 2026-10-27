@@ -11,6 +11,13 @@
 //! webview, so a sign-in to a publisher or a library proxy survives restarts.
 //! What the page in the pane is doing (its address, whether it is loading,
 //! its title) goes back to the window that owns the pane as events.
+//!
+//! In dark mode a light page is inverted the way the reader inverts a PDF.
+//! Pages see the window's appearance, so a site with a dark theme of its own
+//! shows it and is left alone: inverting it would make it light again.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tauri::webview::{NewWindowResponse, PageLoadEvent};
@@ -54,6 +61,71 @@ pub enum Step {
     Back,
     Forward,
     Reload,
+}
+
+/// How strongly each window's pane inverts a light page, keyed by the owning
+/// window's label; a window without an entry does not invert. Kept here rather
+/// than in the page because every page load replaces the page.
+#[derive(Default)]
+pub struct Inversions(Mutex<HashMap<String, f64>>);
+
+impl Inversions {
+    fn get(&self, owner: &str) -> Option<f64> {
+        self.0.lock().unwrap().get(owner).copied()
+    }
+
+    fn set(&self, owner: &str, strength: Option<f64>) {
+        let mut inversions = self.0.lock().unwrap();
+        match strength {
+            Some(strength) => inversions.insert(owner.to_string(), strength),
+            None => inversions.remove(owner),
+        };
+    }
+}
+
+/// The script that inverts the page in view, or stops inverting it. It judges
+/// the page once its markup is in: a page whose own background is dark is
+/// already in dark mode. The filter is the reader's (`reader.css`,
+/// `.pdf-dark-mode`), on the root so it covers the whole canvas; the root's
+/// background is pinned to the page's light one, which is what turns dark.
+fn inversion_script(strength: Option<f64>) -> String {
+    let strength = strength.map_or_else(|| "null".to_string(), |s| s.to_string());
+    format!(
+        r#"(() => {{
+  const strength = {strength};
+  const id = "wilkes-dark-inversion";
+  const background = (element) => {{
+    if (!element) return null;
+    const parts = getComputedStyle(element).backgroundColor.match(/[\d.]+/g);
+    if (!parts) return null;
+    const [r, g, b, a = 1] = parts.map(Number);
+    return a < 0.1 ? null : [r, g, b];
+  }};
+  const apply = () => {{
+    let style = document.getElementById(id);
+    const [r, g, b] = background(document.body) ?? background(document.documentElement) ?? [255, 255, 255];
+    const light = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 > 0.5;
+    if (strength === null || !light) {{
+      style?.remove();
+      return;
+    }}
+    if (!style) {{
+      style = document.createElement("style");
+      style.id = id;
+      document.documentElement.appendChild(style);
+    }}
+    style.textContent = `html {{ filter: invert(${{strength}}) hue-rotate(180deg) brightness(1.1) !important; background-color: rgb(${{r}}, ${{g}}, ${{b}}) !important; }}`;
+  }};
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", apply, {{ once: true }});
+  else apply();
+}})();"#
+    )
+}
+
+fn invert(webview: &Webview, strength: Option<f64>) {
+    if let Err(e) = webview.eval(inversion_script(strength)) {
+        error!("browser pane: could not apply dark-mode inversion: {e}");
+    }
 }
 
 fn label(owner: &str) -> String {
@@ -114,13 +186,17 @@ pub async fn browser_pane_show(
         .on_page_load({
             let app = app.clone();
             let owner = owner.clone();
-            move |_, payload| {
+            move |webview, payload| {
                 let url = payload.url().to_string();
                 let event = match payload.event() {
                     PageLoadEvent::Started => PageEvent::Loading { url },
                     PageLoadEvent::Finished => PageEvent::Loaded { url },
                 };
                 emit(&app, &owner, event);
+                // Started is the new page committed, so the script lands in it
+                // and judges it as soon as its markup is in. Finished judges
+                // it again with every stylesheet applied.
+                invert(&webview, app.state::<Inversions>().get(&owner));
             }
         })
         .on_document_title_changed({
@@ -167,6 +243,23 @@ pub async fn browser_pane_set_bounds(window: Window, bounds: PaneBounds) -> Resu
         Ok(webview) => place(&webview, &bounds),
         Err(_) => Ok(()),
     }
+}
+
+/// How strongly the calling window's pane inverts light pages; `None` stops.
+/// Held for pages yet to load, and applied to the one in view.
+#[tauri::command]
+pub async fn browser_pane_set_inversion(
+    window: Window,
+    strength: Option<f64>,
+) -> Result<(), String> {
+    window
+        .app_handle()
+        .state::<Inversions>()
+        .set(window.label(), strength);
+    if let Ok(webview) = pane(&window) {
+        invert(&webview, strength);
+    }
+    Ok(())
 }
 
 /// Step aside while the page needs the pointer: a native view takes every
@@ -225,6 +318,22 @@ mod tests {
         assert!(web_url("tauri://localhost").is_err());
         assert!(web_url("javascript:alert(1)").is_err());
         assert!(web_url("not a url").is_err());
+    }
+
+    #[test]
+    fn the_inversion_script_carries_the_strength_or_stops() {
+        assert!(inversion_script(Some(0.9)).contains("const strength = 0.9;"));
+        assert!(inversion_script(None).contains("const strength = null;"));
+    }
+
+    #[test]
+    fn inversion_is_held_per_window() {
+        let inversions = Inversions::default();
+        inversions.set("main", Some(0.9));
+        assert_eq!(inversions.get("main"), Some(0.9));
+        assert_eq!(inversions.get("document"), None);
+        inversions.set("main", None);
+        assert_eq!(inversions.get("main"), None);
     }
 
     #[test]

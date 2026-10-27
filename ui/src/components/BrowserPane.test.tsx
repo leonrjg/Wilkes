@@ -7,6 +7,7 @@ vi.mock("../services", () => ({
     browserPaneShow: vi.fn(() => Promise.resolve()),
     browserPaneSetBounds: vi.fn(() => Promise.resolve()),
     browserPaneSetVisible: vi.fn(() => Promise.resolve()),
+    browserPaneSetInversion: vi.fn(() => Promise.resolve()),
     browserPaneStep: vi.fn(() => Promise.resolve()),
     browserPaneClearData: vi.fn(() => Promise.resolve()),
     browserPaneClose: vi.fn(() => Promise.resolve()),
@@ -18,6 +19,8 @@ vi.mock("../lib/utils/dialog", () => ({ confirmDialog: vi.fn(() => Promise.resol
 
 import { api } from "../services";
 import { useBrowserStore } from "../stores/useBrowserStore";
+import { useSettingsStore } from "../stores/useSettingsStore";
+import type { Settings } from "../lib/types";
 import BrowserPane, { addressFrom } from "./BrowserPane";
 
 describe("BrowserPane", () => {
@@ -30,7 +33,29 @@ describe("BrowserPane", () => {
       title: null,
       loading: false,
       held: false,
+      invertLightPages: true,
     });
+    useSettingsStore.setState({ colorScheme: "light", settings: { dark_mode_inversion: 80 } as Settings });
+  });
+
+  it("inverts light pages in dark mode at the reader's strength, until switched off", async () => {
+    useSettingsStore.setState({ colorScheme: "dark" });
+    await act(async () => {
+      render(<BrowserPane />);
+    });
+    expect(api.browserPaneSetInversion).toHaveBeenLastCalledWith(0.8);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Invert light pages"));
+    });
+    expect(api.browserPaneSetInversion).toHaveBeenLastCalledWith(null);
+  });
+
+  it("does not invert in light mode", async () => {
+    await act(async () => {
+      render(<BrowserPane />);
+    });
+    expect(api.browserPaneSetInversion).toHaveBeenLastCalledWith(null);
+    expect(screen.queryByLabelText("Invert light pages")).toBeNull();
   });
 
   it("opens the requested address over its stage", async () => {
