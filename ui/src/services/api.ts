@@ -125,6 +125,9 @@ export interface SearchApi {
   renameWorkspace(workspaceId: string, name: string): Promise<WorkspaceSummary>;
   switchWorkspace(workspaceId: string): Promise<WorkspaceState>;
   deleteWorkspace(workspaceId: string): Promise<WorkspaceState>;
+  /** Desktop-only: the native window's appearance, which every webview in it
+   *  follows; null follows the OS. */
+  setWindowTheme?(theme: "light" | "dark" | null): Promise<void>;
   /** Desktop-only docked browser: a native webview this window keeps over a
    *  page rectangle. Opens `url` in it, creating it at `bounds` if needed. */
   browserPaneShow?(url: string, bounds: PaneBounds): Promise<void>;

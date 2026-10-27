@@ -8,6 +8,7 @@ vi.mock("../services", () => ({
     getSettings: vi.fn(),
     updateSettings: vi.fn(),
     listFiles: vi.fn(),
+    setWindowTheme: vi.fn(() => Promise.resolve()),
   },
 }));
 
@@ -409,5 +410,14 @@ describe("useSettingsStore", () => {
 
     useSettingsStore.getState().applySettingsPatch({ theme: "System" });
     expect(useSettingsStore.getState().theme).toBe("System");
+  });
+
+  it("holds the native window to the chosen appearance, and hands System back to the OS", () => {
+    useSettingsStore.getState().applySettingsPatch({ theme: "Dark" });
+    expect(api.setWindowTheme).toHaveBeenLastCalledWith("dark");
+    useSettingsStore.getState().applySettingsPatch({ theme: "Light" });
+    expect(api.setWindowTheme).toHaveBeenLastCalledWith("light");
+    useSettingsStore.getState().applySettingsPatch({ theme: "System" });
+    expect(api.setWindowTheme).toHaveBeenLastCalledWith(null);
   });
 });

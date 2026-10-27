@@ -37,6 +37,16 @@ function projectColorScheme(colorScheme: ColorScheme): ColorScheme {
   return colorScheme;
 }
 
+/** Mirror the choice onto the native window, so what else the window holds --
+ *  the pages in its browser pane, its title bar, native dialogs -- shows the
+ *  appearance the app does. "System" hands the window back to the OS. The
+ *  choice and not the resolved scheme, or a window held at "dark" would keep
+ *  the OS from ever telling "System" it had changed. */
+function projectWindowTheme(theme: Theme) {
+  const windowTheme = theme === "System" ? null : theme === "Dark" ? "dark" : "light";
+  api.setWindowTheme?.(windowTheme).catch((e) => console.error("Could not set the window's appearance:", e));
+}
+
 /** Project the saved preference without keeping a second copy of it. */
 function projectDarkModeInversion(percent = 90) {
   window.document.documentElement.style.setProperty("--pdf-dark-inversion", String(percent / 100));
@@ -126,6 +136,7 @@ export const useSettingsStore = create<SettingsStore>()(
         media.addEventListener("change", systemThemeListener);
       }
 
+      projectWindowTheme(theme);
       set({ colorScheme: projectColorScheme(resolveColorScheme(theme)) });
     };
 

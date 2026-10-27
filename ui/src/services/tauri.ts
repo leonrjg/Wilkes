@@ -3,6 +3,7 @@ import type { ImagePage } from "@leonrjg/wilkes-reader";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import type {
@@ -385,6 +386,10 @@ export class TauriSearchApi implements SearchApi {
 
   async revealPath(path: string): Promise<void> {
     return invoke("reveal_path", { path });
+  }
+
+  async setWindowTheme(theme: "light" | "dark" | null): Promise<void> {
+    return getCurrentWindow().setTheme(theme);
   }
 
   async browserPaneShow(url: string, bounds: PaneBounds): Promise<void> {

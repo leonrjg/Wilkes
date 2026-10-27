@@ -6,6 +6,7 @@
   "permissions": [
     "core:default",
     "core:window:allow-set-title",
+    "core:window:allow-set-theme",
     "dialog:allow-open",
     "dialog:allow-ask",
     "clipboard-manager:allow-write-text"
