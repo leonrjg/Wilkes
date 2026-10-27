@@ -236,6 +236,51 @@ mod tests {
     use tempfile::tempdir;
     use wilkes_core::types::{FileDisplayField, FileSortDirection, FileSortKey};
 
+    #[tokio::test]
+    async fn download_limit_defaults_migrates_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert_eq!(
+            super::get_settings(&path).await.unwrap().max_download_bytes,
+            1_000_000_000
+        );
+        let mut legacy = serde_json::to_value(wilkes_core::types::Settings::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("max_download_bytes");
+        tokio::fs::write(&path, serde_json::to_vec(&legacy).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            super::get_settings(&path).await.unwrap().max_download_bytes,
+            1_000_000_000
+        );
+        super::update_settings(
+            &path,
+            serde_json::json!({"max_download_bytes": 2_500_000_000u64}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            super::get_settings(&path).await.unwrap().max_download_bytes,
+            2_500_000_000
+        );
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            assert!(super::update_settings(
+                &path,
+                serde_json::json!({"max_download_bytes": invalid})
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                super::get_settings(&path).await.unwrap().max_download_bytes,
+                2_500_000_000
+            );
+        }
+    }
+
     const VALID_MANIFEST: &str = r#"
 manifest_version = 2
 id = "crossref"
@@ -476,6 +521,45 @@ path = "/works?rows=0"
             vec![FileDisplayField::Publication, FileDisplayField::Size]
         );
         assert!(loaded.file_tree_enabled);
+    }
+
+    #[tokio::test]
+    async fn dark_mode_inversion_preserves_default_and_persists_bounds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert_eq!(get_settings(&path).await.unwrap().dark_mode_inversion, 90);
+
+        for percent in [0, 65, 90, 100] {
+            update_settings(&path, serde_json::json!({ "dark_mode_inversion": percent }))
+                .await
+                .unwrap();
+            assert_eq!(
+                get_settings(&path).await.unwrap().dark_mode_inversion,
+                percent
+            );
+        }
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(101),
+            serde_json::json!(0.5),
+        ] {
+            assert!(
+                update_settings(&path, serde_json::json!({ "dark_mode_inversion": invalid }))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(get_settings(&path).await.unwrap().dark_mode_inversion, 100);
+        }
+
+        let mut legacy = serde_json::to_value(Settings::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("dark_mode_inversion");
+        tokio::fs::write(&path, serde_json::to_vec(&legacy).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(get_settings(&path).await.unwrap().dark_mode_inversion, 90);
     }
 
     #[tokio::test]

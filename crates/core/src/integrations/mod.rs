@@ -87,7 +87,9 @@ pub trait LiteratureSource: Send + Sync {
     fn capabilities(&self) -> ProviderCapabilities;
 
     /// `page` is 1-based. A page past the first is refused by a provider whose
-    /// [`ProviderCapabilities::paged_search`] is false.
+    /// [`ProviderCapabilities::paged_search`] is false. For manifest-based
+    /// providers, `limit` caps paginated results; a non-paginated search retains
+    /// every returned record, while still substituting `limit` in its request.
     async fn search(
         &self,
         query: &str,

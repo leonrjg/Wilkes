@@ -73,6 +73,9 @@ pub trait SearchService: Send + Sync {
     /// A value of zero means unlimited.
     async fn max_search_file_size(self: Arc<Self>) -> u64;
 
+    /// Current per-file library download limit, read for each download.
+    async fn max_download_bytes(self: Arc<Self>) -> u64;
+
     async fn list_smart_collections(self: Arc<Self>) -> Result<Vec<SmartCollection>, String> {
         Ok(Vec::new())
     }

@@ -2,12 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- Settings includes an HTTP Requests tab with the latest 500 directly initiated host HTTP calls, retained in memory for the session. Worker and library-internal traffic is excluded.
+- Library downloads default to a 1 GB per-file limit, configurable in Settings → General.
+- More than one chat or literature pane can be open at once, each with its own conversation or search. Open another from the chevron beside the toolbar button; requests such as "Ask about this file" go to the pane last used.
+
 ### Fixed
 
 - CBZ comics open and scroll by loading individual page images, avoiding full-book
   PDF conversion and keeping only nearby images in the reader. They show the same
-  page indicator and zoom controls as other documents, and a page that cannot be
-  read is reported in its own slot instead of failing the comic.
+  page indicator and zoom controls as other documents.
 
 ## 1.0.1 - 2026-10-17
 
@@ -94,7 +99,7 @@ signature: macOS uses ad-hoc signing and Windows packages are unsigned.
 - The sidebar remembers closed folders per workspace across root switches and restarts. New folders open by default.
 - Learning catalogues can be removed in Settings › Integrations › Catalogues and restored by syncing again. Refresh updates only installed catalogues.
 - Literature providers can declare more filter types and combine values with "Any of", "All of" or "None of". OpenAlex now offers 48 filters, including author and institution suggestions, citation relationships and exclusions. An "Add a filter" menu keeps large filter sets manageable.
-- Keyword searches in the literature pane have a "Load more" button per provider. Custom providers can enable pagination with `{page}` or `{offset}` in `search.path`.
+- Keyword searches in the literature pane have a "Load more" button per provider. Custom providers can enable pagination with `{page}` or `{offset}` in `search.path`. Providers without pagination show every result returned in their response.
 - The literature pane supports browsing by filters and sort order, with or without keywords. Each selected provider has its own controls and removable filter chips. Manifests can also declare DOI lookup and reference retrieval.
 - Readers remember page, scroll position, zoom and source/rendered mode across restarts, for up to 500 documents per workspace. Moved or renamed documents start at the beginning; standalone windows do not save reading positions.
 - EPUB, MOBI, AZW3 and FB2 books, plus CBZ/CBT comic archives, can be read, searched and indexed alongside PDFs, with bookmarks, highlights and tables of contents where supported. Comic text requires a configured recognizer. AZW3 layout is approximate and internal Kindle links are unavailable; incomplete text extraction is reported. Ebook support alone does not invalidate PDF indexes; see Breaking changes for extraction-recipe updates.

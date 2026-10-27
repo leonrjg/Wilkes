@@ -1809,6 +1809,16 @@ fn is_semantic_ready(app: AppHandle) -> bool {
 }
 
 #[tauri::command]
+async fn get_http_calls() -> Vec<wilkes_core::http_history::HttpCall> {
+    wilkes_api::commands::logs::get_http_calls()
+}
+
+#[tauri::command]
+async fn clear_http_calls() {
+    wilkes_api::commands::logs::clear_http_calls();
+}
+
+#[tauri::command]
 async fn get_logs() -> Result<Vec<String>, String> {
     Ok(wilkes_api::commands::logs::get_logs())
 }
@@ -2466,6 +2476,8 @@ pub fn run() {
             cancel_embed,
             get_index_status,
             delete_index,
+            get_http_calls,
+            clear_http_calls,
             get_logs,
             clear_logs,
             get_data_paths,

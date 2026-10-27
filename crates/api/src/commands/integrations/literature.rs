@@ -746,6 +746,7 @@ mod tests {
             is_open_access: true,
             pdf_url: Some("https://example.test/paper.pdf".to_string()),
             landing_page_url: None,
+            image_url: None,
             open_access_status: None,
             license: None,
             authors: None,

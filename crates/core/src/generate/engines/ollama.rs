@@ -4,6 +4,7 @@
 //! semantics: sampling, cancellation, stop handling, and the guarantee that a
 //! constrained result is validated before a task can observe it.
 
+use crate::http_history::LoggedBlockingRequest;
 use std::io::{BufRead, BufReader};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
@@ -378,7 +379,7 @@ pub fn list_models(base_url: &str) -> anyhow::Result<Vec<GeneratorDescriptor>> {
     let response: TagsResponse = checked_response(
         client
             .get(endpoint(&base_url, "api/tags")?)
-            .send()
+            .logged_send("Ollama models")
             .with_context(|| format!("could not connect to Ollama at {base_url}"))?,
         "list Ollama models",
     )?

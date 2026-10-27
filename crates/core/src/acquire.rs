@@ -6,6 +6,7 @@
 //! downloader would be a second set of answers to *may this URL be fetched*,
 //! *where may it land*, and *is this already here*.
 
+use crate::http_history::LoggedRequest;
 use std::path::{Path, PathBuf};
 
 use crate::path as wilkes_path;
@@ -13,11 +14,6 @@ use crate::path as wilkes_path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
-
-/// Cap on a single download. Checked twice: against the advertised
-/// `Content-Length` before reading, and against the bytes actually received,
-/// because a server may under-report or omit the header entirely.
-pub const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct DownloadParams {
@@ -262,11 +258,17 @@ fn content_disposition_extension(value: &str) -> Option<String> {
     .then(|| extension.to_ascii_lowercase())
 }
 
+/// Download with the caller's per-file size limit, checked against both the
+/// advertised Content-Length and the actual bytes received.
 pub async fn download_to_root(
     root: &Path,
     params: DownloadParams,
     progress: Option<mpsc::Sender<DownloadProgress>>,
+    max_download_bytes: u64,
 ) -> Result<DownloadResponse, String> {
+    if max_download_bytes == 0 {
+        return Err("Maximum download size must be greater than zero.".into());
+    }
     if !root.is_dir() {
         let message = format!("Current Wilkes root does not exist: {}", root.display());
         tracing::warn!("download refused: {message}");
@@ -336,7 +338,7 @@ pub async fn download_to_root(
     tracing::info!(url = %url, root = %root.display(), "download started");
     let response = reqwest::Client::new()
         .get(url.clone())
-        .send()
+        .logged_send("Download")
         .await
         .map_err(|error| {
             tracing::warn!(url = %url, "download failed before any bytes: {error}");
@@ -348,15 +350,15 @@ pub async fn download_to_root(
             format!("Download failed: {error}")
         })?;
     let total_bytes = response.content_length();
-    if total_bytes.is_some_and(|length| length > MAX_DOWNLOAD_BYTES as u64) {
+    if total_bytes.is_some_and(|length| length > max_download_bytes) {
         tracing::warn!(
             url = %url,
             advertised = total_bytes,
             "download refused: over the size limit before reading"
         );
         return Err(format!(
-            "Download exceeds the {} MiB limit.",
-            MAX_DOWNLOAD_BYTES / 1024 / 1024
+            "Download exceeds the {} MB limit.",
+            max_download_bytes as f64 / 1_000_000.0
         ));
     }
     let content_type = response
@@ -439,11 +441,11 @@ pub async fn download_to_root(
             }
         };
         received += chunk.len() as u64;
-        if received > MAX_DOWNLOAD_BYTES as u64 {
+        if received > max_download_bytes {
             tracing::warn!(url = %url, received, "download refused: over the size limit while reading");
             return Err(format!(
-                "Download exceeds the {} MiB limit.",
-                MAX_DOWNLOAD_BYTES / 1024 / 1024
+                "Download exceeds the {} MB limit.",
+                max_download_bytes as f64 / 1_000_000.0
             ));
         }
         bytes.extend_from_slice(&chunk);
@@ -602,6 +604,7 @@ mod tests {
                 filename: Some("../paper.pdf".to_string()),
             },
             None,
+            crate::types::DEFAULT_MAX_DOWNLOAD_BYTES,
         )
         .await
         .unwrap_err();
@@ -633,6 +636,7 @@ mod tests {
                 filename: Some("paper.pdf".to_string()),
             },
             None,
+            crate::types::DEFAULT_MAX_DOWNLOAD_BYTES,
         )
         .await
         .unwrap_err();
@@ -663,9 +667,23 @@ mod tests {
             filename: Some("paper.pdf".to_string()),
         };
 
-        let first = download_to_root(dir.path(), params(), None).await.unwrap();
+        let first = download_to_root(
+            dir.path(),
+            params(),
+            None,
+            crate::types::DEFAULT_MAX_DOWNLOAD_BYTES,
+        )
+        .await
+        .unwrap();
         assert!(!first.already_present);
-        let second = download_to_root(dir.path(), params(), None).await.unwrap();
+        let second = download_to_root(
+            dir.path(),
+            params(),
+            None,
+            crate::types::DEFAULT_MAX_DOWNLOAD_BYTES,
+        )
+        .await
+        .unwrap();
         assert!(second.already_present, "a second fetch is not a collision");
         assert_eq!(second.path, first.path);
         mock.assert_async().await;
@@ -694,6 +712,7 @@ mod tests {
                 filename: Some("book.pdf".to_string()),
             },
             Some(tx),
+            crate::types::DEFAULT_MAX_DOWNLOAD_BYTES,
         )
         .await
         .expect("download");
@@ -726,6 +745,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advertised_length_obeys_the_configured_limit_inclusively() {
+        let dir = tempdir().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        for (length, accepted) in [(16, true), (17, false)] {
+            let name = format!("book-{length}.pdf");
+            let route = format!("/{name}");
+            let mock = server
+                .mock("GET", route.as_str())
+                .with_status(200)
+                .with_body(vec![b'x'; length])
+                .create_async()
+                .await;
+            let result = download_to_root(
+                dir.path(),
+                DownloadParams {
+                    url: format!("{}{route}", server.url()),
+                    filename: Some(name.clone()),
+                },
+                None,
+                16,
+            )
+            .await;
+            if accepted {
+                assert_eq!(result.unwrap().bytes, length);
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "Download exceeds the 0.000016 MB limit."
+                );
+                assert!(!dir.path().join(name).exists());
+            }
+            mock.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
     async fn a_download_that_outgrows_the_limit_is_refused_while_it_reads() {
         let dir = tempdir().unwrap();
         let mut server = mockito::Server::new_async().await;
@@ -737,7 +792,7 @@ mod tests {
             .with_status(200)
             .with_chunked_body(|writer| {
                 let chunk = vec![b'x'; 1024 * 1024];
-                for _ in 0..(MAX_DOWNLOAD_BYTES / chunk.len() + 2) {
+                for _ in 0..3 {
                     writer.write_all(&chunk)?;
                 }
                 Ok(())
@@ -752,6 +807,7 @@ mod tests {
                 filename: Some("huge.pdf".to_string()),
             },
             None,
+            1_000_000,
         )
         .await
         .expect_err("a body past the limit must be refused");
@@ -907,6 +963,7 @@ mod tests {
                 filename: None,
             },
             None,
+            crate::types::DEFAULT_MAX_DOWNLOAD_BYTES,
         )
         .await
         .unwrap();
@@ -949,6 +1006,7 @@ mod tests {
                 filename: Some(format!("{} -- Anna\u{2019}s Archive.pdf", "é".repeat(200))),
             },
             None,
+            crate::types::DEFAULT_MAX_DOWNLOAD_BYTES,
         )
         .await
         .unwrap();

@@ -69,6 +69,7 @@ where
 }
 
 pub fn init_logging() {
+    crate::http_history::enable();
     let fmt_layer = fmt::layer()
         .with_target(true)
         .with_thread_ids(false)

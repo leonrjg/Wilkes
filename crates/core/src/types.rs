@@ -2684,8 +2684,20 @@ pub struct Settings {
     pub last_directory: Option<PathBuf>,
     pub respect_gitignore: bool,
     pub max_file_size: u64,
+    /// Maximum bytes accepted for a single library download.
+    #[serde(
+        default = "default_max_download_bytes",
+        deserialize_with = "deserialize_max_download_bytes"
+    )]
+    pub max_download_bytes: u64,
     pub context_lines: usize,
     pub theme: Theme,
+    /// Inversion percentage applied to document canvases in dark mode.
+    #[serde(
+        default = "default_dark_mode_inversion",
+        deserialize_with = "deserialize_dark_mode_inversion"
+    )]
+    pub dark_mode_inversion: u8,
     #[serde(default)]
     pub search_prefer_semantic: bool,
     /// When enabled, exact (grep) search reads a PDF's text from the semantic
@@ -2771,6 +2783,25 @@ pub struct Settings {
     pub image_analysis: ImageAnalysisSettings,
 }
 
+pub const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 1_000_000_000;
+
+fn default_max_download_bytes() -> u64 {
+    DEFAULT_MAX_DOWNLOAD_BYTES
+}
+
+fn deserialize_max_download_bytes<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(de::Error::custom(
+            "maximum download size must be greater than zero",
+        ));
+    }
+    Ok(value)
+}
+
 fn default_max_file_size() -> u64 {
     50 * 1024 * 1024
 }
@@ -2781,6 +2812,23 @@ fn default_grep_use_index() -> bool {
 
 fn default_file_display_fields() -> Vec<FileDisplayField> {
     vec![FileDisplayField::Size]
+}
+
+fn default_dark_mode_inversion() -> u8 {
+    90
+}
+
+fn deserialize_dark_mode_inversion<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u8::deserialize(deserializer)?;
+    if value > 100 {
+        return Err(de::Error::custom(
+            "dark-mode inversion must be between 0 and 100",
+        ));
+    }
+    Ok(value)
 }
 
 fn default_pdf_auto_zoom_target_px() -> f64 {
@@ -2834,8 +2882,10 @@ impl Default for Settings {
             last_directory: None,
             respect_gitignore: true,
             max_file_size: default_max_file_size(),
+            max_download_bytes: default_max_download_bytes(),
             context_lines: 2,
             theme: Theme::default(),
+            dark_mode_inversion: default_dark_mode_inversion(),
             search_prefer_semantic: false,
             grep_use_index: default_grep_use_index(),
             semantic: SemanticSettings::default(),
@@ -3322,6 +3372,9 @@ pub struct LiteratureSearchResult {
     pub is_open_access: bool,
     pub pdf_url: Option<String>,
     pub landing_page_url: Option<String>,
+    /// Optional image supplied by the provider, shown beside the result.
+    #[serde(default)]
+    pub image_url: Option<String>,
     pub open_access_status: Option<String>,
     pub license: Option<String>,
     #[serde(default)]

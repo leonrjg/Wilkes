@@ -92,6 +92,7 @@ fn result_from(hit: CatalogueHit) -> LiteratureSearchResult {
         // A documentation set has no landing page of its own; its outline is
         // where it is read.
         landing_page_url: record.landing_url.or(record.outline_url),
+        image_url: None,
         open_access_status: None,
         license: present(record.license),
         authors: present(record.authors),

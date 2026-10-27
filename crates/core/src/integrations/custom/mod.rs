@@ -272,7 +272,7 @@ impl CustomSource {
         let raw = String::from_utf8_lossy(&body);
         let raw_preview: String = raw.chars().take(PROBE_BODY_CHARS).collect();
 
-        match self.project_response(search, &body, query, PROBE_LIMIT) {
+        match self.project_response(search, &body, query, PROBE_LIMIT, Some(PROBE_LIMIT)) {
             Ok(projection) => {
                 let records_seen = projection.records_seen;
                 let issues_empty = projection.issues.is_empty();
@@ -335,17 +335,18 @@ impl CustomSource {
         body: &[u8],
         query: &str,
         limit: usize,
+        record_limit: Option<usize>,
     ) -> anyhow::Result<Projection> {
         match search.response_format {
             ResponseFormat::Json => {
                 let value: Value = serde_json::from_slice(body)
                     .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
-                self.project_json(search, &value, query, limit)
+                self.project_json(search, &value, query, limit, record_limit)
             }
             ResponseFormat::Html => {
                 let html = std::str::from_utf8(body)
                     .map_err(|error| anyhow::anyhow!("response is not UTF-8 HTML: {error}"))?;
-                self.project_html(search, html, query, limit)
+                self.project_html(search, html, query, limit, record_limit)
             }
         }
     }
@@ -356,14 +357,15 @@ impl CustomSource {
         body: &Value,
         query: &str,
         limit: usize,
+        record_limit: Option<usize>,
     ) -> anyhow::Result<Projection> {
         let evaluator = Evaluator::new(&self.base_url);
         let items = records_in(&evaluator, search.items.as_deref(), body, "items")?;
 
-        let records_seen = items.len().min(limit);
+        let records_seen = record_limit.map_or(items.len(), |cap| items.len().min(cap));
         let mut results = Vec::with_capacity(records_seen);
         let mut issues = Vec::new();
-        for (index, item) in items.iter().take(limit).enumerate() {
+        for (index, item) in items.iter().take(records_seen).enumerate() {
             let fields = self.project_fields(
                 &search.fields,
                 search_field_type,
@@ -392,6 +394,7 @@ impl CustomSource {
         html: &str,
         query: &str,
         limit: usize,
+        record_limit: Option<usize>,
     ) -> anyhow::Result<Projection> {
         let items_path = search
             .items
@@ -405,10 +408,10 @@ impl CustomSource {
             anyhow::bail!("items selector '{items_path}' matched nothing in the response");
         }
         let evaluator = Evaluator::new(&self.base_url);
-        let records_seen = items.length().min(limit);
+        let records_seen = record_limit.map_or(items.length(), |cap| items.length().min(cap));
         let mut results = Vec::with_capacity(records_seen);
         let mut issues = Vec::new();
-        for (index, item) in items.iter().take(limit).enumerate() {
+        for (index, item) in items.iter().take(records_seen).enumerate() {
             let fields = self.project_fields(
                 &search.fields,
                 search_field_type,
@@ -516,6 +519,7 @@ impl CustomSource {
             is_open_access: fields.boolean("is_open_access").unwrap_or(false),
             pdf_url,
             landing_page_url: fields.text("landing_page_url"),
+            image_url: fields.text("image_url"),
             open_access_status: fields.text("open_access_status"),
             license: fields.text("license"),
             authors: fields.text("authors"),
@@ -523,7 +527,7 @@ impl CustomSource {
             language: fields.text("language"),
             file_format: fields.text("file_format"),
             file_size: fields.text("file_size"),
-            summary: None,
+            summary: fields.text("description"),
             subject: None,
             kind: None,
             pages: None,
@@ -734,7 +738,11 @@ impl CustomSource {
             ],
         ))?;
         let body = self.fetch(request).await?;
-        let projection = self.project_response(search, &body, query, limit)?;
+        // A non-paginated response is the only chance to read these records.
+        // Keep the request limit for URL substitution and mapped input fields,
+        // but only truncate records when another page can be requested.
+        let record_limit = search.paged().then_some(limit);
+        let projection = self.project_response(search, &body, query, limit, record_limit)?;
         self.warn_unmapped(&projection);
         Ok(projection.results)
     }
@@ -765,7 +773,8 @@ impl CustomSource {
             .map_err(|problem| anyhow::anyhow!("{name} browse: {problem}"))?;
         let prepared = self.request(&browse_path(&browse.path, limit, page, &written))?;
         let body = self.fetch(prepared).await?;
-        let projection = self.project_response(search, &body, query.unwrap_or(""), limit)?;
+        let projection =
+            self.project_response(search, &body, query.unwrap_or(""), limit, Some(limit))?;
         self.warn_unmapped(&projection);
         let total = match &browse.total {
             Some(expression) => self.total_in(expression, &body)?,
@@ -1676,6 +1685,8 @@ fn result_values(result: &LiteratureSearchResult) -> HashMap<String, String> {
         ("venue", &result.venue),
         ("pdf_url", &result.pdf_url),
         ("landing_page_url", &result.landing_page_url),
+        ("description", &result.summary),
+        ("image_url", &result.image_url),
         ("open_access_status", &result.open_access_status),
         ("license", &result.license),
         ("authors", &result.authors),
@@ -2155,6 +2166,130 @@ filename = "{title}"
             .collect()
     }
 
+    #[tokio::test]
+    async fn optional_description_and_image_are_projected_without_losing_sparse_results() {
+        let manifest = r#"manifest_version = 2
+id = "media"
+name = "Media"
+[http]
+base_url = "BASE_URL"
+[capabilities.search]
+path = "/search?q={query}"
+items = "data"
+[capabilities.search.fields]
+id = "id"
+title = "title"
+description = "description"
+image_url = "image"
+[capabilities.browse]
+path = "/works?page={page}&limit={limit}"
+"#;
+        let provider = source(manifest, "https://example.test", &[]);
+        let search = provider.manifest.capabilities.search.as_ref().unwrap();
+        let body = serde_json::json!({"data": [
+            {"id": "1", "title": "A", "description": "A synopsis.", "image": "https://cdn.example.test/cover.jpg"},
+            {"id": "2", "title": "B"},
+            {"id": "3", "title": "C", "description": null, "image": null},
+            {"id": "4", "title": "D", "description": "Still readable.", "image": "javascript:alert(1)"}
+        ]});
+        let projection = provider
+            .project_json(search, &body, "", 10, Some(10))
+            .unwrap();
+        assert_eq!(projection.results.len(), 4);
+        let first = &projection.results[0];
+        assert_eq!(first.summary.as_deref(), Some("A synopsis."));
+        assert_eq!(
+            first.image_url.as_deref(),
+            Some("https://cdn.example.test/cover.jpg")
+        );
+        let mut serialized = serde_json::to_value(first).unwrap();
+        serialized.as_object_mut().unwrap().remove("image_url");
+        let older: LiteratureSearchResult = serde_json::from_value(serialized).unwrap();
+        assert_eq!(older.image_url, None);
+        assert_eq!(older.summary, first.summary);
+        let values = result_values(first);
+        assert_eq!(values["description"], "A synopsis.");
+        assert_eq!(values["image_url"], "https://cdn.example.test/cover.jpg");
+        for result in &projection.results[1..3] {
+            assert_eq!(result.summary, None);
+            assert_eq!(result.image_url, None);
+        }
+        assert_eq!(
+            projection.results[3].summary.as_deref(),
+            Some("Still readable.")
+        );
+        assert_eq!(projection.results[3].image_url, None);
+        assert_eq!(projection.issues.len(), 1);
+        assert_eq!(projection.issues[0].field, "image_url");
+
+        let mut server = mockito::Server::new_async().await;
+        let search_mock = server
+            .mock("GET", "/search")
+            .match_query(Matcher::Any)
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+        let browse_mock = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Any)
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+        let remote = source(manifest, &server.url(), &[]);
+        assert_eq!(
+            remote.search("test", 10, 1).await.unwrap(),
+            projection.results
+        );
+        assert_eq!(
+            remote
+                .browse(&BrowseRequest {
+                    limit: Some(10),
+                    ..BrowseRequest::default()
+                })
+                .await
+                .unwrap()
+                .results,
+            projection.results
+        );
+        search_mock.assert_async().await;
+        browse_mock.assert_async().await;
+    }
+
+    #[test]
+    fn html_description_and_image_use_the_same_result_fields() {
+        let manifest = r#"manifest_version = 2
+id = "html_media"
+name = "HTML Media"
+[http]
+base_url = "https://example.test"
+[capabilities.search]
+path = "/search?q={query}"
+response_format = "html"
+items = "article"
+[capabilities.search.fields]
+id = { path = "h2", attribute = "data-id" }
+title = "h2"
+description = "p"
+image_url = { path = "img", attribute = "src", then = "absolute_url(@)" }
+"#;
+        let provider = source(manifest, "https://example.test", &[]);
+        let search = provider.manifest.capabilities.search.as_ref().unwrap();
+        let body = br#"<article><h2 data-id="1">Title</h2><p>A <b>description</b>.</p><img src="/cover.jpg"></article>"#;
+        let projection = provider
+            .project_response(search, body, "", 10, Some(10))
+            .unwrap();
+        assert!(projection.issues.is_empty(), "{:?}", projection.issues);
+        assert_eq!(projection.results.len(), 1);
+        assert_eq!(
+            projection.results[0].summary.as_deref(),
+            Some("A description.")
+        );
+        assert_eq!(
+            projection.results[0].image_url.as_deref(),
+            Some("https://example.test/cover.jpg")
+        );
+    }
+
     /// A shipped provider, pointed at a mock server in place of its own origin.
     fn shipped(id: &str, base_url: &str, secrets: &[(&str, &str)]) -> CustomSource {
         let mut manifest = builtin::manifests()
@@ -2234,6 +2369,7 @@ filename = "{title}"
             is_open_access: true,
             pdf_url: Some("https://example.test/paper.pdf".into()),
             landing_page_url: Some("https://example.test/article".into()),
+            image_url: None,
             open_access_status: Some("gold".into()),
             license: Some("cc-by".into()),
             authors: None,
@@ -2272,6 +2408,39 @@ filename = "{title}"
             .unwrap();
 
         assert_eq!(results, vec![expected_openalex_record()]);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn openalex_search_and_browse_request_and_reconstruct_the_abstract() {
+        let mut server = mockito::Server::new_async().await;
+        let mut body: Value = serde_json::from_str(OPENALEX_BODY).unwrap();
+        body["results"][0]["abstract_inverted_index"] = serde_json::json!({
+            "café": [3, 1], "研究": [2], "A": [0]
+        });
+        let mock = server
+            .mock("GET", "/works")
+            .match_query(Matcher::Regex("abstract_inverted_index".into()))
+            .with_status(200)
+            .with_body(body.to_string())
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = shipped("openalex", &server.url(), &[]);
+        let mut expected = expected_openalex_record();
+        expected.summary = Some("A café 研究 café".into());
+        assert_eq!(
+            provider.search("coffee", 10, 1).await.unwrap(),
+            vec![expected.clone()]
+        );
+        assert_eq!(
+            provider
+                .browse(&BrowseRequest::default())
+                .await
+                .unwrap()
+                .results,
+            vec![expected]
+        );
         mock.assert_async().await;
     }
 
@@ -2344,6 +2513,84 @@ title = "title"
                 .capabilities()
                 .paged_search
         );
+    }
+
+    /// Single-response providers must not lose records beyond the pane's
+    /// page size. Paged providers still obey it, even if the server overfills.
+    #[tokio::test]
+    async fn search_retains_all_records_only_without_pagination() {
+        let mut server = mockito::Server::new_async().await;
+        for format in ["json", "html"] {
+            let (items, fields, body) = if format == "json" {
+                let records: Vec<_> = (0..15)
+                    .map(|index| {
+                        serde_json::json!({
+                            "id": format!("work-{index}"),
+                            "title": format!("Title {index}"),
+                        })
+                    })
+                    .collect();
+                (
+                    "results",
+                    "id = \"id\"\ntitle = \"title\"",
+                    serde_json::json!({ "results": records }).to_string(),
+                )
+            } else {
+                (
+                    "article",
+                    "id = { path = \"a\", attribute = \"href\" }\ntitle = \"a\"",
+                    (0..15)
+                        .map(|index| {
+                            format!("<article><a href='work-{index}'>Title {index}</a></article>")
+                        })
+                        .collect::<String>(),
+                )
+            };
+            for paged in [false, true] {
+                let path = if paged {
+                    "/search?q={query}&limit={limit}&page={page}"
+                } else {
+                    "/search?q={query}&limit={limit}"
+                };
+                let manifest = format!(
+                    r#"manifest_version = 2
+id = "records"
+name = "Records"
+[http]
+base_url = "BASE_URL"
+[capabilities.search]
+path = "{path}"
+response_format = "{format}"
+items = "{items}"
+[capabilities.search.fields]
+{fields}
+"#
+                );
+                let mock = server
+                    .mock("GET", "/search")
+                    .match_query(Matcher::AllOf(vec![
+                        Matcher::UrlEncoded("q".into(), "graph".into()),
+                        Matcher::UrlEncoded("limit".into(), "10".into()),
+                    ]))
+                    .with_status(200)
+                    .with_body(&body)
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let results = source(&manifest, &server.url(), &[])
+                    .search("graph", 10, 1)
+                    .await
+                    .unwrap();
+                let expected = if paged { 10 } else { 15 };
+                assert_eq!(results.len(), expected, "{format}, paged={paged}");
+                for (index, result) in results.iter().enumerate() {
+                    assert_eq!(result.id, format!("work-{index}"));
+                    assert_eq!(result.title, Some(format!("Title {index}")));
+                }
+                mock.assert_async().await;
+                mock.remove_async().await;
+            }
+        }
     }
 
     #[tokio::test]

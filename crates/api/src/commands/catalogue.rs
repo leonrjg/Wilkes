@@ -422,18 +422,24 @@ pub async fn acquire(
     url: String,
     filename: Option<String>,
     progress: Option<mpsc::Sender<DownloadProgress>>,
+    max_download_bytes: u64,
 ) -> Result<DownloadResponse, CatalogueError> {
     tokio::fs::create_dir_all(uploads_dir)
         .await
         .map_err(|error| {
             CatalogueError::Failed(format!("Cannot prepare uploads directory: {error}"))
         })?;
-    download_to_root(uploads_dir, DownloadParams { url, filename }, progress)
-        .await
-        .map_err(|message| {
-            tracing::warn!("catalogue acquisition failed: {message}");
-            CatalogueError::Request(message)
-        })
+    download_to_root(
+        uploads_dir,
+        DownloadParams { url, filename },
+        progress,
+        max_download_bytes,
+    )
+    .await
+    .map_err(|message| {
+        tracing::warn!("catalogue acquisition failed: {message}");
+        CatalogueError::Request(message)
+    })
 }
 
 /// Fetches one MIT OCW course: its documents, and a generated
@@ -456,6 +462,7 @@ pub async fn acquire_course(
     course_url: String,
     course_progress: Option<mpsc::Sender<CatalogueCourseProgress>>,
     download_progress: Option<mpsc::Sender<DownloadProgress>>,
+    max_download_bytes: u64,
 ) -> Result<CatalogueCourseResponse, CatalogueError> {
     let http = ProviderHttpClient::new("MIT OCW");
     let manifest = ocw::read_course(&http, &course_url, course_progress.as_ref())
@@ -499,7 +506,14 @@ pub async fn acquire_course(
             url: file.url.clone(),
             filename: Some(file.filename.clone()),
         };
-        match download_to_root(&directory, params, download_progress.clone()).await {
+        match download_to_root(
+            &directory,
+            params,
+            download_progress.clone(),
+            max_download_bytes,
+        )
+        .await
+        {
             // Named from the path it was written to, not from the name it was
             // asked for: the downloader holds the name to what a filesystem
             // accepts, and a course listing that reported the asked-for name
@@ -605,6 +619,7 @@ impl AppContext {
             course_url,
             Some(course),
             Some(bytes),
+            self.get_settings().await.max_download_bytes,
         )
         .await
     }
@@ -616,7 +631,14 @@ impl AppContext {
         filename: Option<String>,
     ) -> Result<DownloadResponse, CatalogueError> {
         let tx = forward::<DownloadProgress>(self.emitter(), DOWNLOAD_PROGRESS_EVENT);
-        acquire(&self.data_dir.join("uploads"), url, filename, Some(tx)).await
+        acquire(
+            &self.data_dir.join("uploads"),
+            url,
+            filename,
+            Some(tx),
+            self.get_settings().await.max_download_bytes,
+        )
+        .await
     }
 }
 

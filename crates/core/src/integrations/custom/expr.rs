@@ -16,6 +16,7 @@
 //! | --- | --- |
 //! | `normalize_doi(x)` | a DOI in any spelling, to the one this library stores |
 //! | `year_from_date(x)` | the leading year of a date string, as an integer |
+//! | `inverted_index_text(x)` | a word-to-positions index, reconstructed as text |
 //! | `strip_html(x)` | tags and entities out of a blurb |
 //! | `absolute_url(x)` | a possibly-relative URL, against the capability's base |
 //! | `to_int(x)`, `to_bool(x)` | numeric strings and `0`/`1`/`"true"` made typed |
@@ -39,6 +40,7 @@ use crate::metadata::doi::normalize_doi;
 const REGISTERED: &[&str] = &[
     "normalize_doi",
     "year_from_date",
+    "inverted_index_text",
     "strip_html",
     "absolute_url",
     "to_int",
@@ -118,6 +120,42 @@ impl Evaluator {
                         "a date starting with a four-digit year",
                         &args[0],
                     )),
+                }
+            },
+        );
+        register(
+            &mut runtime,
+            "inverted_index_text",
+            vec![ArgumentType::Any],
+            |args, ctx| {
+                if matches!(&*args[0], Variable::Null) {
+                    return Ok(null());
+                }
+                let index = args[0].as_object().ok_or_else(|| {
+                    invalid(ctx, "an object mapping words to position arrays", &args[0])
+                })?;
+                // Store only reported positions: a sparse or very large position
+                // must not allocate a vector sized by an untrusted index.
+                let mut words = std::collections::BTreeMap::new();
+                for (word, positions) in index {
+                    let positions = positions.as_array().ok_or_else(|| {
+                        invalid(ctx, "an array of non-negative integer positions", positions)
+                    })?;
+                    for position in positions {
+                        let position = match &**position {
+                            Variable::Number(number) => number.as_u64(),
+                            _ => None,
+                        }
+                        .ok_or_else(|| invalid(ctx, "a non-negative integer position", position))?;
+                        if words.insert(position, word.as_str()).is_some() {
+                            return Err(invalid(ctx, "unique word positions", &args[0]));
+                        }
+                    }
+                }
+                if words.is_empty() {
+                    Ok(null())
+                } else {
+                    Ok(text(words.into_values().collect::<Vec<_>>().join(" ")))
                 }
             },
         );
@@ -282,6 +320,7 @@ pub fn registered_function_hints() -> &'static [(&'static str, &'static str)] {
             "year_from_date(x)",
             "leading four-digit year of a date string, as an integer",
         ),
+        ("inverted_index_text(x)", "word-to-position arrays to text in position order; null or an empty index stays absent"),
         ("strip_html(x)", "HTML-bearing string to plain text"),
         (
             "absolute_url(x)",
@@ -562,6 +601,57 @@ mod tests {
 
     fn eval(expression: &str, value: Value) -> Result<Option<Value>, String> {
         Evaluator::new(&base()).eval(expression, &value)
+    }
+
+    #[test]
+    fn inverted_index_text_orders_positions_and_preserves_repeated_unicode_words() {
+        assert_eq!(
+            eval(
+                "inverted_index_text(@)",
+                json!({"café": [3, 1], "研究": [2], "A": [0]})
+            )
+            .unwrap(),
+            Some(json!("A café 研究 café"))
+        );
+        assert_eq!(
+            eval(
+                "inverted_index_text(@)",
+                json!({"later": [1000000000], "first": [0]})
+            )
+            .unwrap(),
+            Some(json!("first later"))
+        );
+    }
+
+    #[test]
+    fn inverted_index_text_leaves_missing_and_empty_abstracts_absent() {
+        for index in [json!(null), json!({}), json!({"word": []})] {
+            assert_eq!(eval("inverted_index_text(@)", index).unwrap(), None);
+        }
+        assert_eq!(
+            eval("inverted_index_text(abstract)", json!({})).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn inverted_index_text_refuses_malformed_or_ambiguous_positions() {
+        for index in [
+            json!("text"),
+            json!([]),
+            json!({"word": "0"}),
+            json!({"word": [-1]}),
+            json!({"word": [0.5]}),
+            json!({"word": ["0"]}),
+            json!({"word": [null]}),
+            json!({"word": [0, 0]}),
+            json!({"one": [0], "two": [0]}),
+        ] {
+            assert!(
+                eval("inverted_index_text(@)", index.clone()).is_err(),
+                "{index}"
+            );
+        }
     }
 
     #[test]

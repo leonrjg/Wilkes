@@ -22,12 +22,14 @@ path = "/works?filter=doi:https://doi.org/10.1145/3801158&select=id&per-page=1"
 # ── Search: keyword in, works out ─────────────────────────────────────────────
 
 [capabilities.search]
-path = "/works?search={query}&per-page={limit}&page={page}&select=id,doi,display_name,publication_year,publication_date,cited_by_count,ids,primary_location,best_oa_location,open_access,authorships"
+path = "/works?search={query}&per-page={limit}&page={page}&select=id,doi,display_name,publication_year,publication_date,cited_by_count,ids,primary_location,best_oa_location,open_access,authorships,abstract_inverted_index"
 items = "results"
 
 [capabilities.search.fields]
 id = "id"
 title = "display_name"
+# OpenAlex returns abstract words with their positions, rather than plain text.
+description = "inverted_index_text(abstract_inverted_index)"
 doi = "normalize_doi(ids.doi)"
 year = "publication_year"
 publication_date = "publication_date"
@@ -46,7 +48,7 @@ authors = "join(', ', authorships[:8].author.display_name || `[]`) || `null`"
 # ── Browse: the same works, listed by filter and sort ─────────────────────────
 
 [capabilities.browse]
-path = "/works?search={query}&filter={filters}&sort={sort}&per-page={limit}&page={page}&select=id,doi,display_name,publication_year,publication_date,cited_by_count,ids,primary_location,best_oa_location,open_access,authorships"
+path = "/works?search={query}&filter={filters}&sort={sort}&per-page={limit}&page={page}&select=id,doi,display_name,publication_year,publication_date,cited_by_count,ids,primary_location,best_oa_location,open_access,authorships,abstract_inverted_index"
 filter_separator = ","
 total = "meta.count"
 

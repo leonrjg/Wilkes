@@ -7,6 +7,7 @@ pub mod embed;
 pub mod extract;
 pub mod figure;
 pub mod generate;
+pub mod http_history;
 pub mod integrations;
 pub mod logging;
 pub mod metadata;

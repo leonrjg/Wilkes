@@ -1,3 +1,4 @@
+use crate::http_history::LoggedRequest;
 use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Cap on a single provider response body.
 ///
-/// Enforced twice, like `acquire::MAX_DOWNLOAD_BYTES`: against the advertised
+/// Enforced twice, like the configured library download limit: against the advertised
 /// `Content-Length` before reading, and against the bytes actually received,
 /// because a server may under-report the header or omit it entirely. A
 /// provider answer is metadata about at most a few hundred records; anything
@@ -316,7 +317,7 @@ impl ProviderHttpClient {
         for (name, value) in headers {
             request = request.header(*name, value);
         }
-        request.send().await
+        request.logged_send(&self.provider).await
     }
 
     async fn sleep_before_retry(&self, attempt: usize, retry_after: Option<Duration>) {
@@ -372,7 +373,10 @@ fn request_error_message(error: &reqwest::Error) -> String {
     error_chain_message(error, error.url().map(reqwest::Url::as_str))
 }
 
-fn error_chain_message(error: &(dyn StdError + 'static), hidden_url: Option<&str>) -> String {
+pub(crate) fn error_chain_message(
+    error: &(dyn StdError + 'static),
+    hidden_url: Option<&str>,
+) -> String {
     let mut messages = Vec::new();
     let mut current = Some(error);
     while let Some(cause) = current {

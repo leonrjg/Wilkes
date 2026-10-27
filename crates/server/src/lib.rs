@@ -187,6 +187,34 @@ async fn surrogate_handler(
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
+async fn get_http_calls_handler() -> impl IntoResponse {
+    Json(wilkes_api::commands::logs::get_http_calls())
+}
+
+async fn clear_http_calls_handler() -> StatusCode {
+    wilkes_api::commands::logs::clear_http_calls();
+    StatusCode::NO_CONTENT
+}
+
+/// Browser calls are captured at the API boundary, in the same history as
+/// outgoing calls. History polling/clearing is excluded to avoid log noise.
+async fn log_http_call(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if request.uri().path() == "/api/http-requests" {
+        return next.run(request).await;
+    }
+    let authority = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .unwrap_or("localhost");
+    let url = format!("http://{authority}{}", request.uri());
+    let guard =
+        wilkes_core::http_history::CallGuard::start("HTTP API", request.method().as_str(), &url);
+    let response = next.run(request).await;
+    guard.finish(Some(response.status().as_u16()), None);
+    response
+}
+
 async fn get_logs_handler() -> impl IntoResponse {
     Json(wilkes_api::commands::logs::get_logs())
 }
@@ -2706,6 +2734,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             get(session_steering_handler).delete(reset_session_steering_handler),
         )
         .route("/api/document/save", post(save_document_handler))
+        .route(
+            "/api/http-requests",
+            get(get_http_calls_handler).delete(clear_http_calls_handler),
+        )
         .route("/api/logs", get(get_logs_handler))
         .route("/api/logs", delete(clear_logs_handler))
         .route("/api/data/paths", get(get_data_paths_handler))
@@ -2755,6 +2787,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/worker/kill", post(kill_worker_handler))
         .route("/api/worker/timeout", patch(set_worker_timeout_handler))
         .layer(CorsLayer::permissive())
+        .layer(axum::middleware::from_fn(log_http_call))
         .with_state(state);
     match mcp {
         Some(mcp) => router.merge(mcp),

@@ -1103,6 +1103,8 @@ pub const SEARCH_FIELDS: &[(&str, FieldType)] = &[
     ("id", FieldType::Text),
     ("doi", FieldType::Text),
     ("title", FieldType::Text),
+    ("description", FieldType::Text),
+    ("image_url", FieldType::Url),
     ("year", FieldType::Integer),
     ("publication_date", FieldType::Text),
     ("venue", FieldType::Text),
@@ -1541,6 +1543,7 @@ response_format = "json"              # optional; "json" or "html"; defaults to 
 items = "expression"                  # JMESPath yielding an array, or a CSS selector for HTML; optional for JSON when the body is the array
 
 [capabilities.search.fields]
+# Optional description is plain text shown with the result; image_url is an HTTP(S) image URL.
 # Each key is one result field listed below. A field specification is either:
 field = "expression"                  # JMESPath (JSON) or CSS selector (HTML)
 # or an object:

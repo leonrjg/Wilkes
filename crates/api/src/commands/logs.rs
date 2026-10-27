@@ -1,3 +1,11 @@
+pub fn get_http_calls() -> Vec<wilkes_core::http_history::HttpCall> {
+    wilkes_core::http_history::get_calls()
+}
+
+pub fn clear_http_calls() {
+    wilkes_core::http_history::clear_calls();
+}
+
 pub fn get_logs() -> Vec<String> {
     wilkes_core::logging::get_logs()
 }

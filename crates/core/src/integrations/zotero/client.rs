@@ -1,3 +1,4 @@
+use crate::http_history::LoggedRequest;
 use anyhow::{anyhow, Context};
 use reqwest::StatusCode;
 
@@ -26,7 +27,11 @@ impl ZoteroClient {
     }
 
     pub async fn status(&self, enabled: bool) -> anyhow::Result<IntegrationStatus> {
-        let connector = self.http.get(self.url("/connector/ping")).send().await;
+        let connector = self
+            .http
+            .get(self.url("/connector/ping"))
+            .logged_send("Zotero")
+            .await;
 
         let version = match connector {
             Ok(response) if response.status().is_success() => response.text().await.ok(),
@@ -44,7 +49,7 @@ impl ZoteroClient {
         let api = self
             .http
             .get(self.api_url("/api/users/0/items?limit=1"))
-            .send()
+            .logged_send("Zotero")
             .await;
 
         match api {
@@ -118,7 +123,7 @@ impl ZoteroClient {
 
     pub async fn item(&self, key: &str) -> anyhow::Result<ZoteroItem> {
         let url = self.api_url(&format!("/api/users/0/items/{}", urlencoding::encode(key)));
-        let response = self.http.get(url).send().await?;
+        let response = self.http.get(url).logged_send("Zotero").await?;
         if !response.status().is_success() {
             anyhow::bail!("Zotero item lookup failed with HTTP {}", response.status());
         }
@@ -134,7 +139,7 @@ impl ZoteroClient {
             urlencoding::encode(key),
             urlencoding::encode(style),
         ));
-        let response = self.http.get(url).send().await?;
+        let response = self.http.get(url).logged_send("Zotero").await?;
         if !response.status().is_success() {
             anyhow::bail!(
                 "Zotero citation request failed with HTTP {}",
@@ -165,7 +170,7 @@ impl ZoteroClient {
             .header("X-Metadata", metadata)
             .header("Content-Type", content_type)
             .body(bytes)
-            .send()
+            .logged_send("Zotero")
             .await
             .context("failed to send file to Zotero connector")?;
 
@@ -188,7 +193,7 @@ impl ZoteroClient {
     }
 
     async fn get_items(&self, url: &str) -> anyhow::Result<Vec<ZoteroItem>> {
-        let response = self.http.get(url).send().await?;
+        let response = self.http.get(url).logged_send("Zotero").await?;
         if !response.status().is_success() {
             anyhow::bail!(
                 "Zotero local API request failed with HTTP {}",

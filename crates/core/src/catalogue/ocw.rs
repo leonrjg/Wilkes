@@ -18,8 +18,8 @@
 //! MathJax and webpack bundles. Every JSON file inside it is served
 //! individually at the same paths, so walking the manifest costs about 15 kB
 //! of metadata and then fetches exactly the documents that were asked for.
-//! It also sidesteps [`crate::acquire::MAX_DOWNLOAD_BYTES`], which the larger
-//! course zips exceed while no single PDF inside one comes close.
+//! The library download size limit applies to each document independently,
+//! rather than to a bundle containing the whole course.
 //!
 //! # What is refused, and why nothing is guessed
 //!

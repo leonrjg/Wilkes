@@ -209,6 +209,10 @@ impl wilkes_agent::search::SearchService for AppContext {
         self.get_settings().await.max_file_size
     }
 
+    async fn max_download_bytes(self: Arc<Self>) -> u64 {
+        self.get_settings().await.max_download_bytes
+    }
+
     fn is_read_only(&self) -> bool {
         AppContext::is_read_only(self)
     }
@@ -13362,13 +13366,18 @@ exit 0
 
         let patch = serde_json::json!({
             "context_lines": 5,
-            "max_file_size": 23 * 1024 * 1024
+            "max_file_size": 23 * 1024 * 1024,
+            "max_download_bytes": 2_000_000_000u64
         });
         let updated = ctx.update_settings(patch).await.unwrap();
         assert_eq!(updated.context_lines, 5);
         assert_eq!(
             wilkes_agent::search::SearchService::max_search_file_size(ctx.clone()).await,
             23 * 1024 * 1024
+        );
+        assert_eq!(
+            wilkes_agent::search::SearchService::max_download_bytes(ctx.clone()).await,
+            2_000_000_000
         );
 
         let _updated_semantic = ctx

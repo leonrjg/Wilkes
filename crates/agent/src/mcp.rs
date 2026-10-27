@@ -1007,6 +1007,8 @@ struct LiteratureResultView {
     /// Whether `download` can fetch a file for this result.
     downloadable: bool,
     landing_page_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_url: Option<String>,
     open_access_status: Option<String>,
     license: Option<String>,
     authors: Option<String>,
@@ -1040,6 +1042,7 @@ impl From<&LiteratureSearchResult> for LiteratureResultView {
             downloadable: result.pdf_url.is_some()
                 || result.acquisition == LiteratureAcquisition::Provider,
             landing_page_url: result.landing_page_url.clone(),
+            image_url: result.image_url.clone(),
             open_access_status: result.open_access_status.clone(),
             license: result.license.clone(),
             authors: result.authors.clone(),
@@ -1546,6 +1549,11 @@ impl WilkesMcp {
                 )])
             }
         };
+        let max_download_bytes = match scope.search() {
+            Some(search) => search.max_download_bytes().await,
+            // A standalone chat session has no application settings service.
+            None => wilkes_core::types::DEFAULT_MAX_DOWNLOAD_BYTES,
+        };
         // No progress sink: an MCP call is one request and one reply, with
         // nowhere to render a bar between them.
         match download_to_root(
@@ -1555,6 +1563,7 @@ impl WilkesMcp {
                 filename: params.filename.or(resolved_filename),
             },
             None,
+            max_download_bytes,
         )
         .await
         {
@@ -2597,6 +2606,10 @@ mod tests {
             }
         }
 
+        async fn max_download_bytes(self: Arc<Self>) -> u64 {
+            wilkes_core::types::DEFAULT_MAX_DOWNLOAD_BYTES
+        }
+
         async fn max_search_file_size(self: Arc<Self>) -> u64 {
             23 * 1024 * 1024
         }
@@ -3287,6 +3300,7 @@ mod tests {
                 is_open_access: true,
                 pdf_url: Some("https://example.org/a.pdf".to_string()),
                 landing_page_url: None,
+                image_url: None,
                 open_access_status: None,
                 license: None,
                 authors: None,

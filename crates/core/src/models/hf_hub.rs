@@ -20,8 +20,15 @@ pub fn fetch_hf_siblings_at(
     revision: Option<&str>,
 ) -> anyhow::Result<Vec<HfSibling>> {
     fetch_hf_siblings_from_response(model_id, revision, |url| {
-        let body = ureq::get(url)
-            .call()
+        let guard = crate::http_history::CallGuard::start("Hugging Face metadata", "GET", url);
+        let response = ureq::get(url).call();
+        let (status, error) = match &response {
+            Ok(response) => (Some(response.status()), None),
+            Err(ureq::Error::Status(status, _)) => (Some(*status), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        guard.finish(status, error);
+        let body = response
             .map_err(|e| anyhow::anyhow!("HF API request failed: {e}"))?
             .into_string()
             .map_err(|e| anyhow::anyhow!("HF API response read failed: {e}"))?;
