@@ -90,7 +90,7 @@ export interface PaneBounds {
 
 export type BrowserStep = "back" | "forward" | "reload";
 
-/** The colours Dark Reader gives a darkened page in the browser pane. */
+/** The colours a darkened page in the browser pane is given. */
 export interface PaneDarkTheme {
   background: string;
   text: string;
@@ -147,7 +147,7 @@ export interface SearchApi {
   /** Native views take the pointer from the page; a drag in the page hides
    *  the pane until it ends. */
   browserPaneSetVisible?(visible: boolean): Promise<void>;
-  /** Darken light pages in the pane with Dark Reader in these colours; null
+  /** Darken light pages in the pane into these colours; null
    *  leaves pages as their sites made them. */
   browserPaneSetDarkTheme?(theme: PaneDarkTheme | null): Promise<void>;
   browserPaneStep?(step: BrowserStep): Promise<void>;

@@ -21,7 +21,7 @@ function sameBounds(a: PaneBounds, b: PaneBounds) {
   return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
 }
 
-/** The app's own background and text colours, for Dark Reader to darken a
+/** The app's own background and text colours, to darken a
  *  page into, so the page sits in the pane like the rest of the app. */
 function appDarkTheme(): PaneDarkTheme {
   const style = getComputedStyle(document.documentElement);

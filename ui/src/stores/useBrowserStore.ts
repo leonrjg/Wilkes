@@ -19,7 +19,7 @@ interface BrowserStore {
    *  for it to keep the pointer. */
   held: boolean;
   /** In dark mode, darken pages that come out light. On by default; the
-   *  pane's own switch, for a page Dark Reader handles badly. */
+   *  pane's own switch, for a page the darkening handles badly. */
   darkenLightPages: boolean;
   show: (url: string) => void;
   togglePane: () => void;

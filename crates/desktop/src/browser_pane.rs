@@ -12,11 +12,11 @@
 //! What the page in the pane is doing (its address, whether it is loading,
 //! its title) goes back to the window that owns the pane as events.
 //!
-//! In dark mode a light page is darkened by Dark Reader's dynamic mode, which
-//! rewrites the page's colours rather than inverting them -- the engine of the
-//! Dark Reader extension, from its API build (vendored, `vendor/darkreader`).
-//! Pages see the window's appearance, so a site with a dark theme of its own
-//! shows it, and the extension's dark-theme check leaves it alone.
+//! In dark mode a light page is darkened by `browser_pane_dark.js`, a small
+//! port of Dark Reader's dynamic mode: it rewrites the page's colours by their
+//! role rather than inverting the page. Pages see the window's appearance, so
+//! a site with a dark theme of its own shows it, and the script's dark-theme
+//! check (the Dark Reader extension's) leaves it alone.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -65,13 +65,9 @@ pub enum Step {
     Reload,
 }
 
-/// What every page in a pane starts with: Dark Reader, then the script that
-/// lets the shell turn it on and off (`browser_pane_dark.js`).
-const DARK_MODE_SCRIPT: &str = concat!(
-    include_str!("../vendor/darkreader/darkreader.js"),
-    "\n",
-    include_str!("browser_pane_dark.js"),
-);
+/// The page script that darkens a light page; it installs itself once per
+/// page, and every evaluation then applies the theme it is given.
+const DARK_MODE_SCRIPT: &str = include_str!("browser_pane_dark.js");
 
 /// The colours a darkened page is given: the app's own dark background and
 /// text, so the page sits in the pane like the rest of the app.
@@ -101,11 +97,11 @@ impl DarkThemes {
     }
 }
 
-/// The call that applies `theme` to the page in view. The theme goes in as
-/// JSON, so nothing in it is ever read as script.
+/// The script, then the call that applies `theme` to the page in view. The
+/// theme goes in as JSON, so nothing in it is ever read as script.
 fn dark_mode_call(theme: Option<&PaneDarkTheme>) -> String {
     let theme = serde_json::to_string(&theme).expect("a dark theme is plain strings");
-    format!("window.__wilkesDarkMode?.({theme});")
+    format!("{DARK_MODE_SCRIPT}\nwindow.__wilkesDarkMode({theme});")
 }
 
 fn darken(webview: &Webview, theme: Option<&PaneDarkTheme>) {
@@ -179,9 +175,9 @@ pub async fn browser_pane_show(
                     PageLoadEvent::Finished => PageEvent::Loaded { url },
                 };
                 emit(&app, &owner, event);
-                // Started is the new page committed, with Dark Reader already
-                // in it, so the page is darkened before it draws. Finished is
-                // a second chance that changes nothing if the first landed.
+                // Started is the new page committed, so the script lands in it
+                // and darkens it as its styles arrive. Finished is a second
+                // chance that changes nothing if the first landed.
                 darken(&webview, app.state::<DarkThemes>().get(&owner).as_ref());
             }
         })
@@ -190,7 +186,6 @@ pub async fn browser_pane_show(
             let owner = owner.clone();
             move |_, title| emit(&app, &owner, PageEvent::Title { title })
         })
-        .initialization_script(DARK_MODE_SCRIPT)
         // A page that asks for a new window gets the pane it is already in.
         .on_new_window({
             let app = app.clone();
@@ -315,12 +310,12 @@ mod tests {
     }
 
     #[test]
-    fn the_dark_mode_call_carries_the_theme_as_json_or_stops() {
-        assert_eq!(
-            dark_mode_call(Some(&theme())),
-            r##"window.__wilkesDarkMode?.({"background":"#0a0a0a","text":"#ededed"});"##
-        );
-        assert_eq!(dark_mode_call(None), "window.__wilkesDarkMode?.(null);");
+    fn the_dark_mode_call_installs_the_script_then_applies_the_theme_as_json() {
+        let call = dark_mode_call(Some(&theme()));
+        assert!(call.starts_with(DARK_MODE_SCRIPT));
+        assert!(call
+            .ends_with(r##"window.__wilkesDarkMode({"background":"#0a0a0a","text":"#ededed"});"##));
+        assert!(dark_mode_call(None).ends_with("window.__wilkesDarkMode(null);"));
     }
 
     #[test]
@@ -330,7 +325,7 @@ mod tests {
             text: "</script>".into(),
         };
         let call = dark_mode_call(Some(&hostile));
-        assert!(call.contains(r#""background":"\"});alert(1);//""#));
+        assert!(call.ends_with(r#"({"background":"\"});alert(1);//","text":"</script>"});"#));
     }
 
     #[test]
@@ -341,13 +336,6 @@ mod tests {
         assert_eq!(themes.get("document"), None);
         themes.set("main", None);
         assert_eq!(themes.get("main"), None);
-    }
-
-    #[test]
-    fn every_page_starts_with_dark_reader_then_the_switch() {
-        let reader = DARK_MODE_SCRIPT.find("Dark Reader v4.9.133").unwrap();
-        let switch = DARK_MODE_SCRIPT.find("__wilkesDarkMode").unwrap();
-        assert!(reader < switch);
     }
 
     #[test]
