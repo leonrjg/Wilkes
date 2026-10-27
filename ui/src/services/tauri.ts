@@ -95,6 +95,7 @@ import type {
   BrowserStep,
   BrowserPageEvent,
   CookieSourceInfo,
+  PaneDarkTheme,
 } from "./api";
 
 export class TauriSearchApi implements SearchApi {
@@ -405,8 +406,8 @@ export class TauriSearchApi implements SearchApi {
     return invoke("browser_pane_set_visible", { visible });
   }
 
-  async browserPaneSetInversion(strength: number | null): Promise<void> {
-    return invoke("browser_pane_set_inversion", { strength });
+  async browserPaneSetDarkTheme(theme: PaneDarkTheme | null): Promise<void> {
+    return invoke("browser_pane_set_dark_theme", { theme });
   }
 
   async browserPaneStep(step: BrowserStep): Promise<void> {

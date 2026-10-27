@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, ExternalLink, Globe, Loader, LogIn, Moon, RotateCw, Trash2, X } from "react-feather";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { api } from "../services";
-import type { BrowserStep, PaneBounds } from "../services/api";
+import type { BrowserStep, PaneBounds, PaneDarkTheme } from "../services/api";
 import { useBrowserStore } from "../stores/useBrowserStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { confirmDialog } from "../lib/utils/dialog";
@@ -19,6 +19,16 @@ function boundsOf(element: HTMLElement): PaneBounds {
 
 function sameBounds(a: PaneBounds, b: PaneBounds) {
   return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
+}
+
+/** The app's own background and text colours, for Dark Reader to darken a
+ *  page into, so the page sits in the pane like the rest of the app. */
+function appDarkTheme(): PaneDarkTheme {
+  const style = getComputedStyle(document.documentElement);
+  return {
+    background: style.getPropertyValue("--bg-app").trim(),
+    text: style.getPropertyValue("--text-main").trim(),
+  };
 }
 
 /** What someone types into the address bar, as an address: a bare host is
@@ -42,12 +52,9 @@ export default function BrowserPane() {
   const loading = useBrowserStore((s) => s.loading);
   const held = useBrowserStore((s) => s.held);
   const closePane = useBrowserStore((s) => s.closePane);
-  const invertLightPages = useBrowserStore((s) => s.invertLightPages);
-  const toggleInversion = useBrowserStore((s) => s.toggleInversion);
+  const darkenLightPages = useBrowserStore((s) => s.darkenLightPages);
+  const toggleDarkening = useBrowserStore((s) => s.toggleDarkening);
   const dark = useSettingsStore((s) => s.colorScheme === "dark");
-  const inversionPercent = useSettingsStore((s) => s.settings?.dark_mode_inversion ?? 90);
-  // The reader's inversion, at the reader's strength.
-  const inversion = dark && invertLightPages ? inversionPercent / 100 : null;
   const [draft, setDraft] = useState(request?.url ?? "");
   const [editing, setEditing] = useState(false);
   const [importingCookies, setImportingCookies] = useState(false);
@@ -107,10 +114,13 @@ export default function BrowserPane() {
   }, [request]);
 
   // Held by the shell for every page the pane loads, so it is sent whether or
-  // not the webview exists yet.
+  // not the webview exists yet. Read after the store has projected the scheme
+  // onto <html>, so these are the dark palette's colours.
   useEffect(() => {
-    api.browserPaneSetInversion?.(inversion).catch((e) => console.error("browser pane: could not set inversion", e));
-  }, [inversion]);
+    api
+      .browserPaneSetDarkTheme?.(dark && darkenLightPages ? appDarkTheme() : null)
+      .catch((e) => console.error("browser pane: could not set its dark theme", e));
+  }, [dark, darkenLightPages]);
 
   useEffect(() => {
     if (!created.current) return;
@@ -187,13 +197,13 @@ export default function BrowserPane() {
           </button>
         </Tooltip>
         {dark && (
-          <Tooltip content={invertLightPages ? "Stop inverting light pages" : "Invert light pages"}>
+          <Tooltip content={darkenLightPages ? "Stop darkening light pages" : "Darken light pages"}>
             <button
               type="button"
-              aria-label="Invert light pages"
-              aria-pressed={invertLightPages}
-              onClick={toggleInversion}
-              className={`${iconButton} ${invertLightPages ? "text-[var(--accent-blue)]" : ""}`}
+              aria-label="Darken light pages"
+              aria-pressed={darkenLightPages}
+              onClick={toggleDarkening}
+              className={`${iconButton} ${darkenLightPages ? "text-[var(--accent-blue)]" : ""}`}
             >
               <Moon size={12} />
             </button>

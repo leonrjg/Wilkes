@@ -12,9 +12,11 @@
 //! What the page in the pane is doing (its address, whether it is loading,
 //! its title) goes back to the window that owns the pane as events.
 //!
-//! In dark mode a light page is inverted the way the reader inverts a PDF.
+//! In dark mode a light page is darkened by Dark Reader's dynamic mode, which
+//! rewrites the page's colours rather than inverting them -- the engine of the
+//! Dark Reader extension, from its API build (vendored, `vendor/darkreader`).
 //! Pages see the window's appearance, so a site with a dark theme of its own
-//! shows it and is left alone: inverting it would make it light again.
+//! shows it, and the extension's dark-theme check leaves it alone.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -63,68 +65,52 @@ pub enum Step {
     Reload,
 }
 
-/// How strongly each window's pane inverts a light page, keyed by the owning
-/// window's label; a window without an entry does not invert. Kept here rather
+/// What every page in a pane starts with: Dark Reader, then the script that
+/// lets the shell turn it on and off (`browser_pane_dark.js`).
+const DARK_MODE_SCRIPT: &str = concat!(
+    include_str!("../vendor/darkreader/darkreader.js"),
+    "\n",
+    include_str!("browser_pane_dark.js"),
+);
+
+/// The colours a darkened page is given: the app's own dark background and
+/// text, so the page sits in the pane like the rest of the app.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PaneDarkTheme {
+    background: String,
+    text: String,
+}
+
+/// Each window's pane's dark theme, keyed by the owning window's label; a
+/// window without one leaves pages as their sites made them. Kept here rather
 /// than in the page because every page load replaces the page.
 #[derive(Default)]
-pub struct Inversions(Mutex<HashMap<String, f64>>);
+pub struct DarkThemes(Mutex<HashMap<String, PaneDarkTheme>>);
 
-impl Inversions {
-    fn get(&self, owner: &str) -> Option<f64> {
-        self.0.lock().unwrap().get(owner).copied()
+impl DarkThemes {
+    fn get(&self, owner: &str) -> Option<PaneDarkTheme> {
+        self.0.lock().unwrap().get(owner).cloned()
     }
 
-    fn set(&self, owner: &str, strength: Option<f64>) {
-        let mut inversions = self.0.lock().unwrap();
-        match strength {
-            Some(strength) => inversions.insert(owner.to_string(), strength),
-            None => inversions.remove(owner),
+    fn set(&self, owner: &str, theme: Option<PaneDarkTheme>) {
+        let mut themes = self.0.lock().unwrap();
+        match theme {
+            Some(theme) => themes.insert(owner.to_string(), theme),
+            None => themes.remove(owner),
         };
     }
 }
 
-/// The script that inverts the page in view, or stops inverting it. It judges
-/// the page once its markup is in: a page whose own background is dark is
-/// already in dark mode. The filter is the reader's (`reader.css`,
-/// `.pdf-dark-mode`), on the root so it covers the whole canvas; the root's
-/// background is pinned to the page's light one, which is what turns dark.
-fn inversion_script(strength: Option<f64>) -> String {
-    let strength = strength.map_or_else(|| "null".to_string(), |s| s.to_string());
-    format!(
-        r#"(() => {{
-  const strength = {strength};
-  const id = "wilkes-dark-inversion";
-  const background = (element) => {{
-    if (!element) return null;
-    const parts = getComputedStyle(element).backgroundColor.match(/[\d.]+/g);
-    if (!parts) return null;
-    const [r, g, b, a = 1] = parts.map(Number);
-    return a < 0.1 ? null : [r, g, b];
-  }};
-  const apply = () => {{
-    let style = document.getElementById(id);
-    const [r, g, b] = background(document.body) ?? background(document.documentElement) ?? [255, 255, 255];
-    const light = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 > 0.5;
-    if (strength === null || !light) {{
-      style?.remove();
-      return;
-    }}
-    if (!style) {{
-      style = document.createElement("style");
-      style.id = id;
-      document.documentElement.appendChild(style);
-    }}
-    style.textContent = `html {{ filter: invert(${{strength}}) hue-rotate(180deg) brightness(1.1) !important; background-color: rgb(${{r}}, ${{g}}, ${{b}}) !important; }}`;
-  }};
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", apply, {{ once: true }});
-  else apply();
-}})();"#
-    )
+/// The call that applies `theme` to the page in view. The theme goes in as
+/// JSON, so nothing in it is ever read as script.
+fn dark_mode_call(theme: Option<&PaneDarkTheme>) -> String {
+    let theme = serde_json::to_string(&theme).expect("a dark theme is plain strings");
+    format!("window.__wilkesDarkMode?.({theme});")
 }
 
-fn invert(webview: &Webview, strength: Option<f64>) {
-    if let Err(e) = webview.eval(inversion_script(strength)) {
-        error!("browser pane: could not apply dark-mode inversion: {e}");
+fn darken(webview: &Webview, theme: Option<&PaneDarkTheme>) {
+    if let Err(e) = webview.eval(dark_mode_call(theme)) {
+        error!("browser pane: could not apply dark mode: {e}");
     }
 }
 
@@ -193,10 +179,10 @@ pub async fn browser_pane_show(
                     PageLoadEvent::Finished => PageEvent::Loaded { url },
                 };
                 emit(&app, &owner, event);
-                // Started is the new page committed, so the script lands in it
-                // and judges it as soon as its markup is in. Finished judges
-                // it again with every stylesheet applied.
-                invert(&webview, app.state::<Inversions>().get(&owner));
+                // Started is the new page committed, with Dark Reader already
+                // in it, so the page is darkened before it draws. Finished is
+                // a second chance that changes nothing if the first landed.
+                darken(&webview, app.state::<DarkThemes>().get(&owner).as_ref());
             }
         })
         .on_document_title_changed({
@@ -204,6 +190,7 @@ pub async fn browser_pane_show(
             let owner = owner.clone();
             move |_, title| emit(&app, &owner, PageEvent::Title { title })
         })
+        .initialization_script(DARK_MODE_SCRIPT)
         // A page that asks for a new window gets the pane it is already in.
         .on_new_window({
             let app = app.clone();
@@ -245,19 +232,19 @@ pub async fn browser_pane_set_bounds(window: Window, bounds: PaneBounds) -> Resu
     }
 }
 
-/// How strongly the calling window's pane inverts light pages; `None` stops.
+/// Darken the calling window's pane's light pages with `theme`; `None` stops.
 /// Held for pages yet to load, and applied to the one in view.
 #[tauri::command]
-pub async fn browser_pane_set_inversion(
+pub async fn browser_pane_set_dark_theme(
     window: Window,
-    strength: Option<f64>,
+    theme: Option<PaneDarkTheme>,
 ) -> Result<(), String> {
     window
         .app_handle()
-        .state::<Inversions>()
-        .set(window.label(), strength);
+        .state::<DarkThemes>()
+        .set(window.label(), theme.clone());
     if let Ok(webview) = pane(&window) {
-        invert(&webview, strength);
+        darken(&webview, theme.as_ref());
     }
     Ok(())
 }
@@ -320,20 +307,47 @@ mod tests {
         assert!(web_url("not a url").is_err());
     }
 
-    #[test]
-    fn the_inversion_script_carries_the_strength_or_stops() {
-        assert!(inversion_script(Some(0.9)).contains("const strength = 0.9;"));
-        assert!(inversion_script(None).contains("const strength = null;"));
+    fn theme() -> PaneDarkTheme {
+        PaneDarkTheme {
+            background: "#0a0a0a".into(),
+            text: "#ededed".into(),
+        }
     }
 
     #[test]
-    fn inversion_is_held_per_window() {
-        let inversions = Inversions::default();
-        inversions.set("main", Some(0.9));
-        assert_eq!(inversions.get("main"), Some(0.9));
-        assert_eq!(inversions.get("document"), None);
-        inversions.set("main", None);
-        assert_eq!(inversions.get("main"), None);
+    fn the_dark_mode_call_carries_the_theme_as_json_or_stops() {
+        assert_eq!(
+            dark_mode_call(Some(&theme())),
+            r##"window.__wilkesDarkMode?.({"background":"#0a0a0a","text":"#ededed"});"##
+        );
+        assert_eq!(dark_mode_call(None), "window.__wilkesDarkMode?.(null);");
+    }
+
+    #[test]
+    fn a_theme_cannot_break_out_of_the_call() {
+        let hostile = PaneDarkTheme {
+            background: "\"});alert(1);//".into(),
+            text: "</script>".into(),
+        };
+        let call = dark_mode_call(Some(&hostile));
+        assert!(call.contains(r#""background":"\"});alert(1);//""#));
+    }
+
+    #[test]
+    fn dark_themes_are_held_per_window() {
+        let themes = DarkThemes::default();
+        themes.set("main", Some(theme()));
+        assert_eq!(themes.get("main"), Some(theme()));
+        assert_eq!(themes.get("document"), None);
+        themes.set("main", None);
+        assert_eq!(themes.get("main"), None);
+    }
+
+    #[test]
+    fn every_page_starts_with_dark_reader_then_the_switch() {
+        let reader = DARK_MODE_SCRIPT.find("Dark Reader v4.9.133").unwrap();
+        let switch = DARK_MODE_SCRIPT.find("__wilkesDarkMode").unwrap();
+        assert!(reader < switch);
     }
 
     #[test]

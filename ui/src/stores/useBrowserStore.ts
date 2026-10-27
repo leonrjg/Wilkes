@@ -18,15 +18,15 @@ interface BrowserStore {
   /** A drag in the page is in progress, and the native pane must step aside
    *  for it to keep the pointer. */
   held: boolean;
-  /** In dark mode, invert pages that come out light. On by default; the pane's
-   *  own switch, for a page the lightness check misjudges. */
-  invertLightPages: boolean;
+  /** In dark mode, darken pages that come out light. On by default; the
+   *  pane's own switch, for a page Dark Reader handles badly. */
+  darkenLightPages: boolean;
   show: (url: string) => void;
   togglePane: () => void;
   closePane: () => void;
   applyPageEvent: (event: BrowserPageEvent) => void;
   setHeld: (held: boolean) => void;
-  toggleInversion: () => void;
+  toggleDarkening: () => void;
 }
 
 export const useBrowserStore = create<BrowserStore>((set, get) => ({
@@ -36,7 +36,7 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
   title: null,
   loading: false,
   held: false,
-  invertLightPages: true,
+  darkenLightPages: true,
   show: (url) => set({ paneOpen: true, request: { url } }),
   togglePane: () => {
     const { paneOpen, url } = get();
@@ -58,5 +58,5 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
     }
   },
   setHeld: (held) => set({ held }),
-  toggleInversion: () => set((state) => ({ invertLightPages: !state.invertLightPages })),
+  toggleDarkening: () => set((state) => ({ darkenLightPages: !state.darkenLightPages })),
 }));
