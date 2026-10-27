@@ -29,6 +29,7 @@ use wilkes_core::worker::manager::WorkerStatus;
 
 mod browser_pane;
 mod chat;
+mod cookie_import;
 mod platform;
 #[cfg(target_os = "macos")]
 mod shell_path;
@@ -2497,6 +2498,8 @@ pub fn run() {
             browser_pane::browser_pane_step,
             browser_pane::browser_pane_clear_data,
             browser_pane::browser_pane_close,
+            cookie_import::browser_cookie_sources,
+            cookie_import::browser_pane_import_cookies,
             is_semantic_ready,
             is_generation_ready,
             list_generation_models,

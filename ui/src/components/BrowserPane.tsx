@@ -3,13 +3,14 @@
 // above everything the page draws -- a menu or a dialog that overlaps the pane
 // is hidden under it -- which is accepted rather than worked around.
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, ArrowRight, ExternalLink, Globe, Loader, Moon, RotateCw, Trash2, X } from "react-feather";
+import { ArrowLeft, ArrowRight, ExternalLink, Globe, Loader, LogIn, Moon, RotateCw, Trash2, X } from "react-feather";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { api } from "../services";
 import type { BrowserStep, PaneBounds } from "../services/api";
 import { useBrowserStore } from "../stores/useBrowserStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { confirmDialog } from "../lib/utils/dialog";
+import CookieImportStrip from "./CookieImportStrip";
 
 function boundsOf(element: HTMLElement): PaneBounds {
   const rect = element.getBoundingClientRect();
@@ -49,6 +50,7 @@ export default function BrowserPane() {
   const inversion = dark && invertLightPages ? inversionPercent / 100 : null;
   const [draft, setDraft] = useState(request?.url ?? "");
   const [editing, setEditing] = useState(false);
+  const [importingCookies, setImportingCookies] = useState(false);
 
   useEffect(() => {
     if (!editing && url) setDraft(url);
@@ -197,6 +199,18 @@ export default function BrowserPane() {
             </button>
           </Tooltip>
         )}
+        <Tooltip content="Sign in with cookies from your browser">
+          <button
+            type="button"
+            aria-label="Import cookies from your browser"
+            aria-pressed={importingCookies}
+            disabled={!hasPage}
+            onClick={() => setImportingCookies((open) => !open)}
+            className={`${iconButton} ${importingCookies ? "text-[var(--accent-blue)]" : ""}`}
+          >
+            <LogIn size={12} />
+          </button>
+        </Tooltip>
         <Tooltip content="Clear cookies and site data">
           <button
             type="button"
@@ -214,6 +228,13 @@ export default function BrowserPane() {
           </button>
         </Tooltip>
       </form>
+      {importingCookies && hasPage && (
+        <CookieImportStrip
+          url={url}
+          onImported={() => void step("reload")}
+          onClose={() => setImportingCookies(false)}
+        />
+      )}
       <div ref={stage} className="relative min-h-0 flex-1">
         {!request && (
           <p className="p-4 text-center text-[11px] text-[var(--text-dim)]">

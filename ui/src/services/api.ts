@@ -90,6 +90,12 @@ export interface PaneBounds {
 
 export type BrowserStep = "back" | "forward" | "reload";
 
+/** A browser whose cookies for a site can be brought into the browser pane. */
+export interface CookieSourceInfo {
+  id: string;
+  name: string;
+}
+
 /** What the page in a window's browser pane is doing. */
 export type BrowserPageEvent =
   | { kind: "loading"; url: string }
@@ -139,6 +145,10 @@ export interface SearchApi {
   browserPaneSetInversion?(strength: number | null): Promise<void>;
   browserPaneStep?(step: BrowserStep): Promise<void>;
   browserPaneClearData?(): Promise<void>;
+  browserCookieSources?(): Promise<CookieSourceInfo[]>;
+  /** Copy one site's cookies from the user's browser into the pane; returns
+   *  how many were copied. */
+  browserPaneImportCookies?(source: string, site: string): Promise<number>;
   browserPaneClose?(): Promise<void>;
   onBrowserPanePage?(handler: (event: BrowserPageEvent) => void): Promise<() => void>;
   /** Desktop-only lifecycle controls for the opt-in external MCP endpoint. */

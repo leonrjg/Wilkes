@@ -94,6 +94,7 @@ import type {
   PaneBounds,
   BrowserStep,
   BrowserPageEvent,
+  CookieSourceInfo,
 } from "./api";
 
 export class TauriSearchApi implements SearchApi {
@@ -414,6 +415,14 @@ export class TauriSearchApi implements SearchApi {
 
   async browserPaneClearData(): Promise<void> {
     return invoke("browser_pane_clear_data");
+  }
+
+  async browserCookieSources(): Promise<CookieSourceInfo[]> {
+    return invoke<CookieSourceInfo[]>("browser_cookie_sources");
+  }
+
+  async browserPaneImportCookies(source: string, site: string): Promise<number> {
+    return invoke<number>("browser_pane_import_cookies", { source, site });
   }
 
   async browserPaneClose(): Promise<void> {

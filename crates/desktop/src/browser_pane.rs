@@ -143,7 +143,7 @@ fn web_url(url: &str) -> Result<Url, String> {
     }
 }
 
-fn pane(window: &Window) -> Result<Webview, String> {
+pub(crate) fn pane(window: &Window) -> Result<Webview, String> {
     window
         .app_handle()
         .get_webview(&label(window.label()))
