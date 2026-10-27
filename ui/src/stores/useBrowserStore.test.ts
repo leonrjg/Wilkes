@@ -51,3 +51,39 @@ describe("useBrowserStore", () => {
     });
   });
 });
+
+describe("useBrowserStore downloads", () => {
+  beforeEach(() => {
+    useBrowserStore.setState({ downloads: [] });
+  });
+
+  it("follows a download from saving to saved, newest first", () => {
+    const { applyPageEvent } = useBrowserStore.getState();
+    applyPageEvent({ kind: "download_started", url: "https://x.org/a.epub", name: "a.epub", path: "/lib/a.epub" });
+    applyPageEvent({ kind: "download_started", url: "https://x.org/b.zip", name: "b.zip", path: "/lib/b.zip" });
+    applyPageEvent({ kind: "download_finished", url: "https://x.org/a.epub", name: "a.epub", path: "/lib/a.epub", success: true });
+    expect(useBrowserStore.getState().downloads).toEqual([
+      { url: "https://x.org/a.epub", name: "a.epub", path: "/lib/a.epub", state: "saved" },
+      { url: "https://x.org/b.zip", name: "b.zip", path: "/lib/b.zip", state: "saving" },
+    ]);
+  });
+
+  it("keeps a refused download's reason, named after its address", () => {
+    useBrowserStore.getState().applyPageEvent({
+      kind: "download_refused",
+      url: "https://x.org/files/report.pdf?token=1",
+      reason: "No library folder is open to save it in",
+    });
+    expect(useBrowserStore.getState().downloads[0]).toMatchObject({
+      name: "report.pdf",
+      state: "refused",
+      reason: "No library folder is open to save it in",
+    });
+  });
+
+  it("clears", () => {
+    useBrowserStore.getState().applyPageEvent({ kind: "download_started", url: "u", name: "n", path: "/p" });
+    useBrowserStore.getState().clearDownloads();
+    expect(useBrowserStore.getState().downloads).toEqual([]);
+  });
+});

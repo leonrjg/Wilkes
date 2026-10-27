@@ -106,7 +106,10 @@ export interface CookieSourceInfo {
 export type BrowserPageEvent =
   | { kind: "loading"; url: string }
   | { kind: "loaded"; url: string }
-  | { kind: "title"; title: string };
+  | { kind: "title"; title: string }
+  | { kind: "download_started"; url: string; name: string; path: string }
+  | { kind: "download_finished"; url: string; name: string; path: string; success: boolean }
+  | { kind: "download_refused"; url: string; reason: string };
 
 // Shared across desktop and web. All methods are identical.
 export interface SearchApi {

@@ -2300,6 +2300,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(NativeOpenState::default())
         .manage(browser_pane::DarkThemes::default())
+        .manage(browser_pane::Downloads::default())
         .setup(|app| {
             let startup = Arc::new(DesktopStartupState::default());
             app.manage(Arc::clone(&startup));

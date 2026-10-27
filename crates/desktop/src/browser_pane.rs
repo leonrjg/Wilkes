@@ -19,10 +19,11 @@
 //! check (the Dark Reader extension's) leaves it alone.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use tauri::webview::{NewWindowResponse, PageLoadEvent};
+use tauri::webview::{DownloadEvent, NewWindowResponse, PageLoadEvent};
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Url, Webview, WebviewBuilder,
     WebviewUrl, Window,
@@ -52,9 +53,32 @@ pub struct PaneBounds {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PageEvent {
-    Loading { url: String },
-    Loaded { url: String },
-    Title { title: String },
+    Loading {
+        url: String,
+    },
+    Loaded {
+        url: String,
+    },
+    Title {
+        title: String,
+    },
+    /// A download from the page, being saved into the library root.
+    DownloadStarted {
+        url: String,
+        name: String,
+        path: String,
+    },
+    DownloadFinished {
+        url: String,
+        name: String,
+        path: String,
+        success: bool,
+    },
+    /// A download that was not saved, and why.
+    DownloadRefused {
+        url: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,6 +156,118 @@ pub(crate) fn pane(window: &Window) -> Result<Webview, String> {
         .ok_or_else(|| "The browser pane is not open".to_string())
 }
 
+/// Where each download in flight is going, by its URL: WebKit says where a
+/// download finished on no platform but Windows, so the shell remembers.
+#[derive(Default)]
+pub struct Downloads(Mutex<HashMap<String, PathBuf>>);
+
+/// `name` in `root`, or `name (2)`, `name (3)`… if it is taken: a download
+/// never replaces a file already in the library.
+fn free_path(root: &Path, name: &str) -> PathBuf {
+    let candidate = root.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .map_or_else(|| name.to_string(), |s| s.to_string_lossy().into_owned());
+    let extension = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    (2..)
+        .map(|n| root.join(format!("{stem} ({n}){extension}")))
+        .find(|candidate| !candidate.exists())
+        .expect("some numbered name is free")
+}
+
+/// The library root a download from the pane is saved into: the active
+/// workspace's open root, when the workspace may be written to. A download is
+/// the user's own act of putting a file there -- unlike a catalogue fetch,
+/// which Wilkes makes and keeps in its uploads directory.
+fn download_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let ctx = crate::app_context(app);
+    ctx.ensure_writable().map_err(|e| e.to_string())?;
+    tauri::async_runtime::block_on(ctx.get_settings())
+        .last_directory
+        .filter(|root| root.is_dir())
+        .ok_or_else(|| "No library folder is open to save it in".to_string())
+}
+
+/// Send a download from the pane to the library root instead of the system's
+/// Downloads folder, under the name WebKit suggests.
+fn route_download(app: &AppHandle, owner: &str, event: DownloadEvent<'_>) -> bool {
+    match event {
+        DownloadEvent::Requested { url, destination } => {
+            let url = url.to_string();
+            let Some(name) = destination
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+            else {
+                emit(
+                    app,
+                    owner,
+                    PageEvent::DownloadRefused {
+                        url,
+                        reason: "The download has no file name".into(),
+                    },
+                );
+                return false;
+            };
+            let root = match download_root(app) {
+                Ok(root) => root,
+                Err(reason) => {
+                    emit(app, owner, PageEvent::DownloadRefused { url, reason });
+                    return false;
+                }
+            };
+            let path = free_path(&root, &name);
+            *destination = path.clone();
+            app.state::<Downloads>()
+                .0
+                .lock()
+                .unwrap()
+                .insert(url.clone(), path.clone());
+            emit(
+                app,
+                owner,
+                PageEvent::DownloadStarted {
+                    url,
+                    name: file_name(&path),
+                    path: path.display().to_string(),
+                },
+            );
+            true
+        }
+        DownloadEvent::Finished { url, path, success } => {
+            let url = url.to_string();
+            let remembered = app.state::<Downloads>().0.lock().unwrap().remove(&url);
+            let Some(path) = path.or(remembered) else {
+                error!("browser pane: a download finished that was never started: {url}");
+                return true;
+            };
+            emit(
+                app,
+                owner,
+                PageEvent::DownloadFinished {
+                    url,
+                    name: file_name(&path),
+                    path: path.display().to_string(),
+                    success,
+                },
+            );
+            true
+        }
+        _ => true,
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+}
+
 fn emit(app: &AppHandle, owner: &str, event: PageEvent) {
     if let Err(e) = app.emit_to(owner, PAGE_EVENT, event) {
         error!("browser pane: could not tell {owner} about its page: {e}");
@@ -185,6 +321,11 @@ pub async fn browser_pane_show(
             let app = app.clone();
             let owner = owner.clone();
             move |_, title| emit(&app, &owner, PageEvent::Title { title })
+        })
+        .on_download({
+            let app = app.clone();
+            let owner = owner.clone();
+            move |_, event| route_download(&app, &owner, event)
         })
         // A page that asks for a new window gets the pane it is already in.
         .on_new_window({
@@ -336,6 +477,30 @@ mod tests {
         assert_eq!(themes.get("document"), None);
         themes.set("main", None);
         assert_eq!(themes.get("main"), None);
+    }
+
+    #[test]
+    fn a_download_takes_a_free_name_in_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            free_path(root.path(), "paper.epub"),
+            root.path().join("paper.epub")
+        );
+        std::fs::write(root.path().join("paper.epub"), b"").unwrap();
+        assert_eq!(
+            free_path(root.path(), "paper.epub"),
+            root.path().join("paper (2).epub")
+        );
+        std::fs::write(root.path().join("paper (2).epub"), b"").unwrap();
+        assert_eq!(
+            free_path(root.path(), "paper.epub"),
+            root.path().join("paper (3).epub")
+        );
+        std::fs::write(root.path().join("README"), b"").unwrap();
+        assert_eq!(
+            free_path(root.path(), "README"),
+            root.path().join("README (2)")
+        );
     }
 
     #[test]

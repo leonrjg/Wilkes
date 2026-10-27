@@ -11,6 +11,7 @@ import { useBrowserStore } from "../stores/useBrowserStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { confirmDialog } from "../lib/utils/dialog";
 import CookieImportStrip from "./CookieImportStrip";
+import BrowserDownloads from "./BrowserDownloads";
 
 function boundsOf(element: HTMLElement): PaneBounds {
   const rect = element.getBoundingClientRect();
@@ -238,6 +239,7 @@ export default function BrowserPane() {
           </button>
         </Tooltip>
       </form>
+      <BrowserDownloads />
       {importingCookies && hasPage && (
         <CookieImportStrip
           url={url}
