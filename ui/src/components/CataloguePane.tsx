@@ -1,5 +1,6 @@
+import { Tooltip } from "@leonrjg/wilkes-reader";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Search, Sliders, Square, X, Zap } from "react-feather";
+import { Search, Sliders, Square, X } from "react-feather";
 import type {
   BrowseControls,
   CatalogueGrain,
@@ -22,6 +23,10 @@ import {
   type Selection,
   selects,
   selectsAny,
+  CatalogueSearchContext,
+  type CataloguePaneEntry,
+  useCatalogueSearch,
+  useCatalogueSearchStore,
   useCatalogueStore,
 } from "../stores/useCatalogueStore";
 import { useGenerationStore } from "../stores/useGenerationStore";
@@ -51,35 +56,50 @@ const GRAIN_LABELS: Record<CatalogueGrain, string> = {
  * chooses which of them are asked. What a catalogue has that an index does not
  * — it is answered from this machine, and holds one kind of thing — is said
  * beside its name rather than by a second section with a second filter.
+ *
+ * Several can be open at once, each asking its own question: the pane's search
+ * is its own `CatalogueSearch`, and only the provider list and the
+ * acquisitions are shared.
  */
-export default function CataloguePane() {
+export default function CataloguePane({ pane }: { pane: CataloguePaneEntry }) {
+  return (
+    <CatalogueSearchContext.Provider value={pane.search}>
+      <CataloguePaneBody paneId={pane.id} />
+    </CatalogueSearchContext.Provider>
+  );
+}
+
+function CataloguePaneBody({ paneId }: { paneId: string }) {
   const closePane = useCatalogueStore((s) => s.closePane);
-  const providers = useCatalogueStore((s) => s.providers);
+  const search = useCatalogueSearchStore();
+  const providers = useCatalogueSearch((s) => s.providers);
   const providerOptions = useCatalogueStore((s) => s.providerOptions);
   const providerOptionsError = useCatalogueStore((s) => s.providerOptionsError);
-  const toggleProvider = useCatalogueStore((s) => s.toggleProvider);
+  const toggleProvider = useCatalogueSearch((s) => s.toggleProvider);
   const loadProviders = useCatalogueStore((s) => s.loadProviders);
-  const runSearch = useCatalogueStore((s) => s.search);
-  const literatureLoading = useCatalogueStore((s) => s.literatureLoading);
-  const literature = useCatalogueStore((s) => s.literature);
-  const literatureError = useCatalogueStore((s) => s.literatureError);
+  const runSearch = useCatalogueSearch((s) => s.search);
+  const clearSearch = useCatalogueSearch((s) => s.clearSearch);
+  const searchInput = useRef<HTMLInputElement>(null);
+  const literatureLoading = useCatalogueSearch((s) => s.literatureLoading);
+  const literature = useCatalogueSearch((s) => s.literature);
+  const literatureError = useCatalogueSearch((s) => s.literatureError);
   const acquireError = useCatalogueStore((s) => s.acquireError);
-  const refinements = useCatalogueStore((s) => s.refinements);
-  const listings = useCatalogueStore((s) => s.listings);
+  const refinements = useCatalogueSearch((s) => s.refinements);
+  const listings = useCatalogueSearch((s) => s.listings);
   const listed = useMemo(
     () => refinedProviderIds({ refinements, providerOptions, providers }),
     [refinements, providerOptions, providers],
   );
-  const setBrowseOpen = useCatalogueStore((s) => s.setBrowseOpen);
-  const compose = useCatalogueStore((s) => s.compose);
+  const setBrowseOpen = useCatalogueSearch((s) => s.setBrowseOpen);
+  const compose = useCatalogueSearch((s) => s.compose);
   const generationReady = useGenerationStore((s) => s.ready);
   const { readOnly, needsDirectory } = useCatalogueAdd();
-  const query = useCatalogueStore((s) => s.query);
-  const composedQuery = useCatalogueStore((s) => s.composedQuery);
+  const query = useCatalogueSearch((s) => s.query);
+  const composedQuery = useCatalogueSearch((s) => s.composedQuery);
   // The box holds what was written. Where that was a request filters were
   // composed from, the sources are asked its subject, not the sentence.
   const [draft, setDraft] = useState(() => {
-    const held = useCatalogueStore.getState();
+    const held = search.getState();
     return held.composedQuery !== null && held.composedQuery.keyword === held.query
       ? held.composedQuery.text
       : held.query;
@@ -120,7 +140,7 @@ export default function CataloguePane() {
         </h2>
         <button
           type="button"
-          onClick={closePane}
+          onClick={() => closePane(paneId)}
           aria-label="Close catalogue"
           className="flex h-[22px] w-[22px] items-center justify-center rounded text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
         >
@@ -140,12 +160,29 @@ export default function CataloguePane() {
           <div className="flex min-w-0 flex-1 items-center gap-1.5 rounded border border-[var(--border-main)] bg-[var(--bg-app)] pl-2 pr-1">
             <Search size={12} className="shrink-0 text-[var(--text-dim)]" />
             <input
+              ref={searchInput}
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               placeholder="What do you want to learn or read?"
               aria-label="Search catalogues and literature"
-              className="w-full bg-transparent py-1.5 text-[11px] text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
+              className="min-w-0 flex-1 bg-transparent py-1.5 text-[11px] text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
             />
+            {draft !== "" && (
+              <Tooltip content="Clear search">
+                <button
+                  type="button"
+                  aria-label="Clear catalogue search"
+                  onClick={() => {
+                    setDraft("");
+                    clearSearch();
+                    searchInput.current?.focus();
+                  }}
+                  className="inline-flex shrink-0 rounded p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)]"
+                >
+                  <X size={14} aria-hidden="true" />
+                </button>
+              </Tooltip>
+            )}
             {composable && (
               <ComposeToggle active={composeMode} onToggle={() => setComposeMode(!composeMode)} />
             )}
@@ -221,7 +258,7 @@ export default function CataloguePane() {
             )}
             {browsable.length > 0 && generationReady && (
               <Note>
-                Use the lightning button to turn a search description into filters.
+                Use the sparkles button to turn a search description into filters.
               </Note>
             )}
           </>
@@ -304,8 +341,8 @@ function Spinner() {
  * for. While a composition works it is the control that stops it.
  */
 function ComposeToggle({ active, onToggle }: { active: boolean; onToggle: () => void }) {
-  const composing = useCatalogueStore((s) => s.composing);
-  const cancel = useCatalogueStore((s) => s.cancelCompose);
+  const composing = useCatalogueSearch((s) => s.composing);
+  const cancel = useCatalogueSearch((s) => s.cancelCompose);
   const label = composing ? "Stop composing filters" : "Compose filters from what you type";
   return (
     <button
@@ -322,7 +359,23 @@ function ComposeToggle({ active, onToggle }: { active: boolean; onToggle: () => 
         active ? "bg-[var(--accent-blue-muted)] text-[var(--accent-blue)]" : "text-[var(--text-dim)]"
       }`}
     >
-      {composing ? <Square size={11} /> : <Zap size={11} />}
+      {composing ? <Square size={11} /> : (
+        <svg
+          width={11}
+          height={11}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={2}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <path d="M9 4L11 10L17 12L11 14L9 20L7 14L1 12L7 10Z" />
+          <path d="M20 2v6m-3-3h6m-3 12v4m-2-2h4" />
+        </svg>
+      )}
     </button>
   );
 }
@@ -336,10 +389,10 @@ function ComposeToggle({ active, onToggle }: { active: boolean; onToggle: () => 
  * not know is a filter silently missing unless something says so.
  */
 function ComposeStatus() {
-  const composing = useCatalogueStore((s) => s.composing);
-  const composed = useCatalogueStore((s) => s.composed);
-  const error = useCatalogueStore((s) => s.composeError);
-  const dismiss = useCatalogueStore((s) => s.dismissComposition);
+  const composing = useCatalogueSearch((s) => s.composing);
+  const composed = useCatalogueSearch((s) => s.composed);
+  const error = useCatalogueSearch((s) => s.composeError);
+  const dismiss = useCatalogueSearch((s) => s.dismissComposition);
   if (composing) {
     return (
       <p role="status" className="px-3 pb-1.5 text-[10px] leading-snug text-[var(--text-muted)]">
@@ -392,10 +445,12 @@ function ComposeStatus() {
  * below are narrowed.
  */
 function FiltersButton() {
-  const open = useCatalogueStore((s) => s.browseOpen);
-  const setOpen = useCatalogueStore((s) => s.setBrowseOpen);
-  const count = useCatalogueStore(totalRefinements);
+  const open = useCatalogueSearch((s) => s.browseOpen);
+  const setOpen = useCatalogueSearch((s) => s.setBrowseOpen);
+  const refinements = useCatalogueSearch((s) => s.refinements);
+  const selected = useCatalogueSearch((s) => s.providers);
   const options = useCatalogueStore((s) => s.providerOptions);
+  const count = totalRefinements({ refinements, providerOptions: options, providers: selected });
   if (browseProviderIds(options).length === 0) return null;
   return (
     <button
@@ -443,13 +498,13 @@ function RefineBar({
   keyword: string;
   options: LiteratureProviderInfo[];
 }) {
-  const open = useCatalogueStore((s) => s.browseOpen);
-  const refinements = useCatalogueStore((s) => s.refinements);
-  const selected = useCatalogueStore((s) => s.providers);
-  const clearFilter = useCatalogueStore((s) => s.clearBrowseFilter);
-  const setSort = useCatalogueStore((s) => s.setBrowseSort);
-  const reset = useCatalogueStore((s) => s.resetRefinement);
-  const refine = useCatalogueStore((s) => s.refine);
+  const open = useCatalogueSearch((s) => s.browseOpen);
+  const refinements = useCatalogueSearch((s) => s.refinements);
+  const selected = useCatalogueSearch((s) => s.providers);
+  const clearFilter = useCatalogueSearch((s) => s.clearBrowseFilter);
+  const setSort = useCatalogueSearch((s) => s.setBrowseSort);
+  const reset = useCatalogueSearch((s) => s.resetRefinement);
+  const refine = useCatalogueSearch((s) => s.refine);
 
   const offered = browseProviderIds(options);
   if (offered.length === 0) return null;
@@ -547,10 +602,10 @@ function ProviderFilters({
   typed: boolean;
   keyword: string;
 }) {
-  const refinement = useCatalogueStore((s) => (info ? s.refinements[info.provider] : undefined));
-  const setSort = useCatalogueStore((s) => s.setBrowseSort);
-  const reset = useCatalogueStore((s) => s.resetRefinement);
-  const refine = useCatalogueStore((s) => s.refine);
+  const refinement = useCatalogueSearch((s) => (info ? s.refinements[info.provider] : undefined));
+  const setSort = useCatalogueSearch((s) => s.setBrowseSort);
+  const reset = useCatalogueSearch((s) => s.resetRefinement);
+  const refine = useCatalogueSearch((s) => s.refine);
   // Rows the user asked to see and has not yet set. A display choice, like
   // the panel being open: it is not part of what is asked.
   const [added, setAdded] = useState<string[]>([]);
@@ -702,8 +757,8 @@ function FilterRowView({
   refinement: Refinement;
   onApply: () => void;
 }) {
-  const setFilter = useCatalogueStore((s) => s.setBrowseFilter);
-  const setMode = useCatalogueStore((s) => s.setBrowseMode);
+  const setFilter = useCatalogueSearch((s) => s.setBrowseFilter);
+  const setMode = useCatalogueSearch((s) => s.setBrowseMode);
   const member = (filter: FilterControl) => {
     const Control = CONTROLS[filter.input];
     const values = refinement.filters[filter.name] ?? [];
@@ -807,49 +862,76 @@ function ToggleControl({ filter, values, onChange, onApply }: FilterControlProps
 
 /** One of a closed list, or several of it where the filter combines values. */
 function OptionsControl({ filter, name, caption, values, onChange, onApply }: FilterControlProps) {
-  if (filter.modes.length === 0) {
-    return (
-      <select
-        aria-label={name}
-        value={values[0] ?? ""}
-        onChange={(e) => {
-          onChange(e.target.value === "" ? [] : [e.target.value]);
-          onApply();
-        }}
-        className={CONTROL_CLASS}
-      >
-        <option value="">{caption ?? "Any"}</option>
-        {filter.options.map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
-    );
-  }
+  const [search, setSearch] = useState("");
+  const searchable = filter.options.length > 10;
+  const query = searchable ? search.trim().toLowerCase() : "";
+  const matches = filter.options.filter((option) =>
+    option.label.toLowerCase().includes(query) || option.value.toLowerCase().includes(query),
+  );
+  const options = filter.options.filter((option) =>
+    values.includes(option.value) || matches.includes(option),
+  );
+
   return (
-    <div
-      role="group"
-      aria-label={name}
-      className="flex max-h-28 flex-col gap-0.5 overflow-y-auto rounded border border-[var(--border-main)] bg-[var(--bg-sidebar)] px-1.5 py-1"
-    >
-      {filter.options.map((option) => (
-        <label key={option.value} className="flex items-center gap-1.5 text-[11px] text-[var(--text-main)]">
-          <input
-            type="checkbox"
-            checked={values.includes(option.value)}
-            onChange={(e) => {
-              onChange(
-                e.target.checked
-                  ? [...values, option.value]
-                  : values.filter((value) => value !== option.value),
-              );
-              onApply();
-            }}
-          />
-          {option.label}
-        </label>
-      ))}
+    <div className="flex min-w-0 flex-col gap-1">
+      {searchable && (
+        <input
+          type="search"
+          aria-label={`Search ${name}`}
+          placeholder="Search…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.preventDefault();
+          }}
+          className={CONTROL_CLASS}
+        />
+      )}
+      {filter.modes.length === 0 ? (
+        <select
+          aria-label={name}
+          value={values[0] ?? ""}
+          onChange={(e) => {
+            onChange(e.target.value === "" ? [] : [e.target.value]);
+            onApply();
+          }}
+          className={CONTROL_CLASS}
+        >
+          <option value="">{caption ?? "Any"}</option>
+          {options.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <div
+          role="group"
+          aria-label={name}
+          className="flex max-h-28 flex-col gap-0.5 overflow-y-auto rounded border border-[var(--border-main)] bg-[var(--bg-sidebar)] px-1.5 py-1"
+        >
+          {options.map((option) => (
+            <label key={option.value} className="flex items-center gap-1.5 text-[11px] text-[var(--text-main)]">
+              <input
+                type="checkbox"
+                checked={values.includes(option.value)}
+                onChange={(e) => {
+                  onChange(
+                    e.target.checked
+                      ? [...values, option.value]
+                      : values.filter((value) => value !== option.value),
+                  );
+                  onApply();
+                }}
+              />
+              {option.label}
+            </label>
+          ))}
+        </div>
+      )}
+      {matches.length === 0 && (
+        <p role="status" className="text-[10px] text-[var(--text-dim)]">No matches</p>
+      )}
     </div>
   );
 }
@@ -1151,8 +1233,8 @@ function optionLabel(
  * does not look like one that was ignored.
  */
 function ListingBody({ provider, name }: { provider: string; name: string }) {
-  const listing = useCatalogueStore((s) => s.listings[provider]);
-  const more = useCatalogueStore((s) => s.browseMore);
+  const listing = useCatalogueSearch((s) => s.listings[provider]);
+  const more = useCatalogueSearch((s) => s.browseMore);
   const answer = listing?.answer ?? null;
   const loading = listing?.loading ?? false;
   const error = listing?.error ?? null;
@@ -1285,9 +1367,9 @@ function ProviderEntry({
   /** What a learning catalogue holds; null for any other provider. */
   grain: CatalogueGrain | null;
 }) {
-  const moreLoading = useCatalogueStore((s) => s.literatureMore);
-  const moreError = useCatalogueStore((s) => s.literatureMoreError);
-  const loadMore = useCatalogueStore((s) => s.loadMoreLiterature);
+  const moreLoading = useCatalogueSearch((s) => s.literatureMore);
+  const moreError = useCatalogueSearch((s) => s.literatureMoreError);
+  const loadMore = useCatalogueSearch((s) => s.loadMoreLiterature);
   return (
     <div className="flex flex-col">
       {/* The provider is the strongest label in the pane: it says whose

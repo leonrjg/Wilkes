@@ -28,6 +28,7 @@ const BOOK: LiteratureSearchResult = {
   is_open_access: true,
   pdf_url: "https://example.invalid/stats.pdf",
   landing_page_url: "https://example.invalid/stats",
+  image_url: null,
   open_access_status: null,
   license: "CC-BY",
   authors: "OpenStax",
@@ -86,7 +87,14 @@ describe("CatalogueGapStrip", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useCatalogueStore.getState().reset();
-    useCatalogueStore.setState({ providers: null, legacy: undefined, providerOptions: [] });
+    useCatalogueStore.setState({
+      panesVisible: false,
+      panes: [],
+      focusedPane: null,
+      preferredProviders: null,
+      legacy: undefined,
+      providerOptions: [],
+    });
     providers.mockResolvedValue([
       provider("openstax", "OpenStax", true),
       provider("libretexts", "LibreTexts", true),
@@ -231,7 +239,10 @@ describe("CatalogueGapStrip", () => {
     render(<CatalogueGapPrompt query="confidence intervals" />);
     fireEvent.click(screen.getByRole("button", { name: "Search learning catalogues" }));
     await waitFor(() => {
-      expect(useCatalogueStore.getState().paneOpen).toBe(true);
+      expect(useCatalogueStore.getState().panesVisible).toBe(true);
+      expect(useCatalogueStore.getState().panes[0].search.getState().query).toBe(
+        "confidence intervals",
+      );
       expect(search).toHaveBeenCalledWith("confidence intervals", 10, undefined);
     });
   });

@@ -37,6 +37,11 @@ function projectColorScheme(colorScheme: ColorScheme): ColorScheme {
   return colorScheme;
 }
 
+/** Project the saved preference without keeping a second copy of it. */
+function projectDarkModeInversion(percent = 90) {
+  window.document.documentElement.style.setProperty("--pdf-dark-inversion", String(percent / 100));
+}
+
 // The one registration that follows the OS while the theme is "System". Held
 // module-side so switching away from System removes it, and switching back
 // installs exactly one -- the previous code added a listener only if System was
@@ -164,6 +169,7 @@ export const useSettingsStore = create<SettingsStore>()(
     load: async () => {
       const s = await api.getSettings();
       applyTheme(s.theme);
+      projectDarkModeInversion(s.dark_mode_inversion);
 
       set({
         settings: s,
@@ -362,6 +368,9 @@ export const useSettingsStore = create<SettingsStore>()(
           },
         });
       }
+      if (patch.dark_mode_inversion !== undefined) {
+        projectDarkModeInversion(patch.dark_mode_inversion);
+      }
       if (patch.theme) {
         applyTheme(patch.theme);
         set({ theme: patch.theme });
@@ -444,6 +453,7 @@ export const useSettingsStore = create<SettingsStore>()(
 
     replaceSettings: (settings) => {
       applyTheme(settings.theme);
+      projectDarkModeInversion(settings.dark_mode_inversion);
       set({
         settings,
         favorites: settings.favorites,

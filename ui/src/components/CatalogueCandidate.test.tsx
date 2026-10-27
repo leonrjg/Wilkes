@@ -1,4 +1,5 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render as renderAlone, screen, waitFor } from "@testing-library/react";
+import type { ReactElement, ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LiteratureSearchResult } from "../lib/types";
 
@@ -20,9 +21,24 @@ vi.mock("../services", () => ({
 
 import { api, source } from "../services";
 import CatalogueCandidate from "./CatalogueCandidate";
-import { useCatalogueStore } from "../stores/useCatalogueStore";
+import {
+  CatalogueSearchContext,
+  createCatalogueSearch,
+  useCatalogueStore,
+} from "../stores/useCatalogueStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
+
+/** A row is rendered in a pane, whose search its filters refine. */
+function InPane({ children }: { children: ReactNode }) {
+  return (
+    <CatalogueSearchContext.Provider value={createCatalogueSearch(null)}>
+      {children}
+    </CatalogueSearchContext.Provider>
+  );
+}
+
+const render = (ui: ReactElement) => renderAlone(ui, { wrapper: InPane });
 
 /// A textbook as a learning catalogue returns it: the result every provider
 /// answers in, carrying what a catalogue knows.
@@ -37,6 +53,7 @@ const HIT: LiteratureSearchResult = {
   is_open_access: true,
   pdf_url: "https://example.invalid/book.pdf",
   landing_page_url: "https://example.invalid/book",
+  image_url: null,
   open_access_status: null,
   license: "CC-BY",
   authors: "Someone",
@@ -60,6 +77,7 @@ const COURSE: LiteratureSearchResult = {
   id: "3308",
   title: "Water Quality Control",
   landing_page_url: "https://ocw.mit.edu/courses/1-77-water-quality-spring-2006/",
+  image_url: null,
   pdf_url: null,
   kind: "course",
   pages: null,
@@ -96,6 +114,69 @@ describe("CatalogueCandidate", () => {
     // open catalogue's licence says more than "open access" would.
     expect(screen.getByText("Mathematics · Someone · CC-BY · 412 pp")).toBeTruthy();
     expect(screen.getByText(HIT.summary as string)).toBeTruthy();
+  });
+
+  it("expands and collapses the full description independently for each result", () => {
+    const description = "First paragraph.\n\n" + "A longer synopsis with more detail. ".repeat(30);
+    render(<>
+      <CatalogueCandidate provider="custom:kitsu" work={{ ...HIT, summary: description }} />
+      <CatalogueCandidate provider="custom:kitsu" work={{ ...HIT, id: "other", title: "Other result" }} />
+    </>);
+    const expand = screen.getByRole("button", { name: `Expand description for ${HIT.title}` });
+    const paragraph = screen.getByText(description, { normalizer: (text) => text });
+    expect(expand.getAttribute("aria-expanded")).toBe("false");
+    expect(expand.getAttribute("aria-controls")).toBe(paragraph.id);
+    expect(paragraph.className).toContain("line-clamp-2");
+    fireEvent.click(expand);
+    const collapse = screen.getByRole("button", { name: `Collapse description for ${HIT.title}` });
+    expect(collapse.getAttribute("aria-expanded")).toBe("true");
+    expect(paragraph.className).not.toContain("line-clamp-2");
+    expect(paragraph.className).toContain("whitespace-pre-wrap");
+    expect(screen.getByRole("button", { name: "Expand description for Other result" }).getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(collapse);
+    expect(paragraph.className).toContain("line-clamp-2");
+  });
+
+  it("offers no expansion for absent or blank descriptions or compact rows", () => {
+    const { rerender } = render(<CatalogueCandidate provider="openalex" work={{ ...HIT, summary: null }} />);
+    expect(screen.queryByRole("button", { name: /description for/ })).toBeNull();
+    rerender(<CatalogueCandidate provider="openalex" work={{ ...HIT, summary: "   " }} />);
+    expect(screen.queryByRole("button", { name: /description for/ })).toBeNull();
+    rerender(<CatalogueCandidate provider="openalex" work={HIT} compact />);
+    expect(screen.queryByRole("button", { name: /description for/ })).toBeNull();
+  });
+
+  it("shows an optional result image and removes it if loading fails", () => {
+    render(
+      <CatalogueCandidate
+        provider="custom:kitsu"
+        work={{ ...HIT, image_url: "https://media.example.invalid/cover.jpg" }}
+      />,
+    );
+    const image = screen.getByRole("img", { name: `Image for ${HIT.title}` });
+    expect(image.getAttribute("src")).toBe("https://media.example.invalid/cover.jpg");
+    expect(image.getAttribute("loading")).toBe("lazy");
+    expect(screen.getByText(HIT.summary as string)).toBeTruthy();
+    fireEvent.error(image);
+    expect(screen.queryByRole("img")).toBeNull();
+    expect(screen.getByText(HIT.title as string)).toBeTruthy();
+  });
+
+  it("keeps results without optional media and compact results free of image placeholders", () => {
+    const { rerender } = render(
+      <CatalogueCandidate provider="openalex" work={{ ...HIT, summary: null }} />,
+    );
+    expect(screen.queryByRole("img")).toBeNull();
+    expect(screen.queryByText(HIT.summary as string)).toBeNull();
+    rerender(
+      <CatalogueCandidate
+        provider="custom:kitsu"
+        work={{ ...HIT, image_url: "https://media.example.invalid/cover.jpg" }}
+        compact
+      />,
+    );
+    expect(screen.queryByRole("img")).toBeNull();
+    expect(screen.queryByText(HIT.summary as string)).toBeNull();
   });
 
   /// A list that mixes providers has no heading to say whose a row is, so the

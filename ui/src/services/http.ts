@@ -1,6 +1,7 @@
 import { decodeComicPage } from "../lib/comicPage";
 import type { ImagePage } from "@leonrjg/wilkes-reader";
 import type {
+  HttpCall,
   CatalogueDownload,
   CatalogueCourse,
   CatalogueCourseProgress,
@@ -493,6 +494,17 @@ export class HttpSearchApi implements SearchApi {
     const res = await fetch("/api/embed/ready");
     if (!res.ok) throw new Error(`isSemanticReady failed: ${res.status}`);
     return res.json() as Promise<boolean>;
+  }
+
+  async getHttpCalls(): Promise<HttpCall[]> {
+    const res = await fetch("/api/http-requests");
+    if (!res.ok) throw new Error(`getHttpCalls failed: ${res.status}`);
+    return res.json();
+  }
+
+  async clearHttpCalls(): Promise<void> {
+    const res = await fetch("/api/http-requests", { method: "DELETE" });
+    if (!res.ok) throw new Error(`clearHttpCalls failed: ${res.status}`);
   }
 
   async getLogs(): Promise<string[]> {

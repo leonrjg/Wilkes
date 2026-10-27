@@ -142,7 +142,7 @@ export function useFileContextMenu({ entryForPath }: UseFileContextMenuOptions =
     try {
       await source.deleteFile(path);
       useViewerStore.getState().closePath(path);
-      useChatStore.getState().removeContext(path);
+      useChatStore.getState().forgetDocument(path);
       await refreshAfterMutation();
       onToast(
         isTrash ? `Moved "${name}" to Trash` : `Permanently deleted "${name}"`,

@@ -1045,6 +1045,8 @@ export interface LiteratureSearchResult {
   is_open_access: boolean;
   pdf_url: string | null;
   landing_page_url: string | null;
+  /** Optional image supplied by the provider. */
+  image_url: string | null;
   open_access_status: string | null;
   license: string | null;
   authors: string | null;
@@ -1285,12 +1287,15 @@ export interface WorkerStatus {
 }
 
 export interface Settings {
+  max_download_bytes: number;
   favorites: string[];
   recent_dirs: string[];
   last_directory: string | null;
   respect_gitignore: boolean;
   max_file_size: number;
   theme: Theme;
+  /** Document canvas inversion in dark mode, as a percentage (0–100). */
+  dark_mode_inversion?: number;
   search_prefer_semantic: boolean;
   grep_use_index: boolean;
   semantic: SemanticSettings;
@@ -1649,4 +1654,16 @@ export interface CatalogueDownload {
   path: string;
   bytes: number;
   already_present: boolean;
+}
+
+/** Latest directly initiated HTTP calls, held only by the running app. */
+export interface HttpCall {
+  id: string;
+  started_at: string;
+  source: string;
+  method: string;
+  url: string;
+  status: number | null;
+  duration_ms: number | null;
+  error: string | null;
 }

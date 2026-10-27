@@ -15,6 +15,7 @@ import DataPanel from "./DataPanel";
 import ExtensionsPanel from "./ExtensionsPanel";
 import IntegrationsPanel from "./IntegrationsPanel";
 import LogsPanel from "./LogsPanel";
+import HttpRequestsPanel from "./HttpRequestsPanel";
 import IndexActivityPanel from "./IndexActivityPanel";
 import { EditorState } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
@@ -193,12 +194,17 @@ export default function SettingsModal({
     | "extraction-ocr"
     | "data"
     | "workers"
+    | "http-requests"
     | "logs"
     | "technical";
 
   const [activeTab, setActiveTab] = useState<SettingsTab>("general");
   const [settings, setSettings] = useState<Settings | null>(null);
   const [literatureProviders, setLiteratureProviders] = useState<LiteratureProviderInfo[]>([]);
+  const [maxDownloadMbDraft, setMaxDownloadMbDraft] = useState("");
+  const [maxDownloadMbDirty, setMaxDownloadMbDirty] = useState(false);
+  const [downloadSizeError, setDownloadSizeError] = useState<string | null>(null);
+  const downloadSizeRevision = useRef(0);
   const [maxFileSizeMbDraft, setMaxFileSizeMbDraft] = useState("");
   const [maxFileSizeMbDirty, setMaxFileSizeMbDirty] = useState(false);
   const [customInstructionsDraft, setCustomInstructionsDraft] = useState("");
@@ -214,12 +220,18 @@ export default function SettingsModal({
   const [httpApiBusy, setHttpApiBusy] = useState(false);
   const [httpApiError, setHttpApiError] = useState<string | null>(null);
   const customInstructionsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const settingsSaveQueue = useRef<Promise<void> | null>(null);
+  const inversionRevision = useRef(0);
+  const [inversionSaveError, setInversionSaveError] = useState<string | null>(null);
   const generationReady = useGenerationStore((state) => state.ready);
 
   useEffect(() => {
     if (isOpen) {
       api.getSettings().then((nextSettings) => {
         setSettings(nextSettings);
+        setMaxDownloadMbDraft(String(nextSettings.max_download_bytes / 1_000_000));
+        setMaxDownloadMbDirty(false);
+        setDownloadSizeError(null);
         setMaxFileSizeMbDraft(String(Math.round(nextSettings.max_file_size / (1024 * 1024))));
         setMaxFileSizeMbDirty(false);
         setCustomInstructionsDraft(nextSettings.chat_custom_instructions ?? "");
@@ -266,22 +278,52 @@ export default function SettingsModal({
     }
   }, [settings, maxFileSizeMbDirty]);
 
-  const handleUpdateSettings = async (patch: Partial<Settings>) => {
-    try {
-      const newSettings = await api.updateSettings(patch);
-      setSettings(newSettings);
-      if (onSettingsUpdate) onSettingsUpdate(patch);
-      // Attaching the generation model is asynchronous, so readiness has to be
-      // re-read from the backend rather than inferred from the flag the user
-      // just flipped. Done here because this is the one place arbitrary
-      // settings patches are applied from the UI, including the JSON editor.
-      if (patch.generation) {
-        void useGenerationStore.getState().refreshReady();
-      }
-    } catch (e) {
-      console.error("Failed to update settings:", e);
-      throw e;
+  useEffect(() => {
+    if (settings && !maxDownloadMbDirty) {
+      setMaxDownloadMbDraft(String(settings.max_download_bytes / 1_000_000));
     }
+  }, [settings, maxDownloadMbDirty]);
+
+  const handleUpdateSettings = (patch: Partial<Settings>): Promise<void> => {
+    const previewsInversion = patch.dark_mode_inversion !== undefined;
+    if (previewsInversion) {
+      inversionRevision.current += 1;
+      setInversionSaveError(null);
+      setSettings((current) => current ? { ...current, ...patch } : current);
+      onSettingsUpdate?.(patch);
+    }
+    const revision = inversionRevision.current;
+
+    const save = async () => {
+      try {
+        const newSettings = await api.updateSettings(patch);
+        // A completed save must not move a slider that has since been dragged.
+        setSettings((current) => revision === inversionRevision.current
+          ? newSettings
+          : { ...newSettings, dark_mode_inversion: current?.dark_mode_inversion });
+        if (!previewsInversion) onSettingsUpdate?.(patch);
+        if (patch.generation) {
+          void useGenerationStore.getState().refreshReady();
+        }
+      } catch (e) {
+        if (previewsInversion && revision === inversionRevision.current) {
+          setInversionSaveError("Could not save color inversion. Adjust it to try again.");
+        }
+        console.error("Failed to update settings:", e);
+        throw e;
+      }
+    };
+
+    // Settings are persisted by read/merge/write: overlapping saves can lose
+    // patches. Keep every modal edit in the same queue, including slider edits.
+    const pending = settingsSaveQueue.current;
+    const result = pending ? pending.then(save) : save();
+    const settled = result.catch(() => {});
+    settingsSaveQueue.current = settled;
+    void settled.then(() => {
+      if (settingsSaveQueue.current === settled) settingsSaveQueue.current = null;
+    });
+    return result;
   };
 
   const persistCustomInstructions = (value: string) => {
@@ -290,6 +332,31 @@ export default function SettingsModal({
     }
     customInstructionsSaveTimer.current = null;
     void handleUpdateSettings({ chat_custom_instructions: value });
+  };
+
+  const persistMaxDownloadSize = async () => {
+    if (!settings || !maxDownloadMbDirty) return;
+    const revision = downloadSizeRevision.current;
+    const megabytes = Number(maxDownloadMbDraft);
+    const bytes = megabytes * 1_000_000;
+    if (maxDownloadMbDraft.trim() === "" || !Number.isFinite(megabytes) ||
+        megabytes <= 0 || !Number.isSafeInteger(bytes)) {
+      setDownloadSizeError("Enter a download size greater than zero.");
+      return;
+    }
+    try {
+      if (bytes !== settings.max_download_bytes) {
+        await handleUpdateSettings({ max_download_bytes: bytes });
+      }
+      if (revision === downloadSizeRevision.current) {
+        setMaxDownloadMbDirty(false);
+        setDownloadSizeError(null);
+      }
+    } catch {
+      if (revision === downloadSizeRevision.current) {
+        setDownloadSizeError("Could not save download size. Try again.");
+      }
+    }
   };
 
   const persistMaxFileSize = async () => {
@@ -525,6 +592,7 @@ export default function SettingsModal({
               <TabButton id="data" label="Data" indent />
               <TabButton id="workers" label="Workers" indent />
               <TabButton id="logs" label="Logs" indent />
+              <TabButton id="http-requests" label="HTTP Requests" indent />
               <TabButton
                 id="technical"
                 label="Raw config"
@@ -541,6 +609,30 @@ export default function SettingsModal({
             <div className={activeTab === "general" ? "block min-h-full" : "hidden"}>
               {settings && (
                 <div className="space-y-4">
+                  <section className="space-y-1">
+                    <label htmlFor="max-download-size-mb" className="text-xs text-[var(--text-muted)]">Maximum download size (MB)</label>
+                    <input
+                      id="max-download-size-mb"
+                      type="number"
+                      min={0.000001}
+                      step="any"
+                      value={maxDownloadMbDraft}
+                      onChange={(e) => {
+                        downloadSizeRevision.current += 1;
+                        setMaxDownloadMbDraft(e.target.value);
+                        setMaxDownloadMbDirty(true);
+                        setDownloadSizeError(null);
+                      }}
+                      onBlur={() => void persistMaxDownloadSize()}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") e.currentTarget.blur();
+                      }}
+                      aria-invalid={!!downloadSizeError}
+                      aria-describedby={downloadSizeError ? "download-size-error" : undefined}
+                      className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
+                    />
+                    {downloadSizeError && <p id="download-size-error" role="alert" className="text-xs text-red-400">{downloadSizeError}</p>}
+                  </section>
                   <section>
                     <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2.5 uppercase tracking-wider">Search Preferences</h3>
                     <div className="space-y-3">
@@ -809,6 +901,31 @@ export default function SettingsModal({
                             {t}
                           </button>
                         ))}
+                      </div>
+                      <div className="space-y-1">
+                        <div className="flex justify-between items-baseline">
+                          <label htmlFor="dark-mode-inversion" className="text-xs text-[var(--text-muted)]">
+                            Dark-mode color inversion
+                          </label>
+                          <output htmlFor="dark-mode-inversion" className="text-xs text-[var(--text-dim)]">
+                            {settings.dark_mode_inversion ?? 90}%
+                          </output>
+                        </div>
+                        <input
+                          id="dark-mode-inversion"
+                          type="range"
+                          min="0"
+                          max="100"
+                          step="1"
+                          value={settings.dark_mode_inversion ?? 90}
+                          onChange={(e) => {
+                            void handleUpdateSettings({ dark_mode_inversion: Number(e.target.value) }).catch(() => {});
+                          }}
+                          className="w-full accent-[var(--accent-blue)]"
+                        />
+                        {inversionSaveError && (
+                          <p role="alert" className="text-xs text-[var(--accent-red)]">{inversionSaveError}</p>
+                        )}
                       </div>
                       <div className="space-y-1">
                         <div className="flex justify-between items-baseline">
@@ -1246,6 +1363,10 @@ export default function SettingsModal({
                   isActive={activeTab === "workers"}
                 />
               )}
+            </div>
+
+            <div className={activeTab === "http-requests" ? "block h-full" : "hidden"}>
+              <HttpRequestsPanel api={api} isActive={activeTab === "http-requests"} />
             </div>
 
             <div className={activeTab === "logs" ? "block h-full" : "hidden"}>

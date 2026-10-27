@@ -13,7 +13,7 @@ import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useResearchStore } from "../stores/useResearchStore";
 import { useGenerationStore } from "../stores/useGenerationStore";
-import { useChatSession, useChatStore } from "../stores/useChatStore";
+import { useChatStore } from "../stores/useChatStore";
 import { useTopicsStore } from "../stores/useTopicsStore";
 import { useCatalogueStore } from "../stores/useCatalogueStore";
 import type { FileEntry, GenerationStreamEvent, LiteratureProviderInfo } from "../lib/types";
@@ -158,7 +158,7 @@ describe("ResultList", () => {
       load: vi.fn().mockResolvedValue(undefined),
     } as any);
     useGenerationStore.setState({ ready: false });
-    useChatSession.setState({ hasAvailableBackend: false });
+    useChatStore.setState({ hasAvailableBackend: false });
     useChatStore.setState({
       openPaneAndSend: mockOpenChatPaneAndSend,
     });
@@ -1210,7 +1210,7 @@ describe("ResultList", () => {
 
   it("skips generation when cleaning leaves only references and offers agent chat", async () => {
     useGenerationStore.setState({ ready: true });
-    useChatSession.setState({ hasAvailableBackend: true });
+    useChatStore.setState({ hasAvailableBackend: true });
     useSearchStore.setState({
       hasQuery: true,
       searching: false,

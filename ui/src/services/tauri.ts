@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import type {
+  HttpCall,
   CatalogueDownload,
   CatalogueCourse,
   CatalogueCourseProgress,
@@ -343,6 +344,14 @@ export class TauriSearchApi implements SearchApi {
     // bytes rather than base64 -- a 6 MB book stays 6 MB on the way over.
     const bytes = await invoke<ArrayBuffer | number[]>("surrogate_bytes", { path });
     return bytes instanceof ArrayBuffer ? bytes : new Uint8Array(bytes).buffer;
+  }
+
+  async getHttpCalls(): Promise<HttpCall[]> {
+    return invoke<HttpCall[]>("get_http_calls");
+  }
+
+  async clearHttpCalls(): Promise<void> {
+    return invoke("clear_http_calls");
   }
 
   async getLogs(): Promise<string[]> {

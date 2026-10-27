@@ -69,6 +69,7 @@ describe("useSettingsStore", () => {
       respect_gitignore: true,
       max_file_size: 100,
       theme: "Dark",
+      dark_mode_inversion: 65,
       search_prefer_semantic: true,
       semantic: { enabled: true, index_path: "/some/path" },
       supported_extensions: ["ts", "js"],
@@ -91,6 +92,7 @@ describe("useSettingsStore", () => {
     expect(state.favorites).toEqual(["/path/1"]);
     expect(state.directory).toBe("/path/1");
     expect(state.theme).toBe("Dark");
+    expect(document.documentElement.style.getPropertyValue("--pdf-dark-inversion")).toBe("0.65");
     expect(state.preferSemantic).toBe(true);
     expect(state.fileSortKey).toBe("modified");
     expect(state.fileSortDirection).toBe("desc");
@@ -114,6 +116,25 @@ describe("useSettingsStore", () => {
     await useSettingsStore.getState().load();
     expect(useSettingsStore.getState().directory).toBe("");
     expect(useSettingsStore.getState().recentDirs).toEqual([]);
+  });
+
+  it("projects inversion patches, including zero, and restores the default for older settings", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue({
+      favorites: [], recent_dirs: [], last_directory: null,
+      theme: "Dark", semantic: {},
+    } as any);
+    await useSettingsStore.getState().load();
+    expect(document.documentElement.style.getPropertyValue("--pdf-dark-inversion")).toBe("0.9");
+
+    useSettingsStore.getState().applySettingsPatch({ dark_mode_inversion: 0 });
+    expect(useSettingsStore.getState().settings?.dark_mode_inversion).toBe(0);
+    expect(document.documentElement.style.getPropertyValue("--pdf-dark-inversion")).toBe("0");
+
+    const settings = useSettingsStore.getState().settings!;
+    useSettingsStore.getState().replaceSettings({ ...settings, dark_mode_inversion: 100 });
+    expect(document.documentElement.style.getPropertyValue("--pdf-dark-inversion")).toBe("1");
+    useSettingsStore.getState().replaceSettings({ ...settings, dark_mode_inversion: undefined });
+    expect(document.documentElement.style.getPropertyValue("--pdf-dark-inversion")).toBe("0.9");
   });
 
   it("should update directory", async () => {

@@ -59,6 +59,7 @@ const CLEAN_PROBE: ProbeReport = {
       is_open_access: false,
       pdf_url: null,
       landing_page_url: null,
+      image_url: null,
       open_access_status: null,
       license: null,
     },

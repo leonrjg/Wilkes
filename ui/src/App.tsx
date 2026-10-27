@@ -1,6 +1,6 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { Fragment, useState, useCallback, useRef, useEffect, type ReactNode } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { BookOpen, Bookmark, Cloud, MessageSquare, Settings as SettingsIcon, ChevronDown, Loader } from "react-feather";
+import { BookOpen, Bookmark, Cloud, MessageSquare, Settings as SettingsIcon, ChevronDown, ChevronLeft, ChevronRight, Loader, Plus } from "react-feather";
 import SearchBar from "./components/SearchBar";
 import ResultList from "./components/ResultList";
 import PreviewPane from "./components/PreviewPane";
@@ -17,7 +17,7 @@ import { useContextMenu, ContextMenu } from "./components/ContextMenu";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useBookmarksStore } from "./stores/useBookmarksStore";
-import { useChatSession, useChatStore } from "./stores/useChatStore";
+import { useChatStore } from "./stores/useChatStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useTopicsStore } from "./stores/useTopicsStore";
 import { useCatalogueStore } from "./stores/useCatalogueStore";
@@ -68,19 +68,30 @@ export default function App() {
   const handleIndexUpdated = useSemanticStore((s) => s.handleIndexUpdated);
   const semanticReadyForRoot = useSemanticStore((s) => s.readyForCurrentRoot);
   const preferSemantic = useSettingsStore((s) => s.preferSemantic);
-  const cataloguePaneOpen = useCatalogueStore((s) => s.paneOpen);
-  const openCataloguePane = useCatalogueStore((s) => s.openPane);
-  const closeCataloguePane = useCatalogueStore((s) => s.closePane);
+  const cataloguePanesVisible = useCatalogueStore((s) => s.panesVisible);
+  const cataloguePanes = useCatalogueStore((s) => s.panes);
+  const focusedCataloguePane = useCatalogueStore((s) => s.focusedPane);
+  const showCataloguePanes = useCatalogueStore((s) => s.showPanes);
+  const hideCataloguePanes = useCatalogueStore((s) => s.hidePanes);
+  const newCataloguePane = useCatalogueStore((s) => s.newPane);
+  const focusCataloguePane = useCatalogueStore((s) => s.focusPane);
   const topicsPaneOpen = useTopicsStore((s) => s.paneOpen);
   const openTopicsPane = useTopicsStore((s) => s.openPane);
   const closeTopicsPane = useTopicsStore((s) => s.closePane);
 
-  const chatPaneOpen = useChatStore((s) => s.paneOpen);
-  const chatPaneOpening = useChatStore((s) => s.paneOpening);
-  const toggleChatPane = useChatStore((s) => s.togglePane);
-  const openChatPane = useChatStore((s) => s.openPane);
-  const loadChatBackends = useChatSession((s) => s.loadBackends);
+  const chatPanesVisible = useChatStore((s) => s.panesVisible);
+  const chatPanes = useChatStore((s) => s.panes);
+  const focusedChatPane = useChatStore((s) => s.focusedPane);
+  const chatPaneOpening = useChatStore((s) => s.panes.some((pane) => pane.opening));
+  const showChatPanes = useChatStore((s) => s.showPanes);
+  const hideChatPanes = useChatStore((s) => s.hidePanes);
+  const newChatPane = useChatStore((s) => s.newPane);
+  const closeChatPane = useChatStore((s) => s.closePane);
+  const focusChatPane = useChatStore((s) => s.focusPane);
+  const loadChatBackends = useChatStore((s) => s.loadBackends);
   const { menu: chatBackendMenu, openMenu: openChatBackendMenu, closeMenu: closeChatBackendMenu } =
+    useContextMenu<null>();
+  const { menu: catalogueMenu, openMenu: openCatalogueMenu, closeMenu: closeCatalogueMenu } =
     useContextMenu<null>();
 
   const openMatch = useViewerStore((state) => state.openMatch);
@@ -95,10 +106,13 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(320);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [bookmarksWidth, setBookmarksWidth] = useState(320);
   const [topicsWidth, setTopicsWidth] = useState(340);
-  const [catalogueWidth, setCatalogueWidth] = useState(360);
-  const [chatWidth, setChatWidth] = useState(320);
+  // Per pane: a second pane opens at the default width, and resizing one does
+  // not resize the others.
+  const [catalogueWidths, setCatalogueWidths] = useState<Record<string, number>>({});
+  const [chatWidths, setChatWidths] = useState<Record<string, number>>({});
   const [fileFilterText, setFileFilterText] = useState("");
   const resizeRef = useRef<{
     startX: number;
@@ -452,12 +466,15 @@ export default function App() {
     </div>
   );
 
+  const chatPanesShown = chatPanesVisible && chatPanes.length > 0;
+  const cataloguePanesShown = cataloguePanesVisible && cataloguePanes.length > 0;
+
   const handleChatButtonClick = () => {
-    if (chatPaneOpen) {
-      toggleChatPane();
+    if (chatPanesShown) {
+      hideChatPanes();
       return;
     }
-    openChatPane().catch((e) => console.error("chat: open pane failed", e));
+    showChatPanes().catch((e) => console.error("chat: open pane failed", e));
   };
 
   const settingsSlot = (
@@ -470,7 +487,7 @@ export default function App() {
               aria-label="Ask the documents"
               aria-busy={chatPaneOpening}
               className={`w-[32px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] transition-all active:scale-95 ${
-                chatPaneOpen
+                chatPanesShown
                   ? "text-[var(--accent-blue)] shadow-inner"
                   : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
               }`}
@@ -478,30 +495,43 @@ export default function App() {
               {chatPaneOpening ? (
                 <Loader size={14} className="animate-spin" />
               ) : (
-                <MessageSquare size={14} fill={chatPaneOpen ? "currentColor" : "none"} />
+                <MessageSquare size={14} fill={chatPanesShown ? "currentColor" : "none"} />
               )}
             </button>
           </Tooltip>
-          <Tooltip content="Choose chat agent">
+          <Tooltip content="Choose chat agent or open another chat">
             <button
               onClick={async (e) => {
                 const event = e;
                 await loadChatBackends().catch((error) => {
                   console.error("chat: failed to load backends", error);
                 });
-                const chatBackends = useChatSession.getState().backends;
+                const chatBackends = useChatStore.getState().backends;
+                // With a chat already showing, an agent picked here opens a
+                // chat of its own beside it: the open one switches agents from
+                // its own selector.
+                const open = (backend?: AgentBackend) =>
+                  (chatPanesShown ? newChatPane(backend) : showChatPanes(backend)).catch((error) =>
+                    console.error("chat: open pane failed", error),
+                  );
                 openChatBackendMenu({
                   event,
                   target: null,
                   size: "content",
-                  items: chatBackends.map((b) => ({
-                    id: b.backend,
-                    label: `${b.available ? "●" : "○"} ${b.label}${
-                      !b.available ? ` — ${b.unavailable_reason ?? b.auth_note}` : ""
-                    }`,
-                    disabled: !b.available,
-                    run: () => openChatPane(b.backend as AgentBackend),
-                  })),
+                  items: [
+                    ...(chatPanesShown
+                      ? [{ id: "new-chat-pane", label: "New chat pane", icon: Plus, run: () => open() }]
+                      : []),
+                    ...chatBackends.map((b, index) => ({
+                      id: b.backend,
+                      label: `${b.available ? "●" : "○"} ${b.label}${
+                        !b.available ? ` — ${b.unavailable_reason ?? b.auth_note}` : ""
+                      }`,
+                      disabled: !b.available,
+                      dividerBefore: chatPanesShown && index === 0,
+                      run: () => open(b.backend as AgentBackend),
+                    })),
+                  ],
                 });
               }}
               aria-label="Choose chat agent"
@@ -552,24 +582,45 @@ export default function App() {
           <Cloud size={14} fill={topicsPaneOpen ? "currentColor" : "none"} />
         </button>
       </Tooltip>
-      <Tooltip content="Catalogues & literature">
-        <button
-          type="button"
-          onClick={() => {
-            if (cataloguePaneOpen) closeCataloguePane();
-            else openCataloguePane();
-          }}
-          aria-label="Catalogues and literature"
-          aria-pressed={cataloguePaneOpen}
-          className={`w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] transition-all border border-[var(--border-main)] ${
-            cataloguePaneOpen
-              ? "text-[var(--accent-blue)] shadow-inner"
-              : "text-[var(--text-muted)] hover:border-[var(--border-strong)] hover:text-[var(--text-main)]"
-          }`}
-        >
-          <BookOpen size={14} />
-        </button>
-      </Tooltip>
+      <div className="inline-flex rounded border border-[var(--border-main)] overflow-hidden">
+        <Tooltip content="Catalogues & literature">
+          <button
+            type="button"
+            onClick={() => {
+              if (cataloguePanesShown) hideCataloguePanes();
+              else showCataloguePanes();
+            }}
+            aria-label="Catalogues and literature"
+            aria-pressed={cataloguePanesShown}
+            className={`w-[32px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] transition-all ${
+              cataloguePanesShown
+                ? "text-[var(--accent-blue)] shadow-inner"
+                : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
+            }`}
+          >
+            <BookOpen size={14} />
+          </button>
+        </Tooltip>
+        <Tooltip content="Open another literature pane">
+          <button
+            type="button"
+            onClick={(event) =>
+              openCatalogueMenu({
+                event,
+                target: null,
+                size: "content",
+                items: [
+                  { id: "new-literature-pane", label: "New literature pane", icon: Plus, run: newCataloguePane },
+                ],
+              })
+            }
+            aria-label="Literature pane options"
+            className="w-[14px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] text-[var(--text-dim)] hover:text-[var(--text-main)] transition-all border-l border-[var(--border-main)]"
+          >
+            <ChevronDown size={10} />
+          </button>
+        </Tooltip>
+      </div>
       <Tooltip content="Settings">
         <button
           onClick={() => setSettingsOpen(true)}
@@ -588,6 +639,7 @@ export default function App() {
         onSettingsUpdate={applySettingsPatch}
       />
       <ContextMenu menu={chatBackendMenu} onClose={closeChatBackendMenu} />
+      <ContextMenu menu={catalogueMenu} onClose={closeCatalogueMenu} />
     </>
   );
 
@@ -661,50 +713,90 @@ export default function App() {
     </>
   ) : null;
 
-  // Chat is right-dock-only for v1 (bookmarks already covers left, spec §7.1).
-  const chatColumn = isTauri && chatPaneOpen ? (
-    <>
+  /** One right-docked pane with its resize handle. A pointer or focus inside
+   *  it makes it the pane in use, which is where a request from elsewhere —
+   *  "Ask about this file", a search of the catalogues — is sent. With more
+   *  than one open, the pane in use is marked. */
+  const rightDockedPane = ({
+    id,
+    width,
+    setWidth,
+    minWidth,
+    focused,
+    marked,
+    onFocus,
+    children,
+  }: {
+    id: string;
+    width: number;
+    setWidth: (width: number) => void;
+    minWidth: number;
+    focused: boolean;
+    marked: boolean;
+    onFocus: () => void;
+    children: ReactNode;
+  }) => (
+    <Fragment key={id}>
       <div
         onMouseDown={startResize({
-          width: chatWidth,
-          setWidth: setChatWidth,
+          width,
+          setWidth,
           direction: -1,
-          minWidth: 320,
+          minWidth,
           maxWidth: window.innerWidth * 0.5,
         })}
         className="w-1 cursor-col-resize flex-shrink-0 bg-transparent hover:bg-[var(--accent-blue)]/30 border-l border-[var(--border-main)] transition-colors"
       />
       <div
-        className="flex-shrink-0 overflow-hidden"
-        style={{ width: `${chatWidth}px`, minWidth: "320px" }}
+        onPointerDownCapture={onFocus}
+        onFocusCapture={onFocus}
+        className="relative flex-shrink-0 overflow-hidden"
+        style={{ width: `${width}px`, minWidth: `${minWidth}px` }}
       >
-        <ChatPane onClose={toggleChatPane} />
+        {marked && focused && (
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 top-0 z-10 h-0.5 bg-[var(--accent-blue)]"
+          />
+        )}
+        {children}
       </div>
-    </>
-  ) : null;
+    </Fragment>
+  );
+
+  // Chat is right-dock-only for v1 (bookmarks already covers left, spec §7.1).
+  const chatColumns =
+    isTauri && chatPanesVisible
+      ? chatPanes.map((pane) =>
+          rightDockedPane({
+            id: pane.id,
+            width: chatWidths[pane.id] ?? 320,
+            setWidth: (width) => setChatWidths((widths) => ({ ...widths, [pane.id]: width })),
+            minWidth: 320,
+            focused: pane.id === focusedChatPane,
+            marked: chatPanes.length > 1,
+            onFocus: () => focusChatPane(pane.id),
+            children: <ChatPane pane={pane} onClose={() => closeChatPane(pane.id)} />,
+          }),
+        )
+      : null;
 
   // Right-dock only, like chat: the left dock is bookmarks' and the pane is a
   // companion to the file list, not a second reading column.
-  const catalogueColumn = cataloguePaneOpen ? (
-    <>
-      <div
-        onMouseDown={startResize({
-          width: catalogueWidth,
-          setWidth: setCatalogueWidth,
-          direction: -1,
+  const catalogueColumns = cataloguePanesVisible
+    ? cataloguePanes.map((pane) =>
+        rightDockedPane({
+          id: pane.id,
+          width: catalogueWidths[pane.id] ?? 360,
+          setWidth: (width) => setCatalogueWidths((widths) => ({ ...widths, [pane.id]: width })),
           minWidth: 300,
-          maxWidth: window.innerWidth * 0.5,
-        })}
-        className="w-1 cursor-col-resize flex-shrink-0 bg-transparent hover:bg-[var(--accent-blue)]/30 border-l border-[var(--border-main)] transition-colors"
-      />
-      <div
-        className="flex-shrink-0 overflow-hidden"
-        style={{ width: `${catalogueWidth}px`, minWidth: "300px" }}
-      >
-        <CataloguePane />
-      </div>
-    </>
-  ) : null;
+          focused: pane.id === focusedCataloguePane,
+          marked: cataloguePanes.length > 1,
+          onFocus: () => focusCataloguePane(pane.id),
+          children: <CataloguePane pane={pane} />,
+        }),
+      )
+    : null;
 
   return (
     <div
@@ -721,7 +813,8 @@ export default function App() {
 
       <div className="flex flex-1 min-h-0 overflow-hidden">
         <div
-          className="flex-shrink-0 flex flex-col min-h-0 bg-[var(--bg-sidebar)]"
+          id="file-sidebar"
+          className={sidebarCollapsed ? "hidden" : "flex-shrink-0 flex flex-col min-h-0 bg-[var(--bg-sidebar)]"}
           style={{ width: `${sidebarWidth}px`, minWidth: "200px" }}
         >
           <ResultList
@@ -733,16 +826,31 @@ export default function App() {
           />
         </div>
 
-        <div
-          onMouseDown={startResize({
-            width: sidebarWidth,
-            setWidth: setSidebarWidth,
-            direction: 1,
-            minWidth: 200,
-            maxWidth: window.innerWidth * 0.45,
-          })}
-          className="w-1 cursor-col-resize flex-shrink-0 bg-transparent hover:bg-[var(--accent-blue)]/30 border-l border-[var(--border-main)] transition-colors"
-        />
+        {!sidebarCollapsed && (
+          <div
+            onMouseDown={startResize({
+              width: sidebarWidth,
+              setWidth: setSidebarWidth,
+              direction: 1,
+              minWidth: 200,
+              maxWidth: window.innerWidth * 0.45,
+            })}
+            className="w-1 cursor-col-resize flex-shrink-0 bg-transparent hover:bg-[var(--accent-blue)]/30 border-l border-[var(--border-main)] transition-colors"
+          />
+        )}
+
+        <div className="relative w-0 shrink-0">
+          <button
+            type="button"
+            aria-label={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
+            aria-expanded={!sidebarCollapsed}
+            aria-controls="file-sidebar"
+            onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+            className="absolute left-0 top-1/2 z-30 flex h-12 w-4 -translate-y-1/2 items-center justify-center rounded-r-md border border-l-0 border-[var(--border-strong)] bg-[var(--bg-sidebar)] text-[var(--text-muted)] shadow-sm transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-main)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent-blue)]"
+          >
+            {sidebarCollapsed ? <ChevronRight size={12} /> : <ChevronLeft size={12} />}
+          </button>
+        </div>
 
         {bookmarksDock === "Left" && bookmarksColumn}
         {bookmarksDock === "Left" && topicsColumn}
@@ -753,8 +861,8 @@ export default function App() {
 
         {bookmarksDock === "Right" && bookmarksColumn}
         {bookmarksDock === "Right" && topicsColumn}
-        {catalogueColumn}
-        {chatColumn}
+        {catalogueColumns}
+        {chatColumns}
       </div>
     </div>
   );

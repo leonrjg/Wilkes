@@ -161,7 +161,7 @@ export default function BulkActionsBar({
       async (path) => {
         await source.deleteFile(path);
         useViewerStore.getState().closePath(path);
-        useChatStore.getState().removeContext(path);
+        useChatStore.getState().forgetDocument(path);
       },
       { clearSelection: true },
     );

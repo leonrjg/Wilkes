@@ -3,7 +3,7 @@ import { isPagedPath } from "../lib/documentFormats";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { FileText, MapPin, X } from "react-feather";
 
-import { useChatSession, useChatStore } from "../stores/useChatStore";
+import { type ChatPaneEntry, useChatStore } from "../stores/useChatStore";
 import { useViewerStore } from "../stores/useViewerStore";
 import { confirmDialog } from "../lib/utils/dialog";
 import type { MatchRef } from "../lib/types";
@@ -31,12 +31,11 @@ export function contextFileMatchRef(path: string, page: number | null = null): M
  *  outside its scroll: it describes the *next* question, not the ones already
  *  asked, and reading back through the thread must not take it off screen.
  */
-function ContextBar() {
-  const contextFiles = useChatStore((s) => s.contextFiles);
-  const activeDoc = useChatStore((s) => s.activeDoc);
+function ContextBar({ pane }: { pane: ChatPaneEntry }) {
+  const { id, contextFiles, activeDoc } = pane;
   const addContext = useChatStore((s) => s.addContext);
   const removeContext = useChatStore((s) => s.removeContext);
-  const setActiveDoc = useChatStore((s) => s.setActiveDoc);
+  const deselectActiveDoc = useChatStore((s) => s.deselectActiveDoc);
   const openMatch = useViewerStore((s) => s.openMatch);
 
   // The open document is in context anyway — it is pushed into every prompt.
@@ -67,7 +66,9 @@ function ContextBar() {
           <Tooltip content={pinned ? "Unpin current document" : "Pin current document to context"}>
             <button
               type="button"
-              onClick={() => (pinned ? removeContext(activeDoc.path) : addContext(activeDoc.path))}
+              onClick={() =>
+                pinned ? removeContext(id, activeDoc.path) : addContext(id, activeDoc.path)
+              }
               aria-label={pinned ? "Unpin current document" : "Pin current document to context"}
               className={`ml-0.5 inline-flex items-center justify-center rounded p-0.5 transition-colors ${
                 pinned
@@ -81,7 +82,7 @@ function ContextBar() {
           <Tooltip content="Deselect current document">
             <button
               type="button"
-              onClick={() => setActiveDoc(null)}
+              onClick={() => deselectActiveDoc(id)}
               aria-label="Deselect current document"
               className="inline-flex items-center justify-center rounded p-0.5 text-[var(--text-dim)] transition-colors hover:text-[var(--text-error)]"
             >
@@ -110,7 +111,7 @@ function ContextBar() {
             <Tooltip content="Remove from context">
               <button
                 type="button"
-                onClick={() => removeContext(file.path)}
+                onClick={() => removeContext(id, file.path)}
                 aria-label={`Remove ${fileName(file.path)} from context`}
                 className="hover:text-[var(--text-error)]"
               >
@@ -138,9 +139,8 @@ function documentCount(paths: string[]) {
  *  prompts. What Wilkes adds is what it is *about* — the strip of documents
  *  above the thread, and the two lines of copy that name them.
  */
-export default function ChatPane({ onClose }: { onClose?: () => void }) {
-  const contextFiles = useChatStore((s) => s.contextFiles);
-  const activeDoc = useChatStore((s) => s.activeDoc);
+export default function ChatPane({ pane, onClose }: { pane: ChatPaneEntry; onClose?: () => void }) {
+  const { contextFiles, activeDoc } = pane;
   const openMatch = useViewerStore((s) => s.openMatch);
 
   const count = documentCount([
@@ -150,7 +150,7 @@ export default function ChatPane({ onClose }: { onClose?: () => void }) {
 
   return (
     <AcpChatPane
-      store={useChatSession}
+      store={pane.session}
       onClose={onClose}
       // A tool call that names a file is a place in the library, and Wilkes
       // has a reader for it. A general chat has nowhere to send one.
@@ -158,7 +158,7 @@ export default function ChatPane({ onClose }: { onClose?: () => void }) {
         openMatch(contextFileMatchRef(location.path, location.line ?? null))
       }
       confirmDelete={(title) => confirmDialog(`Delete "${title}"? This cannot be undone.`)}
-      contextBar={<ContextBar />}
+      contextBar={<ContextBar pane={pane} />}
       placeholder={count > 0 ? `Ask about these ${count} documents…` : "Ask about your documents…"}
       hint={
         count > 0

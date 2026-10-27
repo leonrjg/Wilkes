@@ -71,6 +71,7 @@ describe("SettingsModal", () => {
     last_directory: "/test",
     respect_gitignore: true,
     max_file_size: 1024 * 1024,
+    max_download_bytes: 1_000_000_000,
     theme: "System",
     pdf_auto_zoom_target_px: 15.5,
     search_prefer_semantic: false,
@@ -202,6 +203,41 @@ describe("SettingsModal", () => {
     });
   });
 
+  it("saves the download size in decimal MB on blur", async () => {
+    mockApi.updateSettings.mockImplementation(async (patch: any) => ({ ...mockSettings, ...patch }));
+    await act(async () => { render(<SettingsModal {...defaultProps} />); });
+    const input = screen.getByLabelText("Maximum download size (MB)");
+    expect(input).toHaveValue(1000);
+    fireEvent.change(input, { target: { value: "2500" } });
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+    fireEvent.blur(input);
+    await waitFor(() => {
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ max_download_bytes: 2_500_000_000 });
+    });
+    expect(input).toHaveValue(2500);
+  });
+
+  it("preserves a newer download size draft while a save completes", async () => {
+    let finish!: (settings: unknown) => void;
+    mockApi.updateSettings.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await act(async () => { render(<SettingsModal {...defaultProps} />); });
+    const input = screen.getByLabelText("Maximum download size (MB)");
+    fireEvent.change(input, { target: { value: "2000" } });
+    fireEvent.blur(input);
+    fireEvent.change(input, { target: { value: "3000" } });
+    await act(async () => { finish({ ...mockSettings, max_download_bytes: 2_000_000_000 }); });
+    expect(input).toHaveValue(3000);
+  });
+
+  it.each(["", "0", "-1"])("rejects invalid download size %s", async (value) => {
+    await act(async () => { render(<SettingsModal {...defaultProps} />); });
+    const input = screen.getByLabelText("Maximum download size (MB)");
+    fireEvent.change(input, { target: { value } });
+    fireEvent.blur(input);
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent("greater than zero");
+  });
+
   it("restores the saved max file size when the field is left empty", async () => {
     await act(async () => {
       render(<SettingsModal {...defaultProps} />);
@@ -229,6 +265,63 @@ describe("SettingsModal", () => {
     });
     fireEvent.click(screen.getByText("Dark"));
     expect(mockApi.updateSettings).toHaveBeenCalledWith({ theme: "Dark" });
+  });
+
+  it("keeps the inversion default and saves a change to zero", async () => {
+    const onSettingsUpdate = vi.fn();
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} onSettingsUpdate={onSettingsUpdate} />);
+    });
+    const slider = screen.getByRole("slider", { name: "Dark-mode color inversion" });
+    expect(slider).toHaveValue("90");
+    expect(slider).toHaveAttribute("min", "0");
+    expect(slider).toHaveAttribute("max", "100");
+    await act(async () => {
+      fireEvent.change(slider, { target: { value: "0" } });
+    });
+    expect(mockApi.updateSettings).toHaveBeenCalledWith({ dark_mode_inversion: 0 });
+    expect(onSettingsUpdate).toHaveBeenCalledWith({ dark_mode_inversion: 0 });
+  });
+
+  it("previews dragging immediately and serializes saves without snapping back", async () => {
+    const onSettingsUpdate = vi.fn();
+    let finishFirst!: (settings: unknown) => void;
+    let finishSecond!: (settings: unknown) => void;
+    mockApi.updateSettings
+      .mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishSecond = resolve; }));
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} onSettingsUpdate={onSettingsUpdate} />);
+    });
+    const slider = screen.getByRole("slider", { name: "Dark-mode color inversion" });
+    fireEvent.change(slider, { target: { value: "75" } });
+    expect(slider).toHaveValue("75");
+    expect(onSettingsUpdate).toHaveBeenLastCalledWith({ dark_mode_inversion: 75 });
+    fireEvent.change(slider, { target: { value: "30" } });
+    expect(slider).toHaveValue("30");
+    expect(onSettingsUpdate).toHaveBeenLastCalledWith({ dark_mode_inversion: 30 });
+    expect(mockApi.updateSettings).toHaveBeenCalledTimes(1);
+
+    await act(async () => { finishFirst({ ...mockSettings, dark_mode_inversion: 75 }); });
+    expect(slider).toHaveValue("30");
+    expect(mockApi.updateSettings).toHaveBeenLastCalledWith({ dark_mode_inversion: 30 });
+    expect(mockApi.updateSettings).toHaveBeenCalledTimes(2);
+    expect(onSettingsUpdate).toHaveBeenCalledTimes(2);
+    await act(async () => { finishSecond({ ...mockSettings, dark_mode_inversion: 30 }); });
+    expect(slider).toHaveValue("30");
+  });
+
+  it("reports a failed slider save and allows a subsequent change", async () => {
+    mockApi.updateSettings
+      .mockRejectedValueOnce(new Error("Save failed"))
+      .mockResolvedValueOnce({ ...mockSettings, dark_mode_inversion: 80 });
+    await act(async () => { render(<SettingsModal {...defaultProps} />); });
+    const slider = screen.getByRole("slider", { name: "Dark-mode color inversion" });
+    await act(async () => { fireEvent.change(slider, { target: { value: "70" } }); });
+    expect(screen.getByRole("alert")).toHaveTextContent("Could not save color inversion");
+    await act(async () => { fireEvent.change(slider, { target: { value: "80" } }); });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(slider).toHaveValue("80");
   });
 
   it("updates the PDF auto-zoom target", async () => {

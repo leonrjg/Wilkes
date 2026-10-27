@@ -1,4 +1,5 @@
-import { create } from "zustand";
+import { createContext, useContext } from "react";
+import { create, type StoreApi, type UseBoundStore } from "zustand";
 import { api } from "../services";
 import type {
   BrowseRequest,
@@ -248,23 +249,20 @@ export interface Acquirable {
   url: string;
   filename?: string;
 }
-
-interface CatalogueStore {
-  paneOpen: boolean;
+/**
+ * One pane's search: what it is asking, which sources it asks, how each of
+ * them is filtered, and what came back.
+ *
+ * Its own store, one per open pane, because two panes are two questions. The
+ * request counters that recognise a stale answer are in the same closure for
+ * the same reason: a reply to one pane's query must not be dropped because
+ * another pane asked something since.
+ */
+export interface CatalogueSearchState {
   query: string;
   /** Which providers are asked. Held by id; the names come from
    *  `providerOptions`, which is the registry's answer and not this store's. */
   providers: Selection<string>;
-  /** The grain filter an older build stored, until the provider list arrives
-   *  to say which catalogues it meant. */
-  legacy: LegacyGrains;
-  /** Every provider this installation knows — the learning catalogues and the
-   *  remote indexes, on or off — as the backend registry orders them. Empty
-   *  until `loadProviders` has answered. */
-  providerOptions: LiteratureProviderInfo[];
-  /** Why the provider list could not be read. The pane says so rather than
-   *  showing an empty filter row that looks like "no providers configured". */
-  providerOptionsError: string | null;
   literatureLoading: boolean;
   /** The providers whose next page is on its way. */
   literatureMore: string[];
@@ -297,45 +295,12 @@ interface CatalogueStore {
    *  can keep saying what was written while every source is asked `keyword`.
    *  It describes `query` only while `query` is still that keyword. */
   composedQuery: { text: string; keyword: string } | null;
-  /** Why the last add failed, whichever of its three calls failed. Kept apart
-   *  from the search errors so a failed download does not replace the results
-   *  the user was choosing from. */
-  acquireError: string | null;
-  /** Path in the uploads directory, per candidate key, for what has been
-   *  fetched in this session. Keyed so a row can say "added" without the pane
-   *  having to re-read the directory. */
-  acquired: Record<string, string>;
-  /** How far each add in flight has got, by candidate key. Keyed like the two
-   *  progress maps below, and for the same reason: nothing stops two rows from
-   *  being added at once, and a single key meant the second add to start
-   *  erased the first row's indicator. */
-  adding: Record<string, AddStage>;
-  /** Bytes so far for each download in flight, keyed by the URL that was
-   *  requested. Keyed rather than singular because nothing stops two rows from
-   *  being added at once, and a single figure would be attributed to whichever
-   *  row happened to render. */
-  downloads: Record<string, CatalogueDownloadProgress>;
-  /** How far each course acquisition has got, keyed by the course URL. A
-   *  course is dozens of manifest reads and then dozens of downloads, and the
-   *  byte stream above cannot say which of them it is reporting. */
-  courseProgress: Record<string, CatalogueCourseProgress>;
-  /** What each acquired course produced, per result key: the directory, the
-   *  generated document, and what was refused. Kept so a row can say "14
-   *  documents, 4 videos skipped" instead of only "added". */
-  courses: Record<string, CatalogueCourse>;
-  noteDownloadProgress: (progress: CatalogueDownloadProgress) => void;
-  noteCourseProgress: (progress: CatalogueCourseProgress) => void;
-  /** Marks how far one row's add has got, or clears it when the act is over.
-   *  Written by `useCatalogueAdd` and nothing else. */
-  setAddStage: (key: string, stage: AddStage | null) => void;
-  /** Why an add failed, or null when one begins. Also `useCatalogueAdd`'s:
-   *  one reporter for the whole act, so a resolve that failed and a move that
-   *  failed reach the user by the same route a download does. */
-  noteAddError: (message: string | null) => void;
-  openPane: () => void;
-  closePane: () => void;
   setQuery: (query: string) => void;
+  clearSearch: () => void;
   toggleProvider: (provider: string) => void;
+  /** Replaces the selection without asking anything. `loadProviders` is the
+   *  caller: it is what learns which of the ids a selection names still exist. */
+  setProviders: (providers: Selection<string>) => void;
   setBrowseOpen: (open: boolean) => void;
   /** Sets one filter of one provider to these values; none is no filter.
    *  `labels` says what the values are called, for values a person cannot
@@ -378,14 +343,103 @@ interface CatalogueStore {
   refine: (keyword: string, provider?: string) => Promise<void>;
   /** The next page of one provider's listing. */
   browseMore: (provider: string) => Promise<void>;
-  /** Reads the provider list and prunes any stored selection against it, so a
-   *  filter that outlived the provider it named does not refuse every search. */
-  loadProviders: () => Promise<void>;
   /** The next page of one provider's keyword answer, appended to what it has
    *  already said. */
   loadMoreLiterature: (provider: string) => Promise<void>;
   /** Runs the query afresh against every selected provider. */
   search: (query: string) => Promise<void>;
+}
+
+export type CatalogueSearch = UseBoundStore<StoreApi<CatalogueSearchState>>;
+
+/** One open catalogue pane. */
+export interface CataloguePaneEntry {
+  id: string;
+  search: CatalogueSearch;
+}
+
+/**
+ * What every catalogue pane shares, and which panes there are.
+ *
+ * The provider list, the acquisitions and their progress belong to the
+ * library rather than to a question: a row two panes both show is one file,
+ * and it is being added once. So they are held here, once, and a pane's own
+ * search is a `CatalogueSearch` of its own.
+ */
+interface CatalogueStore {
+  /** Whether the panes are shown. Hiding them keeps every one and what it
+   *  holds, as the toolbar button always has. */
+  panesVisible: boolean;
+  /** The open panes, left to right. */
+  panes: CataloguePaneEntry[];
+  /** The pane a search started elsewhere goes to: the one last used. */
+  focusedPane: string | null;
+  /** The selection a new pane starts on: the one last chosen in any pane,
+   *  which is also what is stored. */
+  preferredProviders: Selection<string>;
+  /** The grain filter an older build stored, until the provider list arrives
+   *  to say which catalogues it meant. */
+  legacy: LegacyGrains;
+  /** Every provider this installation knows — the learning catalogues and the
+   *  remote indexes, on or off — as the backend registry orders them. Empty
+   *  until `loadProviders` has answered. */
+  providerOptions: LiteratureProviderInfo[];
+  /** Why the provider list could not be read. The pane says so rather than
+   *  showing an empty filter row that looks like "no providers configured". */
+  providerOptionsError: string | null;
+  /** Why the last add failed, whichever of its three calls failed. Kept apart
+   *  from the search errors so a failed download does not replace the results
+   *  the user was choosing from. */
+  acquireError: string | null;
+  /** Path in the uploads directory, per candidate key, for what has been
+   *  fetched in this session. Keyed so a row can say "added" without the pane
+   *  having to re-read the directory. */
+  acquired: Record<string, string>;
+  /** How far each add in flight has got, by candidate key. Keyed like the two
+   *  progress maps below, and for the same reason: nothing stops two rows from
+   *  being added at once, and a single key meant the second add to start
+   *  erased the first row's indicator. */
+  adding: Record<string, AddStage>;
+  /** Bytes so far for each download in flight, keyed by the URL that was
+   *  requested. Keyed rather than singular because nothing stops two rows from
+   *  being added at once, and a single figure would be attributed to whichever
+   *  row happened to render. */
+  downloads: Record<string, CatalogueDownloadProgress>;
+  /** How far each course acquisition has got, keyed by the course URL. A
+   *  course is dozens of manifest reads and then dozens of downloads, and the
+   *  byte stream above cannot say which of them it is reporting. */
+  courseProgress: Record<string, CatalogueCourseProgress>;
+  /** What each acquired course produced, per result key: the directory, the
+   *  generated document, and what was refused. Kept so a row can say "14
+   *  documents, 4 videos skipped" instead of only "added". */
+  courses: Record<string, CatalogueCourse>;
+  noteDownloadProgress: (progress: CatalogueDownloadProgress) => void;
+  noteCourseProgress: (progress: CatalogueCourseProgress) => void;
+  /** Marks how far one row's add has got, or clears it when the act is over.
+   *  Written by `useCatalogueAdd` and nothing else. */
+  setAddStage: (key: string, stage: AddStage | null) => void;
+  /** Why an add failed, or null when one begins. Also `useCatalogueAdd`'s:
+   *  one reporter for the whole act, so a resolve that failed and a move that
+   *  failed reach the user by the same route a download does. */
+  noteAddError: (message: string | null) => void;
+  /** Shows the panes, opening one if there are none. */
+  showPanes: () => void;
+  hidePanes: () => void;
+  /** Opens another pane, beside the others, and makes it the one in use. */
+  newPane: () => void;
+  /** Closes one pane. The last one is hidden instead, with what it holds, so
+   *  that its close button means what the toolbar button does. */
+  closePane: (id: string) => void;
+  focusPane: (id: string) => void;
+  /** Asks the pane last used, showing one if none is. What a search started
+   *  outside the panes calls. */
+  searchInPane: (query: string) => Promise<void>;
+  /** Records the selection a pane just made as the one new panes start on. */
+  setPreferredProviders: (providers: Selection<string>) => void;
+  /** Reads the provider list and prunes every pane's selection against it, so
+   *  a filter that outlived the provider it named does not refuse every
+   *  search. */
+  loadProviders: () => Promise<void>;
   /** Fetches one file into uploads. Returns the staged path, and raises if it
    *  could not be fetched — the caller drives the whole add and is the one
    *  place that says what became of it. */
@@ -406,10 +460,38 @@ export function paperKey(provider: string, work: LiteratureSearchResult): string
   return `literature:${provider}:${work.id}`;
 }
 
-// A search records the request it belongs to. A remote provider can take
-// seconds to answer, and a reply to a query the user has since replaced must
-// not overwrite the answer to the new one.
-let literatureRequest = 0;
+/**
+ * The requests one search has out, counted so a stale answer is recognised.
+ *
+ * A remote provider can take seconds to answer, and a reply to a query the
+ * user has since replaced must not overwrite the answer to the new one. The
+ * composition in flight is also named to the backend, so it can be stopped
+ * there.
+ */
+interface Requests {
+  literature: number;
+  compose: number;
+  composeInFlight: string | null;
+  /** Per provider, for its listing. */
+  browse: Record<string, number>;
+}
+
+type SearchSet = (
+  partial:
+    | Partial<CatalogueSearchState>
+    | ((state: CatalogueSearchState) => Partial<CatalogueSearchState>),
+) => void;
+type SearchGet = () => CatalogueSearchState;
+
+/** The provider list every pane reads, which is the window's and not a pane's. */
+function providerOptions(): LiteratureProviderInfo[] {
+  return useCatalogueStore.getState().providerOptions;
+}
+
+/** The providers a search shows as filtered listings. */
+function listedIn(get: SearchGet): string[] {
+  return refinedProviderIds({ ...get(), providerOptions: providerOptions() });
+}
 
 /**
  * Asks the named providers and folds their answers into what is already held.
@@ -420,13 +502,14 @@ let literatureRequest = 0;
  * of the network and their answer to this query has not changed.
  */
 async function searchLiterature(
-  set: (partial: Partial<CatalogueStore>) => void,
-  get: () => CatalogueStore,
+  set: SearchSet,
+  get: SearchGet,
+  requests: Requests,
   query: string,
   providers: Selection<string>,
   merge: boolean,
 ): Promise<void> {
-  const request = ++literatureRequest;
+  const request = ++requests.literature;
   set({ literatureLoading: true, literatureError: null });
   try {
     const response = await api.literatureSearch(
@@ -434,7 +517,7 @@ async function searchLiterature(
       LITERATURE_LIMIT,
       providers === null ? undefined : providers,
     );
-    if (request !== literatureRequest) return;
+    if (request !== requests.literature) return;
     const held = merge ? get().literature : null;
     const carried =
       held !== null && held.query === query
@@ -472,11 +555,11 @@ async function searchLiterature(
         // provider a reply came from and when it was asked are accidents of
         // the network, and a list that reordered itself as filters were
         // toggled would be a different pane each time.
-        providers: inRegistryOrder([...carried, ...response.providers], get().providerOptions),
+        providers: inRegistryOrder([...carried, ...response.providers], providerOptions()),
       },
     });
   } catch (e: any) {
-    if (request !== literatureRequest) return;
+    if (request !== requests.literature) return;
     set({
       literatureLoading: false,
       // A widening that failed leaves what the other providers already said.
@@ -548,30 +631,17 @@ function omitKey<T>(record: Record<string, T>, key: string): Record<string, T> {
   return rest;
 }
 
-// The composition in flight, if any. Named to the backend so it can be stopped
-// there, and counted here so an answer to one that was replaced or stopped is
-// recognised and dropped.
-let composeRequest = 0;
-let composeInFlight: string | null = null;
-
 /** Stops the composition in flight, here and in the backend. */
-function stopComposing(): void {
-  composeRequest++;
-  const stopped = composeInFlight;
-  composeInFlight = null;
+function stopComposing(requests: Requests): void {
+  requests.compose++;
+  const stopped = requests.composeInFlight;
+  requests.composeInFlight = null;
   if (stopped !== null) {
     api.literatureComposeCancel(stopped).catch((error) => {
       console.error("a composition could not be cancelled:", error);
     });
   }
 }
-
-/** In-flight listing requests per provider, so a stale answer is recognised. */
-const browseRequests: Record<string, number> = {};
-
-type StoreSet = (
-  partial: Partial<CatalogueStore> | ((state: CatalogueStore) => Partial<CatalogueStore>),
-) => void;
 
 /** The ids of the enabled providers whose listing can be refined — one that
  *  declares at least a sort or a filter — in registry order. A listing with
@@ -632,7 +702,7 @@ export function totalRefinements(state: {
   );
 }
 
-function patchListing(set: StoreSet, provider: string, patch: Partial<Listing>): void {
+function patchListing(set: SearchSet, provider: string, patch: Partial<Listing>): void {
   set((state) => ({
     listings: {
       ...state.listings,
@@ -642,8 +712,8 @@ function patchListing(set: StoreSet, provider: string, patch: Partial<Listing>):
 }
 
 /** Forgets a provider's listing and ignores any request still out for it. */
-function dropListing(set: StoreSet, provider: string): void {
-  browseRequests[provider] = (browseRequests[provider] ?? 0) + 1;
+function dropListing(set: SearchSet, requests: Requests, provider: string): void {
+  requests.browse[provider] = (requests.browse[provider] ?? 0) + 1;
   set((state) => ({ listings: omitKey(state.listings, provider) }));
 }
 
@@ -672,17 +742,18 @@ function browseRequestFor(
 /** Asks for one page. `held` is the answer to extend, or null for a fresh
  *  listing that replaces whatever was shown. */
 async function runBrowse(
-  set: StoreSet,
+  set: SearchSet,
+  requests: Requests,
   provider: string,
   name: string,
   request: BrowseRequest,
   held: BrowseAnswer | null,
 ): Promise<void> {
-  const token = (browseRequests[provider] = (browseRequests[provider] ?? 0) + 1);
+  const token = (requests.browse[provider] = (requests.browse[provider] ?? 0) + 1);
   patchListing(set, provider, { loading: true, error: null });
   try {
     const answer = await api.literatureBrowse(provider, request);
-    if (token !== browseRequests[provider]) return;
+    if (token !== requests.browse[provider]) return;
     if (answer.error !== null || answer.results === null) {
       // The provider answered, and refused: a request its manifest does not
       // allow, or a service that is down. Pages already read stay.
@@ -706,7 +777,7 @@ async function runBrowse(
       },
     });
   } catch (e: any) {
-    if (token !== browseRequests[provider]) return;
+    if (token !== requests.browse[provider]) return;
     patchListing(set, provider, {
       loading: false,
       error: e?.toString?.() ?? "Browse failed",
@@ -721,34 +792,37 @@ async function runBrowse(
  * Returns the requests started and the providers that are not listings.
  */
 function applyListings(
-  set: StoreSet,
-  get: () => CatalogueStore,
+  set: SearchSet,
+  get: SearchGet,
+  requests: Requests,
   keyword: string,
   ids: string[],
 ): { requests: Promise<void>[]; stopped: string[] } {
-  const listed = refinedProviderIds(get());
-  const requests: Promise<void>[] = [];
+  const listed = listedIn(get);
+  const started: Promise<void>[] = [];
   const stopped: string[] = [];
   for (const id of ids) {
-    if (listed.includes(id)) requests.push(listProvider(set, get(), id, keyword));
+    if (listed.includes(id)) started.push(listProvider(set, requests, get(), id, keyword));
     else {
-      dropListing(set, id);
+      dropListing(set, requests, id);
       stopped.push(id);
     }
   }
-  return { requests, stopped };
+  return { requests: started, stopped };
 }
 
 /** Asks one provider for its listing under what is set now. */
 function listProvider(
-  set: StoreSet,
-  state: CatalogueStore,
+  set: SearchSet,
+  requests: Requests,
+  state: CatalogueSearchState,
   provider: string,
   keyword: string,
 ): Promise<void> {
-  const info = state.providerOptions.find((option) => option.provider === provider);
+  const info = providerOptions().find((option) => option.provider === provider);
   return runBrowse(
     set,
+    requests,
     provider,
     info?.name ?? provider,
     browseRequestFor(state.refinements[provider] ?? NO_REFINEMENT, info, keyword),
@@ -756,24 +830,382 @@ function listProvider(
   );
 }
 
+/** A fresh search, starting from the selection the last one was left on. */
+export function createCatalogueSearch(providers: Selection<string>): CatalogueSearch {
+  const requests: Requests = { literature: 0, compose: 0, composeInFlight: null, browse: {} };
+  return create<CatalogueSearchState>((set, get) => ({
+    query: "",
+    providers,
+    literatureLoading: false,
+    literatureMore: [],
+    literatureMoreError: {},
+    literature: null,
+    literatureError: null,
+    browseOpen: false,
+    refinements: {},
+    listings: {},
+    composing: false,
+    composed: null,
+    composeError: null,
+    composedQuery: null,
+
+    setQuery: (query) => set({ query }),
+
+    setProviders: (next) => set({ providers: next }),
+
+    toggleProvider: (provider) => {
+      const options = providerOptions();
+      const enabled = enabledProviderIds(options);
+      const next = toggled(get().providers, enabled, provider);
+      set({ providers: next });
+      useCatalogueStore.getState().setPreferredProviders(next);
+      // A filtered listing follows its provider's chip: switching the provider
+      // off removes it and switching it on asks for it, as it would a search.
+      if (browseProviderIds(options).includes(provider)) {
+        void get().refine(get().query, provider);
+      }
+      const query = get().query.trim();
+      if (!query) return;
+      if (!selectsAny(next)) {
+        requests.literature++;
+        set({ literature: null, literatureError: null, literatureLoading: false });
+        return;
+      }
+      // Narrowing is free: the answers already held cover it, and the pane
+      // shows the subset. Only a provider that has not been asked this query
+      // costs a request, and then only that provider is asked. A provider shown
+      // as a filtered listing is not one of them.
+      const listed = listedIn(get);
+      const missing = unasked(get().literature, query, next, enabled).filter(
+        (id) => !listed.includes(id),
+      );
+      if (missing.length > 0) void searchLiterature(set, get, requests, query, missing, true);
+    },
+
+    setBrowseOpen: (open) => set({ browseOpen: open }),
+
+    setBrowseFilter: (provider, name, values, labels) =>
+      set((state) => {
+        const current = state.refinements[provider] ?? NO_REFINEMENT;
+        const kept = values.filter((value) => value.trim() !== "");
+        if (kept.length === 0) {
+          return { refinements: { ...state.refinements, [provider]: withoutFilter(current, name) } };
+        }
+        // Labels are kept only for values still chosen, and a label given now
+        // replaces one remembered.
+        const known = { ...(current.labels[name] ?? {}), ...(labels ?? {}) };
+        const named = Object.fromEntries(
+          kept.filter((value) => value in known).map((value) => [value, known[value]]),
+        );
+        return {
+          refinements: {
+            ...state.refinements,
+            [provider]: {
+              ...current,
+              filters: { ...current.filters, [name]: kept },
+              labels: { ...current.labels, [name]: named },
+            },
+          },
+        };
+      }),
+
+    setBrowseMode: (provider, name, mode) =>
+      set((state) => {
+        const current = state.refinements[provider] ?? NO_REFINEMENT;
+        return {
+          refinements: {
+            ...state.refinements,
+            [provider]: { ...current, modes: { ...current.modes, [name]: mode } },
+          },
+        };
+      }),
+
+    clearBrowseFilter: (provider, name) =>
+      set((state) => ({
+        refinements: {
+          ...state.refinements,
+          [provider]: withoutFilter(state.refinements[provider] ?? NO_REFINEMENT, name),
+        },
+      })),
+
+    setBrowseSort: (provider, sort) =>
+      set((state) => ({
+        refinements: {
+          ...state.refinements,
+          [provider]: { ...(state.refinements[provider] ?? NO_REFINEMENT), sort },
+        },
+      })),
+
+    resetRefinement: (provider) =>
+      set((state) => ({
+        refinements:
+          provider === undefined ? {} : omitKey(state.refinements, provider),
+      })),
+
+    compose: async (text) => {
+      const trimmed = text.trim();
+      if (!trimmed) return false;
+      const targets = browseProviderIds(providerOptions()).filter((id) =>
+        selects(get().providers, id),
+      );
+      stopComposing(requests);
+      if (targets.length === 0) {
+        set({
+          composing: false,
+          composed: null,
+          composeError: "None of the selected sources can be filtered, so there is nothing to compose.",
+        });
+        return false;
+      }
+      const request = ++requests.compose;
+      const id = `compose-${Date.now()}-${request}-${Math.random().toString(36).slice(2, 8)}`;
+      requests.composeInFlight = id;
+      set({ composing: true, composed: null, composeError: null });
+      try {
+        const composition = await api.literatureCompose(id, trimmed, targets);
+        if (request !== requests.compose) return false;
+        requests.composeInFlight = null;
+        const refinements = { ...get().refinements };
+        const notes: string[] = [];
+        const failures: ComposeOutcome["failures"] = [];
+        const several = composition.providers.length > 1;
+        for (const listing of composition.providers) {
+          for (const note of listing.notes) {
+            notes.push(several ? `${listing.name}: ${note}` : note);
+          }
+          if (listing.error !== null) {
+            // What was set on it by hand stays: nothing was composed to replace it.
+            failures.push({ name: listing.name, error: listing.error });
+            continue;
+          }
+          refinements[listing.provider] = {
+            filters: listing.filters,
+            modes: {},
+            labels: listing.labels,
+            sort: listing.sort,
+          };
+        }
+        set({
+          composing: false,
+          refinements,
+          composed: { text: composition.text, notes, failures },
+        });
+        // Nothing was composed for anyone: there is no search this describes,
+        // and running the sentence as a keyword would not be what was asked.
+        if (failures.length === composition.providers.length) return false;
+        const keyword = composition.keyword ?? "";
+        set({ composedQuery: { text, keyword } });
+        await get().search(keyword);
+        return true;
+      } catch (e: any) {
+        if (request !== requests.compose) return false;
+        requests.composeInFlight = null;
+        console.error("composing a search failed:", e);
+        set({
+          composing: false,
+          composeError: e?.toString?.() ?? "The search could not be composed",
+        });
+        return false;
+      }
+    },
+
+    cancelCompose: () => {
+      stopComposing(requests);
+      set({ composing: false });
+    },
+
+    dismissComposition: () => set({ composed: null, composeError: null }),
+
+    refine: async (keyword, provider) => {
+      const trimmed = keyword.trim();
+      set({ query: keyword });
+      const options = providerOptions();
+      const considered = provider === undefined ? browseProviderIds(options) : [provider];
+      const { requests: started, stopped } = applyListings(set, get, requests, trimmed, considered);
+      const asked = [...started];
+      // A provider that stopped being a listing goes back to the keyword search
+      // it was left out of; the others' answers to it are already held.
+      if (trimmed && stopped.length > 0) {
+        const enabled = enabledProviderIds(options);
+        const missing = unasked(get().literature, trimmed, get().providers, enabled).filter(
+          (id) => stopped.includes(id),
+        );
+        if (missing.length > 0) {
+          asked.push(searchLiterature(set, get, requests, trimmed, missing, true));
+        }
+      }
+      await Promise.all(asked);
+    },
+
+    browseMore: async (provider) => {
+      const held = get().listings[provider]?.answer ?? null;
+      if (held === null || held.exhausted) return;
+      await runBrowse(
+        set,
+        requests,
+        held.provider,
+        held.name,
+        { ...held.request, page: held.page + 1 },
+        held,
+      );
+    },
+
+    loadMoreLiterature: async (provider) => {
+      const held = get().literature;
+      const progress = held?.pages[provider];
+      if (held === null || progress === undefined || progress.exhausted) return;
+      if (get().literatureMore.includes(provider)) return;
+      const request = requests.literature;
+      const next = progress.page + 1;
+      set((state) => ({
+        literatureMore: [...state.literatureMore, provider],
+        literatureMoreError: omitKey(state.literatureMoreError, provider),
+      }));
+      const settle = (partial: Partial<CatalogueSearchState>) =>
+        set((state) => ({
+          ...partial,
+          literatureMore: state.literatureMore.filter((id) => id !== provider),
+        }));
+      try {
+        const response = await api.literatureSearch(held.query, LITERATURE_LIMIT, [provider], next);
+        // A new question was asked while this one was out: its answer belongs to
+        // the old one.
+        if (request !== requests.literature) return settle({});
+        const entry = response.providers.find((candidate) => candidate.provider === provider);
+        if (entry === undefined || entry.results === null) {
+          return settle({
+            literatureMoreError: {
+              ...get().literatureMoreError,
+              [provider]: entry?.error ?? "the answer carried neither results nor an error",
+            },
+          });
+        }
+        const fetched = entry.results;
+        const current = get().literature;
+        if (current === null || current.query !== held.query) return settle({});
+        settle({
+          literature: {
+            ...current,
+            pages: {
+              ...current.pages,
+              [provider]: { page: next, exhausted: fetched.length < LITERATURE_LIMIT },
+            },
+            providers: current.providers.map((existing) =>
+              existing.provider === provider
+                ? {
+                    ...existing,
+                    results: [...(existing.results ?? []), ...unseen(existing.results ?? [], fetched)],
+                  }
+                : existing,
+            ),
+          },
+        });
+      } catch (e: any) {
+        if (request !== requests.literature) return settle({});
+        settle({
+          literatureMoreError: {
+            ...get().literatureMoreError,
+            [provider]: e?.toString?.() ?? "The next page could not be read",
+          },
+        });
+      }
+    },
+
+    search: async (query) => {
+      const trimmed = query.trim();
+      const listed = listedIn(get);
+      const options = providerOptions();
+      if (!trimmed) {
+        requests.literature++;
+        set({
+          literature: null,
+          literatureError: null,
+          literatureLoading: false,
+        });
+        // Filters need no keyword: that is what browsing is.
+        set({ query });
+        await Promise.all(
+          applyListings(set, get, requests, "", browseProviderIds(options)).requests,
+        );
+        return;
+      }
+      set({ query });
+      useCatalogueStore.getState().noteAddError(null);
+      const { providers } = get();
+      // A provider shown as a filtered listing is asked by the listing, with the
+      // keyword beside its filters, and left out of the keyword search.
+      const searched =
+        listed.length === 0
+          ? providers
+          : (providers ?? enabledProviderIds(options)).filter((id) => !listed.includes(id));
+      const searchesLiterature = selectsAny(searched);
+      // A fresh query replaces what the providers said rather than merging into
+      // it — the held answers belong to the question that was asked before.
+      await Promise.all([
+        searchesLiterature ? searchLiterature(set, get, requests, trimmed, searched, false) : null,
+        ...applyListings(set, get, requests, trimmed, browseProviderIds(options)).requests,
+      ]);
+      if (!searchesLiterature) {
+        set({ literature: null, literatureError: null, literatureLoading: false });
+      }
+    },
+
+    /** Clears the question and its answers without losing filters or acquisitions. */
+    clearSearch: () => {
+      requests.literature++;
+      stopComposing(requests);
+      for (const provider of Object.keys(requests.browse)) requests.browse[provider]++;
+      set({
+        query: "",
+        composing: false,
+        composed: null,
+        composeError: null,
+        composedQuery: null,
+        literature: null,
+        literatureError: null,
+        literatureLoading: false,
+        literatureMore: [],
+        literatureMoreError: {},
+        listings: {},
+      });
+    },
+  }));
+}
+
+/** The search of the pane a component is rendered in. Provided by the pane. */
+export const CatalogueSearchContext = createContext<CatalogueSearch | null>(null);
+
+/** The store behind `useCatalogueSearch`, for a handler that reads it once. */
+export function useCatalogueSearchStore(): CatalogueSearch {
+  const search = useContext(CatalogueSearchContext);
+  if (search === null) {
+    throw new Error("a catalogue search was read outside a catalogue pane");
+  }
+  return search;
+}
+
+/** Reads the search of the pane this component is rendered in. */
+export function useCatalogueSearch<T>(selector: (state: CatalogueSearchState) => T): T {
+  return useCatalogueSearchStore()(selector);
+}
+
+let paneCount = 0;
+
+function openedPane(preferred: Selection<string>): CataloguePaneEntry {
+  paneCount += 1;
+  return { id: `catalogue-${paneCount}`, search: createCatalogueSearch(preferred) };
+}
+
+const { providers: storedProviders, legacy: storedLegacy } = readPreferences();
+
 export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
-  paneOpen: false,
-  query: "",
-  ...readPreferences(),
+  panesVisible: false,
+  panes: [],
+  focusedPane: null,
+  preferredProviders: storedProviders,
+  legacy: storedLegacy,
   providerOptions: [],
   providerOptionsError: null,
-  literatureLoading: false,
-  literatureMore: [],
-  literatureMoreError: {},
-  literature: null,
-  literatureError: null,
-  browseOpen: false,
-  refinements: {},
-  listings: {},
-  composing: false,
-  composed: null,
-  composeError: null,
-  composedQuery: null,
   acquireError: null,
   acquired: {},
   adding: {},
@@ -800,327 +1232,93 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
 
   noteAddError: (message) => set({ acquireError: message }),
 
-  openPane: () => set({ paneOpen: true }),
-  closePane: () => set({ paneOpen: false }),
-  setQuery: (query) => set({ query }),
-
-  toggleProvider: (provider) => {
-    const enabled = enabledProviderIds(get().providerOptions);
-    const next = toggled(get().providers, enabled, provider);
-    set({ providers: next });
-    persistPreferences(next);
-    // A filtered listing follows its provider's chip: switching the provider
-    // off removes it and switching it on asks for it, as it would a search.
-    if (browseProviderIds(get().providerOptions).includes(provider)) {
-      void get().refine(get().query, provider);
-    }
-    const query = get().query.trim();
-    if (!query) return;
-    if (!selectsAny(next)) {
-      literatureRequest++;
-      set({ literature: null, literatureError: null, literatureLoading: false });
+  showPanes: () => {
+    if (get().panes.length > 0) {
+      set({ panesVisible: true });
       return;
     }
-    // Narrowing is free: the answers already held cover it, and the pane
-    // shows the subset. Only a provider that has not been asked this query
-    // costs a request, and then only that provider is asked. A provider shown
-    // as a filtered listing is not one of them.
-    const listed = refinedProviderIds(get());
-    const missing = unasked(get().literature, query, next, enabled).filter(
-      (id) => !listed.includes(id),
-    );
-    if (missing.length > 0) void searchLiterature(set, get, query, missing, true);
+    get().newPane();
   },
 
-  setBrowseOpen: (open) => set({ browseOpen: open }),
+  hidePanes: () => set({ panesVisible: false }),
 
-  setBrowseFilter: (provider, name, values, labels) =>
-    set((state) => {
-      const current = state.refinements[provider] ?? NO_REFINEMENT;
-      const kept = values.filter((value) => value.trim() !== "");
-      if (kept.length === 0) {
-        return { refinements: { ...state.refinements, [provider]: withoutFilter(current, name) } };
-      }
-      // Labels are kept only for values still chosen, and a label given now
-      // replaces one remembered.
-      const known = { ...(current.labels[name] ?? {}), ...(labels ?? {}) };
-      const named = Object.fromEntries(
-        kept.filter((value) => value in known).map((value) => [value, known[value]]),
-      );
-      return {
-        refinements: {
-          ...state.refinements,
-          [provider]: {
-            ...current,
-            filters: { ...current.filters, [name]: kept },
-            labels: { ...current.labels, [name]: named },
-          },
-        },
-      };
-    }),
-
-  setBrowseMode: (provider, name, mode) =>
-    set((state) => {
-      const current = state.refinements[provider] ?? NO_REFINEMENT;
-      return {
-        refinements: {
-          ...state.refinements,
-          [provider]: { ...current, modes: { ...current.modes, [name]: mode } },
-        },
-      };
-    }),
-
-  clearBrowseFilter: (provider, name) =>
+  newPane: () => {
+    const pane = openedPane(get().preferredProviders);
     set((state) => ({
-      refinements: {
-        ...state.refinements,
-        [provider]: withoutFilter(state.refinements[provider] ?? NO_REFINEMENT, name),
-      },
-    })),
-
-  setBrowseSort: (provider, sort) =>
-    set((state) => ({
-      refinements: {
-        ...state.refinements,
-        [provider]: { ...(state.refinements[provider] ?? NO_REFINEMENT), sort },
-      },
-    })),
-
-  resetRefinement: (provider) =>
-    set((state) => ({
-      refinements:
-        provider === undefined ? {} : omitKey(state.refinements, provider),
-    })),
-
-  compose: async (text) => {
-    const trimmed = text.trim();
-    if (!trimmed) return false;
-    const targets = browseProviderIds(get().providerOptions).filter((id) =>
-      selects(get().providers, id),
-    );
-    stopComposing();
-    if (targets.length === 0) {
-      set({
-        composing: false,
-        composed: null,
-        composeError: "None of the selected sources can be filtered, so there is nothing to compose.",
-      });
-      return false;
-    }
-    const request = ++composeRequest;
-    const id = `compose-${Date.now()}-${request}`;
-    composeInFlight = id;
-    set({ composing: true, composed: null, composeError: null });
-    try {
-      const composition = await api.literatureCompose(id, trimmed, targets);
-      if (request !== composeRequest) return false;
-      composeInFlight = null;
-      const refinements = { ...get().refinements };
-      const notes: string[] = [];
-      const failures: ComposeOutcome["failures"] = [];
-      const several = composition.providers.length > 1;
-      for (const listing of composition.providers) {
-        for (const note of listing.notes) {
-          notes.push(several ? `${listing.name}: ${note}` : note);
-        }
-        if (listing.error !== null) {
-          // What was set on it by hand stays: nothing was composed to replace it.
-          failures.push({ name: listing.name, error: listing.error });
-          continue;
-        }
-        refinements[listing.provider] = {
-          filters: listing.filters,
-          modes: {},
-          labels: listing.labels,
-          sort: listing.sort,
-        };
-      }
-      set({
-        composing: false,
-        refinements,
-        composed: { text: composition.text, notes, failures },
-      });
-      // Nothing was composed for anyone: there is no search this describes,
-      // and running the sentence as a keyword would not be what was asked.
-      if (failures.length === composition.providers.length) return false;
-      const keyword = composition.keyword ?? "";
-      set({ composedQuery: { text, keyword } });
-      await get().search(keyword);
-      return true;
-    } catch (e: any) {
-      if (request !== composeRequest) return false;
-      composeInFlight = null;
-      console.error("composing a search failed:", e);
-      set({
-        composing: false,
-        composeError: e?.toString?.() ?? "The search could not be composed",
-      });
-      return false;
-    }
+      panesVisible: true,
+      panes: [...state.panes, pane],
+      focusedPane: pane.id,
+    }));
   },
 
-  cancelCompose: () => {
-    stopComposing();
-    set({ composing: false });
-  },
-
-  dismissComposition: () => set({ composed: null, composeError: null }),
-
-  refine: async (keyword, provider) => {
-    const trimmed = keyword.trim();
-    set({ query: keyword });
-    const considered =
-      provider === undefined ? browseProviderIds(get().providerOptions) : [provider];
-    const { requests, stopped } = applyListings(set, get, trimmed, considered);
-    const asked = [...requests];
-    // A provider that stopped being a listing goes back to the keyword search
-    // it was left out of; the others' answers to it are already held.
-    if (trimmed && stopped.length > 0) {
-      const enabled = enabledProviderIds(get().providerOptions);
-      const missing = unasked(get().literature, trimmed, get().providers, enabled).filter(
-        (id) => stopped.includes(id),
-      );
-      if (missing.length > 0) asked.push(searchLiterature(set, get, trimmed, missing, true));
+  closePane: (id) => {
+    const { panes, focusedPane } = get();
+    const closing = panes.find((pane) => pane.id === id);
+    if (closing === undefined) return;
+    if (panes.length === 1) {
+      set({ panesVisible: false });
+      return;
     }
-    await Promise.all(asked);
+    // What it had in flight is stopped, the composition in the backend too:
+    // nothing is left to show the answer to.
+    closing.search.getState().clearSearch();
+    const remaining = panes.filter((pane) => pane.id !== id);
+    set({
+      panes: remaining,
+      focusedPane: focusedPane === id ? remaining[remaining.length - 1].id : focusedPane,
+    });
   },
 
-  browseMore: async (provider) => {
-    const held = get().listings[provider]?.answer ?? null;
-    if (held === null || held.exhausted) return;
-    await runBrowse(
-      set,
-      held.provider,
-      held.name,
-      { ...held.request, page: held.page + 1 },
-      held,
-    );
+  focusPane: (id) => {
+    if (get().focusedPane !== id) set({ focusedPane: id });
+  },
+
+  searchInPane: async (query) => {
+    get().showPanes();
+    const { panes, focusedPane } = get();
+    const pane = panes.find((candidate) => candidate.id === focusedPane) ?? panes[panes.length - 1];
+    await pane.search.getState().search(query);
+  },
+
+  setPreferredProviders: (providers) => {
+    set({ preferredProviders: providers });
+    persistPreferences(providers);
   },
 
   loadProviders: async () => {
     try {
       const options = await api.literatureProviders();
       const known = options.map((option) => option.provider);
-      const legacy = get().legacy;
-      const stored =
-        legacy === undefined ? get().providers : migrated(get().providers, legacy.grains, options);
       // A selection naming a provider that no longer exists would be refused
       // by the backend on every search, so it is pruned here rather than sent.
-      const pruned = stored === null ? null : stored.filter((id) => known.includes(id));
+      const prune = (selection: Selection<string>) =>
+        selection === null ? null : selection.filter((id) => known.includes(id));
+      const { legacy, preferredProviders } = get();
+      const stored =
+        legacy === undefined ? preferredProviders : migrated(preferredProviders, legacy.grains, options);
+      const preferred = prune(stored);
       set({
         providerOptions: options,
         providerOptionsError: null,
-        providers: pruned,
+        preferredProviders: preferred,
         legacy: undefined,
       });
       if (
         legacy !== undefined ||
-        (stored !== null && pruned !== null && pruned.length !== stored.length)
+        (stored !== null && preferred !== null && preferred.length !== stored.length)
       ) {
-        persistPreferences(pruned);
+        persistPreferences(preferred);
+      }
+      for (const pane of get().panes) {
+        const search = pane.search.getState();
+        // A pane opened before the list arrived started on the stored
+        // selection, which only now can be read in today's terms.
+        search.setProviders(legacy !== undefined ? preferred : prune(search.providers));
       }
     } catch (e: any) {
       const message = e?.toString?.() ?? "Literature providers could not be listed";
       console.error("literature providers could not be listed:", e);
       set({ providerOptionsError: message });
-    }
-  },
-
-  loadMoreLiterature: async (provider) => {
-    const held = get().literature;
-    const progress = held?.pages[provider];
-    if (held === null || progress === undefined || progress.exhausted) return;
-    if (get().literatureMore.includes(provider)) return;
-    const request = literatureRequest;
-    const next = progress.page + 1;
-    set((state) => ({
-      literatureMore: [...state.literatureMore, provider],
-      literatureMoreError: omitKey(state.literatureMoreError, provider),
-    }));
-    const settle = (partial: Partial<CatalogueStore>) =>
-      set((state) => ({
-        ...partial,
-        literatureMore: state.literatureMore.filter((id) => id !== provider),
-      }));
-    try {
-      const response = await api.literatureSearch(held.query, LITERATURE_LIMIT, [provider], next);
-      // A new question was asked while this one was out: its answer belongs to
-      // the old one.
-      if (request !== literatureRequest) return settle({});
-      const entry = response.providers.find((candidate) => candidate.provider === provider);
-      if (entry === undefined || entry.results === null) {
-        return settle({
-          literatureMoreError: {
-            ...get().literatureMoreError,
-            [provider]: entry?.error ?? "the answer carried neither results nor an error",
-          },
-        });
-      }
-      const fetched = entry.results;
-      const current = get().literature;
-      if (current === null || current.query !== held.query) return settle({});
-      settle({
-        literature: {
-          ...current,
-          pages: {
-            ...current.pages,
-            [provider]: { page: next, exhausted: fetched.length < LITERATURE_LIMIT },
-          },
-          providers: current.providers.map((existing) =>
-            existing.provider === provider
-              ? {
-                  ...existing,
-                  results: [...(existing.results ?? []), ...unseen(existing.results ?? [], fetched)],
-                }
-              : existing,
-          ),
-        },
-      });
-    } catch (e: any) {
-      if (request !== literatureRequest) return settle({});
-      settle({
-        literatureMoreError: {
-          ...get().literatureMoreError,
-          [provider]: e?.toString?.() ?? "The next page could not be read",
-        },
-      });
-    }
-  },
-
-  search: async (query) => {
-    const trimmed = query.trim();
-    const listed = refinedProviderIds(get());
-    if (!trimmed) {
-      literatureRequest++;
-      set({
-        literature: null,
-        literatureError: null,
-        literatureLoading: false,
-      });
-      // Filters need no keyword: that is what browsing is.
-      set({ query });
-      await Promise.all(applyListings(set, get, "", browseProviderIds(get().providerOptions)).requests);
-      return;
-    }
-    set({ query, acquireError: null });
-    const { providers, providerOptions } = get();
-    // A provider shown as a filtered listing is asked by the listing, with the
-    // keyword beside its filters, and left out of the keyword search.
-    const searched =
-      listed.length === 0
-        ? providers
-        : (providers ?? enabledProviderIds(providerOptions)).filter(
-            (id) => !listed.includes(id),
-          );
-    const searchesLiterature = selectsAny(searched);
-    // A fresh query replaces what the providers said rather than merging into
-    // it — the held answers belong to the question that was asked before.
-    await Promise.all([
-      searchesLiterature ? searchLiterature(set, get, trimmed, searched, false) : null,
-      ...applyListings(set, get, trimmed, browseProviderIds(providerOptions)).requests,
-    ]);
-    if (!searchesLiterature) {
-      set({ literature: null, literatureError: null, literatureLoading: false });
     }
   },
 
@@ -1176,25 +1374,9 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
     }
   },
 
-  /** Clears the question and everything it produced. The filters are not
-   *  touched: they are the user's standing choice about which sources to ask,
-   *  which is why they outlive a session at all. */
   reset: () => {
-    literatureRequest++;
-    stopComposing();
-    for (const provider of Object.keys(browseRequests)) browseRequests[provider]++;
+    for (const pane of get().panes) pane.search.getState().clearSearch();
     set({
-      query: "",
-      composing: false,
-      composed: null,
-      composeError: null,
-      composedQuery: null,
-      literature: null,
-      literatureError: null,
-      literatureLoading: false,
-      literatureMore: [],
-      literatureMoreError: {},
-      listings: {},
       acquireError: null,
       acquired: {},
       adding: {},

@@ -1,5 +1,6 @@
 import type { ImagePage } from "@leonrjg/wilkes-reader";
 import type {
+  HttpCall,
   EmbedDone,
   EmbedError,
   EmbedProgress,
@@ -183,6 +184,8 @@ export interface SearchApi {
   comicPage(path: string, page: number, signal: AbortSignal): Promise<ImagePage>;
 
   resolveAssetUrl(path: string): string;
+  getHttpCalls(): Promise<HttpCall[]>;
+  clearHttpCalls(): Promise<void>;
   getLogs(): Promise<string[]>;
   clearLogs(): Promise<void>;
   getPythonInfo(): Promise<string>;

@@ -9,20 +9,34 @@ const { default: ChatPane, contextFileMatchRef } = await import("./ChatPane");
 const { useChatStore } = await import("../stores/useChatStore");
 const { useViewerStore } = await import("../stores/useViewerStore");
 
-/** Mount and wait for the session the pane opens on mount. */
+/** The pane's own documents, as the reader and the pins would have set them. */
+function setContext(
+  contextFiles: { path: string; pages: number | null }[],
+  activeDoc: { path: string; page: number | null } | null,
+) {
+  useChatStore.setState((state) => ({
+    panes: state.panes.map((pane) => ({ ...pane, contextFiles, activeDoc })),
+  }));
+}
+
+function Mounted() {
+  const pane = useChatStore((s) => s.panes[0]);
+  return <ChatPane pane={pane} onClose={vi.fn()} />;
+}
+
+/** Mount and wait for the session the pane opens on. */
 async function mount() {
-  const rendered = render(<ChatPane onClose={vi.fn()} />);
+  const rendered = render(<Mounted />);
   await waitFor(() => expect(screen.getByLabelText("Message")).toBeInTheDocument());
   return rendered;
 }
 
-beforeEach(() => {
-  useChatStore.setState({
-    paneOpen: true,
-    paneOpening: false,
-    contextFiles: [{ path: "/tmp/notes.md", pages: null }],
-    activeDoc: { path: "/tmp/paper.pdf", page: 7 },
-  });
+const pane = () => useChatStore.getState().panes[0];
+
+beforeEach(async () => {
+  useChatStore.getState().resetForWorkspace();
+  await useChatStore.getState().newPane();
+  setContext([{ path: "/tmp/notes.md", pages: null }], { path: "/tmp/paper.pdf", page: 7 });
   useViewerStore.setState({ openMatch: vi.fn() });
 });
 
@@ -71,7 +85,7 @@ describe("the documents the next question will be answered from", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Deselect current document" }));
 
-    expect(useChatStore.getState().activeDoc).toBeNull();
+    expect(pane().activeDoc).toBeNull();
     expect(transport.hosts).toHaveLength(before);
   });
 
@@ -80,21 +94,18 @@ describe("the documents the next question will be answered from", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Pin current document to context" }));
 
-    expect(useChatStore.getState().contextFiles.map((f) => f.path)).toContain("/tmp/paper.pdf");
+    expect(pane().contextFiles.map((f) => f.path)).toContain("/tmp/paper.pdf");
   });
 
   it("are counted once when the open document is also pinned", async () => {
-    useChatStore.setState({
-      contextFiles: [{ path: "/tmp/paper.pdf", pages: null }],
-      activeDoc: { path: "/tmp/paper.pdf", page: 2 },
-    });
+    setContext([{ path: "/tmp/paper.pdf", pages: null }], { path: "/tmp/paper.pdf", page: 2 });
     await mount();
 
     expect(screen.getByText("Answering about 1 document")).toBeInTheDocument();
   });
 
   it("say so when there are none", async () => {
-    useChatStore.setState({ contextFiles: [], activeDoc: null });
+    setContext([], null);
     await mount();
 
     expect(screen.getByText("No documents in context yet")).toBeInTheDocument();

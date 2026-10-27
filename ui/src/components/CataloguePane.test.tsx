@@ -32,6 +32,46 @@ vi.mock("../services", () => ({
 import { api, source } from "../services";
 import CataloguePane from "./CataloguePane";
 import { useCatalogueStore } from "../stores/useCatalogueStore";
+
+/** What a pane's own search holds, as against what every pane shares. */
+const SEARCH_KEYS = new Set([
+  "query",
+  "providers",
+  "literatureLoading",
+  "literatureMore",
+  "literatureMoreError",
+  "literature",
+  "literatureError",
+  "browseOpen",
+  "refinements",
+  "listings",
+  "composing",
+  "composed",
+  "composeError",
+  "composedQuery",
+]);
+
+/** The pane in use. */
+function pane() {
+  const { panes, focusedPane } = useCatalogueStore.getState();
+  return panes.find((candidate) => candidate.id === focusedPane)!;
+}
+
+/** The pane's search and what it shares with the others, read as one. */
+function held() {
+  return { ...useCatalogueStore.getState(), ...pane().search.getState() };
+}
+
+/** Sets each field where it lives: in the pane's search, or in what is shared. */
+function setCatalogue(partial: Record<string, unknown>) {
+  const search: Record<string, unknown> = {};
+  const shared: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(partial)) {
+    (SEARCH_KEYS.has(key) ? search : shared)[key] = value;
+  }
+  pane().search.setState(search);
+  useCatalogueStore.setState(shared);
+}
 import { useGenerationStore } from "../stores/useGenerationStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
@@ -47,6 +87,7 @@ const WORK: LiteratureSearchResult = {
   is_open_access: true,
   pdf_url: "https://example.invalid/lists.pdf",
   landing_page_url: null,
+  image_url: null,
   open_access_status: "gold",
   license: "cc-by",
   authors: null,
@@ -74,6 +115,7 @@ const REFERENCE: LiteratureSearchResult = {
   citation_count: null,
   pdf_url: null,
   landing_page_url: "https://example.invalid/python",
+  image_url: null,
   open_access_status: null,
   license: "PSF",
   authors: "PSF",
@@ -210,16 +252,16 @@ describe("CataloguePane", () => {
     useCatalogueStore.getState().reset();
     // The filters outlive a reset by design, so a test that means "nothing
     // filtered" says so rather than assuming the last test left it that way.
+    // A fresh pane is a fresh search; the stored choice it starts on is reset.
     useCatalogueStore.setState({
-      paneOpen: true,
-      providers: null,
+      panes: [],
+      focusedPane: null,
+      preferredProviders: null,
       legacy: undefined,
       providerOptions: [],
       providerOptionsError: null,
-      browseOpen: false,
-      refinements: {},
-      listings: {},
     });
+    useCatalogueStore.getState().newPane();
     useSettingsStore.setState({ directory: "/library", refreshFileList: vi.fn() as never });
     useWorkspaceStore.setState({ workspaces: [], activeWorkspaceId: null } as never);
     useGenerationStore.setState({ ready: false });
@@ -257,11 +299,53 @@ describe("CataloguePane", () => {
     });
   };
 
+  it("clears the catalogue query and results, refocuses the input, and preserves filters and downloads", async () => {
+    render(<CataloguePane pane={pane()} />);
+    expect(screen.queryByRole("button", { name: "Clear catalogue search" })).toBeNull();
+    submit("python lists");
+    await screen.findByText("Persistent Lists Revisited");
+    const refinement = { filters: { type: ["book"] }, modes: {}, labels: {}, sort: null };
+    act(() => setCatalogue({
+      refinements: { openalex: refinement },
+      adding: { "openalex:W1": "fetching" },
+      acquired: { "already-added": "/library/book.pdf" },
+    }));
+    const before = held();
+    const clear = screen.getByRole("button", { name: "Clear catalogue search" });
+    expect(clear.parentElement).toBe(screen.getByLabelText("Search catalogues and literature").parentElement);
+    fireEvent.click(clear);
+    const input = screen.getByLabelText("Search catalogues and literature");
+    expect(input).toHaveProperty("value", "");
+    expect(document.activeElement).toBe(input);
+    expect(screen.queryByText("Persistent Lists Revisited")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Clear catalogue search" })).toBeNull();
+    const state = held();
+    expect(state.query).toBe("");
+    expect(state.literature).toBeNull();
+    expect(state.refinements).toEqual(before.refinements);
+    expect(state.adding).toEqual(before.adding);
+    expect(state.acquired).toEqual(before.acquired);
+    expect(literature).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a pending search response after clearing the catalogue search", async () => {
+    let finish!: (value: Awaited<ReturnType<typeof api.literatureSearch>>) => void;
+    literature.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    render(<CataloguePane pane={pane()} />);
+    submit("python lists");
+    await waitFor(() => expect(literature).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "Clear catalogue search" }));
+    await act(async () => { finish(answerOf("openalex", "OpenAlex", [WORK])); });
+    expect(screen.queryByText("Persistent Lists Revisited")).toBeNull();
+    expect(held().literature).toBeNull();
+    expect(held().literatureLoading).toBe(false);
+  });
+
   /// A catalogue is one more provider: one request asks it and the index, and
   /// each answers under its own name in the one list.
   it("asks a catalogue and an index the same question, each under its own name", async () => {
     withCatalogue();
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     await screen.findByRole("button", { name: "DevDocs" });
     submit("python lists");
     expect(await screen.findByText("Python 3.12")).toBeTruthy();
@@ -281,7 +365,7 @@ describe("CataloguePane", () => {
   /// nothing else is asked again.
   it("leaves a deselected catalogue out of the question", async () => {
     withCatalogue();
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     fireEvent.click(await screen.findByRole("button", { name: "DevDocs" }));
     submit("python lists");
     await screen.findByText("Persistent Lists Revisited");
@@ -294,7 +378,7 @@ describe("CataloguePane", () => {
   /// citation count to show a blank for.
   it("shows a catalogue's result by what a catalogue knows about it", async () => {
     withCatalogue();
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("python lists");
     await screen.findByText("Python 3.12");
     expect(screen.getByText("Reference")).toBeTruthy();
@@ -321,7 +405,7 @@ describe("CataloguePane", () => {
         },
       ],
     });
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("C");
     expect(
       await screen.findByText(/DevDocs could not answer: nothing in “C” could be searched for/),
@@ -338,6 +422,7 @@ describe("CataloguePane", () => {
       title: "Linear Algebra",
       kind: "course",
       landing_page_url: "https://ocw.example.invalid/18-06",
+      image_url: null,
       acquisition: "course",
     };
     providers.mockResolvedValue([catalogue("mit_ocw", "MIT OCW", "course")]);
@@ -353,7 +438,7 @@ describe("CataloguePane", () => {
       failures: [],
       skipped: [{}],
     });
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("linear algebra");
     fireEvent.click(await screen.findByLabelText("Add Linear Algebra to library"));
     await waitFor(() => {
@@ -377,15 +462,15 @@ describe("CataloguePane", () => {
       "wilkes.catalogue.filters",
       JSON.stringify({ grains: ["reference"], providers: null, collapsed: ["literature"] }),
     );
-    useCatalogueStore.setState({ providers: null, legacy: { grains: ["reference"] } });
+    setCatalogue({ providers: null, legacy: { grains: ["reference"] } });
     providers.mockResolvedValue([
       catalogue("libretexts", "LibreTexts", "textbook"),
       catalogue("devdocs", "DevDocs", "reference"),
       provider("openalex", "OpenAlex"),
     ]);
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     await waitFor(() => {
-      expect(useCatalogueStore.getState().providers).toEqual(["devdocs", "openalex"]);
+      expect(held().providers).toEqual(["devdocs", "openalex"]);
     });
     expect(JSON.parse(localStorage.getItem("wilkes.catalogue.filters") ?? "null")).toEqual({
       providers: ["devdocs", "openalex"],
@@ -399,22 +484,22 @@ describe("CataloguePane", () => {
   /// Nothing was filtered before, so nothing is now — and a source added
   /// later still joins, which an enumeration of today's would not allow.
   it("keeps an unfiltered stored choice unfiltered", async () => {
-    useCatalogueStore.setState({ providers: null, legacy: { grains: null } });
+    setCatalogue({ providers: null, legacy: { grains: null } });
     providers.mockResolvedValue([
       catalogue("devdocs", "DevDocs", "reference"),
       provider("openalex", "OpenAlex"),
     ]);
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     await screen.findByRole("button", { name: "DevDocs" });
-    expect(useCatalogueStore.getState().providers).toBeNull();
-    expect(useCatalogueStore.getState().legacy).toBeUndefined();
+    expect(held().providers).toBeNull();
+    expect(held().legacy).toBeUndefined();
   });
 
   /// Narrowing to one provider asks that provider alone. Filtering the answer
   /// afterwards would have spent the request on a rate-limited service for
   /// results it then threw away.
   it("asks only the selected providers and remembers the choice", async () => {
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     await screen.findByRole("button", { name: "OpenAlex" });
     fireEvent.click(screen.getByRole("button", { name: "Semantic Scholar" }));
     submit("python lists");
@@ -435,7 +520,7 @@ describe("CataloguePane", () => {
         { provider: "openalex", name: "OpenAlex", results: [WORK], error: null },
       ],
     });
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     await screen.findByRole("button", { name: "OpenAlex" });
     submit("python lists");
     await screen.findByText("Persistent Lists Revisited");
@@ -447,8 +532,8 @@ describe("CataloguePane", () => {
   /// Re-selecting a provider asks that provider, and only that provider: the
   /// siblings already answered this question.
   it("asks only the provider a widened filter adds", async () => {
-    useCatalogueStore.setState({ providers: ["openalex"] });
-    render(<CataloguePane />);
+    setCatalogue({ providers: ["openalex"] });
+    render(<CataloguePane pane={pane()} />);
     await screen.findByRole("button", { name: "Semantic Scholar" });
     submit("python lists");
     await screen.findByText("Persistent Lists Revisited");
@@ -472,8 +557,8 @@ describe("CataloguePane", () => {
   /// A widening that fails must not take the results the user is already
   /// reading with it.
   it("keeps the answers it holds when a widening request fails", async () => {
-    useCatalogueStore.setState({ providers: ["openalex"] });
-    render(<CataloguePane />);
+    setCatalogue({ providers: ["openalex"] });
+    render(<CataloguePane pane={pane()} />);
     await screen.findByRole("button", { name: "Semantic Scholar" });
     submit("python lists");
     await screen.findByText("Persistent Lists Revisited");
@@ -486,8 +571,8 @@ describe("CataloguePane", () => {
   /// Deselecting every provider is a thing a user is allowed to mean. It is
   /// not "ask them all", and it is not a search.
   it("asks nobody when no provider is selected", async () => {
-    useCatalogueStore.setState({ providers: [] });
-    render(<CataloguePane />);
+    setCatalogue({ providers: [] });
+    render(<CataloguePane pane={pane()} />);
     submit("python lists");
     expect(await screen.findByText(/No source selected/)).toBeTruthy();
     expect(literature).not.toHaveBeenCalled();
@@ -496,10 +581,10 @@ describe("CataloguePane", () => {
   /// A stored filter naming a provider the user has since removed would be
   /// refused by the backend on every search, so it is dropped on the way in.
   it("drops a stored provider that no longer exists", async () => {
-    useCatalogueStore.setState({ providers: ["openalex", "custom:gone"] });
-    render(<CataloguePane />);
+    setCatalogue({ providers: ["openalex", "custom:gone"] });
+    render(<CataloguePane pane={pane()} />);
     await waitFor(() => {
-      expect(useCatalogueStore.getState().providers).toEqual(["openalex"]);
+      expect(held().providers).toEqual(["openalex"]);
     });
   });
 
@@ -507,7 +592,7 @@ describe("CataloguePane", () => {
   /// rather than shown as an empty row that reads like "none configured".
   it("says when the provider list could not be read", async () => {
     providers.mockRejectedValue(new Error("no backend"));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     expect(await screen.findByText(/providers could not be listed/)).toBeTruthy();
   });
 
@@ -520,7 +605,7 @@ describe("CataloguePane", () => {
         { provider: "openalex", name: "OpenAlex", results: [WORK], error: null },
       ],
     });
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("python lists");
     expect(await screen.findByText(/Semantic Scholar could not answer: 429/)).toBeTruthy();
     expect(screen.getByText("Persistent Lists Revisited")).toBeTruthy();
@@ -530,7 +615,7 @@ describe("CataloguePane", () => {
   it("says when no source is on", async () => {
     providers.mockResolvedValue([]);
     literature.mockResolvedValue({ query: "python lists", providers: [] });
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("python lists");
     expect(await screen.findByText(/No sources enabled/)).toBeTruthy();
   });
@@ -558,7 +643,7 @@ describe("CataloguePane", () => {
         ],
       })
       .mockResolvedValueOnce(answerOf("openalex", "OpenAlex", hits(4, 10)));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("python lists");
     await screen.findByText("Searched work 9");
 
@@ -578,7 +663,7 @@ describe("CataloguePane", () => {
     literature
       .mockResolvedValueOnce(answerOf("openalex", "OpenAlex", hits(10)))
       .mockResolvedValueOnce(answerOf("openalex", "OpenAlex", [...hits(1, 9), ...hits(2, 10)]));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("python lists");
     await screen.findByText("Searched work 9");
     fireEvent.click(screen.getByRole("button", { name: "Load more from OpenAlex" }));
@@ -594,7 +679,7 @@ describe("CataloguePane", () => {
       } },
     ]);
     literature.mockResolvedValue(answerOf("openalex", "OpenAlex", hits(10)));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("python lists");
     await screen.findByText("Searched work 9");
     expect(screen.queryByRole("button", { name: /Load more from/ })).toBeNull();
@@ -609,7 +694,7 @@ describe("CataloguePane", () => {
           { provider: "openalex", name: "OpenAlex", results: null, error: "rate limit reached" },
         ],
       });
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("python lists");
     await screen.findByText("Searched work 9");
     fireEvent.click(screen.getByRole("button", { name: "Load more from OpenAlex" }));
@@ -622,7 +707,7 @@ describe("CataloguePane", () => {
   });
 
   it("names the source chips for what they decide, apart from the Filters button", async () => {
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     await screen.findByRole("button", { name: "OpenAlex" });
     expect(screen.getAllByRole("group", { name: "Search in" })).toHaveLength(1);
     expect(screen.getByRole("button", { name: "Filters" })).toBeTruthy();
@@ -638,7 +723,7 @@ describe("CataloguePane", () => {
         { ...WORK, authors: "Ada Lovelace, Alan Turing, Grace Hopper" },
       ]),
     );
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("python lists");
     const facts = await screen.findByTitle(/^2021 · 12 citations · Open access · Ada Lovelace/);
     expect(facts).toBeTruthy();
@@ -649,7 +734,7 @@ describe("CataloguePane", () => {
     literature.mockResolvedValue(
       answerOf("openalex", "OpenAlex", [{ ...WORK, citation_count: null }]),
     );
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("python lists");
     await screen.findByText("Persistent Lists Revisited");
     expect(screen.queryByText(/citation/)).toBeNull();
@@ -682,20 +767,20 @@ describe("CataloguePane", () => {
   /// question the provider cannot answer.
   it("offers filters only when an enabled provider declares something to refine", async () => {
     providers.mockResolvedValue([provider("semantic_scholar", "Semantic Scholar")]);
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     await screen.findByRole("button", { name: "Semantic Scholar" });
     expect(screen.queryByRole("button", { name: /^Filters/ })).toBeNull();
   });
 
   it("does not offer filters from a provider that is switched off", async () => {
     providers.mockResolvedValue([provider("openalex", "OpenAlex", OPENALEX_BROWSE, false)]);
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     await waitFor(() => expect(providers).toHaveBeenCalled());
     expect(screen.queryByRole("button", { name: /^Filters/ })).toBeNull();
   });
 
   it("puts the filters beside the search box, and says so before anything is asked", async () => {
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     expect(await screen.findByRole("button", { name: "Filters" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "open Filters" }));
     expect(screen.getByRole("group", { name: "Filters" })).toBeTruthy();
@@ -703,7 +788,7 @@ describe("CataloguePane", () => {
 
   it("applies each change as it is made, asking for exactly what was set", async () => {
     browse.mockResolvedValue(listing(works(3)));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
 
     fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
@@ -742,7 +827,7 @@ describe("CataloguePane", () => {
   /// and "202" on the way to 2024 would be three requests nobody wanted.
   it("applies a range when the field is left, once, and not per keystroke", async () => {
     browse.mockResolvedValue(listing(works(1)));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     const min = within(panel).getByLabelText("Year from");
     fireEvent.focus(min);
@@ -760,7 +845,7 @@ describe("CataloguePane", () => {
 
   it("counts what is set on the button and shows it as removable chips when closed", async () => {
     browse.mockResolvedValue(listing(works(2)));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "book" } });
     fireEvent.click(within(panel).getByLabelText("Open access only"));
@@ -783,7 +868,7 @@ describe("CataloguePane", () => {
 
   it("goes back to keyword search when the last filter is cleared", async () => {
     browse.mockResolvedValue(listing(works(2)));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     fireEvent.change(searchBox(), { target: { value: "python lists" } });
     const panel = await openFilters();
     fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "book" } });
@@ -809,7 +894,7 @@ describe("CataloguePane", () => {
         { provider: "semantic_scholar", name: "Semantic Scholar", results: [], error: null },
       ],
     });
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "book" } });
     await screen.findByText("Browsed work 0");
@@ -832,7 +917,7 @@ describe("CataloguePane", () => {
     browse
       .mockResolvedValueOnce(listing(works(10)))
       .mockResolvedValueOnce(listing(works(3, 10)));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
     expect(await screen.findByText("Browsed work 9")).toBeTruthy();
@@ -859,7 +944,7 @@ describe("CataloguePane", () => {
         results: null,
         error: "OpenAlex rate limit reached",
       });
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
     await screen.findByText("Browsed work 0");
@@ -870,7 +955,7 @@ describe("CataloguePane", () => {
 
   it("says what a request the manifest refused was", async () => {
     browse.mockRejectedValue(new Error("OpenAlex integration is disabled."));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
     expect(await screen.findByText(/could not list works: Error: OpenAlex integration is disabled/)).toBeTruthy();
@@ -880,7 +965,7 @@ describe("CataloguePane", () => {
   /// said, because nothing about it is shown.
   it("shows no filters for a provider the user has switched off, and asks it nothing", async () => {
     browse.mockResolvedValue(listing(works(2)));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
     await screen.findByText("Browsed work 0");
@@ -915,7 +1000,7 @@ describe("CataloguePane", () => {
         filters: [],
       }),
     ]);
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     const scholar = within(panel).getByRole("group", { name: "Scholar filters" });
     expect(within(scholar).getByText(/to list Scholar works, with a keyword\s*\./)).toBeTruthy();
@@ -948,7 +1033,7 @@ describe("CataloguePane", () => {
       results: works(1).map((w) => ({ ...w, id: `${id}-1`, title: `${id} work` })),
       error: null,
     }));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     const openalex = within(panel).getByRole("group", { name: "OpenAlex filters" });
     const crossref = within(panel).getByRole("group", { name: "Crossref filters" });
@@ -993,7 +1078,7 @@ describe("CataloguePane", () => {
         filters: [],
       }),
     ]);
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     fireEvent.change(searchBox(), { target: { value: "ignored" } });
     expect(within(panel).getByText(/Crossref's listing does not take a keyword/)).toBeTruthy();
@@ -1005,12 +1090,80 @@ describe("CataloguePane", () => {
   const rich = () =>
     providers.mockResolvedValue([provider("openalex", "OpenAlex", RICH_BROWSE)]);
 
+  const longOptions = [
+    { value: "action", label: "Action" },
+    { value: "science-fiction", label: "Science Fiction" },
+    ...Array.from({ length: 10 }, (_, i) => ({ value: `theme-${i}`, label: `Theme ${i}` })),
+  ];
+
+  it("searches long checklists locally and keeps selected values visible and removable", async () => {
+    providers.mockResolvedValue([provider("openalex", "OpenAlex", {
+      ...OPENALEX_BROWSE,
+      filters: [control("categories", "Genres and themes", "options", {
+        modes: ["all"], options: longOptions,
+      })],
+    })]);
+    browse.mockResolvedValue(listing(works(1)));
+    render(<CataloguePane pane={pane()} />);
+    const panel = await openFilters();
+    const search = within(panel).getByRole("searchbox", { name: "Search Genres and themes" });
+    const categories = within(panel).getByRole("group", { name: "Genres and themes" });
+    fireEvent.change(search, { target: { value: "  ACTION  " } });
+    expect(within(categories).getAllByRole("checkbox")).toHaveLength(1);
+    expect(browse).not.toHaveBeenCalled();
+    expect(literature).not.toHaveBeenCalled();
+    fireEvent.click(within(categories).getByLabelText("Action"));
+    await waitFor(() => expect(browse).toHaveBeenCalledTimes(1));
+    fireEvent.change(search, { target: { value: "science-fiction" } });
+    expect(within(categories).getByLabelText("Action")).toHaveProperty("checked", true);
+    expect(within(categories).getByLabelText("Science Fiction")).toBeTruthy();
+    expect(within(categories).queryByLabelText("Theme 0")).toBeNull();
+    expect(browse).toHaveBeenCalledTimes(1);
+    fireEvent.change(search, { target: { value: "no such genre" } });
+    expect(within(panel).getByRole("status").textContent).toBe("No matches");
+    expect(within(categories).getByLabelText("Action")).toHaveProperty("checked", true);
+    fireEvent.click(within(categories).getByLabelText("Action"));
+    expect(held().refinements.openalex.filters.categories).toBeUndefined();
+    fireEvent.change(search, { target: { value: "" } });
+    expect(within(categories).getAllByRole("checkbox")).toHaveLength(longOptions.length);
+    expect(within(panel).queryByText("No matches")).toBeNull();
+  });
+
+  it("searches long dropdowns without changing the selected option", async () => {
+    providers.mockResolvedValue([provider("openalex", "OpenAlex", {
+      ...OPENALEX_BROWSE,
+      filters: [control("categories", "Genres and themes", "options", { options: longOptions })],
+    })]);
+    browse.mockResolvedValue(listing(works(1)));
+    render(<CataloguePane pane={pane()} />);
+    const panel = await openFilters();
+    const select = within(panel).getByRole("combobox", { name: "Genres and themes" });
+    const search = within(panel).getByRole("searchbox", { name: "Search Genres and themes" });
+    fireEvent.change(select, { target: { value: "action" } });
+    await waitFor(() => expect(browse).toHaveBeenCalledTimes(1));
+    fireEvent.change(search, { target: { value: "fiction" } });
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(select).toHaveProperty("value", "action");
+    expect(within(select).getAllByRole("option")).toHaveLength(3);
+    expect(within(select).getByRole("option", { name: "Science Fiction" })).toBeTruthy();
+    expect(browse).toHaveBeenCalledTimes(1);
+    fireEvent.change(search, { target: { value: "" } });
+    expect(within(select).getAllByRole("option")).toHaveLength(longOptions.length + 1);
+  });
+
+  it("keeps short option lists free of an extra search field", async () => {
+    rich();
+    render(<CataloguePane pane={pane()} />);
+    const panel = await openFilters();
+    expect(within(panel).queryByRole("searchbox")).toBeNull();
+  });
+
   /// A filter that combines values is a checklist, and how they combine is
   /// the provider's declared modes, sent only when it is not the first.
   it("sets several values of one filter and says how they are combined", async () => {
     rich();
     browse.mockResolvedValue(listing(works(1)));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     const language = within(panel).getByRole("group", { name: "Language" });
     fireEvent.click(within(language).getByLabelText("English"));
@@ -1052,7 +1205,7 @@ describe("CataloguePane", () => {
       { value: "https://openalex.org/A1", label: "Geoffrey Hinton", hint: "University of Toronto" },
       { value: "https://openalex.org/A2", label: "G. Hinton", hint: null },
     ]);
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     const box = within(panel).getByLabelText("Author");
     fireEvent.change(box, { target: { value: "h" } });
@@ -1083,7 +1236,7 @@ describe("CataloguePane", () => {
   it("says why suggestions could not be read", async () => {
     rich();
     suggest.mockRejectedValue(new Error("OpenAlex rate limit reached"));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     fireEvent.change(within(panel).getByLabelText("Author"), { target: { value: "hinton" } });
     expect(await within(panel).findByText(/OpenAlex rate limit reached/)).toBeTruthy();
@@ -1095,7 +1248,7 @@ describe("CataloguePane", () => {
     rich();
     literature.mockResolvedValue(answerOf("openalex", "OpenAlex", [WORK]));
     browse.mockResolvedValue(listing(works(2)));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("python lists");
     fireEvent.click(
       await screen.findByRole("button", { name: "Works citing Persistent Lists Revisited" }),
@@ -1117,7 +1270,7 @@ describe("CataloguePane", () => {
 
   it("offers no row filters from a provider that declares none", async () => {
     literature.mockResolvedValue(answerOf("openalex", "OpenAlex", [WORK]));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("python lists");
     await screen.findByText("Persistent Lists Revisited");
     expect(screen.queryByRole("button", { name: /^Works citing/ })).toBeNull();
@@ -1126,7 +1279,7 @@ describe("CataloguePane", () => {
   /// Ten of twelve thousand is a different thing from ten in all.
   it("says how many works match in all when the provider says", async () => {
     browse.mockResolvedValue({ ...listing(works(10)), total: 12430 });
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     fireEvent.click(within(panel).getByLabelText("Open access only"));
     await screen.findByText("Browsed work 9");
@@ -1142,7 +1295,7 @@ describe("CataloguePane", () => {
     };
     providers.mockResolvedValue([provider("openalex", "OpenAlex", many)]);
     browse.mockResolvedValue(listing(works(1)));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const panel = await openFilters();
     expect(within(panel).queryByLabelText("Flag 3")).toBeNull();
 
@@ -1163,7 +1316,7 @@ describe("CataloguePane", () => {
 
   it("adds a paper through uploads and into the library", async () => {
     acquire.mockResolvedValue({ path: "/uploads/lists.pdf", bytes: 10, already_present: false });
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("python lists");
     fireEvent.click(await screen.findByLabelText("Add Persistent Lists Revisited to library"));
     await waitFor(() => {
@@ -1198,7 +1351,7 @@ describe("CataloguePane", () => {
       already_present: false,
     });
 
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("resolved book");
     // What a provider reported about the file is named in the row's one line
     // of facts, so the user knows what an Add would fetch before clicking it.
@@ -1239,7 +1392,7 @@ describe("CataloguePane", () => {
     let finishResolve = (_: { url: string; filename: string | null }) => {};
     resolveDownload.mockImplementation(() => new Promise((resolve) => (finishResolve = resolve)));
 
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("resolved book");
     fireEvent.click(await screen.findByLabelText("Add Resolved Book to library"));
     expect(await screen.findByText("Finding a copy…")).toBeTruthy();
@@ -1270,11 +1423,11 @@ describe("CataloguePane", () => {
     });
     resolveDownload.mockRejectedValue(new Error("membership required"));
 
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     submit("resolved book");
     fireEvent.click(await screen.findByLabelText("Add Resolved Book to library"));
     expect(await screen.findByText(/membership required/)).toBeTruthy();
-    expect(useCatalogueStore.getState().adding).toEqual({});
+    expect(held().adding).toEqual({});
   });
 
   // ── Composing filters from a request in words ────────────────────────────
@@ -1318,14 +1471,14 @@ describe("CataloguePane", () => {
   /// Every model-dependent control is absent, not greyed out, where the model
   /// is not ready — and this one also where no provider has filters to set.
   it("offers composing only where there is a model and something to filter", async () => {
-    const { unmount } = render(<CataloguePane />);
+    const { unmount } = render(<CataloguePane pane={pane()} />);
     await screen.findByRole("button", { name: "Filters" });
     expect(screen.queryByRole("button", { name: /Compose filters/ })).toBeNull();
     unmount();
 
     useGenerationStore.setState({ ready: true });
     providers.mockResolvedValue([provider("semantic_scholar", "Semantic Scholar")]);
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     await screen.findByRole("button", { name: "Semantic Scholar" });
     expect(screen.queryByRole("button", { name: /Compose filters/ })).toBeNull();
   });
@@ -1338,7 +1491,7 @@ describe("CataloguePane", () => {
     composeCall.mockResolvedValue(composition());
     browse.mockResolvedValue(listing(works(3)));
     literature.mockResolvedValue(answerOf("semantic_scholar", "Semantic Scholar", []));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     typeRequest(REQUEST);
     await composeSubmit();
 
@@ -1381,7 +1534,7 @@ describe("CataloguePane", () => {
   /// The choice is a toggle, not an action: off, Enter searches for the words.
   it("searches for the words while composing is switched off", async () => {
     useGenerationStore.setState({ ready: true });
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     const toggle = await composeToggle();
     expect(toggle.getAttribute("aria-pressed")).toBe("false");
     fireEvent.click(toggle);
@@ -1399,7 +1552,7 @@ describe("CataloguePane", () => {
     useGenerationStore.setState({ ready: true });
     composeCall.mockResolvedValue(composition({}, null));
     browse.mockResolvedValue(listing(works(3)));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     typeRequest("open reviews since 2020");
     await composeSubmit();
     await waitFor(() =>
@@ -1423,7 +1576,7 @@ describe("CataloguePane", () => {
       }),
     );
     browse.mockResolvedValue(listing(works(1)));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     typeRequest(REQUEST);
     await composeSubmit();
     expect(await screen.findByText(/knows no Author called “Nobody Atall”/)).toBeTruthy();
@@ -1442,7 +1595,7 @@ describe("CataloguePane", () => {
     composeCall.mockResolvedValue(
       composition({ filters: {}, sort: null, notes: ["No option for review"], error: "nothing in the request could be turned into a search" }, null),
     );
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     typeRequest("hello there");
     await composeSubmit();
     expect(
@@ -1457,17 +1610,17 @@ describe("CataloguePane", () => {
 
   it("says why nothing could be composed and leaves the filters as they were", async () => {
     useGenerationStore.setState({ ready: true });
-    useCatalogueStore.setState({
+    setCatalogue({
       refinements: { openalex: { filters: { type: ["book"] }, modes: {}, labels: {}, sort: null } },
     });
     composeCall.mockRejectedValue(new Error("Generation is not available"));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     typeRequest(REQUEST);
     await composeSubmit();
     expect(
       await screen.findByText(/could not be composed: Error: Generation is not available/),
     ).toBeTruthy();
-    expect(useCatalogueStore.getState().refinements.openalex.filters).toEqual({ type: ["book"] });
+    expect(held().refinements.openalex.filters).toEqual({ type: ["book"] });
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
     expect(screen.queryByText(/could not be composed/)).toBeNull();
   });
@@ -1478,7 +1631,7 @@ describe("CataloguePane", () => {
     useGenerationStore.setState({ ready: true });
     let answer: (value: unknown) => void = () => {};
     composeCall.mockReturnValue(new Promise((resolve) => { answer = resolve; }));
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     typeRequest(REQUEST);
     await composeSubmit();
     expect(await screen.findByText("Composing filters…")).toBeTruthy();
@@ -1490,7 +1643,7 @@ describe("CataloguePane", () => {
     await act(async () => {
       answer(composition());
     });
-    expect(useCatalogueStore.getState().refinements).toEqual({});
+    expect(held().refinements).toEqual({});
     expect(browse).not.toHaveBeenCalled();
     expect(searchBox()).toHaveProperty("value", REQUEST);
   });
@@ -1499,8 +1652,8 @@ describe("CataloguePane", () => {
   /// deselected is not composed for.
   it("composes only for the providers that are selected", async () => {
     useGenerationStore.setState({ ready: true });
-    useCatalogueStore.setState({ providers: ["semantic_scholar"] });
-    render(<CataloguePane />);
+    setCatalogue({ providers: ["semantic_scholar"] });
+    render(<CataloguePane pane={pane()} />);
     typeRequest(REQUEST);
     await composeSubmit();
     expect(await screen.findByText(/None of the selected sources can be filtered/)).toBeTruthy();
@@ -1512,7 +1665,89 @@ describe("CataloguePane", () => {
       workspaces: [{ id: "w", name: "W", roots: [], active_root: null, read_only: true }],
       activeWorkspaceId: "w",
     } as never);
-    render(<CataloguePane />);
+    render(<CataloguePane pane={pane()} />);
     expect(screen.getByText(/read-only/i)).toBeTruthy();
+  });
+
+  // ── Several panes ────────────────────────────────────────────────────────
+
+  /// Two panes are two questions. One pane asking something new must not make
+  /// the other drop the answer it is still waiting for.
+  it("keeps each pane's question and answer its own", async () => {
+    let finishFirst!: (value: Awaited<ReturnType<typeof api.literatureSearch>>) => void;
+    literature.mockReturnValueOnce(new Promise((resolve) => { finishFirst = resolve; }));
+    literature.mockResolvedValueOnce({
+      query: "graph theory",
+      providers: [{ provider: "openalex", name: "OpenAlex", results: [], error: null }],
+    });
+    const first = pane();
+    useCatalogueStore.getState().newPane();
+    const second = pane();
+    expect(second.id).not.toBe(first.id);
+
+    const asking = first.search.getState().search("python lists");
+    await second.search.getState().search("graph theory");
+    await act(async () => { finishFirst(answerOf("openalex", "OpenAlex", [WORK])); });
+    await asking;
+
+    expect(first.search.getState().query).toBe("python lists");
+    expect(first.search.getState().literature?.providers[0].results).toEqual([WORK]);
+    expect(second.search.getState().query).toBe("graph theory");
+    expect(second.search.getState().literature?.providers[0].results).toEqual([]);
+  });
+
+  /// A new pane starts on the sources last chosen, which is also what is
+  /// stored; changing them there leaves the pane already open alone.
+  it("opens a new pane on the sources last chosen", async () => {
+    render(<CataloguePane pane={pane()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Semantic Scholar" }));
+    const first = pane();
+    expect(first.search.getState().providers).toEqual(["openalex"]);
+
+    useCatalogueStore.getState().newPane();
+
+    expect(pane().search.getState().providers).toEqual(["openalex"]);
+    pane().search.getState().toggleProvider("openalex");
+    expect(first.search.getState().providers).toEqual(["openalex"]);
+  });
+
+  /// A search started outside the panes — the offer under a failed library
+  /// search — goes to the pane last used, not to every pane.
+  it("searches in the pane last used", async () => {
+    const first = pane();
+    useCatalogueStore.getState().newPane();
+    useCatalogueStore.getState().focusPane(first.id);
+
+    await useCatalogueStore.getState().searchInPane("python lists");
+
+    const [a, b] = useCatalogueStore.getState().panes;
+    expect(a.search.getState().query).toBe("python lists");
+    expect(b.search.getState().query).toBe("");
+  });
+
+  /// Closing one of several stops what it had in flight, the composition in
+  /// the backend too. The last one is only hidden, with what it holds.
+  it("stops a closed pane's work, and only hides the last one", async () => {
+    useGenerationStore.setState({ ready: true });
+    providers.mockResolvedValue([provider("openalex", "OpenAlex", OPENALEX_BROWSE)]);
+    await useCatalogueStore.getState().loadProviders();
+    const first = pane();
+    useCatalogueStore.getState().newPane();
+    const second = pane();
+    composeCall.mockReturnValue(new Promise(() => {}));
+    void second.search.getState().compose("introductory books about graphs");
+    expect(second.search.getState().composing).toBe(true);
+
+    useCatalogueStore.getState().closePane(second.id);
+
+    expect(composeCancel).toHaveBeenCalledTimes(1);
+    expect(useCatalogueStore.getState().panes.map((entry) => entry.id)).toEqual([first.id]);
+    expect(useCatalogueStore.getState().focusedPane).toBe(first.id);
+
+    first.search.getState().setQuery("kept");
+    useCatalogueStore.getState().closePane(first.id);
+    expect(useCatalogueStore.getState().panesVisible).toBe(false);
+    expect(useCatalogueStore.getState().panes).toHaveLength(1);
+    expect(first.search.getState().query).toBe("kept");
   });
 });

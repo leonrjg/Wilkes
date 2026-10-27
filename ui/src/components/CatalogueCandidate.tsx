@@ -1,3 +1,4 @@
+import { useId, useState } from "react";
 import { Check, Download, ExternalLink } from "react-feather";
 import type {
   CatalogueCourseProgress,
@@ -6,7 +7,13 @@ import type {
 } from "../lib/types";
 import { api } from "../services";
 import { useCatalogueAdd } from "../hooks/useCatalogueAdd";
-import { type AddStage, paperKey, useCatalogueStore } from "../stores/useCatalogueStore";
+import {
+  type AddStage,
+  paperKey,
+  useCatalogueSearch,
+  useCatalogueSearchStore,
+  useCatalogueStore,
+} from "../stores/useCatalogueStore";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 
 function formatBytes(bytes: number): string {
@@ -60,12 +67,54 @@ function RowTitle({ title }: { title: string }) {
   );
 }
 
+function ResultImage({ url, title }: { url: string; title: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return null;
+  return (
+    <img
+      src={url}
+      alt={`Image for ${title}`}
+      loading="lazy"
+      referrerPolicy="no-referrer"
+      onError={() => setFailed(true)}
+      className="h-20 w-14 shrink-0 rounded object-contain"
+    />
+  );
+}
+
+function ResultDescription({ text, title }: { text: string; title: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const id = useId();
+  return (
+    <div className="flex min-w-0 flex-col items-start gap-0.5">
+      <p
+        id={id}
+        className={`${expanded ? "whitespace-pre-wrap" : "line-clamp-2"} break-words text-[10px] leading-snug text-[var(--text-muted)]`}
+      >
+        {text}
+      </p>
+      <button
+        type="button"
+        aria-expanded={expanded}
+        aria-controls={id}
+        aria-label={`${expanded ? "Collapse" : "Expand"} description for ${title}`}
+        onClick={() => setExpanded((current) => !current)}
+        className="text-[10px] text-[var(--text-dim)] hover:text-[var(--text-main)] hover:underline"
+      >
+        {expanded ? "Show less" : "Show more"}
+      </button>
+    </div>
+  );
+}
+
 interface Props {
   /** The provider that returned the result, as the registry names it. */
   provider: string;
   work: LiteratureSearchResult;
   /** Compact drops the blurb: the strip under a search result is an offer, not
-   *  a reading list, and four two-line rows beat two paragraphs. */
+   *  a reading list, and four two-line rows beat two paragraphs. It also drops
+   *  the row's filters, which refine the search of the pane the row is in —
+   *  and only a row in a pane has one. */
   compact?: boolean;
   /** The provider's name, for a list that mixes providers and so has no
    *  heading to say whose row this is. */
@@ -125,104 +174,102 @@ export default function CatalogueCandidate({ provider, work, compact = false, so
         : "Fetch this document and add it to the current directory";
 
   return (
-    /* The buttons share a line with the title and nothing else. They used to
-       stand beside the whole text column, so every line under the title — the
-       facts, the blurb, the progress bar — was laid out in the width left over
-       beside them: 186px of a 316px pane, and the blurb wrapped at 59% of the
-       space it had. Below the title line, the row is the pane's full width. */
-    <div className="flex flex-col gap-0.5 py-1.5">
-      <div className="flex items-start justify-between gap-2">
-        <div className="flex min-w-0 flex-1 items-start gap-1.5">
-          <RowTitle title={title} />
-          {/* Only where the source says what kind of thing it returned. A
-              bibliographic index names none, and a badge reading "Paper" over
-              its monographs, standards and theses would be wrong for some of
-              its rows. */}
-          {work.kind !== null && (
-            <span className="mt-px shrink-0 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1 text-[9px] uppercase tracking-wider text-[var(--text-dim)]">
-              {KIND_LABELS[work.kind] ?? work.kind}
-            </span>
-          )}
-        </div>
-
-        <div className="flex shrink-0 items-center gap-1">
-          {link !== null && <OpenLink link={link} title={title} />}
-          {acquirable && (
-            <AddButton
-              title={title}
-              tooltip={added ? "Added to this library" : addTitle}
-              label="Add"
-              onAdd={() => void add(provider, work)}
-              disabled={!canAdd || adding || added}
-              adding={adding}
-              added={added}
+    <div className="flex items-start gap-2 py-1.5">
+      {!compact && work.image_url && (
+        <ResultImage key={work.image_url} url={work.image_url} title={title} />
+      )}
+      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+            <div className="flex min-w-0 flex-1 items-start gap-1.5">
+              <RowTitle title={title} />
+              {/* Only where the source says what kind of thing it returned. A
+                  bibliographic index names none, and a badge reading "Paper" over
+                  its monographs, standards and theses would be wrong for some of
+                  its rows. */}
+              {work.kind !== null && (
+                <span className="mt-px shrink-0 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1 text-[9px] uppercase tracking-wider text-[var(--text-dim)]">
+                  {KIND_LABELS[work.kind] ?? work.kind}
+                </span>
+              )}
+            </div>
+            {/* What a person chooses by comes first — when, how cited, whether it
+                can be had — because the line is clamped at two lines and a long
+                author list used to push the citations and the access out of view. A
+                count the provider did not report is left out rather than shown as
+                zero, and "open access" is left to the licence where the whole source
+                is an open catalogue. */}
+            <MetaLine
+              parts={[
+                source,
+                work.year !== null && `${work.year}`,
+                work.citation_count !== null &&
+                  `${work.citation_count.toLocaleString()} citation${work.citation_count === 1 ? "" : "s"}`,
+                work.is_open_access && work.kind === null && "Open access",
+                work.subject,
+                work.authors,
+                work.venue,
+                work.publisher !== work.venue && work.publisher,
+                work.language,
+                work.file_format,
+                work.file_size,
+                work.license,
+                work.pages !== null && `${work.pages.toLocaleString()} pp`,
+              ]}
             />
-          )}
-        </div>
-      </div>
+          </div>
 
-      {/* What a person chooses by comes first — when, how cited, whether it
-          can be had — because the line is clamped at two lines and a long
-          author list used to push the citations and the access out of view. A
-          count the provider did not report is left out rather than shown as
-          zero, and "open access" is left to the licence where the whole source
-          is an open catalogue. */}
-      <MetaLine
-        parts={[
-          source,
-          work.year !== null && `${work.year}`,
-          work.citation_count !== null &&
-            `${work.citation_count.toLocaleString()} citation${work.citation_count === 1 ? "" : "s"}`,
-          work.is_open_access && work.kind === null && "Open access",
-          work.subject,
-          work.authors,
-          work.venue,
-          work.publisher !== work.venue && work.publisher,
-          work.language,
-          work.file_format,
-          work.file_size,
-          work.license,
-          work.pages !== null && `${work.pages.toLocaleString()} pp`,
-        ]}
-      />
-      {!compact && work.summary !== null && (
-        <p className="line-clamp-2 text-[10px] leading-snug text-[var(--text-muted)]">
-          {work.summary}
-        </p>
-      )}
-      {!compact && <ResultFilters provider={provider} work={work} title={title} />}
-      {stage !== undefined && (
-        <AddProgress
-          stage={stage}
-          title={title}
-          download={download}
-          course={isCourse ? courseProgress : undefined}
-        />
-      )}
-      {added && course !== undefined && (
-        /* What a course actually turned out to be. A gap in the sequence has
-           a reason, and saying "4 audiovisual" is how a reader learns the
-           lectures they cannot find were never documents. */
-        <span className="text-[10px] text-[var(--text-dim)]">
-          {course.documents.length} document
-          {course.documents.length === 1 ? "" : "s"} and a syllabus
-          {course.skipped.length > 0 && `, ${course.skipped.length} skipped`}
-          {course.failures.length > 0 && `, ${course.failures.length} failed`}
-        </span>
-      )}
-      {/* Why there is no add button, in the space a button would have
-          taken. What adding a course *does* is the button's own tooltip:
-          a paragraph of it under every course row was the same sentence
-          repeated down the pane. */}
-      {!acquirable && (
-        <span className="text-[10px] leading-snug text-[var(--text-dim)]">
-          {work.kind !== null
-            ? "No downloadable copy — open it to read it where it lives."
-            : work.is_open_access
-              ? "Listed as open access, but no file was reported — open it to find one."
-              : "No open-access copy reported — open it to read it where it lives."}
-        </span>
-      )}
+          <div className="flex shrink-0 items-center gap-1">
+            {link !== null && <OpenLink link={link} title={title} />}
+            {acquirable && (
+              <AddButton
+                title={title}
+                tooltip={added ? "Added to this library" : addTitle}
+                label="Add"
+                onAdd={() => void add(provider, work)}
+                disabled={!canAdd || adding || added}
+                adding={adding}
+                added={added}
+              />
+            )}
+          </div>
+        </div>
+
+        {!compact && work.summary?.trim() && (
+          <ResultDescription key={work.summary} text={work.summary} title={title} />
+        )}
+        {!compact && <ResultFilters provider={provider} work={work} title={title} />}
+        {stage !== undefined && (
+          <AddProgress
+            stage={stage}
+            title={title}
+            download={download}
+            course={isCourse ? courseProgress : undefined}
+          />
+        )}
+        {added && course !== undefined && (
+          /* What a course actually turned out to be. A gap in the sequence has
+             a reason, and saying "4 audiovisual" is how a reader learns the
+             lectures they cannot find were never documents. */
+          <span className="text-[10px] text-[var(--text-dim)]">
+            {course.documents.length} document
+            {course.documents.length === 1 ? "" : "s"} and a syllabus
+            {course.skipped.length > 0 && `, ${course.skipped.length} skipped`}
+            {course.failures.length > 0 && `, ${course.failures.length} failed`}
+          </span>
+        )}
+        {/* Why there is no add button, in the space a button would have
+            taken. What adding a course *does* is the button's own tooltip:
+            a paragraph of it under every course row was the same sentence
+            repeated down the pane. */}
+        {!acquirable && (work.kind !== null || work.is_open_access) && (
+          <span className="text-[10px] leading-snug text-[var(--text-dim)]">
+            {work.kind !== null
+              ? "No downloadable copy — open it to read it where it lives."
+              : "Listed as open access, but no file was reported — open it to find one."}
+          </span>
+        )}
+      </div>
     </div>
   );
 }
@@ -449,8 +496,9 @@ function ResultFilters({
       s.providerOptions.find((option) => option.provider === provider)?.capabilities.browse
         ?.filters,
   );
-  const setFilter = useCatalogueStore((s) => s.setBrowseFilter);
-  const refine = useCatalogueStore((s) => s.refine);
+  const search = useCatalogueSearchStore();
+  const setFilter = useCatalogueSearch((s) => s.setBrowseFilter);
+  const refine = useCatalogueSearch((s) => s.refine);
   const offers = (filters ?? []).flatMap((filter) => {
     if (filter.from_result === null) return [];
     const value = (work as unknown as Record<string, unknown>)[filter.from_result];
@@ -465,7 +513,7 @@ function ResultFilters({
           type="button"
           onClick={() => {
             setFilter(provider, filter.name, [value], { [value]: title });
-            void refine(useCatalogueStore.getState().query, provider);
+            void refine(search.getState().query, provider);
           }}
           aria-label={`${filter.label} ${title}`}
           className="text-[var(--text-dim)] underline-offset-2 transition-colors hover:text-[var(--accent-blue)] hover:underline"

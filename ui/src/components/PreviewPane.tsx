@@ -24,7 +24,7 @@ import {
 import { readTextViewMode, readerPositionStore, saveTextViewMode } from "../stores/readerPositions";
 import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
-import { useChatSession, useChatStore } from "../stores/useChatStore";
+import { useChatStore } from "../stores/useChatStore";
 import { api, isTauri } from "../services";
 import type { BoundingBox, DocumentMetadata, Match, MatchRef } from "../lib/types";
 import { buildExternalLinks } from "../lib/externalLinks";
@@ -140,9 +140,9 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   const addBookmark = useBookmarksStore((s) => s.add);
   const removeBookmark = useBookmarksStore((s) => s.remove);
   const workspaceBookmarks = useBookmarksStore((s) => s.bookmarks);
-  const setChatActiveDoc = useChatStore((s) => s.setActiveDoc);
-  const chatBackendsLoaded = useChatSession((s) => s.backendsLoaded);
-  const hasAvailableChatBackend = useChatSession((s) => s.hasAvailableBackend);
+  const setChatReaderDoc = useChatStore((s) => s.setReaderDoc);
+  const chatBackendsLoaded = useChatStore((s) => s.backendsLoaded);
+  const hasAvailableChatBackend = useChatStore((s) => s.hasAvailableBackend);
   const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
   const workspaceGenerationReady = useGenerationStore((state) => state.ready);
   const workspaceSemanticReady = useSemanticStore((state) => state.readyForCurrentRoot);
@@ -282,15 +282,15 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
       api.setActiveDocument?.(null).catch((error) =>
         console.error("mcp: failed to clear active document", error),
       );
-      if (isTauri) setChatActiveDoc(null);
+      if (isTauri) setChatReaderDoc(null);
       return;
     }
     const page = "PdfPage" in selectedMatch.origin ? selectedMatch.origin.PdfPage.page : null;
     api.setActiveDocument?.(selectedMatch.path, page).catch((error) =>
       console.error("mcp: failed to update active document", error),
     );
-    if (isTauri) setChatActiveDoc(selectedMatch.path, page);
-  }, [selectedMatch, setChatActiveDoc, standalone]);
+    if (isTauri) setChatReaderDoc(selectedMatch.path, page);
+  }, [selectedMatch, setChatReaderDoc, standalone]);
 
   const handleChatPageChange = (page: number) => {
     if (standalone) return;
@@ -299,7 +299,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
         console.error("mcp: failed to update active document page", error),
       );
     }
-    if (isTauri && selectedMatch) setChatActiveDoc(selectedMatch.path, page);
+    if (isTauri && selectedMatch) setChatReaderDoc(selectedMatch.path, page);
   };
 
   const [isPdfRendering, setIsPdfRendering] = useState(false);

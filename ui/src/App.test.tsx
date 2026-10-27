@@ -5,6 +5,7 @@ import { useSettingsStore } from "./stores/useSettingsStore";
 import { useSearchStore } from "./stores/useSearchStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useChatStore } from "./stores/useChatStore";
+import { useCatalogueStore } from "./stores/useCatalogueStore";
 import { useBookmarksStore } from "./stores/useBookmarksStore";
 import { useViewerStore } from "./stores/useViewerStore";
 import { useWorkspaceStore } from "./stores/useWorkspaceStore";
@@ -116,6 +117,12 @@ vi.mock("@leonrjg/wilkes-reader", async (importOriginal) => ({
   PdfViewer: () => <div data-testid="pdf-viewer">PdfViewer</div>,
 }));
 vi.mock("./components/SettingsModal", () => ({ default: ({ isOpen }: any) => isOpen ? <div data-testid="settings-modal">Settings Modal</div> : null }));
+vi.mock("./components/ChatPane", () => ({
+  default: ({ pane }: any) => <div data-testid="chat-pane">{pane.id}</div>,
+}));
+vi.mock("./components/CataloguePane", () => ({
+  default: ({ pane }: any) => <div data-testid="catalogue-pane">{pane.id}</div>,
+}));
 
 const bookmarkPaneActions = {
   openPane: useBookmarksStore.getState().openPane,
@@ -124,6 +131,11 @@ const bookmarkPaneActions = {
 const viewerSessionActions = {
   restoreSession: useViewerStore.getState().restoreSession,
 };
+
+/** A pane entry as App reads it; the pane itself is stubbed above. */
+function chatPane(id: string) {
+  return { id, session: null, opening: false, contextFiles: [], activeDoc: null } as any;
+}
 
 describe("App", () => {
   beforeEach(() => {
@@ -157,10 +169,19 @@ describe("App", () => {
       hasQuery: false,
     });
     useChatStore.setState({
-      paneOpen: false,
-      paneOpening: false,
-      openPane: vi.fn().mockResolvedValue(undefined),
-      togglePane: vi.fn(),
+      panesVisible: false,
+      panes: [],
+      focusedPane: null,
+      showPanes: vi.fn().mockResolvedValue(undefined),
+      hidePanes: vi.fn(),
+      newPane: vi.fn().mockResolvedValue(undefined),
+      loadBackends: vi.fn().mockResolvedValue(undefined),
+      backends: [],
+    });
+    useCatalogueStore.setState({
+      panesVisible: false,
+      panes: [],
+      focusedPane: null,
     });
     useBookmarksStore.setState({
       ...bookmarkPaneActions,
@@ -290,31 +311,93 @@ describe("App", () => {
     expect(screen.getByTestId("settings-modal")).toBeInTheDocument();
   });
 
-  it("toggles the chat pane from the navbar button", async () => {
-    const openPane = vi.fn().mockResolvedValue(undefined);
-    const togglePane = vi.fn();
-    useChatStore.setState({ paneOpen: false, openPane, togglePane });
+  it("toggles the chat panes from the navbar button", async () => {
+    const showPanes = vi.fn().mockResolvedValue(undefined);
+    const hidePanes = vi.fn();
+    useChatStore.setState({ panesVisible: false, showPanes, hidePanes });
 
-    const { rerender } = render(
+    render(
       <ToastProvider>
         <App />
       </ToastProvider>
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Ask the documents" }));
-    expect(openPane).toHaveBeenCalledTimes(1);
-    expect(togglePane).not.toHaveBeenCalled();
+    expect(showPanes).toHaveBeenCalledTimes(1);
+    expect(hidePanes).not.toHaveBeenCalled();
 
-    useChatStore.setState({ paneOpen: true, openPane, togglePane });
-    rerender(
+    act(() => {
+      useChatStore.setState({ panesVisible: true, panes: [chatPane("chat-1")] });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Ask the documents" }));
+    expect(hidePanes).toHaveBeenCalledTimes(1);
+    expect(showPanes).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens another chat pane, on a chosen agent, from the agent menu", async () => {
+    const newPane = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      panesVisible: true,
+      panes: [chatPane("chat-1"), chatPane("chat-2")],
+      newPane,
+      backends: [
+        {
+          backend: "Codex",
+          label: "Codex",
+          available: true,
+          unavailable_reason: null,
+          auth_note: "",
+        } as any,
+      ],
+    });
+
+    render(
       <ToastProvider>
         <App />
       </ToastProvider>
     );
+    expect(screen.getAllByTestId("chat-pane").map((pane) => pane.textContent)).toEqual([
+      "chat-1",
+      "chat-2",
+    ]);
 
-    fireEvent.click(screen.getByRole("button", { name: "Ask the documents" }));
-    expect(togglePane).toHaveBeenCalledTimes(1);
-    expect(openPane).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Choose chat agent" }));
+    fireEvent.click(await screen.findByText("New chat pane"));
+    expect(newPane).toHaveBeenLastCalledWith(undefined);
+    await waitFor(() => expect(screen.queryByText("New chat pane")).not.toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Choose chat agent" }));
+    fireEvent.click(await screen.findByText("● Codex"));
+    expect(newPane).toHaveBeenLastCalledWith("Codex");
+  });
+
+  it("opens another literature pane from its menu, beside the ones open", async () => {
+    useCatalogueStore.setState({
+      panesVisible: true,
+      panes: [{ id: "catalogue-a" } as any, { id: "catalogue-b" } as any],
+    });
+    const newPane = vi.spyOn(useCatalogueStore.getState(), "newPane");
+    useCatalogueStore.setState({ newPane });
+
+    render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>
+    );
+    expect(screen.getAllByTestId("catalogue-pane").map((pane) => pane.textContent)).toEqual([
+      "catalogue-a",
+      "catalogue-b",
+    ]);
+    expect(screen.getByRole("button", { name: "Catalogues and literature" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Literature pane options" }));
+    fireEvent.click(await screen.findByText("New literature pane"));
+    expect(newPane).toHaveBeenCalledTimes(1);
+    expect(useCatalogueStore.getState().panes.map((pane) => pane.id)).toHaveLength(3);
   });
 
   it("opens bookmarks in This file scope when a document was opened while the pane was closed", () => {

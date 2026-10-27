@@ -45,8 +45,7 @@ type Gap =
  */
 export default function CatalogueGapStrip({ query }: Props) {
   const [gap, setGap] = useState<Gap | null>(null);
-  const openPane = useCatalogueStore((s) => s.openPane);
-  const paneSearch = useCatalogueStore((s) => s.search);
+  const searchInPane = useCatalogueStore((s) => s.searchInPane);
 
   useEffect(() => {
     let cancelled = false;
@@ -123,10 +122,7 @@ export default function CatalogueGapStrip({ query }: Props) {
         </h3>
         <button
           type="button"
-          onClick={() => {
-            openPane();
-            void paneSearch(query);
-          }}
+          onClick={() => void searchInPane(query)}
           className="text-[10px] text-[var(--text-muted)] underline transition-colors hover:text-[var(--text-main)]"
         >
           Search the catalogues
@@ -160,17 +156,13 @@ export default function CatalogueGapStrip({ query }: Props) {
  * reachable from the moment they might be wanted.
  */
 export function CatalogueGapPrompt({ query }: Props) {
-  const openPane = useCatalogueStore((s) => s.openPane);
-  const paneSearch = useCatalogueStore((s) => s.search);
+  const searchInPane = useCatalogueStore((s) => s.searchInPane);
   if (query.trim() === "") return null;
   return (
     <div className="px-4 py-3 text-center">
       <button
         type="button"
-        onClick={() => {
-          openPane();
-          void paneSearch(query);
-        }}
+        onClick={() => void searchInPane(query)}
         className="text-[10px] text-[var(--text-dim)] underline transition-colors hover:text-[var(--text-main)]"
       >
         Search learning catalogues

@@ -94,11 +94,7 @@ export function buildFileContextMenuItems({
       id: "ask-about-file",
       label: "Ask about this file",
       icon: MessageSquare,
-      run: async () => {
-        const chat = useChatStore.getState();
-        await chat.openPane();
-        chat.addContext(target.path);
-      },
+      run: () => useChatStore.getState().askAbout(target.path),
     });
   }
 
