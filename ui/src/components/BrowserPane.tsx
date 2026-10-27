@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, Download, ExternalLink, Globe, Loader, LogIn, Moon, RotateCw, Trash2, X } from "react-feather";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { api } from "../services";
-import type { BrowserStep, PaneBounds } from "../services/api";
+import type { BrowserStep, PaneBounds, RgbColor } from "../services/api";
 import { useBrowserStore } from "../stores/useBrowserStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { confirmDialog } from "../lib/utils/dialog";
@@ -16,6 +16,15 @@ import BrowserDownloads from "./BrowserDownloads";
 function boundsOf(element: HTMLElement): PaneBounds {
   const rect = element.getBoundingClientRect();
   return { x: rect.left, y: rect.top, width: rect.width, height: rect.height };
+}
+
+/** The colour an element paints, which the webview over it starts out in
+ *  rather than its own white. */
+function backgroundOf(element: HTMLElement): RgbColor {
+  const painted = getComputedStyle(element).backgroundColor;
+  const channels = painted.match(/[\d.]+/g)?.map(Number);
+  if (!channels || channels.length < 3) throw new Error(`no colour in "${painted}"`);
+  return [Math.round(channels[0]), Math.round(channels[1]), Math.round(channels[2])];
 }
 
 function sameBounds(a: PaneBounds, b: PaneBounds) {
@@ -33,6 +42,7 @@ const iconButton =
   "inline-flex shrink-0 rounded p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-40 disabled:hover:bg-transparent";
 
 export default function BrowserPane() {
+  const root = useRef<HTMLDivElement>(null);
   const stage = useRef<HTMLDivElement>(null);
   // Whether the native webview exists yet: it is made by the first address
   // the pane is asked to show, not by the pane opening.
@@ -97,10 +107,11 @@ export default function BrowserPane() {
 
   useEffect(() => {
     const element = stage.current;
-    if (!request || !element) return;
+    const pane = root.current;
+    if (!request || !element || !pane) return;
     setDraft(request.url);
-    api
-      .browserPaneShow?.(request.url, boundsOf(element))
+    const show = async () => api.browserPaneShow?.(request.url, boundsOf(element), backgroundOf(pane));
+    show()
       .then(() => {
         created.current = true;
       })
@@ -132,7 +143,7 @@ export default function BrowserPane() {
   const hasPage = url !== null && request !== null;
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[var(--bg-sidebar)]">
+    <div ref={root} className="flex h-full min-h-0 flex-col bg-[var(--bg-sidebar)]">
       <form
         className="flex items-center gap-1 border-b border-[var(--border-main)] p-2"
         onSubmit={(event) => {

@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../services", () => ({
   isTauri: true,
@@ -25,6 +25,13 @@ import type { Settings } from "../lib/types";
 import BrowserPane, { addressFrom } from "./BrowserPane";
 
 describe("BrowserPane", () => {
+  beforeAll(() => {
+    // The colour the app's own stylesheet gives the pane.
+    const style = document.createElement("style");
+    style.textContent = `[class~="bg-[var(--bg-sidebar)]"] { background-color: rgb(30, 31, 34); }`;
+    document.head.appendChild(style);
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     useBrowserStore.setState({
@@ -59,7 +66,7 @@ describe("BrowserPane", () => {
     expect(screen.queryByLabelText("Invert light pages")).toBeNull();
   });
 
-  it("opens the requested address over its stage", async () => {
+  it("opens the requested address over its stage, in the colour behind it", async () => {
     useBrowserStore.setState({ request: { url: "https://example.org/" } });
     await act(async () => {
       render(<BrowserPane />);
@@ -67,6 +74,7 @@ describe("BrowserPane", () => {
     expect(api.browserPaneShow).toHaveBeenCalledWith(
       "https://example.org/",
       expect.objectContaining({ x: expect.any(Number), width: expect.any(Number) }),
+      [30, 31, 34],
     );
   });
 
@@ -79,7 +87,7 @@ describe("BrowserPane", () => {
     await act(async () => {
       fireEvent.submit(address.closest("form")!);
     });
-    expect(api.browserPaneShow).toHaveBeenCalledWith("https://arxiv.org", expect.anything());
+    expect(api.browserPaneShow).toHaveBeenCalledWith("https://arxiv.org", expect.anything(), expect.anything());
   });
 
   it("steps aside while the page holds the pointer, once the webview exists", async () => {

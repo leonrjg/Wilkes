@@ -36,7 +36,9 @@ wilkes-core = { path = "../core" }
 # For the HTTP API the app serves over its own workspace — the same router the
 # standalone server mounts, so consumers see one API and not two.
 wilkes-server = { path = "../server" }
-tauri = { version = "2", features = ["protocol-asset", "devtools", "test", "unstable"] }
+# `macos-private-api` is what lets the browser pane open in the app's
+# background colour on macOS rather than the webview's white.
+tauri = { version = "2", features = ["protocol-asset", "devtools", "test", "unstable", "macos-private-api"] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -54,6 +56,9 @@ rookie = "0.5.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+# Turns the browser pane's own background back on, which Tauri cannot.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSValue"] }
 
 [dev-dependencies]
 tempfile = "3.10"

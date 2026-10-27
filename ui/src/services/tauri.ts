@@ -92,6 +92,7 @@ import type {
   DataPaths,
   PathKind,
   PaneBounds,
+  RgbColor,
   BrowserStep,
   BrowserPageEvent,
   CookieSourceInfo,
@@ -393,8 +394,8 @@ export class TauriSearchApi implements SearchApi {
     return getCurrentWindow().setTheme(theme);
   }
 
-  async browserPaneShow(url: string, bounds: PaneBounds): Promise<void> {
-    return invoke("browser_pane_show", { url, bounds });
+  async browserPaneShow(url: string, bounds: PaneBounds, background: RgbColor): Promise<void> {
+    return invoke("browser_pane_show", { url, bounds, background });
   }
 
   async browserPaneSetBounds(bounds: PaneBounds): Promise<void> {

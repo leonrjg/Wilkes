@@ -9733,6 +9733,8 @@ dependencies = [
  "anyhow",
  "clipboard-files",
  "libc",
+ "objc2",
+ "objc2-foundation",
  "rookie",
  "serde",
  "serde_json",

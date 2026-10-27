@@ -88,6 +88,9 @@ export interface PaneBounds {
   height: number;
 }
 
+/** An opaque colour as red, green and blue, each 0-255. */
+export type RgbColor = [number, number, number];
+
 export type BrowserStep = "back" | "forward" | "reload";
 
 /** A browser whose cookies for a site can be brought into the browser pane. */
@@ -138,8 +141,9 @@ export interface SearchApi {
    *  follows; null follows the OS. */
   setWindowTheme?(theme: "light" | "dark" | null): Promise<void>;
   /** Desktop-only docked browser: a native webview this window keeps over a
-   *  page rectangle. Opens `url` in it, creating it at `bounds` if needed. */
-  browserPaneShow?(url: string, bounds: PaneBounds): Promise<void>;
+   *  page rectangle. Opens `url` in it, creating it at `bounds` if needed,
+   *  in `background` until its first page is in. */
+  browserPaneShow?(url: string, bounds: PaneBounds, background: RgbColor): Promise<void>;
   browserPaneSetBounds?(bounds: PaneBounds): Promise<void>;
   /** Native views take the pointer from the page; a drag in the page hides
    *  the pane until it ends. */

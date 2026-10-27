@@ -15,13 +15,20 @@
 //! In dark mode a light page is inverted the way the reader inverts a PDF.
 //! Pages see the window's appearance, so a site with a dark theme of its own
 //! shows it and is left alone: inverting it would make it light again.
+//!
+//! A new webview paints itself white until its first page has something to
+//! draw, which in dark mode is a white flash for as long as that page takes
+//! to arrive. So the pane is made in the app's own background colour and
+//! given back a browser's white once its first page is in: that white is also
+//! what shows behind a page that sets no background of its own.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use tauri::webview::{DownloadEvent, NewWindowResponse, PageLoadEvent};
+use tauri::webview::{Color, DownloadEvent, NewWindowResponse, PageLoadEvent};
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Url, Webview, WebviewBuilder,
     WebviewUrl, Window,
@@ -149,6 +156,30 @@ fn inversion_script(strength: Option<f64>) -> String {
 fn invert(webview: &Webview, strength: Option<f64>) {
     if let Err(e) = webview.eval(inversion_script(strength)) {
         error!("browser pane: could not apply dark-mode inversion: {e}");
+    }
+}
+
+/// Give the pane the background a browser paints behind a page: white. It is
+/// made with the app's colour instead, which on macOS Tauri gets by switching
+/// the webview's background off altogether -- the app shows through -- and
+/// has no way to switch back on, so there it is switched back on here.
+fn paint_own_background(webview: &Webview) {
+    #[cfg(target_os = "macos")]
+    let painted = webview.with_webview(|platform| {
+        use objc2::{msg_send, runtime::AnyObject};
+        use objc2_foundation::{ns_string, NSNumber};
+        // SAFETY: `inner` is the pane's live WKWebView, and this runs on the
+        // main thread, where `with_webview` calls back.
+        unsafe {
+            let view = &*platform.inner().cast::<AnyObject>();
+            let yes = NSNumber::new_bool(true);
+            let _: () = msg_send![view, setValue: &*yes, forKey: ns_string!("drawsBackground")];
+        }
+    });
+    #[cfg(not(target_os = "macos"))]
+    let painted = webview.set_background_color(None);
+    if let Err(e) = painted {
+        error!("browser pane: could not give the page its own background: {e}");
     }
 }
 
@@ -301,13 +332,14 @@ fn place(webview: &Webview, bounds: &PaneBounds) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Open `url` in the calling window's pane, creating the pane at `bounds` if
-/// the window has none yet.
+/// Open `url` in the calling window's pane, creating the pane at `bounds` in
+/// `background`, the colour of what is behind it, if the window has none yet.
 #[tauri::command]
 pub async fn browser_pane_show(
     window: Window,
     url: String,
     bounds: PaneBounds,
+    background: Color,
 ) -> Result<(), String> {
     let url = web_url(&url)?;
     if let Ok(webview) = pane(&window) {
@@ -318,11 +350,14 @@ pub async fn browser_pane_show(
     let app = window.app_handle().clone();
     let owner = window.label().to_string();
     let label = label(&owner);
+    let first_load = AtomicBool::new(true);
     let builder = WebviewBuilder::new(&label, WebviewUrl::External(url))
+        .background_color(background)
         .on_page_load({
             let app = app.clone();
             let owner = owner.clone();
             move |webview, payload| {
+                let finished = matches!(payload.event(), PageLoadEvent::Finished);
                 let url = payload.url().to_string();
                 let event = match payload.event() {
                     PageLoadEvent::Started => PageEvent::Loading { url },
@@ -333,6 +368,9 @@ pub async fn browser_pane_show(
                 // and judges it as soon as its markup is in. Finished judges
                 // it again with every stylesheet applied.
                 invert(&webview, app.state::<Inversions>().get(&owner));
+                if finished && first_load.swap(false, Ordering::Relaxed) {
+                    paint_own_background(&webview);
+                }
             }
         })
         .on_document_title_changed({
