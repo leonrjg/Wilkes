@@ -112,8 +112,24 @@ fn same_site(value: i64) -> Option<SameSite> {
     }
 }
 
+/// The domain to build a cookie with so that the pane's store gets
+/// `cookie_domain` as the browser had it. A leading dot is what makes a cookie
+/// the whole site's rather than its host's alone, and the webview reads the
+/// domain back through `Cookie::domain`, which strips one -- so a site-wide
+/// cookie is built with a second.
+fn store_domain(cookie_domain: String) -> String {
+    if cookie_domain.starts_with('.') {
+        format!(".{cookie_domain}")
+    } else {
+        cookie_domain
+    }
+}
+
 /// The cookie as the pane's store takes it, or nothing for one that has
-/// already expired.
+/// already expired. `Secure` and `HttpOnly` are only ever set, never set to
+/// false: the macOS webview writes a false flag as "FALSE", which WebKit
+/// reads as set, so a cookie its page's scripts should see would be hidden
+/// from them.
 fn pane_cookie(cookie: rookie::enums::Cookie, now: i64) -> Option<Cookie<'static>> {
     let expires = match cookie.expires {
         Some(seconds) => {
@@ -126,10 +142,14 @@ fn pane_cookie(cookie: rookie::enums::Cookie, now: i64) -> Option<Cookie<'static
         None => None,
     };
     let mut builder = Cookie::build((cookie.name, cookie.value))
-        .domain(cookie.domain)
-        .path(cookie.path)
-        .secure(cookie.secure)
-        .http_only(cookie.http_only);
+        .domain(store_domain(cookie.domain))
+        .path(cookie.path);
+    if cookie.secure {
+        builder = builder.secure(true);
+    }
+    if cookie.http_only {
+        builder = builder.http_only(true);
+    }
     if let Some(expires) = expires {
         builder = builder.expires(expires);
     }
@@ -203,6 +223,24 @@ mod tests {
     }
 
     #[test]
+    fn a_site_wide_cookie_stays_site_wide_and_a_host_cookie_stays_the_hosts() {
+        let site_wide = pane_cookie(cookie(".example.org", None, -1), 1_000).unwrap();
+        assert_eq!(site_wide.domain(), Some(".example.org"));
+        let host = pane_cookie(cookie("id.example.org", None, -1), 1_000).unwrap();
+        assert_eq!(host.domain(), Some("id.example.org"));
+    }
+
+    #[test]
+    fn flags_a_cookie_does_not_have_are_left_unset() {
+        let mut readable = cookie("example.org", None, -1);
+        readable.secure = false;
+        readable.http_only = false;
+        let pane = pane_cookie(readable, 1_000).unwrap();
+        assert_eq!(pane.secure(), None);
+        assert_eq!(pane.http_only(), None);
+    }
+
+    #[test]
     fn a_site_is_a_bare_host_name() {
         assert_eq!(site_domain(" www.Example.org ").unwrap(), "example.org");
         assert_eq!(
@@ -231,7 +269,6 @@ mod tests {
         let pane = pane_cookie(cookie(".example.org", Some(2_000_000_000), 1), 1_000).unwrap();
         assert_eq!(pane.name(), "session");
         assert_eq!(pane.value(), "abc");
-        assert_eq!(pane.domain(), Some("example.org"));
         assert_eq!(pane.path(), Some("/"));
         assert_eq!(pane.secure(), Some(true));
         assert_eq!(pane.http_only(), Some(true));
