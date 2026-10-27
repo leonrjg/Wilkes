@@ -418,6 +418,10 @@ export class TauriSearchApi implements SearchApi {
     return invoke("browser_pane_clear_data");
   }
 
+  async browserPaneSavePage(): Promise<void> {
+    return invoke("browser_pane_save_page");
+  }
+
   async browserCookieSources(): Promise<CookieSourceInfo[]> {
     return invoke<CookieSourceInfo[]>("browser_cookie_sources");
   }

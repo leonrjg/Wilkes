@@ -410,6 +410,27 @@ pub async fn browser_pane_step(window: Window, step: Step) -> Result<(), String>
     .map_err(|e| e.to_string())
 }
 
+/// Clicks a `download` link to the page's own address: WebKit then downloads
+/// what the address serves -- the PDF its viewer is showing, the page's HTML
+/// -- through the pane's own session, so a sign-in the page needed carries
+/// over, and the download is routed into the library root like any other.
+const SAVE_PAGE_SCRIPT: &str = r#"(() => {
+  const link = document.createElement("a");
+  link.href = location.href;
+  link.download = "";
+  (document.body ?? document.documentElement).appendChild(link);
+  link.click();
+  link.remove();
+})();"#;
+
+/// Save what the calling window's pane is showing into the library root.
+#[tauri::command]
+pub async fn browser_pane_save_page(window: Window) -> Result<(), String> {
+    pane(&window)?
+        .eval(SAVE_PAGE_SCRIPT)
+        .map_err(|e| e.to_string())
+}
+
 /// Forget every cookie and site record the panes hold, then reload, so the
 /// page in view shows what a signed-out visit sees.
 #[tauri::command]

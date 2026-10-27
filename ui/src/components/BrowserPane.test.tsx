@@ -10,6 +10,7 @@ vi.mock("../services", () => ({
     browserPaneSetDarkTheme: vi.fn(() => Promise.resolve()),
     browserPaneStep: vi.fn(() => Promise.resolve()),
     browserPaneClearData: vi.fn(() => Promise.resolve()),
+    browserPaneSavePage: vi.fn(() => Promise.resolve()),
     browserPaneClose: vi.fn(() => Promise.resolve()),
     onBrowserPanePage: vi.fn(() => Promise.resolve(() => {})),
     openPath: vi.fn(() => Promise.resolve()),
@@ -104,6 +105,15 @@ describe("BrowserPane", () => {
     });
     view!.unmount();
     expect(api.browserPaneClose).toHaveBeenCalled();
+  });
+
+  it("saves what it is showing to the library", async () => {
+    useBrowserStore.setState({ request: { url: "https://arxiv.org/pdf/1706.03762" }, url: "https://arxiv.org/pdf/1706.03762" });
+    await act(async () => {
+      render(<BrowserPane />);
+    });
+    fireEvent.click(screen.getByLabelText("Save to library"));
+    expect(api.browserPaneSavePage).toHaveBeenCalled();
   });
 
   it("reads a bare host as its https site", () => {

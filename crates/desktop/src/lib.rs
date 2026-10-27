@@ -2498,6 +2498,7 @@ pub fn run() {
             browser_pane::browser_pane_set_dark_theme,
             browser_pane::browser_pane_step,
             browser_pane::browser_pane_clear_data,
+            browser_pane::browser_pane_save_page,
             browser_pane::browser_pane_close,
             cookie_import::browser_cookie_sources,
             cookie_import::browser_pane_import_cookies,

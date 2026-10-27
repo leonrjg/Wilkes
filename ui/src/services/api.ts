@@ -155,6 +155,8 @@ export interface SearchApi {
   browserPaneSetDarkTheme?(theme: PaneDarkTheme | null): Promise<void>;
   browserPaneStep?(step: BrowserStep): Promise<void>;
   browserPaneClearData?(): Promise<void>;
+  /** Save what the pane is showing into the library root, as a download. */
+  browserPaneSavePage?(): Promise<void>;
   browserCookieSources?(): Promise<CookieSourceInfo[]>;
   /** Copy one site's cookies from the user's browser into the pane; returns
    *  how many were copied. */

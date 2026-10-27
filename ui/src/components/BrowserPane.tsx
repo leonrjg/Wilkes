@@ -3,7 +3,7 @@
 // above everything the page draws -- a menu or a dialog that overlaps the pane
 // is hidden under it -- which is accepted rather than worked around.
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, ArrowRight, ExternalLink, Globe, Loader, LogIn, Moon, RotateCw, Trash2, X } from "react-feather";
+import { ArrowLeft, ArrowRight, Download, ExternalLink, Globe, Loader, LogIn, Moon, RotateCw, Trash2, X } from "react-feather";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { api } from "../services";
 import type { BrowserStep, PaneBounds, PaneDarkTheme } from "../services/api";
@@ -184,6 +184,19 @@ export default function BrowserPane() {
             className="min-w-0 flex-1 bg-transparent py-1.5 text-[11px] text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
           />
         </div>
+        <Tooltip content="Save to library">
+          <button
+            type="button"
+            aria-label="Save to library"
+            disabled={!hasPage}
+            onClick={() => {
+              api.browserPaneSavePage?.().catch((e) => console.error("browser pane: save to library failed", e));
+            }}
+            className={iconButton}
+          >
+            <Download size={12} />
+          </button>
+        </Tooltip>
         <Tooltip content="Open in your browser">
           <button
             type="button"
