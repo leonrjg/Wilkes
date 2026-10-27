@@ -27,9 +27,9 @@ interface BrowserStore {
   /** A drag in the page is in progress, and the native pane must step aside
    *  for it to keep the pointer. */
   held: boolean;
-  /** In dark mode, darken pages that come out light. On by default; the
-   *  pane's own switch, for a page the darkening handles badly. */
-  darkenLightPages: boolean;
+  /** In dark mode, invert pages that come out light. On by default; the pane's
+   *  own switch, for a page the lightness check misjudges. */
+  invertLightPages: boolean;
   /** This session's downloads, newest first, until cleared. */
   downloads: BrowserDownload[];
   show: (url: string) => void;
@@ -37,7 +37,7 @@ interface BrowserStore {
   closePane: () => void;
   applyPageEvent: (event: BrowserPageEvent) => void;
   setHeld: (held: boolean) => void;
-  toggleDarkening: () => void;
+  toggleInversion: () => void;
   clearDownloads: () => void;
 }
 
@@ -54,7 +54,7 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
   title: null,
   loading: false,
   held: false,
-  darkenLightPages: true,
+  invertLightPages: true,
   downloads: [],
   show: (url) => set({ paneOpen: true, request: { url } }),
   togglePane: () => {
@@ -103,6 +103,6 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
     }
   },
   setHeld: (held) => set({ held }),
-  toggleDarkening: () => set((state) => ({ darkenLightPages: !state.darkenLightPages })),
+  toggleInversion: () => set((state) => ({ invertLightPages: !state.invertLightPages })),
   clearDownloads: () => set({ downloads: [] }),
 }));

@@ -90,12 +90,6 @@ export interface PaneBounds {
 
 export type BrowserStep = "back" | "forward" | "reload";
 
-/** The colours a darkened page in the browser pane is given. */
-export interface PaneDarkTheme {
-  background: string;
-  text: string;
-}
-
 /** A browser whose cookies for a site can be brought into the browser pane. */
 export interface CookieSourceInfo {
   id: string;
@@ -150,9 +144,8 @@ export interface SearchApi {
   /** Native views take the pointer from the page; a drag in the page hides
    *  the pane until it ends. */
   browserPaneSetVisible?(visible: boolean): Promise<void>;
-  /** Darken light pages in the pane into these colours; null
-   *  leaves pages as their sites made them. */
-  browserPaneSetDarkTheme?(theme: PaneDarkTheme | null): Promise<void>;
+  /** How strongly light pages in the pane are inverted (0 to 1); null stops. */
+  browserPaneSetInversion?(strength: number | null): Promise<void>;
   browserPaneStep?(step: BrowserStep): Promise<void>;
   browserPaneClearData?(): Promise<void>;
   /** Save what the pane is showing into the library root, as a download. */

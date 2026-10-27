@@ -7,7 +7,7 @@ vi.mock("../services", () => ({
     browserPaneShow: vi.fn(() => Promise.resolve()),
     browserPaneSetBounds: vi.fn(() => Promise.resolve()),
     browserPaneSetVisible: vi.fn(() => Promise.resolve()),
-    browserPaneSetDarkTheme: vi.fn(() => Promise.resolve()),
+    browserPaneSetInversion: vi.fn(() => Promise.resolve()),
     browserPaneStep: vi.fn(() => Promise.resolve()),
     browserPaneClearData: vi.fn(() => Promise.resolve()),
     browserPaneSavePage: vi.fn(() => Promise.resolve()),
@@ -21,6 +21,7 @@ vi.mock("../lib/utils/dialog", () => ({ confirmDialog: vi.fn(() => Promise.resol
 import { api } from "../services";
 import { useBrowserStore } from "../stores/useBrowserStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import type { Settings } from "../lib/types";
 import BrowserPane, { addressFrom } from "./BrowserPane";
 
 describe("BrowserPane", () => {
@@ -33,31 +34,29 @@ describe("BrowserPane", () => {
       title: null,
       loading: false,
       held: false,
-      darkenLightPages: true,
+      invertLightPages: true,
     });
-    useSettingsStore.setState({ colorScheme: "light" });
-    document.documentElement.style.setProperty("--bg-app", "#0a0a0a");
-    document.documentElement.style.setProperty("--text-main", "#ededed");
+    useSettingsStore.setState({ colorScheme: "light", settings: { dark_mode_inversion: 80 } as Settings });
   });
 
-  it("darkens light pages in dark mode in the app's own colours, until switched off", async () => {
+  it("inverts light pages in dark mode at the reader's strength, until switched off", async () => {
     useSettingsStore.setState({ colorScheme: "dark" });
     await act(async () => {
       render(<BrowserPane />);
     });
-    expect(api.browserPaneSetDarkTheme).toHaveBeenLastCalledWith({ background: "#0a0a0a", text: "#ededed" });
+    expect(api.browserPaneSetInversion).toHaveBeenLastCalledWith(0.8);
     await act(async () => {
-      fireEvent.click(screen.getByLabelText("Darken light pages"));
+      fireEvent.click(screen.getByLabelText("Invert light pages"));
     });
-    expect(api.browserPaneSetDarkTheme).toHaveBeenLastCalledWith(null);
+    expect(api.browserPaneSetInversion).toHaveBeenLastCalledWith(null);
   });
 
-  it("does not darken in light mode", async () => {
+  it("does not invert in light mode", async () => {
     await act(async () => {
       render(<BrowserPane />);
     });
-    expect(api.browserPaneSetDarkTheme).toHaveBeenLastCalledWith(null);
-    expect(screen.queryByLabelText("Darken light pages")).toBeNull();
+    expect(api.browserPaneSetInversion).toHaveBeenLastCalledWith(null);
+    expect(screen.queryByLabelText("Invert light pages")).toBeNull();
   });
 
   it("opens the requested address over its stage", async () => {
