@@ -27,6 +27,7 @@ use wilkes_core::types::{
 };
 use wilkes_core::worker::manager::WorkerStatus;
 
+mod browser_pane;
 mod chat;
 mod platform;
 #[cfg(target_os = "macos")]
@@ -2488,6 +2489,9 @@ pub fn run() {
             delete_workspace,
             open_path,
             reveal_path,
+            browser_pane::browser_pane_show,
+            browser_pane::browser_pane_set_bounds,
+            browser_pane::browser_pane_close,
             is_semantic_ready,
             is_generation_ready,
             list_generation_models,

@@ -1,6 +1,6 @@
 import { Fragment, useState, useCallback, useRef, useEffect, type ReactNode } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { BookOpen, Bookmark, Cloud, MessageSquare, Settings as SettingsIcon, ChevronDown, ChevronLeft, ChevronRight, Loader, Plus } from "react-feather";
+import { BookOpen, Bookmark, Cloud, Globe, MessageSquare, Settings as SettingsIcon, ChevronDown, ChevronLeft, ChevronRight, Loader, Plus } from "react-feather";
 import SearchBar from "./components/SearchBar";
 import ResultList from "./components/ResultList";
 import PreviewPane from "./components/PreviewPane";
@@ -11,6 +11,7 @@ import DirectoryPicker from "./components/DirectoryPicker";
 import WorkspacePicker from "./components/WorkspacePicker";
 import UploadZone from "./components/UploadZone";
 import CataloguePane from "./components/CataloguePane";
+import BrowserPane from "./components/BrowserPane";
 import SettingsModal from "./components/SettingsModal";
 import { useToasts } from "./components/Toast";
 import { useContextMenu, ContextMenu } from "./components/ContextMenu";
@@ -112,6 +113,8 @@ export default function App() {
   // Per pane: a second pane opens at the default width, and resizing one does
   // not resize the others.
   const [catalogueWidths, setCatalogueWidths] = useState<Record<string, number>>({});
+  const [browserPaneOpen, setBrowserPaneOpen] = useState(false);
+  const [browserWidth, setBrowserWidth] = useState(480);
   const [chatWidths, setChatWidths] = useState<Record<string, number>>({});
   const [fileFilterText, setFileFilterText] = useState("");
   const resizeRef = useRef<{
@@ -621,6 +624,22 @@ export default function App() {
           </button>
         </Tooltip>
       </div>
+      {isTauri && (
+        <Tooltip content="Browser pane (prototype)">
+          <button
+            onClick={() => setBrowserPaneOpen((open) => !open)}
+            aria-label="Browser pane"
+            aria-pressed={browserPaneOpen}
+            className={`w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] transition-all border border-[var(--border-main)] hover:border-[var(--border-strong)] ${
+              browserPaneOpen
+                ? "text-[var(--accent-blue)] shadow-inner"
+                : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
+            }`}
+          >
+            <Globe size={14} />
+          </button>
+        </Tooltip>
+      )}
       <Tooltip content="Settings">
         <button
           onClick={() => setSettingsOpen(true)}
@@ -863,6 +882,17 @@ export default function App() {
         {bookmarksDock === "Right" && topicsColumn}
         {catalogueColumns}
         {chatColumns}
+        {isTauri && browserPaneOpen &&
+          rightDockedPane({
+            id: "browser-pane",
+            width: browserWidth,
+            setWidth: setBrowserWidth,
+            minWidth: 320,
+            focused: false,
+            marked: false,
+            onFocus: () => {},
+            children: <BrowserPane onClose={() => setBrowserPaneOpen(false)} />,
+          })}
       </div>
     </div>
   );

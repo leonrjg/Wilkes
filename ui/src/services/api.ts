@@ -80,6 +80,14 @@ export interface DataPaths {
   workspace: string;
 }
 
+/** A page rectangle in CSS pixels, relative to the main webview. */
+export interface PaneBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 // Shared across desktop and web. All methods are identical.
 export interface SearchApi {
   getStartupStatus(): Promise<StartupStatus>;
@@ -109,6 +117,10 @@ export interface SearchApi {
   renameWorkspace(workspaceId: string, name: string): Promise<WorkspaceSummary>;
   switchWorkspace(workspaceId: string): Promise<WorkspaceState>;
   deleteWorkspace(workspaceId: string): Promise<WorkspaceState>;
+  /** PROTOTYPE: a native webview kept over the given page rectangle. */
+  browserPaneShow?(url: string, bounds: PaneBounds): Promise<void>;
+  browserPaneSetBounds?(bounds: PaneBounds): Promise<void>;
+  browserPaneClose?(): Promise<void>;
   /** Desktop-only lifecycle controls for the opt-in external MCP endpoint. */
   getExternalMcpStatus?(): Promise<ExternalMcpStatus>;
   /** Desktop-only live viewer context exposed by the external MCP endpoint. */

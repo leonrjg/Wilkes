@@ -84,7 +84,7 @@ import type {
   NativeOpenRequest,
 } from "../lib/types";
 import { randomId } from "../lib/types";
-import type { SearchApi, DesktopSourceApi, DataPaths, PathKind } from "./api";
+import type { SearchApi, DesktopSourceApi, DataPaths, PathKind, PaneBounds } from "./api";
 
 export class TauriSearchApi implements SearchApi {
   async getStartupStatus(): Promise<StartupStatus> {
@@ -376,6 +376,18 @@ export class TauriSearchApi implements SearchApi {
 
   async revealPath(path: string): Promise<void> {
     return invoke("reveal_path", { path });
+  }
+
+  async browserPaneShow(url: string, bounds: PaneBounds): Promise<void> {
+    return invoke("browser_pane_show", { url, bounds });
+  }
+
+  async browserPaneSetBounds(bounds: PaneBounds): Promise<void> {
+    return invoke("browser_pane_set_bounds", { bounds });
+  }
+
+  async browserPaneClose(): Promise<void> {
+    return invoke("browser_pane_close");
   }
 
   async writeClipboard(text: string): Promise<void> {
