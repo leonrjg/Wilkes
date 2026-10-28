@@ -252,7 +252,7 @@ fn download_root(app: &AppHandle) -> Result<PathBuf, String> {
 
 /// Send a download from the pane to the library root instead of the system's
 /// Downloads folder, under the name WebKit suggests.
-fn route_download(app: &AppHandle, owner: &str, event: DownloadEvent<'_>) -> bool {
+pub(crate) fn route_download(app: &AppHandle, owner: &str, event: DownloadEvent<'_>) -> bool {
     match event {
         DownloadEvent::Requested { url, destination } => {
             let url = url.to_string();
@@ -419,6 +419,8 @@ pub async fn browser_pane_show(
         .map_err(|e| e.to_string())?;
     crate::browser_find::listen_for_find_key(&webview, &app, &owner);
     crate::browser_hover::listen_for_hover(&webview, &app, &owner);
+    #[cfg(target_os = "macos")]
+    crate::browser_context_download::listen(&webview, &app, &owner);
     Ok(())
 }
 
@@ -512,6 +514,8 @@ pub async fn browser_pane_close(window: Window) -> Result<(), String> {
         Ok(webview) => {
             crate::browser_find::stop_listening(&webview, window.label());
             crate::browser_hover::stop_listening(&webview, window.label());
+            #[cfg(target_os = "macos")]
+            crate::browser_context_download::stop_listening(&webview, window.label());
             webview.close().map_err(|e| e.to_string())
         }
         Err(_) => Ok(()),
