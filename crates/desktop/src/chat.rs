@@ -668,8 +668,9 @@ pub async fn chat_answer_permission(
 /// has finished in the browser or given up.
 ///
 /// Awaited rather than detached like a turn: there is nothing to stream, and
-/// the outcome is the whole answer. The pane reopens the conversation on a
-/// fresh session afterwards; this one was started logged out.
+/// the outcome is the whole answer. The pane starts a new chat on a fresh
+/// session afterwards: this one was started logged out, and resuming its
+/// conversation would bring back an agent without Wilkes's tools.
 #[tauri::command]
 pub async fn chat_log_in(
     session_id: String,
