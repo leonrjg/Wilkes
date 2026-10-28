@@ -32,11 +32,34 @@ function sameBounds(a: PaneBounds, b: PaneBounds) {
   return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
 }
 
-/** What someone types into the address bar, as an address: a bare host is
- *  taken to mean its https site. */
+const SEARCH = "https://www.google.com/search?q=";
+
+/** Whether `input`, which has no scheme, starts with a host: a name with a
+ *  dot and a top-level domain (`arxiv.org`, `en.wikipedia.org/wiki/EDSAC`),
+ *  `localhost` or an IP address, with any port and path after it. A number
+ *  like `3.14` or `1706.03762` is not one, nor is anything with a space. */
+function startsWithHost(input: string): boolean {
+  if (/\s/.test(input)) return false;
+  if (/^(\d{1,3}\.){3}\d{1,3}(:\d+)?([/?#]|$)/.test(input) || input.startsWith("[")) return true;
+  let host: string;
+  try {
+    host = new URL(`https://${input}`).hostname;
+  } catch {
+    return false;
+  }
+  if (host === "localhost") return true;
+  const labels = host.split(".");
+  const domain = labels[labels.length - 1];
+  return labels.length > 1 && !labels.includes("") && /^([a-z]{2,}|xn--[a-z0-9-]+)$/.test(domain);
+}
+
+/** What someone types into the address bar, as an address: an address as it
+ *  is, a host as its https site, and anything else as a Google search. */
 export function addressFrom(input: string): string {
   const trimmed = input.trim();
-  return /^[a-z][a-z0-9+.-]*:/i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) return trimmed;
+  if (startsWithHost(trimmed)) return `https://${trimmed}`;
+  return `${SEARCH}${encodeURIComponent(trimmed)}`;
 }
 
 const iconButton =

@@ -148,5 +148,19 @@ describe("BrowserPane", () => {
   it("reads a bare host as its https site", () => {
     expect(addressFrom(" example.org/a ")).toBe("https://example.org/a");
     expect(addressFrom("http://example.org")).toBe("http://example.org");
+    expect(addressFrom("en.wikipedia.org/wiki/EDSAC?x=1#y")).toBe("https://en.wikipedia.org/wiki/EDSAC?x=1#y");
+    expect(addressFrom("localhost:5173")).toBe("https://localhost:5173");
+    expect(addressFrom("192.168.0.1:8080/a")).toBe("https://192.168.0.1:8080/a");
+    expect(addressFrom("münchen.de")).toBe("https://münchen.de");
+  });
+
+  it("searches Google for anything that is not a host", () => {
+    const search = (q: string) => `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+    expect(addressFrom("attention is all you need")).toBe(search("attention is all you need"));
+    expect(addressFrom("transformers")).toBe(search("transformers"));
+    expect(addressFrom("1706.03762")).toBe(search("1706.03762"));
+    expect(addressFrom("3.14")).toBe(search("3.14"));
+    expect(addressFrom("define:entropy")).toBe(search("define:entropy"));
+    expect(addressFrom("c++ & rust?")).toBe(search("c++ & rust?"));
   });
 });
