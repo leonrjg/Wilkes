@@ -2602,6 +2602,9 @@ pub fn run() {
             chat::chat_send,
             chat::chat_cancel,
             chat::chat_answer_permission,
+            chat::chat_log_in,
+            chat::chat_cancel_log_in,
+            chat::chat_log_out,
             chat::chat_close,
         ])
         .build(tauri::generate_context!())

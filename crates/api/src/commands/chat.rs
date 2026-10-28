@@ -22,6 +22,7 @@ use wilkes_chat::session::{SpawnOptions, SpawnedChatSession};
 use wilkes_core::types::IntegrationsSettings;
 
 pub use wilkes_agent::{HostActiveDoc, HostContext, HostContextFile};
+pub use wilkes_chat::auth::{ChatAuth, LoginOutcome};
 pub use wilkes_chat::backend::{
     backend_status, install_backend, is_resumable, label, list_backends, AgentBackend,
     BackendStatus,
@@ -29,7 +30,7 @@ pub use wilkes_chat::backend::{
 pub use wilkes_chat::session::{
     config_for_backend, config_values_from_options, upsert_backend_config, ChatBackendConfig,
     ChatConfigOption, ChatConfigValue, ChatEvent, ChatReplayContentBlock, ChatReplayMessage,
-    ChatReplayToolCall, ChatSession,
+    ChatReplayToolCall, ChatSession, TurnError,
 };
 pub use wilkes_chat::store::{
     branch_history_text, create_conversation, create_fork_conversation, environment_at_message,
@@ -38,7 +39,7 @@ pub use wilkes_chat::store::{
     update_conversation_config, ChatConversationRecord, ChatMessageRecord, ChatTurnEnvironment,
 };
 pub use wilkes_chat::transcript::apply_chat_event;
-pub use wilkes_chat::wire::{emission, ChatEmission, ChatUpdate};
+pub use wilkes_chat::wire::{emission, turn_failure, ChatEmission, ChatUpdate};
 
 /// Start a subprocess, its MCP server, and complete the ACP handshake.
 ///

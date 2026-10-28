@@ -23,9 +23,10 @@ use tauri::{AppHandle, Manager};
 use tracing::{error, info};
 use wilkes_agent::WilkesChatHost;
 use wilkes_api::commands::chat::{
-    apply_chat_event, config_values_from_options, emission, is_resumable, upsert_backend_config,
-    AgentBackend, BackendStatus, ChatConfigOption, ChatConversationRecord, ChatEmission, ChatEvent,
-    ChatMessageRecord, ChatSession, ChatTurnEnvironment, HostContext,
+    apply_chat_event, config_values_from_options, emission, is_resumable, turn_failure,
+    upsert_backend_config, AgentBackend, BackendStatus, ChatAuth, ChatConfigOption,
+    ChatConversationRecord, ChatEmission, ChatEvent, ChatMessageRecord, ChatSession,
+    ChatTurnEnvironment, HostContext, LoginOutcome,
 };
 use wilkes_api::context::AppContext;
 use wilkes_api::context::EventEmitter;
@@ -104,6 +105,9 @@ pub struct ChatStartResult {
     /// `chat/config-<sessionId>`.
     config_options: Vec<ChatConfigOption>,
     messages: Vec<ChatMessageRecord>,
+    /// The logins the agent offered, and whether it can be logged out, so the
+    /// pane has them before a turn is refused for want of one.
+    auth: ChatAuth,
 }
 
 #[derive(Debug, Serialize)]
@@ -292,6 +296,7 @@ pub async fn chat_start(
     .to_vec();
     let config_options = apply_settings(&ctx, &session, &stored).await;
     let backend_session_id = session.backend_session_id().to_string();
+    let auth = session.auth().clone();
 
     let session_id = adopt(
         &app,
@@ -310,6 +315,7 @@ pub async fn chat_start(
         backend_session_id: Some(backend_session_id),
         config_options,
         messages: Vec::new(),
+        auth,
     })
 }
 
@@ -336,6 +342,7 @@ pub async fn chat_open_conversation(
     let messages = wilkes_api::commands::chat::records_from_replay(spawned.replay_messages);
     let config_options = apply_settings(&ctx, &session, &record.config_values).await;
     let backend_session_id = session.backend_session_id().to_string();
+    let auth = session.auth().clone();
 
     if record.branch_history_pending {
         session.set_prelude(Some(wilkes_api::commands::chat::branch_history_text(
@@ -372,6 +379,7 @@ pub async fn chat_open_conversation(
         backend_session_id: Some(backend_session_id),
         config_options,
         messages,
+        auth,
     })
 }
 
@@ -411,6 +419,7 @@ pub async fn chat_fork_conversation(
     let session = Arc::new(spawned.session);
     let config_options = apply_settings(&ctx, &session, &environment.config_values).await;
     let backend_session_id = session.backend_session_id().to_string();
+    let auth = session.auth().clone();
 
     let record = match wilkes_api::commands::chat::create_fork_conversation(
         &ctx.data_dir,
@@ -450,6 +459,7 @@ pub async fn chat_fork_conversation(
         backend_session_id: Some(backend_session_id),
         config_options,
         messages: record.messages,
+        auth,
     })
 }
 
@@ -561,7 +571,7 @@ pub async fn chat_send(
         let payload = match result {
             Ok(stop_reason) => serde_json::json!({ "stop_reason": stop_reason }),
             Err(e) => {
-                let message = format!("{e:#}");
+                let message = e.to_string();
                 error!("chat turn {turn_id} failed: {message}");
                 if let Some(last) = managed_for_task
                     .messages
@@ -575,9 +585,11 @@ pub async fn chat_send(
                 // Reported on the turn's own channel, in the same union as
                 // every other update, so the client learns of the failure
                 // where it is already listening rather than in a second shape.
+                // Which kind of failure it is -- a logged-out agent is one the
+                // pane can fix -- is the wire's decision, not this function's.
                 emitter.emit(
                     &format!("chat/update-{turn_id}"),
-                    serde_json::json!({ "kind": "error", "message": message }),
+                    serde_json::to_value(turn_failure(&e)).unwrap_or_default(),
                 );
                 serde_json::json!({ "stop_reason": null })
             }
@@ -650,4 +662,44 @@ pub async fn chat_answer_permission(
         .session
         .answer_permission(&request_id, option_id);
     Ok(())
+}
+
+/// Run one of the logins the session's agent offered, and answer once the user
+/// has finished in the browser or given up.
+///
+/// Awaited rather than detached like a turn: there is nothing to stream, and
+/// the outcome is the whole answer. The pane reopens the conversation on a
+/// fresh session afterwards; this one was started logged out.
+#[tauri::command]
+pub async fn chat_log_in(
+    session_id: String,
+    method_id: String,
+    app: AppHandle,
+) -> Result<LoginOutcome, String> {
+    let managed = session_or_err(&app, &session_id)?;
+    let outcome = managed
+        .session
+        .log_in(&method_id)
+        .await
+        .map_err(|e| format!("{e:#}"));
+    match &outcome {
+        Ok(outcome) => info!("chat_log_in: session={session_id} method={method_id} {outcome:?}"),
+        Err(message) => error!("chat_log_in: session={session_id} method={method_id}: {message}"),
+    }
+    outcome
+}
+
+#[tauri::command]
+pub async fn chat_cancel_log_in(session_id: String, app: AppHandle) -> Result<(), String> {
+    session_or_err(&app, &session_id)?.session.cancel_log_in();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn chat_log_out(session_id: String, app: AppHandle) -> Result<(), String> {
+    session_or_err(&app, &session_id)?
+        .session
+        .log_out()
+        .await
+        .map_err(|e| format!("{e:#}"))
 }
