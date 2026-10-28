@@ -9731,10 +9731,14 @@ name = "wilkes-desktop"
 version = "1.0.1"
 dependencies = [
  "anyhow",
+ "block2",
  "clipboard-files",
+ "gtk",
  "libc",
  "objc2",
+ "objc2-app-kit",
  "objc2-foundation",
+ "objc2-web-kit",
  "rookie",
  "serde",
  "serde_json",
@@ -9749,6 +9753,7 @@ dependencies = [
  "tracing",
  "trash",
  "uuid",
+ "webkit2gtk",
  "wilkes-agent",
  "wilkes-api",
  "wilkes-core",

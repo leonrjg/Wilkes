@@ -32,6 +32,11 @@ interface BrowserStore {
   invertLightPages: boolean;
   /** This session's downloads, newest first, until cleared. */
   downloads: BrowserDownload[];
+  /** The find strip is open. */
+  finding: boolean;
+  /** How many times Cmd/Ctrl+F has asked for the strip, so asking again while
+   *  it is open puts the keyboard back in it. */
+  findRequests: number;
   show: (url: string) => void;
   togglePane: () => void;
   closePane: () => void;
@@ -39,6 +44,7 @@ interface BrowserStore {
   setHeld: (held: boolean) => void;
   toggleInversion: () => void;
   clearDownloads: () => void;
+  closeFind: () => void;
 }
 
 /** The download for `url` replaced by `next`, or `next` added first. */
@@ -56,13 +62,15 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
   held: false,
   invertLightPages: true,
   downloads: [],
+  finding: false,
+  findRequests: 0,
   show: (url) => set({ paneOpen: true, request: { url } }),
   togglePane: () => {
     const { paneOpen, url } = get();
     if (paneOpen) set({ paneOpen: false });
     else set({ paneOpen: true, request: url ? { url } : null });
   },
-  closePane: () => set({ paneOpen: false, loading: false }),
+  closePane: () => set({ paneOpen: false, loading: false, finding: false }),
   applyPageEvent: (event) => {
     switch (event.kind) {
       case "loading":
@@ -100,9 +108,13 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
           }),
         }));
         break;
+      case "find_requested":
+        set((state) => ({ finding: true, findRequests: state.findRequests + 1 }));
+        break;
     }
   },
   setHeld: (held) => set({ held }),
   toggleInversion: () => set((state) => ({ invertLightPages: !state.invertLightPages })),
   clearDownloads: () => set({ downloads: [] }),
+  closeFind: () => set({ finding: false }),
 }));

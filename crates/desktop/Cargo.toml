@@ -56,9 +56,17 @@ rookie = "0.5.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
-# Turns the browser pane's own background back on, which Tauri cannot.
+# The browser pane's own background, and its find, which Tauri has no way to.
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSValue"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSEvent", "NSResponder", "NSView", "NSWindow"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "WKWebView", "WKFindConfiguration", "WKFindResult"] }
+block2 = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The browser pane's find, which Tauri has no way to.
+webkit2gtk = "2.0"
+gtk = "0.18"
 
 [dev-dependencies]
 tempfile = "3.10"

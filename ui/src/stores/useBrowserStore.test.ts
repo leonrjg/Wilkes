@@ -87,3 +87,22 @@ describe("useBrowserStore downloads", () => {
     expect(useBrowserStore.getState().downloads).toEqual([]);
   });
 });
+
+describe("useBrowserStore find", () => {
+  beforeEach(() => {
+    useBrowserStore.setState({ paneOpen: true, finding: false, findRequests: 0 });
+  });
+
+  it("opens the find strip for Cmd/Ctrl+F, counting each ask", () => {
+    const { applyPageEvent } = useBrowserStore.getState();
+    applyPageEvent({ kind: "find_requested" });
+    applyPageEvent({ kind: "find_requested" });
+    expect(useBrowserStore.getState()).toMatchObject({ finding: true, findRequests: 2 });
+  });
+
+  it("closes the strip with the pane", () => {
+    useBrowserStore.getState().applyPageEvent({ kind: "find_requested" });
+    useBrowserStore.getState().closePane();
+    expect(useBrowserStore.getState().finding).toBe(false);
+  });
+});

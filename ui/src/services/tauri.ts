@@ -92,6 +92,7 @@ import type {
   DataPaths,
   PathKind,
   PaneBounds,
+  BrowserFound,
   RgbColor,
   BrowserStep,
   BrowserPageEvent,
@@ -420,6 +421,14 @@ export class TauriSearchApi implements SearchApi {
 
   async browserPaneSavePage(): Promise<void> {
     return invoke("browser_pane_save_page");
+  }
+
+  async browserPaneFind(query: string, backwards: boolean): Promise<BrowserFound> {
+    return invoke("browser_pane_find", { query, backwards });
+  }
+
+  async browserPaneEndFind(): Promise<void> {
+    return invoke("browser_pane_end_find");
   }
 
   async browserCookieSources(): Promise<CookieSourceInfo[]> {

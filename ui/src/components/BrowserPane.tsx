@@ -12,6 +12,7 @@ import { useSettingsStore } from "../stores/useSettingsStore";
 import { confirmDialog } from "../lib/utils/dialog";
 import CookieImportStrip from "./CookieImportStrip";
 import BrowserDownloads from "./BrowserDownloads";
+import BrowserFindStrip from "./BrowserFindStrip";
 
 function boundsOf(element: HTMLElement): PaneBounds {
   const rect = element.getBoundingClientRect();
@@ -55,6 +56,8 @@ export default function BrowserPane() {
   const closePane = useBrowserStore((s) => s.closePane);
   const invertLightPages = useBrowserStore((s) => s.invertLightPages);
   const toggleInversion = useBrowserStore((s) => s.toggleInversion);
+  const finding = useBrowserStore((s) => s.finding);
+  const findRequests = useBrowserStore((s) => s.findRequests);
   const dark = useSettingsStore((s) => s.colorScheme === "dark");
   const inversionPercent = useSettingsStore((s) => s.settings?.dark_mode_inversion ?? 90);
   // The reader's inversion, at the reader's strength.
@@ -138,6 +141,11 @@ export default function BrowserPane() {
     );
     if (!confirmed) return;
     await api.browserPaneClearData?.().catch((e) => console.error("browser pane: clearing data failed", e));
+  };
+
+  const endFind = () => {
+    useBrowserStore.getState().closeFind();
+    api.browserPaneEndFind?.().catch((e) => console.error("browser pane: could not end find", e));
   };
 
   const hasPage = url !== null && request !== null;
@@ -253,6 +261,7 @@ export default function BrowserPane() {
           </button>
         </Tooltip>
       </form>
+      {finding && hasPage && <BrowserFindStrip requests={findRequests} onClose={endFind} />}
       <BrowserDownloads />
       {importingCookies && hasPage && (
         <CookieImportStrip

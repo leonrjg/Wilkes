@@ -57,7 +57,7 @@ pub struct PaneBounds {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum PageEvent {
+pub(crate) enum PageEvent {
     Loading {
         url: String,
     },
@@ -84,6 +84,8 @@ enum PageEvent {
         url: String,
         reason: String,
     },
+    /// Cmd/Ctrl+F in the pane: open the find strip.
+    FindRequested,
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,7 +319,7 @@ fn file_name(path: &Path) -> String {
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
 }
 
-fn emit(app: &AppHandle, owner: &str, event: PageEvent) {
+pub(crate) fn emit(app: &AppHandle, owner: &str, event: PageEvent) {
     if let Err(e) = app.emit_to(owner, PAGE_EVENT, event) {
         error!("browser pane: could not tell {owner} about its page: {e}");
     }
@@ -404,13 +406,14 @@ pub async fn browser_pane_show(
     #[cfg(not(target_os = "macos"))]
     let builder = builder.data_directory(crate::app_context(&app).shared_data_dir.join("browser"));
 
-    window
+    let webview = window
         .add_child(
             builder,
             LogicalPosition::new(bounds.x, bounds.y),
             LogicalSize::new(bounds.width, bounds.height),
         )
         .map_err(|e| e.to_string())?;
+    crate::browser_find::listen_for_find_key(&webview, &app, &owner);
     Ok(())
 }
 
@@ -501,7 +504,10 @@ pub async fn browser_pane_clear_data(window: Window) -> Result<(), String> {
 #[tauri::command]
 pub async fn browser_pane_close(window: Window) -> Result<(), String> {
     match pane(&window) {
-        Ok(webview) => webview.close().map_err(|e| e.to_string()),
+        Ok(webview) => {
+            crate::browser_find::stop_listening(&webview, window.label());
+            webview.close().map_err(|e| e.to_string())
+        }
         Err(_) => Ok(()),
     }
 }

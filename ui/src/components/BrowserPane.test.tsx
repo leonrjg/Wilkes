@@ -11,6 +11,8 @@ vi.mock("../services", () => ({
     browserPaneStep: vi.fn(() => Promise.resolve()),
     browserPaneClearData: vi.fn(() => Promise.resolve()),
     browserPaneSavePage: vi.fn(() => Promise.resolve()),
+    browserPaneFind: vi.fn(() => Promise.resolve({ found: true, matches: null })),
+    browserPaneEndFind: vi.fn(() => Promise.resolve()),
     browserPaneClose: vi.fn(() => Promise.resolve()),
     onBrowserPanePage: vi.fn(() => Promise.resolve(() => {})),
     openPath: vi.fn(() => Promise.resolve()),
@@ -42,6 +44,8 @@ describe("BrowserPane", () => {
       loading: false,
       held: false,
       invertLightPages: true,
+      finding: false,
+      findRequests: 0,
     });
     useSettingsStore.setState({ colorScheme: "light", settings: { dark_mode_inversion: 80 } as Settings });
   });
@@ -76,6 +80,24 @@ describe("BrowserPane", () => {
       expect.objectContaining({ x: expect.any(Number), width: expect.any(Number) }),
       [30, 31, 34],
     );
+  });
+
+  it("opens the find strip for Cmd/Ctrl+F in the pane, and ends the find on Escape", async () => {
+    useBrowserStore.setState({ request: { url: "https://example.org/" }, url: "https://example.org/" });
+    await act(async () => {
+      render(<BrowserPane />);
+    });
+    expect(screen.queryByLabelText("Find in page")).toBeNull();
+    await act(async () => {
+      useBrowserStore.getState().applyPageEvent({ kind: "find_requested" });
+    });
+    const input = screen.getByLabelText("Find in page");
+    expect(input).toHaveFocus();
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Escape" });
+    });
+    expect(screen.queryByLabelText("Find in page")).toBeNull();
+    expect(api.browserPaneEndFind).toHaveBeenCalled();
   });
 
   it("navigates to what is typed in the address bar", async () => {

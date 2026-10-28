@@ -106,7 +106,15 @@ export type BrowserPageEvent =
   | { kind: "title"; title: string }
   | { kind: "download_started"; url: string; name: string; path: string }
   | { kind: "download_finished"; url: string; name: string; path: string; success: boolean }
-  | { kind: "download_refused"; url: string; reason: string };
+  | { kind: "download_refused"; url: string; reason: string }
+  | { kind: "find_requested" };
+
+/** What finding in the pane's page turned up. `matches` is how many there
+ *  are, where the platform counts them. */
+export interface BrowserFound {
+  found: boolean;
+  matches: number | null;
+}
 
 // Shared across desktop and web. All methods are identical.
 export interface SearchApi {
@@ -154,6 +162,11 @@ export interface SearchApi {
   browserPaneClearData?(): Promise<void>;
   /** Save what the pane is showing into the library root, as a download. */
   browserPaneSavePage?(): Promise<void>;
+  /** Find in the pane's page with the platform's own find: the next match, or
+   *  with `backwards` the one before. The same text again steps on. */
+  browserPaneFind?(query: string, backwards: boolean): Promise<BrowserFound>;
+  /** Stop finding and give the keyboard back to the page. */
+  browserPaneEndFind?(): Promise<void>;
   browserCookieSources?(): Promise<CookieSourceInfo[]>;
   /** Copy one site's cookies from the user's browser into the pane; returns
    *  how many were copied. */
