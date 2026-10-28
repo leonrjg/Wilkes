@@ -86,6 +86,10 @@ pub(crate) enum PageEvent {
     },
     /// Cmd/Ctrl+F in the pane: open the find strip.
     FindRequested,
+    /// The link the pointer is now over, or none.
+    Hover {
+        url: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -414,6 +418,7 @@ pub async fn browser_pane_show(
         )
         .map_err(|e| e.to_string())?;
     crate::browser_find::listen_for_find_key(&webview, &app, &owner);
+    crate::browser_hover::listen_for_hover(&webview, &app, &owner);
     Ok(())
 }
 
@@ -506,6 +511,7 @@ pub async fn browser_pane_close(window: Window) -> Result<(), String> {
     match pane(&window) {
         Ok(webview) => {
             crate::browser_find::stop_listening(&webview, window.label());
+            crate::browser_hover::stop_listening(&webview, window.label());
             webview.close().map_err(|e| e.to_string())
         }
         Err(_) => Ok(()),

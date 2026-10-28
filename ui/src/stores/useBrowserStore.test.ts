@@ -106,3 +106,20 @@ describe("useBrowserStore find", () => {
     expect(useBrowserStore.getState().finding).toBe(false);
   });
 });
+
+describe("useBrowserStore hovered link", () => {
+  beforeEach(() => {
+    useBrowserStore.setState({ paneOpen: true, hoveredLink: null });
+  });
+
+  it("follows the link under the pointer, and forgets it on the next page", () => {
+    const { applyPageEvent } = useBrowserStore.getState();
+    applyPageEvent({ kind: "hover", url: "https://example.org/paper.pdf" });
+    expect(useBrowserStore.getState().hoveredLink).toBe("https://example.org/paper.pdf");
+    applyPageEvent({ kind: "hover", url: null });
+    expect(useBrowserStore.getState().hoveredLink).toBeNull();
+    applyPageEvent({ kind: "hover", url: "https://example.org/a" });
+    applyPageEvent({ kind: "loading", url: "https://example.org/a" });
+    expect(useBrowserStore.getState().hoveredLink).toBeNull();
+  });
+});

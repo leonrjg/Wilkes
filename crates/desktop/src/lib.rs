@@ -28,6 +28,7 @@ use wilkes_core::types::{
 use wilkes_core::worker::manager::WorkerStatus;
 
 mod browser_find;
+mod browser_hover;
 mod browser_pane;
 mod chat;
 mod cookie_import;

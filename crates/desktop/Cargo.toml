@@ -56,15 +56,22 @@ rookie = "0.5.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
-# The browser pane's own background, and its find, which Tauri has no way to.
+# The browser pane's own background, its find and the link under the
+# pointer, which Tauri has no way to.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSValue"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSObject", "NSString", "NSURL", "NSValue"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSEvent", "NSResponder", "NSView", "NSWindow"] }
 objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "WKWebView", "WKFindConfiguration", "WKFindResult"] }
 block2 = "0.6"
 
+[target.'cfg(windows)'.dependencies]
+# The link under the pointer in the browser pane, which Tauri has no way to.
+webview2-com = "0.38"
+windows-core = "0.61"
+
 [target.'cfg(target_os = "linux")'.dependencies]
-# The browser pane's find, which Tauri has no way to.
+# The browser pane's find and the link under the pointer, which Tauri has no
+# way to.
 webkit2gtk = "2.0"
 gtk = "0.18"
 

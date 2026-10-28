@@ -81,6 +81,7 @@ export default function BrowserPane() {
   const toggleInversion = useBrowserStore((s) => s.toggleInversion);
   const finding = useBrowserStore((s) => s.finding);
   const findRequests = useBrowserStore((s) => s.findRequests);
+  const hoveredLink = useBrowserStore((s) => s.hoveredLink);
   const dark = useSettingsStore((s) => s.colorScheme === "dark");
   const inversionPercent = useSettingsStore((s) => s.settings?.dark_mode_inversion ?? 90);
   // The reader's inversion, at the reader's strength.
@@ -300,6 +301,14 @@ export default function BrowserPane() {
           </p>
         )}
       </div>
+      {/* Where a browser shows a link's address on hover. Always there, so
+          the page above does not resize as the pointer crosses links. */}
+      <p
+        aria-label="Link under the pointer"
+        className="h-[18px] shrink-0 truncate border-t border-[var(--border-main)] px-2 text-[10px] leading-[17px] text-[var(--text-muted)]"
+      >
+        {hoveredLink}
+      </p>
     </div>
   );
 }

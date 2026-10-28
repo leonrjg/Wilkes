@@ -32,6 +32,8 @@ interface BrowserStore {
   invertLightPages: boolean;
   /** This session's downloads, newest first, until cleared. */
   downloads: BrowserDownload[];
+  /** The link the pointer is over in the page, for the pane's status line. */
+  hoveredLink: string | null;
   /** The find strip is open. */
   finding: boolean;
   /** How many times Cmd/Ctrl+F has asked for the strip, so asking again while
@@ -62,6 +64,7 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
   held: false,
   invertLightPages: true,
   downloads: [],
+  hoveredLink: null,
   finding: false,
   findRequests: 0,
   show: (url) => set({ paneOpen: true, request: { url } }),
@@ -70,11 +73,11 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
     if (paneOpen) set({ paneOpen: false });
     else set({ paneOpen: true, request: url ? { url } : null });
   },
-  closePane: () => set({ paneOpen: false, loading: false, finding: false }),
+  closePane: () => set({ paneOpen: false, loading: false, finding: false, hoveredLink: null }),
   applyPageEvent: (event) => {
     switch (event.kind) {
       case "loading":
-        set({ url: event.url, loading: true });
+        set({ url: event.url, loading: true, hoveredLink: null });
         break;
       case "loaded":
         set({ url: event.url, loading: false });
@@ -107,6 +110,9 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
             reason: event.reason,
           }),
         }));
+        break;
+      case "hover":
+        set({ hoveredLink: event.url });
         break;
       case "find_requested":
         set((state) => ({ finding: true, findRequests: state.findRequests + 1 }));

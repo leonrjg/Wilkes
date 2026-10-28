@@ -46,6 +46,7 @@ describe("BrowserPane", () => {
       invertLightPages: true,
       finding: false,
       findRequests: 0,
+      hoveredLink: null,
     });
     useSettingsStore.setState({ colorScheme: "light", settings: { dark_mode_inversion: 80 } as Settings });
   });
@@ -98,6 +99,18 @@ describe("BrowserPane", () => {
     });
     expect(screen.queryByLabelText("Find in page")).toBeNull();
     expect(api.browserPaneEndFind).toHaveBeenCalled();
+  });
+
+  it("shows the link under the pointer below the page", async () => {
+    await act(async () => {
+      render(<BrowserPane />);
+    });
+    const line = screen.getByLabelText("Link under the pointer");
+    expect(line).toBeEmptyDOMElement();
+    await act(async () => {
+      useBrowserStore.getState().applyPageEvent({ kind: "hover", url: "https://example.org/paper.pdf" });
+    });
+    expect(line).toHaveTextContent("https://example.org/paper.pdf");
   });
 
   it("navigates to what is typed in the address bar", async () => {
