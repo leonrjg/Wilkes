@@ -20,6 +20,36 @@ describe("TauriSearchApi", () => {
     api = new TauriSearchApi();
   });
 
+  it("opens and closes the browser pane one change at a time, in order", async () => {
+    const answers: Array<() => void> = [];
+    (invoke as any).mockImplementation(
+      (command: string) =>
+        new Promise<void>((resolve, reject) =>
+          answers.push(command === "browser_pane_close" ? () => reject(new Error("no pane")) : resolve),
+        ),
+    );
+    const bounds = { x: 0, y: 0, width: 100, height: 100 };
+    // React's development mount, unmount and mount of a new pane.
+    const first = api.browserPaneShow("https://example.org/", bounds, [0, 0, 0]);
+    const close = api.browserPaneClose();
+    const second = api.browserPaneShow("https://example.org/", bounds, [0, 0, 0]);
+    await Promise.resolve();
+    expect(invoke).toHaveBeenCalledTimes(1);
+
+    answers[0]();
+    await first;
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(2));
+    expect(invoke).toHaveBeenLastCalledWith("browser_pane_close");
+
+    // A change that fails still lets the next one through, and its caller hears it.
+    answers[1]();
+    await expect(close).rejects.toThrow("no pane");
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(3));
+    answers[2]();
+    await second;
+    expect(invoke).toHaveBeenLastCalledWith("browser_pane_show", expect.objectContaining({ url: "https://example.org/" }));
+  });
+
   it("reads generic startup status before the app runtime is used", async () => {
     (invoke as any).mockResolvedValue({ blockers: [] });
     await expect(api.getStartupStatus()).resolves.toEqual({ blockers: [] });

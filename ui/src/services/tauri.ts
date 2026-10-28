@@ -101,6 +101,21 @@ import type {
   CookieSourceInfo,
 } from "./api";
 
+/** The browser pane is opened and closed in the order the page asks, each
+ *  change after the last has landed. Sent all at once they could land in any
+ *  order -- React, in development, mounts a new pane, unmounts it and mounts
+ *  it again, a show, a close and a show -- and two shows in flight together
+ *  would both find no pane and both try to make one, the second failing with
+ *  its label taken. */
+let paneChanges: Promise<unknown> = Promise.resolve();
+
+function inTurn<T>(change: () => Promise<T>): Promise<T> {
+  const landed = paneChanges.then(change, change);
+  // The next change waits for this one either way; its caller hears how it went.
+  paneChanges = landed.catch(() => undefined);
+  return landed;
+}
+
 export class TauriSearchApi implements SearchApi {
   async getStartupStatus(): Promise<StartupStatus> {
     return invoke<StartupStatus>("get_startup_status");
@@ -422,7 +437,7 @@ export class TauriSearchApi implements SearchApi {
   }
 
   async browserPaneShow(url: string, bounds: PaneBounds, background: RgbColor): Promise<void> {
-    return invoke("browser_pane_show", { url, bounds, background });
+    return inTurn(() => invoke("browser_pane_show", { url, bounds, background }));
   }
 
   async browserPaneSetBounds(bounds: PaneBounds): Promise<void> {
@@ -466,7 +481,7 @@ export class TauriSearchApi implements SearchApi {
   }
 
   async browserPaneClose(): Promise<void> {
-    return invoke("browser_pane_close");
+    return inTurn(() => invoke("browser_pane_close"));
   }
 
   async onBrowserPanePage(handler: (event: BrowserPageEvent) => void): Promise<() => void> {
