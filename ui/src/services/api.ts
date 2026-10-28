@@ -39,6 +39,9 @@ import type {
   CitationLinks,
   CitationLinksQuery,
   NewBookmark,
+  LiteratureSearchResult,
+  NewSavedWork,
+  SavedWork,
   PreviewData,
   RelatedDocument,
   RelatedDocumentsQuery,
@@ -197,6 +200,19 @@ export interface SearchApi {
   addBookmark(bookmark: NewBookmark): Promise<Bookmark>;
   removeBookmark(id: string): Promise<void>;
   updateBookmarkNote(id: string, note: string | null): Promise<Bookmark>;
+  listSavedWorks(): Promise<SavedWork[]>;
+  /** Saving what is already saved — the same result, or the same DOI from
+   *  another provider — returns the work held. */
+  saveWork(work: NewSavedWork): Promise<SavedWork>;
+  removeSavedWork(id: string): Promise<void>;
+  updateSavedWorkNote(id: string, note: string | null): Promise<SavedWork>;
+  /** Records where a result landed in the library, if it is saved; null when
+   *  it was not. */
+  markSavedWorkAcquired(
+    provider: string,
+    work: LiteratureSearchResult,
+    path: string,
+  ): Promise<SavedWork | null>;
   clusterBookmarks(query: BookmarkClustersQuery): Promise<BookmarkClustersResult>;
   chunkTopics(requestId: string, query: ChunkTopicsQuery): Promise<ChunkTopicsResult>;
   cancelChunkTopics(requestId: string): Promise<void>;

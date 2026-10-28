@@ -8,9 +8,16 @@ import type {
   LiteratureSearchResult,
 } from "../lib/types";
 
+vi.mock("./Toast", () => ({ useToasts: () => ({ addToast: vi.fn() }) }));
+
 vi.mock("../services", () => ({
   isTauri: true,
   api: {
+    listSavedWorks: vi.fn(() => Promise.resolve([])),
+    saveWork: vi.fn(),
+    removeSavedWork: vi.fn(() => Promise.resolve()),
+    markSavedWorkAcquired: vi.fn(() => Promise.resolve(null)),
+    updateSavedWorkNote: vi.fn(),
     catalogueAcquire: vi.fn(),
     catalogueAcquireCourse: vi.fn(),
     literatureProviders: vi.fn(),
@@ -73,6 +80,8 @@ function setCatalogue(partial: Record<string, unknown>) {
   useCatalogueStore.setState(shared);
 }
 import { useGenerationStore } from "../stores/useGenerationStore";
+import { useSavedWorksStore } from "../stores/useSavedWorksStore";
+import { useViewerStore } from "../stores/useViewerStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 
@@ -265,6 +274,7 @@ describe("CataloguePane", () => {
     useSettingsStore.setState({ directory: "/library", refreshFileList: vi.fn() as never });
     useWorkspaceStore.setState({ workspaces: [], activeWorkspaceId: null } as never);
     useGenerationStore.setState({ ready: false });
+    useSavedWorksStore.setState({ works: [] });
     composeCancel.mockResolvedValue(undefined);
     providers.mockResolvedValue([
       provider("semantic_scholar", "Semantic Scholar"),
@@ -298,6 +308,65 @@ describe("CataloguePane", () => {
       ],
     });
   };
+
+  /// What was kept is listed as the rows a search shows, newest first, each
+  /// with where it landed in the library and the user's note.
+  it("lists the saved works with where each landed and a note to edit", async () => {
+    const openFile = vi.fn();
+    useViewerStore.setState({ openFile } as never);
+    const older = {
+      id: "s1",
+      provider: "openalex",
+      work: WORK,
+      note: "read the proofs",
+      saved_at: "2026-10-01T00:00:00Z",
+      acquired: { path: "/library/lists.pdf", acquired_at: "2026-10-02T00:00:00Z" },
+    };
+    const newer = {
+      id: "s2",
+      provider: "devdocs",
+      work: REFERENCE,
+      note: null,
+      saved_at: "2026-10-03T00:00:00Z",
+      acquired: null,
+    };
+    useSavedWorksStore.setState({ works: [older, newer] });
+    (api.updateSavedWorkNote as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...newer,
+      note: "the dict chapter",
+    });
+    render(<CataloguePane pane={pane()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Saved works" }));
+    expect(screen.queryByLabelText("Search catalogues and literature")).toBeNull();
+    const titles = screen
+      .getAllByText(/Persistent Lists Revisited|Python 3\.12/)
+      .map((element) => element.textContent);
+    expect(titles).toEqual(["Python 3.12", "Persistent Lists Revisited"]);
+    expect(screen.getByText("read the proofs")).toBeTruthy();
+
+    fireEvent.click(screen.getByLabelText("Open Persistent Lists Revisited from the library"));
+    expect(openFile).toHaveBeenCalledWith("/library/lists.pdf");
+
+    fireEvent.click(screen.getByLabelText("Add note for Python 3.12"));
+    fireEvent.change(screen.getByLabelText("Note for Python 3.12"), {
+      target: { value: "the dict chapter" },
+    });
+    fireEvent.click(screen.getByText("Save note"));
+    await waitFor(() =>
+      expect(api.updateSavedWorkNote).toHaveBeenCalledWith("s2", "the dict chapter"),
+    );
+    expect(await screen.findByText("the dict chapter")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Saved works" }));
+    expect(screen.getByLabelText("Search catalogues and literature")).toBeTruthy();
+  });
+
+  it("says when nothing has been saved", () => {
+    render(<CataloguePane pane={pane()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Saved works" }));
+    expect(screen.getByText(/Nothing saved yet/)).toBeTruthy();
+  });
 
   it("clears the catalogue query and results, refocuses the input, and preserves filters and downloads", async () => {
     render(<CataloguePane pane={pane()} />);

@@ -5,6 +5,7 @@ import { api } from "../services";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
+import { useSavedWorksStore } from "../stores/useSavedWorksStore";
 import { useGenerationStore } from "../stores/useGenerationStore";
 import { useTopicsStore } from "../stores/useTopicsStore";
 import { useSearchStore } from "../stores/useSearchStore";
@@ -104,6 +105,7 @@ export function useGlobalEvents() {
       // An MCP edit has no initiating screen to refresh these projections.
       void Promise.all([
         useBookmarksStore.getState().load(),
+        useSavedWorksStore.getState().load(),
         useResearchStore.getState().load(),
         useSettingsStore.getState().refreshFileList(),
       ]).catch((error) => addToast(`Could not refresh the library: ${error}`, { type: "error" }));

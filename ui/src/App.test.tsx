@@ -15,6 +15,10 @@ import { api, source } from "./services";
 // Mock services and hooks at top level
 vi.mock("./services", () => ({
   api: {
+    listSavedWorks: vi.fn(() => Promise.resolve([])),
+    saveWork: vi.fn(),
+    removeSavedWork: vi.fn(() => Promise.resolve()),
+    markSavedWorkAcquired: vi.fn(() => Promise.resolve(null)),
     onEmbedProgress: vi.fn(() => Promise.resolve(() => {})),
     onEmbedDone: vi.fn(() => Promise.resolve(() => {})),
     onEmbedError: vi.fn(() => Promise.resolve(() => {})),

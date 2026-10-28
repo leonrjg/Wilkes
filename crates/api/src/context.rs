@@ -58,6 +58,7 @@ use wilkes_core::types::{
 };
 use wilkes_core::types::{
     GenerationSettings, GenerationStreamEvent, GenerationTask, GeneratorDescriptor,
+    LiteratureSearchResult, NewSavedWork, SavedWork,
 };
 use wilkes_core::worker::ipc::WorkerKind;
 use wilkes_core::worker::manager::{
@@ -103,6 +104,7 @@ impl wilkes_agent::search::SearchService for AppContext {
         let result: anyhow::Result<serde_json::Value> = async {
             Ok(match kind {
                 LibraryKind::Bookmarks => serde_json::to_value(self.list_bookmarks().await?)?,
+                LibraryKind::SavedWorks => serde_json::to_value(self.list_saved_works().await?)?,
                 LibraryKind::Tags => serde_json::to_value(self.list_tags()?)?,
                 LibraryKind::SearchHistory => serde_json::to_value(self.list_search_log(1000)?)?,
             })
@@ -143,6 +145,13 @@ impl wilkes_agent::search::SearchService for AppContext {
                 }
                 Edit::RemoveBookmark { id } => {
                     self.remove_bookmark(&id).await?;
+                    serde_json::json!({"removed":id})
+                }
+                Edit::UpdateSavedWorkNote { id, note } => {
+                    serde_json::to_value(self.update_saved_work_note(&id, note)?)?
+                }
+                Edit::RemoveSavedWork { id } => {
+                    self.remove_saved_work(&id)?;
                     serde_json::json!({"removed":id})
                 }
                 Edit::CreateTag { name, color } => {
@@ -194,6 +203,34 @@ impl wilkes_agent::search::SearchService for AppContext {
         }
         .await;
         result.map_err(|e| format!("{e:#}"))
+    }
+
+    async fn save_literature_result(
+        self: Arc<Self>,
+        provider: String,
+        work: LiteratureSearchResult,
+        note: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        self.ensure_writable().map_err(|e| e.to_string())?;
+        let result: anyhow::Result<serde_json::Value> = (|| {
+            Ok(serde_json::to_value(self.save_work(NewSavedWork {
+                provider,
+                work,
+                note,
+            })?)?)
+        })();
+        result.map_err(|e| format!("{e:#}"))
+    }
+
+    async fn mark_literature_acquired(
+        self: Arc<Self>,
+        provider: String,
+        work: LiteratureSearchResult,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        self.mark_saved_work_acquired(&provider, &work, path)
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
     }
 
     async fn default_root(self: Arc<Self>) -> Option<PathBuf> {
@@ -1745,8 +1782,27 @@ impl AppContext {
     /// been re-listed yet). Such a bookmark simply resolves on a later read once
     /// a listing has populated the cache; it never fails to load.
     fn resolve_bookmark_paths(&self, bookmarks: &mut [Bookmark], settings: &Settings) {
+        self.resolve_moved_paths(
+            bookmarks
+                .iter_mut()
+                .map(|bookmark| (&mut bookmark.path, bookmark.identity)),
+            settings,
+        );
+    }
+
+    /// The re-pointing [`Self::resolve_bookmark_paths`] describes, for any
+    /// record that holds a path and the identity captured with it.
+    fn resolve_moved_paths<'a>(
+        &self,
+        entries: impl Iterator<Item = (&'a mut PathBuf, Option<FileIdentity>)>,
+        settings: &Settings,
+    ) {
+        let stale: Vec<(&mut PathBuf, FileIdentity)> = entries
+            .filter(|(path, _)| !path.exists())
+            .filter_map(|(path, identity)| identity.map(|identity| (path, identity)))
+            .collect();
         // Avoid opening/locking the cache unless something is actually stale.
-        if bookmarks.iter().all(|b| b.path.exists()) {
+        if stale.is_empty() {
             return;
         }
         let (preferred_roots, _) = library_roots(settings);
@@ -1756,19 +1812,13 @@ impl AppContext {
         let Ok(guard) = cache.lock() else {
             return;
         };
-        for bookmark in bookmarks.iter_mut() {
-            if bookmark.path.exists() {
-                continue;
-            }
-            let Some(identity) = bookmark.identity else {
-                continue;
-            };
+        for (path, identity) in stale {
             match guard.find_current_path(identity, &preferred_roots) {
                 Ok(Some(current)) => {
-                    bookmark.path = current;
+                    *path = current;
                 }
                 Ok(None) => {}
-                Err(e) => error!("bookmark path resolution {}: {e:#}", bookmark.id),
+                Err(e) => error!("path resolution {}: {e:#}", path.display()),
             }
         }
     }
@@ -1799,6 +1849,87 @@ impl AppContext {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .update_bookmark_note(id, note)
+    }
+
+    pub async fn list_saved_works(&self) -> anyhow::Result<Vec<SavedWork>> {
+        let mut works = self
+            .research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .list_saved_works()?;
+        let settings = self.get_settings().await;
+        self.resolve_moved_paths(
+            works
+                .iter_mut()
+                .filter_map(|saved| saved.acquired.as_mut())
+                .map(|acquired| (&mut acquired.path, acquired.identity)),
+            &settings,
+        );
+        Ok(works)
+    }
+
+    pub fn save_work(&self, new: NewSavedWork) -> anyhow::Result<SavedWork> {
+        let saved = self
+            .research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .save_work(new)?;
+        self.events.emit(
+            "research-state-updated",
+            serde_json::json!({"kind":"saved_works"}),
+        );
+        Ok(saved)
+    }
+
+    pub fn remove_saved_work(&self, id: &str) -> anyhow::Result<()> {
+        self.research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove_saved_work(id)?;
+        self.events.emit(
+            "research-state-updated",
+            serde_json::json!({"kind":"saved_works"}),
+        );
+        Ok(())
+    }
+
+    pub fn update_saved_work_note(
+        &self,
+        id: &str,
+        note: Option<String>,
+    ) -> anyhow::Result<SavedWork> {
+        let saved = self
+            .research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .update_saved_work_note(id, note)?;
+        self.events.emit(
+            "research-state-updated",
+            serde_json::json!({"kind":"saved_works"}),
+        );
+        Ok(saved)
+    }
+
+    /// The one place a saved work is marked as in the library, whoever added
+    /// it: the pane once its import has finished, or the MCP download.
+    pub fn mark_saved_work_acquired(
+        &self,
+        provider: &str,
+        work: &LiteratureSearchResult,
+        path: PathBuf,
+    ) -> anyhow::Result<Option<SavedWork>> {
+        let saved = self
+            .research_store()?
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .mark_saved_work_acquired(provider, work, path)?;
+        if saved.is_some() {
+            self.events.emit(
+                "research-state-updated",
+                serde_json::json!({"kind":"saved_works"}),
+            );
+        }
+        Ok(saved)
     }
 
     pub async fn cluster_bookmarks(
@@ -10564,6 +10695,47 @@ mod tests {
         let (ctx, _rx, _loop) =
             AppContext::new(dir.path().to_path_buf(), settings_path, paths, emitter);
         (dir, ctx)
+    }
+
+    #[tokio::test]
+    async fn saved_work_acquisition_follows_a_renamed_file() {
+        let (dir, ctx) = test_ctx();
+        let work: LiteratureSearchResult = serde_json::from_value(serde_json::json!({
+            "id": "W1",
+            "title": "A Study",
+            "is_open_access": true,
+        }))
+        .unwrap();
+        ctx.save_work(NewSavedWork {
+            provider: "openalex".into(),
+            work: work.clone(),
+            note: None,
+        })
+        .unwrap();
+        let landed = dir.path().join("study.pdf");
+        std::fs::write(&landed, b"pdf").unwrap();
+        ctx.mark_saved_work_acquired("openalex", &work, landed.clone())
+            .unwrap()
+            .expect("the saved work is marked");
+
+        let renamed = dir.path().join("renamed.pdf");
+        std::fs::rename(&landed, &renamed).unwrap();
+        let identity = FileIdentity::for_path(&renamed).unwrap();
+        ctx.metadata_cache()
+            .expect("cache opens")
+            .lock()
+            .unwrap()
+            .upsert(
+                &renamed,
+                identity,
+                &DocumentMetadata::default(),
+                MetadataSource::File,
+            )
+            .unwrap();
+
+        let works = ctx.list_saved_works().await.unwrap();
+        assert_eq!(works.len(), 1);
+        assert_eq!(works[0].acquired.as_ref().unwrap().path, renamed);
     }
 
     #[tokio::test]

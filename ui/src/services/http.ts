@@ -46,6 +46,8 @@ import type {
   CitationLinks,
   CitationLinksQuery,
   NewBookmark,
+  NewSavedWork,
+  SavedWork,
   PreviewData,
   RelatedDocument,
   RelatedDocumentsQuery,
@@ -327,6 +329,51 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw new Error(`updateBookmarkNote failed: ${res.status}`);
     return res.json() as Promise<Bookmark>;
+  }
+
+  async listSavedWorks(): Promise<SavedWork[]> {
+    const res = await fetch("/api/saved-works");
+    if (!res.ok) throw new Error(`listSavedWorks failed: ${res.status}`);
+    return res.json() as Promise<SavedWork[]>;
+  }
+
+  async saveWork(work: NewSavedWork): Promise<SavedWork> {
+    const res = await fetch("/api/saved-works", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(work),
+    });
+    if (!res.ok) throw new Error(`saveWork failed: ${res.status}`);
+    return res.json() as Promise<SavedWork>;
+  }
+
+  async removeSavedWork(id: string): Promise<void> {
+    const res = await fetch(`/api/saved-works/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!res.ok && res.status !== 204) throw new Error(`removeSavedWork failed: ${res.status}`);
+  }
+
+  async updateSavedWorkNote(id: string, note: string | null): Promise<SavedWork> {
+    const res = await fetch(`/api/saved-works/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note }),
+    });
+    if (!res.ok) throw new Error(`updateSavedWorkNote failed: ${res.status}`);
+    return res.json() as Promise<SavedWork>;
+  }
+
+  async markSavedWorkAcquired(
+    provider: string,
+    work: LiteratureSearchResult,
+    path: string,
+  ): Promise<SavedWork | null> {
+    const res = await fetch("/api/saved-works/acquired", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, work, path }),
+    });
+    if (!res.ok) throw new Error(`markSavedWorkAcquired failed: ${res.status}`);
+    return res.json() as Promise<SavedWork | null>;
   }
 
   async listFiles(root: string, collectionId?: string | null, tagIds: string[] = [], collectionExpression?: string | null): Promise<FileListResponse> {

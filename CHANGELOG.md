@@ -7,6 +7,7 @@
 - Settings includes an HTTP Requests tab with the latest 500 directly initiated host HTTP calls, retained in memory for the session. Worker and library-internal traffic is excluded.
 - Library downloads default to a 1 GB per-file limit, configurable in Settings → General.
 - More than one chat or literature pane can be open at once, each with its own conversation or search. Open another from the chevron beside the toolbar button; requests such as "Ask about this file" go to the pane last used.
+- Literature and catalogue results can be saved for later with the bookmark button on a result, and listed from the bookmark button in the literature pane's header. A saved work keeps the result as it was found, takes a note, and once added to the library stays on the list, linked to the file. The same DOI from another provider counts as the same saved work. MCP clients can save a `literature_search` result with `save_literature_result`, and list, annotate or remove saved works with `read_library` and `edit_library`.
 
 ### Fixed
 

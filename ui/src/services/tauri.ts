@@ -50,6 +50,8 @@ import type {
   DocumentMetadata,
   EmbedderCapabilityManifest,
   NewBookmark,
+  NewSavedWork,
+  SavedWork,
   PreviewData,
   CitationLinks,
   CitationLinksQuery,
@@ -252,6 +254,30 @@ export class TauriSearchApi implements SearchApi {
 
   async updateBookmarkNote(id: string, note: string | null): Promise<Bookmark> {
     return invoke<Bookmark>("update_bookmark_note", { id, note });
+  }
+
+  async listSavedWorks(): Promise<SavedWork[]> {
+    return invoke<SavedWork[]>("list_saved_works");
+  }
+
+  async saveWork(work: NewSavedWork): Promise<SavedWork> {
+    return invoke<SavedWork>("save_work", { work });
+  }
+
+  async removeSavedWork(id: string): Promise<void> {
+    return invoke("remove_saved_work", { id });
+  }
+
+  async updateSavedWorkNote(id: string, note: string | null): Promise<SavedWork> {
+    return invoke<SavedWork>("update_saved_work_note", { id, note });
+  }
+
+  async markSavedWorkAcquired(
+    provider: string,
+    work: LiteratureSearchResult,
+    path: string,
+  ): Promise<SavedWork | null> {
+    return invoke<SavedWork | null>("mark_saved_work_acquired", { provider, work, path });
   }
 
   async clusterBookmarks(query: BookmarkClustersQuery): Promise<BookmarkClustersResult> {

@@ -3442,6 +3442,48 @@ pub struct ResolvedLiteratureDownload {
     pub filename: Option<String>,
 }
 
+/// A literature result kept for later: a work the user has found but does not
+/// hold yet.
+///
+/// Not a [`Bookmark`]. A bookmark points into a file of the library; a saved
+/// work is known only by the provider that returned it, so it carries the
+/// result itself — copied when it was saved, because the provider may be
+/// unreachable, or a mirrored catalogue re-synced under new ids, when the user
+/// comes back to it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SavedWork {
+    pub id: String,
+    /// The provider that returned the work, as the registry names it.
+    pub provider: String,
+    pub work: LiteratureSearchResult,
+    #[serde(default)]
+    pub note: Option<String>,
+    pub saved_at: String,
+    /// Where the work landed once it was added to the library. A saved work
+    /// stays saved after it is acquired, marked by this.
+    #[serde(default)]
+    pub acquired: Option<SavedWorkAcquisition>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SavedWorkAcquisition {
+    pub path: PathBuf,
+    /// Content fingerprint of the acquired file, so the mark follows a rename
+    /// exactly as a bookmark does. `None` only when the file could not be
+    /// stat-ed when it was recorded.
+    #[serde(default)]
+    pub identity: Option<crate::metadata::cache::FileIdentity>,
+    pub acquired_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NewSavedWork {
+    pub provider: String,
+    pub work: LiteratureSearchResult,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
 /// What kind of source a catalogue record is, which decides what it can
 /// answer. A gap in an API's behaviour is answered by `Reference` and never
 /// well by `Textbook`; a subject with no ordering yet is answered by `Course`.

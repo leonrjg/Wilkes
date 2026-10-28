@@ -390,27 +390,34 @@ struct WilkesMcp {
 impl WilkesMcp {
     /// The file a literature result names, resolved here so the URL never
     /// passes through the model.
-    async fn resolve_literature_download(
+    /// The full record of a result an earlier `literature_search` returned.
+    fn cached_literature_result(
         &self,
         provider: &str,
         result_id: &str,
-    ) -> Result<ResolvedLiteratureDownload, String> {
-        let result = self
-            .literature_results
+    ) -> Result<LiteratureSearchResult, String> {
+        self.literature_results
             .lock()
             .unwrap()
             .get(&(provider.to_string(), result_id.to_string()))
             .cloned()
             .ok_or_else(|| {
                 format!(
-                    "No result '{result_id}' from {provider} is available to download; run literature_search again and use an id it returns."
+                    "No result '{result_id}' from {provider} is available; run literature_search again and use an id it returns."
                 )
-            })?;
+            })
+    }
+
+    async fn resolve_literature_download(
+        &self,
+        provider: &str,
+        result: &LiteratureSearchResult,
+    ) -> Result<ResolvedLiteratureDownload, String> {
         let registry = self.literature_registry().await;
         let source = registry
             .literature_for_search(provider)
             .map_err(|error| error.to_string())?;
-        match source.resolve_download(&result).await {
+        match source.resolve_download(result).await {
             Ok(Some(download)) => Ok(download),
             Ok(None) => Err(format!(
                 "{} did not provide a downloadable file for result '{}'",
@@ -985,6 +992,20 @@ struct DownloadParams {
     workspace: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SaveLiteratureResultParams {
+    /// Literature provider id the result came from.
+    provider: String,
+    /// The id of a result returned by literature_search for provider.
+    result_id: String,
+    /// Why the work is worth coming back to, in the user's words.
+    note: Option<String>,
+    /// Workspace id to save into, from list_context. Omit for the workspace
+    /// that is active in Wilkes. Naming one does not switch the app to it.
+    workspace: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct LiteratureSearchResponse {
     query: String,
@@ -1288,7 +1309,7 @@ struct EditLibraryParams {
 #[tool_router]
 impl WilkesMcp {
     #[tool(
-        description = "Read bookmarks (quotes and notes), tags, or recent search_history from a workspace. Offset is zero-based and limit is 1..500 (default 50). Search history covers the most recent 1000 entries. Use list_smart_collections for collections."
+        description = "Read bookmarks (quotes and notes), saved_works (literature results kept for later, each with where it landed if added to the library), tags, or recent search_history from a workspace. Offset is zero-based and limit is 1..500 (default 50). Search history covers the most recent 1000 entries. Use list_smart_collections for collections."
     )]
     async fn read_library(
         &self,
@@ -1311,7 +1332,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Edit the user's Wilkes research library: add/update/remove bookmarks; create/update/delete tags and smart collections; tag documents; rename a file while preserving its index and research links; refresh document metadata. Use only for user-requested changes. Paths must resolve inside the named workspace's library roots. Managed read_only workspaces refuse every edit. Existing files are never overwritten. Bookmark page/line numbers are 1-based. Collection expressions use Wilkes's existing CEL filter schema."
+        description = "Edit the user's Wilkes research library: add/update/remove bookmarks; update the note of or remove saved works; create/update/delete tags and smart collections; tag documents; rename a file while preserving its index and research links; refresh document metadata. Use only for user-requested changes. Paths must resolve inside the named workspace's library roots. Managed read_only workspaces refuse every edit. Existing files are never overwritten. Bookmark page/line numbers are 1-based. Collection expressions use Wilkes's existing CEL filter schema."
     )]
     async fn edit_library(
         &self,
@@ -1530,14 +1551,23 @@ impl WilkesMcp {
                 return CallToolResult::error(vec![ContentBlock::text(message)]);
             }
         };
-        let (url, resolved_filename) = match (params.url, params.provider, params.result_id) {
-            (Some(url), None, None) => (url, None),
+        // The result a download names, kept so a saved one can be marked as
+        // in the library once the file is there.
+        let (url, resolved_filename, named) = match (params.url, params.provider, params.result_id)
+        {
+            (Some(url), None, None) => (url, None, None),
             (None, Some(provider), Some(result_id)) => {
-                match self
-                    .resolve_literature_download(&provider, &result_id)
-                    .await
-                {
-                    Ok(resolved) => (resolved.url, resolved.filename),
+                let resolved = match self.cached_literature_result(&provider, &result_id) {
+                    Ok(result) => self
+                        .resolve_literature_download(&provider, &result)
+                        .await
+                        .map(|resolved| (resolved, result)),
+                    Err(message) => Err(message),
+                };
+                match resolved {
+                    Ok((resolved, result)) => {
+                        (resolved.url, resolved.filename, Some((provider, result)))
+                    }
                     Err(message) => {
                         return CallToolResult::error(vec![ContentBlock::text(message)])
                     }
@@ -1567,7 +1597,44 @@ impl WilkesMcp {
         )
         .await
         {
-            Ok(response) => structured(response),
+            Ok(response) => {
+                if let (Some((provider, result)), Some(search)) = (named, scope.search()) {
+                    // The file is in the library whether or not the mark is
+                    // written, so a failure here is reported, not returned.
+                    if let Err(message) = search
+                        .mark_literature_acquired(provider, result, PathBuf::from(&response.path))
+                        .await
+                    {
+                        error!("marking a saved work as acquired failed: {message}");
+                    }
+                }
+                structured(response)
+            }
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        }
+    }
+
+    #[tool(
+        description = "Save a literature_search result to the user's saved works in Wilkes, a list of works to read or add later. Name the result by provider and result_id from literature_search; note is optional. Saving a work already saved, or the same DOI from another provider, returns the one held. Use only when the user asks to save or remember a result. Remove or annotate saved works with edit_library, list them with read_library kind saved_works. Refused for a workspace list_context reports as read_only."
+    )]
+    async fn save_literature_result(
+        &self,
+        Parameters(params): Parameters<SaveLiteratureResultParams>,
+    ) -> CallToolResult {
+        let result: Result<serde_json::Value, String> = async {
+            let scope = self.scope(params.workspace.as_deref()).await?;
+            if scope.is_read_only() {
+                return Err("MANAGED_WORKSPACE_PROTECTED: this workspace is owned by another application and can only be read".into());
+            }
+            let work = self.cached_literature_result(&params.provider, &params.result_id)?;
+            scope
+                .require_search("No research library is available")?
+                .save_literature_result(params.provider, work, params.note)
+                .await
+        }
+        .await;
+        match result {
+            Ok(value) => structured(value),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
     }
@@ -1582,7 +1649,7 @@ impl ServerHandler for WilkesMcp {
                     .with_title("Wilkes")
                     .with_description("Document search, literature and research-library tools"),
             )
-            .with_instructions("Wilkes document context and literature tools. Context and search tools are read-only. The download and edit_library tools write real library data and must only be used for user-requested changes. Managed read_only workspaces refuse writes.")
+            .with_instructions("Wilkes document context and literature tools. Context and search tools are read-only. The download, save_literature_result and edit_library tools write real library data and must only be used for user-requested changes. Managed read_only workspaces refuse writes.")
     }
 }
 
@@ -2299,6 +2366,8 @@ mod tests {
         related_response: Mutex<Option<Vec<RelatedDocument>>>,
         documents: Mutex<Option<FileListResponse>>,
         metadata: Mutex<Option<DocumentMetadata>>,
+        /// (provider, result id, note) of every result saved.
+        saved: Mutex<Vec<(String, String, Option<String>)>>,
     }
 
     #[test]
@@ -2593,6 +2662,18 @@ mod tests {
         ) -> Result<serde_json::Value, String> {
             Ok(serde_json::json!([{"id":"one"},{"id":"two"}]))
         }
+        async fn save_literature_result(
+            self: Arc<Self>,
+            provider: String,
+            work: LiteratureSearchResult,
+            note: Option<String>,
+        ) -> Result<serde_json::Value, String> {
+            self.saved
+                .lock()
+                .unwrap()
+                .push((provider.clone(), work.id.clone(), note));
+            Ok(serde_json::json!({"provider": provider, "work": work}))
+        }
 
         async fn default_root(self: Arc<Self>) -> Option<PathBuf> {
             self.default_root.clone()
@@ -2724,6 +2805,7 @@ mod tests {
 
     fn fake_search_with_root(root: PathBuf) -> Arc<FakeSearch> {
         Arc::new(FakeSearch {
+            saved: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -3535,6 +3617,7 @@ mod tests {
         let context = ContextStateHandle::default();
         context.set_search_root(Some(current_root.to_string_lossy().into_owned()));
         let search = Arc::new(FakeSearch {
+            saved: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -3749,6 +3832,7 @@ mod tests {
     async fn combined_search_response(collected: CollectedSearch) -> SearchResponse {
         let dir = tempdir().unwrap();
         let service = Arc::new(FakeSearch {
+            saved: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -3991,6 +4075,7 @@ mod tests {
         let root = dir.path().join("library");
         let active = root.join("paper.md");
         let service = Arc::new(FakeSearch {
+            saved: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -4037,6 +4122,7 @@ mod tests {
         let default_root = dir.path().join("active-root");
         let live_root = dir.path().join("live-ui-root");
         let service = Arc::new(FakeSearch {
+            saved: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -4164,6 +4250,7 @@ mod tests {
                 .into_owned(),
         ));
         let service = Arc::new(FakeSearch {
+            saved: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -4554,6 +4641,77 @@ mod tests {
         }
         assert!(file.exists());
         assert!(other.exists());
+    }
+
+    #[tokio::test]
+    async fn save_literature_result_saves_the_whole_cached_result() {
+        let root = tempdir().unwrap();
+        let service = fake_search_with_root(root.path().into());
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(single_workspace(service.clone())),
+            None,
+        );
+        let mut work: LiteratureSearchResult = serde_json::from_value(serde_json::json!({
+            "id": "W1",
+            "title": "A Study",
+            "is_open_access": true,
+        }))
+        .unwrap();
+        work.pdf_url = Some("https://example.org/a.pdf".into());
+        mcp.literature_results
+            .lock()
+            .unwrap()
+            .insert(("openalex".into(), "W1".into()), work);
+        let params = |result_id: &str| SaveLiteratureResultParams {
+            provider: "openalex".into(),
+            result_id: result_id.into(),
+            note: Some("for chapter 2".into()),
+            workspace: None,
+        };
+
+        let reply = mcp.save_literature_result(Parameters(params("W1"))).await;
+        assert_ne!(reply.is_error, Some(true));
+        // The URL the model never saw is in what was saved.
+        assert_eq!(
+            reply.structured_content.unwrap()["work"]["pdf_url"],
+            "https://example.org/a.pdf"
+        );
+        assert_eq!(
+            *service.saved.lock().unwrap(),
+            vec![("openalex".into(), "W1".into(), Some("for chapter 2".into()))]
+        );
+
+        let unknown = mcp.save_literature_result(Parameters(params("W2"))).await;
+        assert_eq!(unknown.is_error, Some(true));
+        assert_eq!(service.saved.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn save_literature_result_is_refused_for_protected_workspaces() {
+        let root = tempdir().unwrap();
+        let mut service = fake_search_with_root(root.path().into());
+        Arc::get_mut(&mut service).unwrap().read_only = true;
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(single_workspace(service.clone())),
+            None,
+        );
+        let reply = mcp
+            .save_literature_result(Parameters(SaveLiteratureResultParams {
+                provider: "openalex".into(),
+                result_id: "W1".into(),
+                note: None,
+                workspace: None,
+            }))
+            .await;
+        assert_eq!(reply.is_error, Some(true));
+        assert!(serde_json::to_string(&reply)
+            .unwrap()
+            .contains("MANAGED_WORKSPACE_PROTECTED"));
+        assert!(service.saved.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

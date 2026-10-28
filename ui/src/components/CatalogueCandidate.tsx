@@ -1,5 +1,5 @@
 import { useId, useState } from "react";
-import { Check, Download, ExternalLink } from "react-feather";
+import { Bookmark, Check, Download, ExternalLink } from "react-feather";
 import type {
   CatalogueCourseProgress,
   CatalogueDownloadProgress,
@@ -7,6 +7,8 @@ import type {
 } from "../lib/types";
 import { openLink } from "../lib/openLink";
 import { useCatalogueAdd } from "../hooks/useCatalogueAdd";
+import { findSavedWork, useSavedWorksStore } from "../stores/useSavedWorksStore";
+import { useToasts } from "./Toast";
 import {
   type AddStage,
   paperKey,
@@ -119,6 +121,10 @@ interface Props {
   /** The provider's name, for a list that mixes providers and so has no
    *  heading to say whose row this is. */
   source?: string;
+  /** Whether the row offers the filters that refine its pane's search. Off
+   *  where the pane is not showing a search, so a filter would refine one
+   *  nobody can see. */
+  refinable?: boolean;
 }
 
 /**
@@ -131,7 +137,13 @@ interface Props {
  * year, a venue and a citation count; a textbook has a kind, a subject, a
  * licence and a blurb; neither shows a blank for what the other has.
  */
-export default function CatalogueCandidate({ provider, work, compact = false, source }: Props) {
+export default function CatalogueCandidate({
+  provider,
+  work,
+  compact = false,
+  source,
+  refinable = !compact,
+}: Props) {
   const { add, canAdd, needsDirectory, readOnly, stageOf, isAdded } = useCatalogueAdd();
   const stage = stageOf(provider, work);
   const adding = stage !== undefined;
@@ -220,6 +232,7 @@ export default function CatalogueCandidate({ provider, work, compact = false, so
           </div>
 
           <div className="flex shrink-0 items-center gap-1">
+            <SaveButton provider={provider} work={work} title={title} />
             {link !== null && <OpenLink link={link} title={title} />}
             {acquirable && (
               <AddButton
@@ -238,7 +251,7 @@ export default function CatalogueCandidate({ provider, work, compact = false, so
         {!compact && work.summary?.trim() && (
           <ResultDescription key={work.summary} text={work.summary} title={title} />
         )}
-        {!compact && <ResultFilters provider={provider} work={work} title={title} />}
+        {refinable && <ResultFilters provider={provider} work={work} title={title} />}
         {stage !== undefined && (
           <AddProgress
             stage={stage}
@@ -399,6 +412,59 @@ function DownloadProgress({
         />
       </div>
     </div>
+  );
+}
+
+/**
+ * Keeps the result for later, or lets it go. Offered on every row, the strip's
+ * included: a result is worth keeping wherever it was found, and whether it
+ * can be fetched now says nothing about whether it is wanted.
+ */
+function SaveButton({
+  provider,
+  work,
+  title,
+}: {
+  provider: string;
+  work: LiteratureSearchResult;
+  title: string;
+}) {
+  const saved = useSavedWorksStore((s) => findSavedWork(s.works, provider, work));
+  const save = useSavedWorksStore((s) => s.save);
+  const remove = useSavedWorksStore((s) => s.remove);
+  const { addToast } = useToasts();
+  const [busy, setBusy] = useState(false);
+  const toggle = async () => {
+    setBusy(true);
+    try {
+      if (saved === undefined) await save(provider, work);
+      else await remove(saved.id);
+    } catch (error) {
+      console.error("saving a literature result failed:", error);
+      addToast(`Could not ${saved === undefined ? "save" : "unsave"} ${title}: ${error}`, {
+        type: "error",
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Tooltip content={saved === undefined ? "Save for later" : "Remove from saved"}>
+      <button
+        type="button"
+        onClick={() => void toggle()}
+        disabled={busy}
+        aria-pressed={saved !== undefined}
+        aria-label={`${saved === undefined ? "Save" : "Unsave"} ${title}`}
+        className={`flex h-[26px] w-[26px] items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-app)] transition-colors disabled:opacity-50 ${
+          saved === undefined
+            ? "text-[var(--text-muted)] hover:text-[var(--text-main)]"
+            : "text-[var(--accent-blue)]"
+        }`}
+      >
+        <Bookmark size={12} fill={saved === undefined ? "none" : "currentColor"} />
+      </button>
+    </Tooltip>
   );
 }
 

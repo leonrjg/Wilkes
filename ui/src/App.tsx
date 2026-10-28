@@ -18,6 +18,7 @@ import { useContextMenu, ContextMenu } from "./components/ContextMenu";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useBookmarksStore } from "./stores/useBookmarksStore";
+import { useSavedWorksStore } from "./stores/useSavedWorksStore";
 import { useChatStore } from "./stores/useChatStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useTopicsStore } from "./stores/useTopicsStore";
@@ -50,6 +51,7 @@ export default function App() {
   // pointing, so a dropped file lands in the folder it was dropped on.
   const fileTreeRef = useRef<FileTreeHandle>(null);
   const loadBookmarks = useBookmarksStore((s) => s.load);
+  const loadSavedWorks = useSavedWorksStore((s) => s.load);
   const openBookmarksPane = useBookmarksStore((s) => s.openPane);
   const closeBookmarksPane = useBookmarksStore((s) => s.closePane);
   const bookmarksPaneOpen = useBookmarksStore((s) => s.paneOpen);
@@ -130,14 +132,14 @@ export default function App() {
 
   useEffect(() => {
     loadWorkspaces()
-      .then(() => Promise.all([loadSettings(), loadBookmarks()]))
+      .then(() => Promise.all([loadSettings(), loadBookmarks(), loadSavedWorks()]))
       .then(() => restoreViewerSession())
       .catch(console.error)
       // Even a failed load ends the wait. A link held back forever is the one
       // outcome with nothing to show for it; a link answered against an empty
       // workspace list at least says which library it could not find.
       .finally(() => setWorkspaceLoaded(true));
-  }, [loadWorkspaces, loadSettings, loadBookmarks, restoreViewerSession]);
+  }, [loadWorkspaces, loadSettings, loadBookmarks, loadSavedWorks, restoreViewerSession]);
 
   /**
    * A `wilkes://` link that named a workspace, opened here as a click in the

@@ -1,6 +1,6 @@
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Search, Sliders, Square, X } from "react-feather";
+import { Bookmark, Search, Sliders, Square, X } from "react-feather";
 import type {
   BrowseControls,
   CatalogueGrain,
@@ -33,6 +33,9 @@ import { useGenerationStore } from "../stores/useGenerationStore";
 import { useCatalogueAdd } from "../hooks/useCatalogueAdd";
 import { api } from "../services";
 import CatalogueCandidate from "./CatalogueCandidate";
+import { useSavedWorksStore } from "../stores/useSavedWorksStore";
+import { useViewerStore } from "../stores/useViewerStore";
+import type { SavedWork } from "../lib/types";
 
 /** What a learning catalogue holds, said beside its name: the one thing a
  *  catalogue's name does not say about it. */
@@ -105,6 +108,10 @@ function CataloguePaneBody({ paneId }: { paneId: string }) {
       : held.query;
   });
   const [composeMode, setComposeMode] = useState(false);
+  // Which the pane shows: what the sources hold, or what the user kept. Held
+  // per pane, so a second pane can search while another lists the saved.
+  const [view, setView] = useState<"search" | "saved">("search");
+  const savedCount = useSavedWorksStore((s) => s.works.length);
 
   // The filter is offered before anything has been asked, so the list it is
   // built from is read when the pane opens rather than from a search.
@@ -136,62 +143,82 @@ function CataloguePaneBody({ paneId }: { paneId: string }) {
     <div className="flex h-full flex-col border-l border-[var(--border-main)] bg-[var(--bg-sidebar)]">
       <div className="flex items-center justify-between border-b border-[var(--border-main)] px-3 py-1.5">
         <h2 className="text-[11px] font-bold uppercase tracking-wider text-[var(--text-dim)]">
-          Catalogues & literature
+          {view === "saved" ? "Saved works" : "Catalogues & literature"}
         </h2>
-        <button
-          type="button"
-          onClick={() => closePane(paneId)}
-          aria-label="Close catalogue"
-          className="flex h-[22px] w-[22px] items-center justify-center rounded text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
-        >
-          <X size={13} />
-        </button>
+        <div className="flex items-center gap-1">
+          <Tooltip content={view === "saved" ? "Back to search" : "Works you saved for later"}>
+            <button
+              type="button"
+              onClick={() => setView(view === "saved" ? "search" : "saved")}
+              aria-pressed={view === "saved"}
+              aria-label="Saved works"
+              className={`flex h-[22px] items-center gap-1 rounded px-1 text-[10px] tabular-nums transition-colors hover:text-[var(--text-main)] ${
+                view === "saved" ? "text-[var(--accent-blue)]" : "text-[var(--text-dim)]"
+              }`}
+            >
+              <Bookmark size={12} fill={view === "saved" ? "currentColor" : "none"} />
+              {savedCount > 0 && savedCount}
+            </button>
+          </Tooltip>
+          <button
+            type="button"
+            onClick={() => closePane(paneId)}
+            aria-label="Close catalogue"
+            className="flex h-[22px] w-[22px] items-center justify-center rounded text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
+          >
+            <X size={13} />
+          </button>
+        </div>
       </div>
 
-      <form
-        className="px-3 py-1.5"
-        onSubmit={(e) => {
-          e.preventDefault();
-          if (composeInForce && draft.trim() !== "") void compose(draft);
-          else void runSearch(draft);
-        }}
-      >
-        <div className="flex items-stretch gap-1.5">
-          <div className="flex min-w-0 flex-1 items-center gap-1.5 rounded border border-[var(--border-main)] bg-[var(--bg-app)] pl-2 pr-1">
-            <Search size={12} className="shrink-0 text-[var(--text-dim)]" />
-            <input
-              ref={searchInput}
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              placeholder="What do you want to learn or read?"
-              aria-label="Search catalogues and literature"
-              className="min-w-0 flex-1 bg-transparent py-1.5 text-[11px] text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
-            />
-            {draft !== "" && (
-              <Tooltip content="Clear search">
-                <button
-                  type="button"
-                  aria-label="Clear catalogue search"
-                  onClick={() => {
-                    setDraft("");
-                    clearSearch();
-                    searchInput.current?.focus();
-                  }}
-                  className="inline-flex shrink-0 rounded p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)]"
-                >
-                  <X size={14} aria-hidden="true" />
-                </button>
-              </Tooltip>
-            )}
-            {composable && (
-              <ComposeToggle active={composeMode} onToggle={() => setComposeMode(!composeMode)} />
-            )}
-          </div>
-          <FiltersButton />
-        </div>
-      </form>
-      <RefineBar keyword={keyword} options={providerOptions} />
-      <ComposeStatus />
+      {view === "search" && (
+        <>
+          <form
+            className="px-3 py-1.5"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (composeInForce && draft.trim() !== "") void compose(draft);
+              else void runSearch(draft);
+            }}
+          >
+            <div className="flex items-stretch gap-1.5">
+              <div className="flex min-w-0 flex-1 items-center gap-1.5 rounded border border-[var(--border-main)] bg-[var(--bg-app)] pl-2 pr-1">
+                <Search size={12} className="shrink-0 text-[var(--text-dim)]" />
+                <input
+                  ref={searchInput}
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  placeholder="What do you want to learn or read?"
+                  aria-label="Search catalogues and literature"
+                  className="min-w-0 flex-1 bg-transparent py-1.5 text-[11px] text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
+                />
+                {draft !== "" && (
+                  <Tooltip content="Clear search">
+                    <button
+                      type="button"
+                      aria-label="Clear catalogue search"
+                      onClick={() => {
+                        setDraft("");
+                        clearSearch();
+                        searchInput.current?.focus();
+                      }}
+                      className="inline-flex shrink-0 rounded p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)]"
+                    >
+                      <X size={14} aria-hidden="true" />
+                    </button>
+                  </Tooltip>
+                )}
+                {composable && (
+                  <ComposeToggle active={composeMode} onToggle={() => setComposeMode(!composeMode)} />
+                )}
+              </div>
+              <FiltersButton />
+            </div>
+          </form>
+          <RefineBar keyword={keyword} options={providerOptions} />
+          <ComposeStatus />
+        </>
+      )}
 
       {(readOnly || needsDirectory) && (
         <p className="border-b border-[var(--border-main)] px-3 py-1.5 text-[10px] leading-snug text-[var(--text-dim)]">
@@ -206,64 +233,201 @@ function CataloguePaneBody({ paneId }: { paneId: string }) {
           <p className="py-1.5 text-[10px] leading-snug text-red-400">{acquireError}</p>
         )}
 
-        {providerOptionsError !== null ? (
-          <p className="py-1 text-[10px] leading-snug text-red-400">
-            The providers could not be listed: {providerOptionsError}
-          </p>
-        ) : (
-          <FilterChips
-            selection={providers}
-            all={enabledProviderIds(providerOptions)}
-            label={(id) => enabled.find((option) => option.provider === id)?.name ?? id}
-            onToggle={toggleProvider}
-          />
-        )}
-        {!selectsAny(providers) ? (
-          <Note>No source selected, so nothing was searched.</Note>
+        {view === "saved" ? (
+          <SavedWorksList />
         ) : (
           <>
-            {literatureLoading && <Spinner />}
-            {/* The error and the answer are shown together when both exist.
-                A failed request for a provider the user has just re-selected
-                says nothing about what the others already answered, and
-                hiding their results would take away what is being read. */}
-            {literatureError !== null && !literatureLoading && (
-              <p className="py-2 text-[10px] leading-snug text-red-400">{literatureError}</p>
+            {providerOptionsError !== null ? (
+              <p className="py-1 text-[10px] leading-snug text-red-400">
+                The providers could not be listed: {providerOptionsError}
+              </p>
+            ) : (
+              <FilterChips
+                selection={providers}
+                all={enabledProviderIds(providerOptions)}
+                label={(id) => enabled.find((option) => option.provider === id)?.name ?? id}
+                onToggle={toggleProvider}
+              />
             )}
-            <ProviderResults
-              answer={literatureLoading ? null : literature}
-              listed={listed}
-              providerOptions={providerOptions}
-              selection={providers}
-            />
-          </>
-        )}
+            {!selectsAny(providers) ? (
+              <Note>No source selected, so nothing was searched.</Note>
+            ) : (
+              <>
+                {literatureLoading && <Spinner />}
+                {/* The error and the answer are shown together when both exist.
+                    A failed request for a provider the user has just re-selected
+                    says nothing about what the others already answered, and
+                    hiding their results would take away what is being read. */}
+                {literatureError !== null && !literatureLoading && (
+                  <p className="py-2 text-[10px] leading-snug text-red-400">{literatureError}</p>
+                )}
+                <ProviderResults
+                  answer={literatureLoading ? null : literature}
+                  listed={listed}
+                  providerOptions={providerOptions}
+                  selection={providers}
+                />
+              </>
+            )}
 
-        {!asked && (
-          <>
-            <Note>
-              Search your enabled catalogues and indexes.
-            </Note>
-            {browsable.length > 0 && (
-              <Note>
-                Browse without keywords:{" "}
-                <button
-                  type="button"
-                  onClick={() => setBrowseOpen(true)}
-                  className="font-bold text-[var(--accent-blue)] hover:underline"
-                >
-                  open Filters
-                </button>.
-              </Note>
-            )}
-            {browsable.length > 0 && generationReady && (
-              <Note>
-                Use the sparkles button to turn a search description into filters.
-              </Note>
+            {!asked && (
+              <>
+                <Note>
+                  Search your enabled catalogues and indexes.
+                </Note>
+                {browsable.length > 0 && (
+                  <Note>
+                    Browse without keywords:{" "}
+                    <button
+                      type="button"
+                      onClick={() => setBrowseOpen(true)}
+                      className="font-bold text-[var(--accent-blue)] hover:underline"
+                    >
+                      open Filters
+                    </button>.
+                  </Note>
+                )}
+                {browsable.length > 0 && generationReady && (
+                  <Note>
+                    Use the sparkles button to turn a search description into filters.
+                  </Note>
+                )}
+              </>
             )}
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * What the user kept for later, newest first, in the rows a search shows: a
+ * saved work is a result, and is added, opened and unsaved as one.
+ *
+ * Each row is the result as it was when saved, so the list reads the same
+ * when its provider is unreachable or has since been switched off.
+ */
+function SavedWorksList() {
+  const works = useSavedWorksStore((s) => s.works);
+  const providerOptions = useCatalogueStore((s) => s.providerOptions);
+  if (works.length === 0) {
+    return <Note>Nothing saved yet. Use the bookmark button on a result to keep it for later.</Note>;
+  }
+  return (
+    <div className="flex flex-col divide-y divide-[var(--border-main)]">
+      {[...works].reverse().map((saved) => (
+        <div key={saved.id} className="py-0.5">
+          <CatalogueCandidate
+            provider={saved.provider}
+            work={saved.work}
+            source={
+              providerOptions.find((option) => option.provider === saved.provider)?.name ??
+              saved.provider
+            }
+            refinable={false}
+          />
+          <SavedWorkDetails saved={saved} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** The last segment of a path, for a link that names a file it opens. */
+function fileName(path: string): string {
+  const cut = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return path.slice(cut + 1);
+}
+
+/** What a saved work has that a result does not: where it landed in the
+ *  library, if it was added, and the user's note. */
+function SavedWorkDetails({ saved }: { saved: SavedWork }) {
+  const updateNote = useSavedWorksStore((s) => s.updateNote);
+  const openFile = useViewerStore((s) => s.openFile);
+  const [draft, setDraft] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const title = saved.work.title ?? saved.work.id;
+
+  const commit = async () => {
+    if (draft === null) return;
+    try {
+      await updateNote(saved.id, draft);
+      setDraft(null);
+      setError(null);
+    } catch (failure) {
+      console.error("saving a note on a saved work failed:", failure);
+      setError(`The note could not be saved: ${failure}`);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-1 pb-1.5 text-[10px] leading-snug">
+      {saved.acquired && (
+        <p className="flex min-w-0 items-center gap-1 text-[var(--text-dim)]">
+          <span className="shrink-0">In library:</span>
+          <Tooltip content={saved.acquired.path}>
+            <button
+              type="button"
+              onClick={() => openFile(saved.acquired!.path)}
+              aria-label={`Open ${title} from the library`}
+              className="min-w-0 truncate text-[var(--accent-blue)] hover:underline"
+            >
+              {fileName(saved.acquired.path)}
+            </button>
+          </Tooltip>
+        </p>
+      )}
+      {draft === null ? (
+        <div className="flex min-w-0 items-start gap-2">
+          {saved.note && (
+            <p className="min-w-0 flex-1 whitespace-pre-wrap break-words text-[var(--text-muted)]">
+              {saved.note}
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={() => setDraft(saved.note ?? "")}
+            aria-label={`${saved.note ? "Edit" : "Add"} note for ${title}`}
+            className="shrink-0 text-[var(--text-dim)] hover:text-[var(--text-main)] hover:underline"
+          >
+            {saved.note ? "Edit note" : "Add note"}
+          </button>
+        </div>
+      ) : (
+        <form
+          className="flex flex-col gap-1"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void commit();
+          }}
+        >
+          <textarea
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            autoFocus
+            rows={3}
+            aria-label={`Note for ${title}`}
+            className="w-full resize-y rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1.5 py-1 text-[11px] text-[var(--text-main)] outline-none"
+          />
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setDraft(null);
+                setError(null);
+              }}
+              className="text-[var(--text-dim)] hover:text-[var(--text-main)]"
+            >
+              Cancel
+            </button>
+            <button type="submit" className="font-bold text-[var(--accent-blue)] hover:underline">
+              Save note
+            </button>
+          </div>
+        </form>
+      )}
+      {error !== null && <p className="text-red-400">{error}</p>}
     </div>
   );
 }

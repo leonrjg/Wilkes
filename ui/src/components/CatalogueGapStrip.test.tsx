@@ -2,9 +2,15 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LiteratureProviderInfo, LiteratureSearchResult } from "../lib/types";
 
+vi.mock("./Toast", () => ({ useToasts: () => ({ addToast: vi.fn() }) }));
+
 vi.mock("../services", () => ({
   isTauri: true,
   api: {
+    listSavedWorks: vi.fn(() => Promise.resolve([])),
+    saveWork: vi.fn(),
+    removeSavedWork: vi.fn(() => Promise.resolve()),
+    markSavedWorkAcquired: vi.fn(() => Promise.resolve(null)),
     literatureProviders: vi.fn(),
     literatureSearch: vi.fn(),
     catalogueAcquire: vi.fn(),

@@ -21,9 +21,9 @@ use wilkes_core::types::{
     AddOutcome, Bookmark, BookmarkClustersQuery, BookmarkClustersResult, ChunkTopicsQuery,
     ChunkTopicsResult, CitationResult, CollectionValidation, DataPaths, DocumentMetadata,
     DocumentTagUpdate, EmbedderCapabilityManifest, EmbeddingEngine, ExternalMcpSettings,
-    FileListResponse, HttpApiSettings, IndexStatus, IntegrationStatus, NewBookmark,
-    NewSmartCollection, NewTag, RootCoverage, SearchLogEntry, SelectedEmbedder, Settings,
-    SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
+    FileListResponse, HttpApiSettings, IndexStatus, IntegrationStatus, LiteratureSearchResult,
+    NewBookmark, NewSavedWork, NewSmartCollection, NewTag, RootCoverage, SavedWork, SearchLogEntry,
+    SelectedEmbedder, Settings, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::worker::manager::WorkerStatus;
 
@@ -1670,6 +1670,49 @@ async fn cancel_chunk_topics(request_id: String, app: AppHandle) -> Result<(), S
 }
 
 #[tauri::command]
+async fn list_saved_works(app: AppHandle) -> Result<Vec<SavedWork>, String> {
+    app_context(&app)
+        .list_saved_works()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn save_work(work: NewSavedWork, app: AppHandle) -> Result<SavedWork, String> {
+    app_context(&app).save_work(work).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remove_saved_work(id: String, app: AppHandle) -> Result<(), String> {
+    app_context(&app)
+        .remove_saved_work(&id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_saved_work_note(
+    id: String,
+    note: Option<String>,
+    app: AppHandle,
+) -> Result<SavedWork, String> {
+    app_context(&app)
+        .update_saved_work_note(&id, note)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn mark_saved_work_acquired(
+    provider: String,
+    work: LiteratureSearchResult,
+    path: PathBuf,
+    app: AppHandle,
+) -> Result<Option<SavedWork>, String> {
+    app_context(&app)
+        .mark_saved_work_acquired(&provider, &work, path)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn list_tags(app: AppHandle) -> Result<Vec<Tag>, String> {
     app_context(&app).list_tags().map_err(|e| e.to_string())
 }
@@ -2448,6 +2491,11 @@ pub fn run() {
             add_bookmark,
             remove_bookmark,
             update_bookmark_note,
+            list_saved_works,
+            save_work,
+            remove_saved_work,
+            update_saved_work_note,
+            mark_saved_work_acquired,
             cluster_bookmarks,
             chunk_topics,
             cancel_chunk_topics,

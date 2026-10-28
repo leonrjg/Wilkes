@@ -48,8 +48,9 @@ use wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryIn
 use wilkes_core::types::{
     AddOutcome, BookmarkClustersQuery, ChunkTopicsQuery, CitationLinksQuery, CitationResult,
     CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, IntegrationStatus,
-    MatchRef, NewBookmark, NewSmartCollection, NewTag, RelatedDocumentsQuery, SearchLogEntry,
-    SearchQuery, SelectedEmbedder, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
+    LiteratureSearchResult, MatchRef, NewBookmark, NewSavedWork, NewSmartCollection, NewTag,
+    RelatedDocumentsQuery, SearchLogEntry, SearchQuery, SelectedEmbedder, SmartCollection, Tag,
+    UpdateSmartCollection, UpdateTag,
 };
 #[cfg(test)]
 use wilkes_core::worker::manager::WorkerPaths;
@@ -1273,6 +1274,72 @@ async fn update_bookmark_note_handler(
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(bookmark))
+}
+
+async fn list_saved_works_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let works = state
+        .context()
+        .list_saved_works()
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(works))
+}
+
+async fn save_work_handler(
+    State(state): State<Arc<AppState>>,
+    Json(work): Json<NewSavedWork>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let saved = state
+        .context()
+        .save_work(work)
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(saved))
+}
+
+async fn remove_saved_work_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .remove_saved_work(&id)
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_saved_work_note_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<UpdateNoteBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let saved = state
+        .context()
+        .update_saved_work_note(&id, body.note)
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(saved))
+}
+
+#[derive(Deserialize)]
+struct SavedWorkAcquiredBody {
+    provider: String,
+    work: LiteratureSearchResult,
+    path: String,
+}
+
+/// The path is one the web build fetched into its uploads directory, which is
+/// the root it serves; anything else is not a file this server added.
+async fn mark_saved_work_acquired_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SavedWorkAcquiredBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let path = confine_to_uploads(&body.path, &uploads_dir)?;
+    let saved = ctx
+        .mark_saved_work_acquired(&body.provider, &body.work, path)
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(saved))
 }
 
 async fn list_tags_handler(
@@ -2628,6 +2695,18 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/bookmarks/{id}", delete(remove_bookmark_handler))
         .route("/api/bookmarks/{id}", patch(update_bookmark_note_handler))
+        .route(
+            "/api/saved-works",
+            get(list_saved_works_handler).post(save_work_handler),
+        )
+        .route(
+            "/api/saved-works/acquired",
+            post(mark_saved_work_acquired_handler),
+        )
+        .route(
+            "/api/saved-works/{id}",
+            patch(update_saved_work_note_handler).delete(remove_saved_work_handler),
+        )
         .route("/api/tags", get(list_tags_handler).post(create_tag_handler))
         .route(
             "/api/tags/{id}",

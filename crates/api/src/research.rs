@@ -9,10 +9,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// rows from accumulating: there is no cascade to hang them off.
 const MAX_CLUSTER_LABEL_ROWS: i64 = 500;
 use wilkes_core::metadata::cache::FileIdentity;
+use wilkes_core::metadata::doi::normalize_doi;
 use wilkes_core::types::{
-    Bookmark, CollectionValidation, DocumentTagUpdate, FileEntry, NewBookmark, NewSmartCollection,
-    NewTag, SearchLogEntry, SearchLogStatus, SearchQuery, SmartCollection, Tag,
-    UpdateSmartCollection, UpdateTag,
+    Bookmark, CollectionValidation, DocumentTagUpdate, FileEntry, LiteratureSearchResult,
+    NewBookmark, NewSavedWork, NewSmartCollection, NewTag, SavedWork, SavedWorkAcquisition,
+    SearchLogEntry, SearchLogStatus, SearchQuery, SmartCollection, Tag, UpdateSmartCollection,
+    UpdateTag,
 };
 
 const FILTER_SCHEMA_VERSION: i64 = 1;
@@ -106,7 +108,7 @@ impl ResearchStore {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(
-            version <= 4,
+            version <= 5,
             "research database schema {version} is newer than this app supports"
         );
         self.conn.execute_batch(
@@ -170,7 +172,13 @@ impl ResearchStore {
                result_count INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER,
                status TEXT NOT NULL, error_message TEXT
              );
-             CREATE INDEX IF NOT EXISTS search_log_started_at ON search_log(started_at_ms DESC);",
+             CREATE INDEX IF NOT EXISTS search_log_started_at ON search_log(started_at_ms DESC);
+             CREATE TABLE IF NOT EXISTS saved_works (
+               id TEXT PRIMARY KEY, provider TEXT NOT NULL, work_id TEXT NOT NULL,
+               doi TEXT, payload_json TEXT NOT NULL, saved_at TEXT NOT NULL,
+               UNIQUE(provider, work_id)
+             );
+             CREATE INDEX IF NOT EXISTS saved_works_doi ON saved_works(doi);",
         )?;
         self.conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(1, ?1)",
@@ -188,7 +196,11 @@ impl ResearchStore {
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(4, ?1)",
             [now_ms()],
         )?;
-        self.conn.pragma_update(None, "user_version", 4)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(5, ?1)",
+            [now_ms()],
+        )?;
+        self.conn.pragma_update(None, "user_version", 5)?;
         self.conn.execute(
             "UPDATE search_log SET status='cancelled', completed_at_ms=?1
              WHERE status='running'",
@@ -299,6 +311,122 @@ impl ResearchStore {
             params![id, serde_json::to_string(&bookmark)?],
         )?;
         Ok(bookmark)
+    }
+
+    pub fn list_saved_works(&self) -> anyhow::Result<Vec<SavedWork>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT payload_json FROM saved_works ORDER BY saved_at")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    /// Saving a work that is already saved returns the one held rather than a
+    /// second copy: the same provider's result by its id, or any provider's
+    /// record of the same DOI, since the indexes overlap.
+    pub fn save_work(&mut self, new: NewSavedWork) -> anyhow::Result<SavedWork> {
+        let doi = new.work.doi.as_deref().and_then(normalize_doi);
+        if let Some(held) = self.find_saved_work(&new.provider, &new.work.id, doi.as_deref())? {
+            return Ok(held);
+        }
+        let saved = SavedWork {
+            id: uuid::Uuid::new_v4().to_string(),
+            provider: new.provider,
+            work: new.work,
+            note: clean_note(new.note),
+            saved_at: chrono::Utc::now().to_rfc3339(),
+            acquired: None,
+        };
+        self.conn.execute(
+            "INSERT INTO saved_works(id, provider, work_id, doi, payload_json, saved_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                saved.id,
+                saved.provider,
+                saved.work.id,
+                doi,
+                serde_json::to_string(&saved)?,
+                saved.saved_at
+            ],
+        )?;
+        Ok(saved)
+    }
+
+    pub fn remove_saved_work(&mut self, id: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute("DELETE FROM saved_works WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn update_saved_work_note(
+        &mut self,
+        id: &str,
+        note: Option<String>,
+    ) -> anyhow::Result<SavedWork> {
+        let payload: String = self
+            .conn
+            .query_row(
+                "SELECT payload_json FROM saved_works WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("saved work not found: {id}"))?;
+        let mut saved: SavedWork = serde_json::from_str(&payload)?;
+        saved.note = clean_note(note);
+        self.write_saved_work(&saved)?;
+        Ok(saved)
+    }
+
+    /// Records where a work landed in the library, if it is saved. A work
+    /// that was never saved is not an error: most adds are of results nobody
+    /// kept, and there is nothing to mark.
+    pub fn mark_saved_work_acquired(
+        &mut self,
+        provider: &str,
+        work: &LiteratureSearchResult,
+        path: PathBuf,
+    ) -> anyhow::Result<Option<SavedWork>> {
+        let doi = work.doi.as_deref().and_then(normalize_doi);
+        let Some(mut saved) = self.find_saved_work(provider, &work.id, doi.as_deref())? else {
+            return Ok(None);
+        };
+        saved.acquired = Some(SavedWorkAcquisition {
+            identity: FileIdentity::for_path(&path),
+            path,
+            acquired_at: chrono::Utc::now().to_rfc3339(),
+        });
+        self.write_saved_work(&saved)?;
+        Ok(Some(saved))
+    }
+
+    fn find_saved_work(
+        &self,
+        provider: &str,
+        work_id: &str,
+        doi: Option<&str>,
+    ) -> anyhow::Result<Option<SavedWork>> {
+        let payload: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload_json FROM saved_works
+                 WHERE (provider = ?1 AND work_id = ?2) OR (?3 IS NOT NULL AND doi = ?3)
+                 ORDER BY saved_at LIMIT 1",
+                params![provider, work_id, doi],
+                |r| r.get(0),
+            )
+            .optional()?;
+        payload
+            .map(|payload| Ok(serde_json::from_str(&payload)?))
+            .transpose()
+    }
+
+    fn write_saved_work(&self, saved: &SavedWork) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE saved_works SET payload_json = ?2 WHERE id = ?1",
+            params![saved.id, serde_json::to_string(saved)?],
+        )?;
+        Ok(())
     }
 
     pub fn cached_bookmark_embeddings(
@@ -1100,6 +1228,13 @@ fn normalize_name(value: &str) -> anyhow::Result<String> {
     Ok(value.to_string())
 }
 
+/// A note is kept as written, minus surrounding blank space; a note that is
+/// only blank space is no note.
+fn clean_note(note: Option<String>) -> Option<String> {
+    note.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -1152,6 +1287,86 @@ mod tests {
             .cached_chunk_cluster_labels(&["members-a".into()], "model-a", 2)
             .unwrap()
             .is_empty());
+    }
+
+    fn literature_result(id: &str, doi: Option<&str>) -> LiteratureSearchResult {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "doi": doi,
+            "title": "A Study",
+            "is_open_access": true,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn saved_works_are_kept_once_and_marked_where_they_landed() {
+        let dir = tempdir().unwrap();
+        let mut store =
+            ResearchStore::open(dir.path(), &dir.path().join("bookmarks.json")).unwrap();
+        let saved = store
+            .save_work(NewSavedWork {
+                provider: "openalex".into(),
+                work: literature_result("W1", Some("10.1000/ABC")),
+                note: Some("  read the methods  ".into()),
+            })
+            .unwrap();
+        assert_eq!(saved.note.as_deref(), Some("read the methods"));
+        assert!(saved.acquired.is_none());
+
+        // The same result again, and the same DOI from another provider, are
+        // the work already held.
+        let again = store
+            .save_work(NewSavedWork {
+                provider: "openalex".into(),
+                work: literature_result("W1", None),
+                note: None,
+            })
+            .unwrap();
+        let elsewhere = store
+            .save_work(NewSavedWork {
+                provider: "semantic_scholar".into(),
+                work: literature_result("S9", Some("https://doi.org/10.1000/abc")),
+                note: None,
+            })
+            .unwrap();
+        assert_eq!(again.id, saved.id);
+        assert_eq!(elsewhere.id, saved.id);
+        assert_eq!(store.list_saved_works().unwrap().len(), 1);
+
+        // Acquiring a result nobody saved marks nothing.
+        let unsaved = dir.path().join("other.pdf");
+        std::fs::write(&unsaved, b"pdf").unwrap();
+        assert!(store
+            .mark_saved_work_acquired("openalex", &literature_result("W2", None), unsaved)
+            .unwrap()
+            .is_none());
+
+        // Acquiring it from the other provider marks the saved one, which stays.
+        let path = dir.path().join("study.pdf");
+        std::fs::write(&path, b"pdf").unwrap();
+        let marked = store
+            .mark_saved_work_acquired(
+                "semantic_scholar",
+                &literature_result("S9", Some("10.1000/abc")),
+                path.clone(),
+            )
+            .unwrap()
+            .expect("the saved work is marked");
+        assert_eq!(marked.id, saved.id);
+        let acquired = marked.acquired.clone().expect("acquisition recorded");
+        assert_eq!(acquired.path, path);
+        assert!(acquired.identity.is_some());
+        assert_eq!(store.list_saved_works().unwrap(), vec![marked]);
+
+        let renoted = store
+            .update_saved_work_note(&saved.id, Some("   ".into()))
+            .unwrap();
+        assert!(renoted.note.is_none());
+        assert!(renoted.acquired.is_some());
+
+        store.remove_saved_work(&saved.id).unwrap();
+        assert!(store.list_saved_works().unwrap().is_empty());
     }
 
     #[test]

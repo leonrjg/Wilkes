@@ -3,6 +3,7 @@ import { api } from "../services";
 import { confirmDialog } from "../lib/utils/dialog";
 import type { WorkspaceSummary } from "../lib/types";
 import { useBookmarksStore } from "./useBookmarksStore";
+import { useSavedWorksStore } from "./useSavedWorksStore";
 import { useChatStore } from "./useChatStore";
 import { useEditorStore } from "./useEditorStore";
 import { useFolderStateStore } from "./useFolderStateStore";
@@ -185,6 +186,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       await Promise.all([
         useSettingsStore.getState().load(),
         useBookmarksStore.getState().load(),
+        useSavedWorksStore.getState().load(),
         useResearchStore.getState().load(),
       ]);
     } catch (error) {
@@ -204,6 +206,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         await Promise.all([
           useSettingsStore.getState().load(),
           useBookmarksStore.getState().load(),
+          useSavedWorksStore.getState().load(),
           useResearchStore.getState().load(),
         ]);
       }

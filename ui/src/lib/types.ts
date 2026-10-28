@@ -237,6 +237,31 @@ export interface Bookmark {
   rects: BoundingBox[];
 }
 
+/** A literature result kept for later: a work found but not yet held. Carries
+ *  the result as it was when saved, since its provider may not answer, or may
+ *  have re-numbered it, when the user comes back to it. */
+export interface SavedWork {
+  id: string;
+  provider: string;
+  work: LiteratureSearchResult;
+  note?: string | null;
+  saved_at: string;
+  /** Where the work landed once it was added to the library. A saved work
+   *  stays saved after it is acquired, marked by this. */
+  acquired?: SavedWorkAcquisition | null;
+}
+
+export interface SavedWorkAcquisition {
+  path: string;
+  acquired_at: string;
+}
+
+export interface NewSavedWork {
+  provider: string;
+  work: LiteratureSearchResult;
+  note?: string | null;
+}
+
 export type BookmarkClusterGranularity =
   | "much_fewer"
   | "fewer"

@@ -9,9 +9,14 @@ import type {
 
 // The panel tells the pane's store that the providers changed, and the store
 // reads them through the application's own client.
+vi.mock("./Toast", () => ({ useToasts: () => ({ addToast: vi.fn() }) }));
+
 vi.mock("../services", () => ({
   isTauri: true,
-  api: { literatureProviders: vi.fn(() => Promise.resolve([])) },
+  api: {
+    literatureProviders: vi.fn(() => Promise.resolve([])),
+    listSavedWorks: vi.fn(() => Promise.resolve([])),
+  },
   source: { type: "desktop" },
 }));
 

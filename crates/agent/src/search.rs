@@ -4,8 +4,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Serialize;
 use wilkes_core::types::{
-    DocumentMetadata, FileListResponse, FileMatches, IntegrationsSettings, RelatedDocument,
-    RelatedDocumentsQuery, SearchQuery, SearchStats, SmartCollection,
+    DocumentMetadata, FileListResponse, FileMatches, IntegrationsSettings, LiteratureSearchResult,
+    RelatedDocument, RelatedDocumentsQuery, SearchQuery, SearchStats, SmartCollection,
 };
 
 /// How long a search started by an agent may run before it answers with what
@@ -52,6 +52,31 @@ pub trait SearchService: Send + Sync {
     ) -> Result<serde_json::Value, String> {
         let _ = edit;
         Err("Research-library edits are not available in this session".into())
+    }
+
+    /// Keeps a literature result for later. The result is the whole record
+    /// the provider returned, which the MCP server holds and the model never
+    /// sees, so this is not an `edit_library` action.
+    async fn save_literature_result(
+        self: Arc<Self>,
+        provider: String,
+        work: LiteratureSearchResult,
+        note: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        let _ = (provider, work, note);
+        Err("Saving literature results is not available in this session".into())
+    }
+
+    /// Marks a saved literature result as in the library once `download` has
+    /// fetched it to `path`. A result that was never saved is left alone.
+    async fn mark_literature_acquired(
+        self: Arc<Self>,
+        provider: String,
+        work: LiteratureSearchResult,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        let _ = (provider, work, path);
+        Err("Saved literature results are not available in this session".into())
     }
 
     async fn default_root(self: Arc<Self>) -> Option<PathBuf> {

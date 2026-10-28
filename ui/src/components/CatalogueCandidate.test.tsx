@@ -3,9 +3,15 @@ import type { ReactElement, ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LiteratureSearchResult } from "../lib/types";
 
+vi.mock("./Toast", () => ({ useToasts: () => ({ addToast: vi.fn() }) }));
+
 vi.mock("../services", () => ({
   isTauri: true,
   api: {
+    listSavedWorks: vi.fn(() => Promise.resolve([])),
+    saveWork: vi.fn(),
+    removeSavedWork: vi.fn(() => Promise.resolve()),
+    markSavedWorkAcquired: vi.fn(() => Promise.resolve(null)),
     catalogueAcquire: vi.fn(),
     catalogueAcquireCourse: vi.fn(),
     openPath: vi.fn(() => Promise.resolve()),
@@ -26,6 +32,7 @@ import {
   createCatalogueSearch,
   useCatalogueStore,
 } from "../stores/useCatalogueStore";
+import { useSavedWorksStore } from "../stores/useSavedWorksStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 
@@ -97,6 +104,7 @@ describe("CatalogueCandidate", () => {
       already_present: false,
     });
     useCatalogueStore.getState().reset();
+    useSavedWorksStore.setState({ works: [] });
     useSettingsStore.setState({ directory: "/library", refreshFileList: vi.fn() as never });
     useWorkspaceStore.setState({ workspaces: [], activeWorkspaceId: null } as never);
   });
@@ -219,6 +227,78 @@ describe("CatalogueCandidate", () => {
       );
     });
     expect(await screen.findByText("Added")).toBeTruthy();
+  });
+
+  /// The add says where the file landed, whether or not the result was saved:
+  /// which saved work it is, if any, is the backend's to say, since it also
+  /// knows one by its DOI.
+  it("tells the saved works where an added result landed", async () => {
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
+    fireEvent.click(screen.getByLabelText(/Add Combinatorial Optimization/));
+    await waitFor(() =>
+      expect(api.markSavedWorkAcquired).toHaveBeenCalledWith(
+        "libretexts",
+        HIT,
+        "/library/book.pdf",
+      ),
+    );
+  });
+
+  it("saves a result for later and lets it go again", async () => {
+    const saved = {
+      id: "s1",
+      provider: "libretexts",
+      work: HIT,
+      note: null,
+      saved_at: "2026-10-27T00:00:00Z",
+      acquired: null,
+    };
+    (api.saveWork as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(saved);
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
+
+    fireEvent.click(screen.getByLabelText("Save Combinatorial Optimization"));
+    await waitFor(() =>
+      expect(api.saveWork).toHaveBeenCalledWith({ provider: "libretexts", work: HIT }),
+    );
+    const unsave = await screen.findByLabelText("Unsave Combinatorial Optimization");
+    expect(unsave.getAttribute("aria-pressed")).toBe("true");
+
+    fireEvent.click(unsave);
+    await waitFor(() => expect(api.removeSavedWork).toHaveBeenCalledWith("s1"));
+    expect(await screen.findByLabelText("Save Combinatorial Optimization")).toBeTruthy();
+  });
+
+  /// Another provider's record of the same DOI is the same work.
+  it("shows a result saved from another provider as saved", () => {
+    useSavedWorksStore.setState({
+      works: [
+        {
+          id: "s1",
+          provider: "openalex",
+          work: { ...HIT, id: "W9", doi: "10.1000/ABC" },
+          saved_at: "2026-10-27T00:00:00Z",
+        },
+      ],
+    });
+    render(<CatalogueCandidate provider="libretexts" work={{ ...HIT, doi: "10.1000/abc" }} />);
+    expect(screen.getByLabelText("Unsave Combinatorial Optimization")).toBeTruthy();
+  });
+
+  /// A saved work added in an earlier session is still added in this one.
+  it("shows a saved work recorded as added as added", () => {
+    useSavedWorksStore.setState({
+      works: [
+        {
+          id: "s1",
+          provider: "libretexts",
+          work: HIT,
+          saved_at: "2026-10-27T00:00:00Z",
+          acquired: { path: "/library/book.pdf", acquired_at: "2026-10-27T00:00:00Z" },
+        },
+      ],
+    });
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
+    expect(screen.getByText("Added")).toBeTruthy();
   });
 
   /// Discovery and admission are not the same thing, and a button that fails

@@ -8,6 +8,9 @@ use std::path::PathBuf;
 #[serde(rename_all = "snake_case")]
 pub enum LibraryKind {
     Bookmarks,
+    /// Literature results the user kept for later, and where each landed once
+    /// it was added to the library.
+    SavedWorks,
     Tags,
     SearchHistory,
 }
@@ -26,6 +29,13 @@ pub enum LibraryEdit {
         note: Option<String>,
     },
     RemoveBookmark {
+        id: String,
+    },
+    UpdateSavedWorkNote {
+        id: String,
+        note: Option<String>,
+    },
+    RemoveSavedWork {
         id: String,
     },
     CreateTag {

@@ -3,6 +3,7 @@ import { api, source } from "../services";
 import type { DesktopSourceApi } from "../services/api";
 import type { LiteratureSearchResult } from "../lib/types";
 import { type AddStage, paperKey, useCatalogueStore } from "../stores/useCatalogueStore";
+import { findSavedWork, useSavedWorksStore } from "../stores/useSavedWorksStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
 
@@ -36,6 +37,8 @@ export function useCatalogueAdd() {
   const acquired = useCatalogueStore((s) => s.acquired);
   const setAddStage = useCatalogueStore((s) => s.setAddStage);
   const noteAddError = useCatalogueStore((s) => s.noteAddError);
+  const savedWorks = useSavedWorksStore((s) => s.works);
+  const markAcquired = useSavedWorksStore((s) => s.markAcquired);
 
   // A desktop import needs somewhere to import to. The web build has its root
   // by construction, so it can add before the user has chosen anything.
@@ -44,21 +47,24 @@ export function useCatalogueAdd() {
 
   /** The second step, shared by both kinds of candidate: whatever was staged
    *  in uploads is imported into the library root, or — on the web build,
-   *  where uploads *is* the root — the root is simply pointed at it.
+   *  where uploads *is* the root — the root is simply pointed at it. Answers
+   *  where the files now are.
    *
    *  `folder` is passed for a course and omitted for a single document, so a
    *  course keeps its folder across the move instead of arriving as forty
    *  loose files the root cannot attribute to it. */
   const install = useCallback(
-    async (staged: string[], folder?: string): Promise<void> => {
+    async (staged: string[], folder?: string): Promise<string[]> => {
+      let installed = staged;
       if (source.type === "desktop") {
-        await (source as DesktopSourceApi).importFiles(staged, directory, "move", folder);
+        installed = await (source as DesktopSourceApi).importFiles(staged, directory, "move", folder);
       } else if (!directory && staged.length > 0) {
         // On the web build the files are already in their course folder under
         // the served root, so the folder is where the root should point.
         setDirectory(parentDirectory(staged[0]));
       }
       await refreshFileList();
+      return installed;
     },
     [directory, setDirectory, refreshFileList],
   );
@@ -73,10 +79,16 @@ export function useCatalogueAdd() {
    * cleared however the act ends, so a failure cannot leave a row spinning.
    */
   const runAdd = useCallback(
-    async (key: string, act: () => Promise<string | null>): Promise<string | null> => {
+    async (
+      provider: string,
+      work: LiteratureSearchResult,
+      act: () => Promise<string | null>,
+    ): Promise<string | null> => {
+      const key = paperKey(provider, work);
       noteAddError(null);
+      let path: string | null;
       try {
-        return await act();
+        path = await act();
       } catch (error: any) {
         // Every failing stage reaches the user the same way. A resolver that
         // refused and a move that failed used to reject into nothing at all.
@@ -86,8 +98,21 @@ export function useCatalogueAdd() {
       } finally {
         setAddStage(key, null);
       }
+      // Asked for every add, saved or not: whether this result is a saved
+      // work is the backend's to decide, since it also knows a saved work by
+      // its DOI. The file is in the library either way, so a failure here is
+      // reported as what it is rather than as a failed add.
+      if (path !== null) {
+        try {
+          await markAcquired(provider, work, path);
+        } catch (error: any) {
+          console.error("marking a saved work as added failed:", error);
+          noteAddError(`Added, but the saved work could not be marked as added: ${error}`);
+        }
+      }
+      return path;
     },
-    [noteAddError, setAddStage],
+    [noteAddError, setAddStage, markAcquired],
   );
 
   /**
@@ -110,15 +135,15 @@ export function useCatalogueAdd() {
         // nothing to walk, and the row offered no button.
         const courseUrl = work.landing_page_url;
         if (courseUrl === null) return null;
-        return runAdd(key, async () => {
+        return runAdd(provider, work, async () => {
           setAddStage(key, "fetching");
           const course = await acquireCourse(key, courseUrl);
           setAddStage(key, "importing");
-          await install(course.paths, course.folder);
-          return course.paths[0] ?? null;
+          const installed = await install(course.paths, course.folder);
+          return installed[0] ?? null;
         });
       }
-      return runAdd(key, async () => {
+      return runAdd(provider, work, async () => {
         // Resolving is a request of its own, and a credentialed resolver is
         // not a fast one. It is named as its own stage rather than spent
         // before the row has said anything is happening.
@@ -134,8 +159,8 @@ export function useCatalogueAdd() {
           filename: resolved.filename ?? undefined,
         });
         setAddStage(key, "importing");
-        await install([staged]);
-        return staged;
+        const installed = await install([staged]);
+        return installed[0] ?? null;
       });
     },
     [canAdd, acquire, acquireCourse, install, runAdd, setAddStage],
@@ -150,7 +175,9 @@ export function useCatalogueAdd() {
      *  The key is built here so a row never has to know how one is spelled. */
     stageOf: (provider: string, work: LiteratureSearchResult): AddStage | undefined =>
       adding[paperKey(provider, work)],
+    /** Added this session, or a saved work recorded as added in any. */
     isAdded: (provider: string, work: LiteratureSearchResult) =>
-      paperKey(provider, work) in acquired,
+      paperKey(provider, work) in acquired ||
+      Boolean(findSavedWork(savedWorks, provider, work)?.acquired),
   };
 }
