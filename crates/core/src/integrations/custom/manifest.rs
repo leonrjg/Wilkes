@@ -888,9 +888,10 @@ pub struct ResolveDownloadCapability {
     /// assembled by a downloader of its own rather than served at one URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<RunSpec>,
-    /// Optional caller-chosen filename. When absent, the downloader derives
-    /// one from the URL and response content type. A program names its own
-    /// files, so this is for `url` only.
+    /// Optional caller-chosen filename, sanitized to one file name. With
+    /// `url`, the downloader saves under it; absent, it derives one from the
+    /// URL and response content type. With `run`, it is `{filename}` to the
+    /// arguments, for a program that takes the name of what it writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
 }
@@ -916,7 +917,8 @@ pub struct RunSpec {
     /// A command found on `PATH`, or an absolute path to one.
     pub program: String,
     /// Each a template over result fields, values extracted by prior steps,
-    /// and `{output_dir}`.
+    /// `{output_dir}`, and `{filename}` when `resolve_download.filename` is
+    /// declared.
     #[serde(default)]
     pub args: Vec<String>,
 }
@@ -924,6 +926,9 @@ pub struct RunSpec {
 /// Where a program writes. Known only when it runs, so it is the one value an
 /// argument may name that no result or step supplies.
 pub const RUN_OUTPUT_DIR: &str = "output_dir";
+/// `resolve_download.filename` as written for this result, for a program
+/// that takes the name of the file it writes.
+pub const RUN_FILENAME: &str = "filename";
 /// Enough for any downloader's flags, few enough that a manifest stays a
 /// description of one call.
 pub const MAX_RUN_ARGS: usize = 64;
@@ -1695,12 +1700,13 @@ doi = "expression"                    # JMESPath over one record yielding its DO
 url = "{result_or_step_value}"        # required; HTTP(S) or relative to http.base_url. Or a list in order of preference,
                                       # url = ["{pdf_url}", "{step_value}"]: the first whose values are all known is used, and
                                       # steps run only while none is, so a result that already holds the URL costs no request
-filename = "{title}.{file_format}"   # optional, url only; sanitized before download
-# Or, instead of url and filename, a program that writes the files itself:
-run = { program = "downloader", args = ["{landing_page_url}", "--out", "{output_dir}"] }
+filename = "{title}.{file_format}"   # optional; sanitized to one file name before use
+# Or, instead of url, a program that writes the files itself:
+run = { program = "downloader", args = ["{landing_page_url}", "--out", "{output_dir}", "--name", "{filename}"] }
 # program: a command name found on PATH, or an absolute path; a literal, shown before save, and run only once the user
 # allows it by name. args: a list, never a shell command line; each is one argument, a template over result values,
-# step values and {output_dir}, the empty directory the program writes into (also its working directory). A value that
+# step values, {output_dir}, the empty directory the program writes into (also its working directory), and {filename},
+# the rendered filename above, which every run that declares one must pass to the program. A value that
 # would start an argument with "-" is refused. Everything the program leaves in {output_dir} is imported, so pass the
 # flags that keep it to the documents: no cover images, logs or tracking databases. It runs non-interactively, with
 # no input, so pass whatever flag the program needs to not prompt.
@@ -2140,13 +2146,7 @@ impl Manifest {
             }
         }
         if let Some(run) = &resolve.run {
-            problems.extend(run_problems(run, &available));
-            if resolve.filename.is_some() {
-                problems.push(
-                    "resolve_download.filename is for url; a program names the files it writes"
-                        .to_string(),
-                );
-            }
+            problems.extend(run_problems(run, &available, resolve.filename.is_some()));
         }
         if let Some(filename) = &resolve.filename {
             problems.extend(template_problems_owned(
@@ -2972,7 +2972,7 @@ fn template_problems(field: &str, template: &str, allowed: &[&str]) -> Vec<Strin
     problems
 }
 
-fn run_problems(run: &RunSpec, available: &[String]) -> Vec<String> {
+fn run_problems(run: &RunSpec, available: &[String], has_filename: bool) -> Vec<String> {
     let mut problems = Vec::new();
     let program = run.program.as_str();
     if program.trim().is_empty() {
@@ -2998,7 +2998,27 @@ fn run_problems(run: &RunSpec, available: &[String]) -> Vec<String> {
         ));
     }
     let mut allowed = available.to_vec();
-    allowed.push(RUN_OUTPUT_DIR.to_string());
+    let mut written_for_run = vec![RUN_OUTPUT_DIR];
+    if has_filename {
+        written_for_run.push(RUN_FILENAME);
+    }
+    for name in written_for_run {
+        // A step value of the same name would be one placeholder meaning two
+        // things.
+        if available.iter().any(|value| value == name) {
+            problems.push(format!(
+                "resolve_download: a step field named '{name}' would be read as the run's own {{{name}}}"
+            ));
+        }
+        allowed.push(name.to_string());
+    }
+    // Declared and passed to nothing, a filename would name no file.
+    let filename = format!("{{{RUN_FILENAME}}}");
+    if has_filename && !run.args.iter().any(|arg| arg.contains(&filename)) {
+        problems.push(format!(
+            "resolve_download.filename is declared but no run argument names {filename}, so the program never receives it"
+        ));
+    }
     for (index, arg) in run.args.iter().enumerate() {
         problems.extend(template_problems_owned(
             &format!("resolve_download.run.args[{index}]"),
@@ -3800,6 +3820,12 @@ url = "{id}"
             run(r#"run = { program = "/opt/bin/fetch", args = ["--into={output_dir}/{id}"] }"#)
                 .unwrap();
         assert_eq!(manifest.programs(), vec!["/opt/bin/fetch"]);
+        // A program that takes the name of what it writes is given one.
+        run(
+            r#"run = { program = "fetch", args = ["{id}", "-o", "{output_dir}/{filename}"] }
+filename = "{title}.pdf""#,
+        )
+        .unwrap();
 
         for (line, expected) in [
             (
@@ -3825,7 +3851,16 @@ url = "{id}"
             (
                 r#"run = { program = "fetch", args = [] }
 filename = "{title}.pdf""#,
-                "resolve_download.filename is for url",
+                "no run argument names {filename}",
+            ),
+            (
+                r#"run = { program = "fetch", args = ["--out", "{filename}"] }"#,
+                "resolve_download.run.args[1]: '{filename}' is not available here",
+            ),
+            (
+                r#"run = { program = "fetch", args = ["{output_dir}"] }
+steps = [ { path = "/manga/{id}", fields = { output_dir = "data.id" } } ]"#,
+                "a step field named 'output_dir' would be read as the run's own {output_dir}",
             ),
             (
                 r#"run = { program = "fetch", args = [] }

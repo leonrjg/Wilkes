@@ -1164,7 +1164,25 @@ impl CustomSource {
             }
         }
 
+        let filename = resolve
+            .filename
+            .as_ref()
+            .map(|template| substitute_values(template, &values, Substitution::Raw))
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("resolve_download.filename: {error}"))?
+            // The same answer the downloader gives: a name a manifest
+            // rendered is written by the same filesystem as any other, and two
+            // ideas of what one may contain would differ exactly where a
+            // template is long.
+            .map(|name| {
+                crate::path::sanitize_file_name(&name)
+                    .map_err(|error| anyhow::anyhow!("resolve_download.filename: {error}"))
+            })
+            .transpose()?;
         if let Some(run) = &resolve.run {
+            if let Some(filename) = filename {
+                values.insert(manifest::RUN_FILENAME.to_string(), filename);
+            }
             return run_plan(run, &values).map(|run| Some(DownloadPlan::Run(run)));
         }
         let template = match writable(alternatives, &values) {
@@ -1188,21 +1206,6 @@ impl CustomSource {
             "resolved download URL uses unsupported scheme '{}'",
             url.scheme()
         );
-        let filename = resolve
-            .filename
-            .as_ref()
-            .map(|template| substitute_values(template, &values, Substitution::Raw))
-            .transpose()
-            .map_err(|error| anyhow::anyhow!("resolve_download.filename: {error}"))?
-            // The same answer the downloader gives: a name a manifest
-            // rendered is written by the same filesystem as any other, and two
-            // ideas of what one may contain would differ exactly where a
-            // template is long.
-            .map(|name| {
-                crate::path::sanitize_file_name(&name)
-                    .map_err(|error| anyhow::anyhow!("resolve_download.filename: {error}"))
-            })
-            .transpose()?;
         Ok(Some(DownloadPlan::Fetch(ResolvedLiteratureDownload {
             url: url.to_string(),
             filename,
@@ -2232,7 +2235,8 @@ filename = "{title}"
         assert!(ANNA_DOI_MANIFEST.contains(from));
         let manifest = ANNA_DOI_MANIFEST.replace(
             from,
-            r#"run = { program = "fetch", args = ["{doi}", "--out", "{output_dir}/{id}", "--name={title}"] }"#,
+            r#"run = { program = "fetch", args = ["{doi}", "--out", "{output_dir}/{id}", "--name={filename}"] }
+filename = "{title}.pdf""#,
         );
         let anna = source(&manifest, &server.url(), &[]);
         let book = anna
@@ -2254,7 +2258,8 @@ filename = "{title}"
                 "10.1234/example",
                 "--out",
                 "/staging/1/deadbeef",
-                "--name=Graph: Networks",
+                // Sanitized as a download's name would be.
+                "--name=Graph_ Networks.pdf",
             ]
         );
     }
