@@ -110,7 +110,6 @@ pub(crate) async fn start(
     context: ContextStateHandle,
     cwd: PathBuf,
     workspaces: Option<Arc<dyn WorkspaceCatalog>>,
-    integrations: IntegrationsSettings,
 ) -> anyhow::Result<McpRuntime> {
     let token = uuid::Uuid::new_v4().to_string();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -121,7 +120,6 @@ pub(crate) async fn start(
         McpContext::Session(context),
         cwd,
         workspaces,
-        Some(integrations),
         HostValidation::LoopbackOnly,
         "chat",
     )
@@ -209,7 +207,6 @@ pub async fn start_external(
         McpContext::Library(context),
         PathBuf::new(),
         Some(workspaces),
-        None,
         HostValidation::Any,
         "external",
     )
@@ -225,7 +222,6 @@ pub fn api_router(workspaces: Arc<dyn WorkspaceCatalog>) -> Router {
         McpContext::Library(ExternalMcpContext::default()),
         PathBuf::new(),
         Some(workspaces),
-        None,
         rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
             .with_stateful_mode(false)
             .with_json_response(true)
@@ -252,19 +248,15 @@ fn mcp_service(
     context: McpContext,
     cwd: PathBuf,
     workspaces: Option<Arc<dyn WorkspaceCatalog>>,
-    integrations: Option<IntegrationsSettings>,
     config: rmcp::transport::streamable_http_server::StreamableHttpServerConfig,
 ) -> McpService {
     let literature_results = LiteratureResultCache::default();
     McpService::new(
         move || {
-            Ok(WilkesMcp::new(
-                context.clone(),
-                cwd.clone(),
-                workspaces.clone(),
-                integrations.clone(),
+            Ok(
+                WilkesMcp::new(context.clone(), cwd.clone(), workspaces.clone())
+                    .with_literature_results(literature_results.clone()),
             )
-            .with_literature_results(literature_results.clone()))
         },
         Default::default(),
         config,
@@ -290,7 +282,6 @@ async fn start_server(
     context: McpContext,
     cwd: PathBuf,
     workspaces: Option<Arc<dyn WorkspaceCatalog>>,
-    integrations: Option<IntegrationsSettings>,
     host_validation: HostValidation,
     lifecycle: &'static str,
 ) -> anyhow::Result<McpRuntime> {
@@ -305,7 +296,7 @@ async fn start_server(
         HostValidation::LoopbackOnly => config,
         HostValidation::Any => config.disable_allowed_hosts(),
     };
-    let service = mcp_service(context, cwd, workspaces, integrations, config);
+    let service = mcp_service(context, cwd, workspaces, config);
 
     let router =
         Router::new()
@@ -378,7 +369,6 @@ struct WilkesMcp {
     /// Resolves the library a call reads. Held instead of a `SearchService` so
     /// no server is pinned to the workspace that was active when it started.
     workspaces: Option<Arc<dyn WorkspaceCatalog>>,
-    integrations: Option<IntegrationsSettings>,
     /// Full literature results by (provider, result id), kept so `download`
     /// can resolve a chosen result server-side. The model is shown a view
     /// without file URLs and names a result by id only.
@@ -416,7 +406,6 @@ impl WilkesMcp {
         context: McpContext,
         cwd: PathBuf,
         workspaces: Option<Arc<dyn WorkspaceCatalog>>,
-        integrations: Option<IntegrationsSettings>,
     ) -> Self {
         let mut tool_router = Self::tool_router();
         normalize_tool_input_schemas(&mut tool_router);
@@ -424,7 +413,6 @@ impl WilkesMcp {
             context,
             cwd,
             workspaces,
-            integrations,
             literature_results: Arc::default(),
             tool_router,
         }
@@ -529,7 +517,6 @@ impl std::fmt::Debug for WilkesMcp {
                 "workspaces",
                 &self.workspaces.as_ref().map(|_| "WorkspaceCatalog"),
             )
-            .field("integrations", &self.integrations)
             .finish_non_exhaustive()
     }
 }
@@ -688,12 +675,9 @@ impl WilkesMcp {
     /// own: `list_context` holds one, and resolving a second time would send a
     /// redundant lookup through the workspace catalog on every call.
     async fn literature_provider_ids(&self, scope: &WorkspaceScope) -> Vec<String> {
-        let settings = match &self.integrations {
-            Some(integrations) => integrations.clone(),
-            None => match scope.search() {
-                Some(search) => search.integrations().await,
-                None => IntegrationsSettings::default(),
-            },
+        let settings = match scope.search() {
+            Some(search) => search.integrations().await,
+            None => IntegrationsSettings::default(),
         };
         let mirror = scope.search().and_then(|search| search.catalogue_mirror());
         IntegrationRegistry::from_settings(&settings, mirror.as_deref())
@@ -729,9 +713,6 @@ impl WilkesMcp {
     /// Literature and provider settings are global rather than per-workspace,
     /// so this deliberately resolves through the active workspace only.
     async fn integrations(&self) -> IntegrationsSettings {
-        if let Some(integrations) = &self.integrations {
-            return integrations.clone();
-        }
         let search = match self.scope(None).await {
             Ok(scope) => scope.search(),
             Err(error) => {
@@ -1768,9 +1749,8 @@ impl WilkesMcp {
 }
 
 impl WilkesMcp {
-    /// The service custom integrations are read and written through. Always
-    /// the live settings, never the snapshot a chat started with: these tools
-    /// are about what is stored, which includes what they just stored.
+    /// The service custom integrations are read and written through, the
+    /// active workspace's because integration settings are the installation's.
     async fn integrations_service(&self) -> Result<Arc<dyn SearchService>, String> {
         self.scope(None)
             .await?
@@ -2508,6 +2488,8 @@ mod tests {
         saved: Mutex<Vec<(String, String, Option<String>)>>,
         /// (manifest, enabled) of every custom integration saved.
         saved_manifests: Mutex<Vec<(String, Option<bool>)>>,
+        /// What the service reports as the integration settings right now.
+        integrations: Mutex<IntegrationsSettings>,
     }
 
     #[test]
@@ -2539,7 +2521,6 @@ mod tests {
         let mcp = WilkesMcp::new(
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
-            None,
             None,
         );
         let search = &mcp.tool_router.map.get("search").unwrap().attr.input_schema;
@@ -2591,7 +2572,6 @@ mod tests {
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             None,
-            None,
         );
         let schema = &mcp
             .tool_router
@@ -2622,7 +2602,6 @@ mod tests {
         let mcp = WilkesMcp::new(
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
-            None,
             None,
         );
         for route in mcp.tool_router.map.values() {
@@ -2814,6 +2793,9 @@ mod tests {
                 .push((provider.clone(), work.id.clone(), note));
             Ok(serde_json::json!({"provider": provider, "work": work}))
         }
+        async fn integrations(self: Arc<Self>) -> IntegrationsSettings {
+            self.integrations.lock().unwrap().clone()
+        }
         async fn custom_integrations(
             self: Arc<Self>,
             id: Option<String>,
@@ -2971,6 +2953,7 @@ mod tests {
         Arc::new(FakeSearch {
             saved: Mutex::default(),
             saved_manifests: Mutex::default(),
+            integrations: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -3007,7 +2990,6 @@ mod tests {
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(Arc::clone(&catalog) as Arc<dyn WorkspaceCatalog>),
-            None,
         );
 
         let response = serde_json::to_value(
@@ -3052,7 +3034,6 @@ mod tests {
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(Arc::clone(&catalog) as Arc<dyn WorkspaceCatalog>),
-            None,
         );
 
         // The active workspace's roots do not admit it...
@@ -3102,7 +3083,6 @@ mod tests {
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(catalog),
-            None,
         );
 
         let error = get_document_text_for_mcp(
@@ -3134,7 +3114,6 @@ mod tests {
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(catalog),
-            None,
         );
 
         let error = get_document_text_for_mcp(
@@ -3185,7 +3164,6 @@ mod tests {
             McpContext::Session(context),
             chat_root.path().to_path_buf(),
             Some(catalog),
-            None,
         );
 
         // The chat's own context file is readable while the call stays in the
@@ -3230,7 +3208,6 @@ mod tests {
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             None,
-            None,
         );
         let error = match mcp.scope(Some("any-id")).await {
             Ok(_) => panic!("expected a named workspace to be refused"),
@@ -3261,7 +3238,6 @@ mod tests {
             Some(single_workspace(fake_search_with_root(
                 library.path().to_path_buf(),
             ))),
-            None,
         );
 
         let response = get_document_text_for_mcp(
@@ -3302,7 +3278,6 @@ mod tests {
             Some(single_workspace(fake_search_with_root(
                 library.path().to_path_buf(),
             ))),
-            None,
         );
 
         let error = get_document_text_for_mcp(
@@ -3330,7 +3305,6 @@ mod tests {
             Some(single_workspace(fake_search_with_root(
                 library.path().to_path_buf(),
             ))),
-            None,
         );
 
         let error = search_documents_for_mcp(
@@ -3551,11 +3525,12 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
                 .to_string(),
                 secrets: Default::default(),
             });
+        let service = fake_search_with_root(root.path().into());
+        *service.integrations.lock().unwrap() = integrations;
         let mcp = WilkesMcp::new(
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
-            Some(single_workspace(fake_search_with_root(root.path().into()))),
-            Some(integrations),
+            Some(single_workspace(service)),
         );
         mcp.literature_results.lock().unwrap().insert(
             ("custom:runner".to_string(), "M1".to_string()),
@@ -3617,7 +3592,6 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             WilkesMcp::new(
                 McpContext::Library(ExternalMcpContext::default()),
                 PathBuf::new(),
-                None,
                 None,
             )
             .with_literature_results(cache.clone())
@@ -3714,12 +3688,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         std::fs::write(&path, "active document text").unwrap();
         let context = ContextStateHandle::default();
         context.set_active_doc(Some(path.to_string_lossy().into_owned()), None);
-        let mcp = WilkesMcp::new(
-            McpContext::Session(context),
-            dir.path().to_path_buf(),
-            None,
-            None,
-        );
+        let mcp = WilkesMcp::new(McpContext::Session(context), dir.path().to_path_buf(), None);
 
         let response = get_document_text_for_mcp(
             &mcp,
@@ -3745,12 +3714,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         std::fs::write(&path, "# Overview\ntext\n## Details\nmore text\n").unwrap();
         let context = ContextStateHandle::default();
         context.set_active_doc(Some(path.to_string_lossy().into_owned()), None);
-        let mcp = WilkesMcp::new(
-            McpContext::Session(context),
-            dir.path().to_path_buf(),
-            None,
-            None,
-        );
+        let mcp = WilkesMcp::new(McpContext::Session(context), dir.path().to_path_buf(), None);
 
         let response = get_document_outline_for_mcp(
             &mcp,
@@ -3780,7 +3744,6 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             Some(single_workspace(fake_search_with_root(
                 library.path().to_path_buf(),
             ))),
-            None,
         );
 
         let error = get_document_outline_for_mcp(
@@ -3803,12 +3766,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         std::fs::write(&path, "context document text").unwrap();
         let context = ContextStateHandle::default();
         context.add_context(path.to_string_lossy().into_owned(), None);
-        let mcp = WilkesMcp::new(
-            McpContext::Session(context),
-            dir.path().to_path_buf(),
-            None,
-            None,
-        );
+        let mcp = WilkesMcp::new(McpContext::Session(context), dir.path().to_path_buf(), None);
 
         let response = get_document_text_for_mcp(
             &mcp,
@@ -3835,12 +3793,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         std::fs::write(&path, "root document text").unwrap();
         let context = ContextStateHandle::default();
         context.set_search_root(Some(dir.path().to_string_lossy().into_owned()));
-        let mcp = WilkesMcp::new(
-            McpContext::Session(context),
-            dir.path().to_path_buf(),
-            None,
-            None,
-        );
+        let mcp = WilkesMcp::new(McpContext::Session(context), dir.path().to_path_buf(), None);
 
         let response = get_document_text_for_mcp(
             &mcp,
@@ -3873,6 +3826,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         let search = Arc::new(FakeSearch {
             saved: Mutex::default(),
             saved_manifests: Mutex::default(),
+            integrations: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -3887,7 +3841,6 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             McpContext::Session(context),
             current_root,
             Some(single_workspace(search)),
-            None,
         );
 
         let scope = mcp.scope(None).await.unwrap();
@@ -3928,7 +3881,6 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             McpContext::Session(context),
             root.clone(),
             Some(single_workspace(fake_search_with_root(root))),
-            None,
         );
 
         let err = get_document_text_for_mcp(
@@ -3971,7 +3923,6 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             McpContext::Session(context),
             root.clone(),
             Some(single_workspace(fake_search_with_root(root))),
-            None,
         );
 
         let err = get_document_text_for_mcp(
@@ -3997,12 +3948,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         std::fs::write(&path, "aé日b").unwrap();
         let context = ContextStateHandle::default();
         context.add_context(path.to_string_lossy().into_owned(), None);
-        let mcp = WilkesMcp::new(
-            McpContext::Session(context),
-            dir.path().to_path_buf(),
-            None,
-            None,
-        );
+        let mcp = WilkesMcp::new(McpContext::Session(context), dir.path().to_path_buf(), None);
 
         let response = get_document_text_for_mcp(
             &mcp,
@@ -4028,12 +3974,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         std::fs::write(&path, "active document text").unwrap();
         let context = ContextStateHandle::default();
         context.set_active_doc(Some(path.to_string_lossy().into_owned()), Some(3));
-        let mcp = WilkesMcp::new(
-            McpContext::Session(context),
-            dir.path().to_path_buf(),
-            None,
-            None,
-        );
+        let mcp = WilkesMcp::new(McpContext::Session(context), dir.path().to_path_buf(), None);
 
         let response = get_document_text_for_mcp(
             &mcp,
@@ -4089,6 +4030,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         let service = Arc::new(FakeSearch {
             saved: Mutex::default(),
             saved_manifests: Mutex::default(),
+            integrations: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -4333,6 +4275,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         let service = Arc::new(FakeSearch {
             saved: Mutex::default(),
             saved_manifests: Mutex::default(),
+            integrations: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -4381,6 +4324,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         let service = Arc::new(FakeSearch {
             saved: Mutex::default(),
             saved_manifests: Mutex::default(),
+            integrations: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -4510,6 +4454,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         let service = Arc::new(FakeSearch {
             saved: Mutex::default(),
             saved_manifests: Mutex::default(),
+            integrations: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -4614,7 +4559,6 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(single_workspace(service)),
-            None,
         );
 
         let response = list_documents_for_mcp(
@@ -4654,7 +4598,6 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(single_workspace(service)),
-            None,
         );
 
         let response = get_file_metadata_for_mcp(
@@ -4682,7 +4625,6 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             Some(single_workspace(fake_search_with_root(
                 library.path().to_path_buf(),
             ))),
-            None,
         );
 
         let error = get_file_metadata_for_mcp(
@@ -4710,7 +4652,6 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             Some(single_workspace(fake_search_with_root(
                 library.path().to_path_buf(),
             ))),
-            None,
         );
 
         let scope = mcp.scope(None).await.unwrap();
@@ -4833,7 +4774,6 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(single_workspace(service)),
-            None,
         );
         let reply = mcp
             .edit_library(Parameters(EditLibraryParams {
@@ -4862,7 +4802,6 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(single_workspace(fake_search_with_root(root.path().into()))),
-            None,
         );
         let edit = |path: PathBuf| EditLibraryParams {
             workspace: None,
@@ -4910,7 +4849,6 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(single_workspace(service.clone())),
-            None,
         );
         let mut work: LiteratureSearchResult = serde_json::from_value(serde_json::json!({
             "id": "W1",
@@ -4956,7 +4894,6 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(single_workspace(service.clone())),
-            None,
         );
         let reply = mcp
             .save_literature_result(Parameters(SaveLiteratureResultParams {
@@ -4974,15 +4911,13 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
     }
 
     #[tokio::test]
-    async fn a_chat_reads_back_the_manifest_it_saved_rather_than_its_starting_snapshot() {
+    async fn a_saved_manifest_is_read_back_with_its_text_and_the_authoring_guide() {
         let root = tempdir().unwrap();
         let service = fake_search_with_root(root.path().into());
         let mcp = WilkesMcp::new(
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(single_workspace(service.clone())),
-            // A chat's snapshot, taken before anything was saved.
-            Some(IntegrationsSettings::default()),
         );
         let saved = mcp
             .save_custom_integration(Parameters(SaveCustomIntegrationParams {
@@ -5011,6 +4946,52 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         );
     }
 
+    #[tokio::test]
+    async fn a_chat_can_search_a_provider_saved_after_it_started() {
+        let root = tempdir().unwrap();
+        let service = fake_search_with_root(root.path().into());
+        let mcp = WilkesMcp::new(
+            McpContext::Session(ContextStateHandle::default()),
+            root.path().into(),
+            Some(single_workspace(service.clone())),
+        );
+        assert!(!mcp
+            .literature_registry()
+            .await
+            .enabled_literature_ids()
+            .contains(&"custom:later"));
+
+        service.integrations.lock().unwrap().custom.push(
+            wilkes_core::types::CustomIntegrationConfig {
+                id: "later".to_string(),
+                name: None,
+                enabled: true,
+                manifest: r#"manifest_version = 2
+id = "later"
+name = "Later"
+
+[http]
+base_url = "https://later.test"
+
+[capabilities.search]
+path = "/search?q={query}"
+
+[capabilities.search.fields]
+id = "id"
+title = "title"
+"#
+                .to_string(),
+                secrets: Default::default(),
+            },
+        );
+
+        assert!(mcp
+            .literature_registry()
+            .await
+            .enabled_literature_ids()
+            .contains(&"custom:later"));
+    }
+
     #[test]
     fn only_reading_custom_integrations_skips_the_prompt() {
         assert!(WILKES_MCP_TOOL_NAMES.contains(&"read_custom_integrations"));
@@ -5025,7 +5006,6 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             McpContext::Library(ExternalMcpContext::default()),
             PathBuf::new(),
             Some(single_workspace(fake_search_with_root(root.path().into()))),
-            None,
         );
         let reply = mcp
             .read_library(Parameters(ReadLibraryParams {

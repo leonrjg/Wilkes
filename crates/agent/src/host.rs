@@ -31,7 +31,6 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use wilkes_chat::host::ChatHost;
 use wilkes_chat::AgentBackend;
-use wilkes_core::types::IntegrationsSettings;
 
 use crate::context::{
     build_context_block, root_context, ActiveDoc, ActiveDocText, ContextFile, RootContext,
@@ -280,11 +279,10 @@ impl WilkesChatHost {
         backend: AgentBackend,
         cwd: PathBuf,
         workspaces: Option<Arc<dyn WorkspaceCatalog>>,
-        integrations: IntegrationsSettings,
     ) -> anyhow::Result<Arc<Self>> {
         let context = ContextStateHandle::default();
         let mcp = if matches!(backend, AgentBackend::ClaudeCode | AgentBackend::Codex) {
-            Some(crate::mcp::start(context.clone(), cwd, workspaces, integrations).await?)
+            Some(crate::mcp::start(context.clone(), cwd, workspaces).await?)
         } else {
             None
         };

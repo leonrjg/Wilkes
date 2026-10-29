@@ -105,15 +105,15 @@ pub trait SearchService: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Current integration settings for long-lived MCP servers. Chat-scoped
-    /// servers receive a point-in-time snapshot directly, while an external
-    /// application-scoped server must observe settings edits without a restart.
+    /// Current integration settings, read for each call so a server observes
+    /// settings edits — including a manifest an agent just saved — without a
+    /// restart.
     async fn integrations(self: Arc<Self>) -> IntegrationsSettings {
         IntegrationsSettings::default()
     }
 
     /// The custom integrations the user stored, or the one `id` names with its
-    /// manifest, as settings hold them now rather than as a chat began.
+    /// manifest.
     async fn custom_integrations(
         self: Arc<Self>,
         id: Option<String>,

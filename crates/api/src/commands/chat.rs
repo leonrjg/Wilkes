@@ -19,7 +19,6 @@ use serde_json::Value;
 use wilkes_agent::search::WorkspaceCatalog;
 use wilkes_agent::WilkesChatHost;
 use wilkes_chat::session::{SpawnOptions, SpawnedChatSession};
-use wilkes_core::types::IntegrationsSettings;
 
 pub use wilkes_agent::{HostActiveDoc, HostContext, HostContextFile};
 pub use wilkes_chat::auth::{ChatAuth, LoginOutcome};
@@ -54,9 +53,8 @@ pub async fn start(
     backend: AgentBackend,
     cwd: PathBuf,
     workspaces: Option<Arc<dyn WorkspaceCatalog>>,
-    integrations: IntegrationsSettings,
 ) -> anyhow::Result<(SpawnedChatSession, Arc<WilkesChatHost>)> {
-    let host = WilkesChatHost::start(backend, cwd.clone(), workspaces, integrations).await?;
+    let host = WilkesChatHost::start(backend, cwd.clone(), workspaces).await?;
     let spawned =
         wilkes_chat::session::spawn(SpawnOptions::new(backend, cwd).host(host.clone())).await?;
     Ok((spawned, host))
@@ -70,10 +68,9 @@ pub async fn start(
 pub async fn open(
     record: &ChatConversationRecord,
     workspaces: Option<Arc<dyn WorkspaceCatalog>>,
-    integrations: IntegrationsSettings,
 ) -> anyhow::Result<(SpawnedChatSession, Arc<WilkesChatHost>)> {
     let cwd = PathBuf::from(&record.cwd);
-    let host = WilkesChatHost::start(record.backend, cwd.clone(), workspaces, integrations).await?;
+    let host = WilkesChatHost::start(record.backend, cwd.clone(), workspaces).await?;
     let spawned = wilkes_chat::session::spawn(
         SpawnOptions::new(record.backend, cwd)
             .host(host.clone())

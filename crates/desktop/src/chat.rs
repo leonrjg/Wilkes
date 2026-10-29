@@ -277,15 +277,10 @@ pub async fn chat_start(
 ) -> Result<ChatStartResult, String> {
     let ctx = app_context(&app);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let integrations = ctx.get_settings().await.integrations;
-    let (spawned, wilkes) = wilkes_api::commands::chat::start(
-        backend,
-        cwd.clone(),
-        Some(workspace_manager(&app)),
-        integrations,
-    )
-    .await
-    .map_err(|e| format!("{e:#}"))?;
+    let (spawned, wilkes) =
+        wilkes_api::commands::chat::start(backend, cwd.clone(), Some(workspace_manager(&app)))
+            .await
+            .map_err(|e| format!("{e:#}"))?;
     wilkes.apply(host.unwrap_or_default());
 
     let session = Arc::new(spawned.session);
@@ -328,9 +323,8 @@ pub async fn chat_open_conversation(
     let ctx = app_context(&app);
     let record = wilkes_api::commands::chat::get_conversation(&ctx.data_dir, &conversation_id)
         .map_err(|e| format!("{e:#}"))?;
-    let integrations = ctx.get_settings().await.integrations;
     let (spawned, wilkes) =
-        wilkes_api::commands::chat::open(&record, Some(workspace_manager(&app)), integrations)
+        wilkes_api::commands::chat::open(&record, Some(workspace_manager(&app)))
             .await
             .map_err(|e| format!("{e:#}"))?;
     wilkes.apply(host.unwrap_or_default());
@@ -398,7 +392,6 @@ pub async fn chat_fork_conversation(
         return Err("This chat backend does not support durable forks".to_string());
     }
     let environment = wilkes_api::commands::chat::environment_at_message(&source, &message_id);
-    let integrations = ctx.get_settings().await.integrations;
 
     // A *new* session, not a resume: the point of a branch is to go where the
     // original did not, and an agent reattached to its own last state still
@@ -408,7 +401,6 @@ pub async fn chat_fork_conversation(
         source.backend,
         cwd.clone(),
         Some(workspace_manager(&app)),
-        integrations,
     )
     .await
     .map_err(|e| format!("{e:#}"))?;
