@@ -1,4 +1,4 @@
-import { Fragment, useState, useCallback, useRef, useEffect, type ReactNode } from "react";
+import { useState, useCallback, useRef, useEffect, type ReactNode } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { BookOpen, Bookmark, Cloud, Globe, MessageSquare, Settings as SettingsIcon, ChevronDown, ChevronLeft, ChevronRight, Loader, Plus } from "react-feather";
 import SearchBar from "./components/SearchBar";
@@ -34,10 +34,28 @@ import { useGlobalEvents } from "./hooks/useGlobalEvents";
 import { useNativeOpen } from "./hooks/useNativeOpen";
 import { useWindowTitle } from "./hooks/useWindowTitle";
 import { pathIsWithinRoot } from "./lib/configuredRoots";
+import { arrangePanes, movePane } from "./lib/paneOrder";
 import { relativeFolderPath, type FileTreeHandle } from "./components/FileTree";
 import { api, source, isTauri } from "./services";
-import type { AgentBackend, NativeOpenRequest } from "./lib/types";
+import type { AgentBackend, BookmarkDock, NativeOpenRequest } from "./lib/types";
 import type { DesktopSourceApi, PathKind, WebSourceApi } from "./services/api";
+
+/** A pane docked beside the reader, as the dock lays it out. */
+interface DockedPane {
+  /** Names the pane in the arrangement the user makes. */
+  key: string;
+  /** What the pane is, for its grip's label. */
+  label: string;
+  side: BookmarkDock;
+  width: number;
+  setWidth: (width: number) => void;
+  minWidth: number;
+  maxWidth: number;
+  focused?: boolean;
+  marked?: boolean;
+  onFocus?: () => void;
+  children: ReactNode;
+}
 
 export default function App() {
   useGlobalEvents();
@@ -120,6 +138,15 @@ export default function App() {
   const toggleBrowserPane = useBrowserStore((s) => s.togglePane);
   const [browserWidth, setBrowserWidth] = useState(480);
   const [chatWidths, setChatWidths] = useState<Record<string, number>>({});
+  // The arrangement of the docked panes the user last made, as pane keys.
+  const [paneOrder, setPaneOrder] = useState<string[]>([]);
+  // The pane being dragged by its grip, and the line showing where it would
+  // land — none while it would land where it is.
+  const [paneDrag, setPaneDrag] = useState<{
+    key: string;
+    line: { left: number; top: number; height: number } | null;
+  } | null>(null);
+  const dockRef = useRef<HTMLDivElement>(null);
   const [fileFilterText, setFileFilterText] = useState("");
   const resizeRef = useRef<{
     startX: number;
@@ -669,160 +696,266 @@ export default function App() {
     </>
   );
 
-  const bookmarksColumn = bookmarksPaneOpen ? (
-    <>
-      {bookmarksDock === "Right" && (
-        <div
-          onMouseDown={startResize({
-            width: bookmarksWidth,
-            setWidth: setBookmarksWidth,
-            direction: -1,
-            minWidth: 240,
-            maxWidth: window.innerWidth * 0.5,
-          })}
-          className="w-1 cursor-col-resize flex-shrink-0 bg-transparent hover:bg-[var(--accent-blue)]/30 border-l border-[var(--border-main)] transition-colors"
-        />
-      )}
-      <div
-        className="flex-shrink-0 overflow-hidden"
-        style={{ width: `${bookmarksWidth}px`, minWidth: "240px" }}
-      >
-        <BookmarksPane />
-      </div>
-      {bookmarksDock === "Left" && (
-        <div
-          onMouseDown={startResize({
-            width: bookmarksWidth,
-            setWidth: setBookmarksWidth,
-            direction: 1,
-            minWidth: 240,
-            maxWidth: window.innerWidth * 0.5,
-          })}
-          className="w-1 cursor-col-resize flex-shrink-0 bg-transparent hover:bg-[var(--accent-blue)]/30 border-r border-[var(--border-main)] transition-colors"
-        />
-      )}
-    </>
-  ) : null;
-
-  const topicsColumn = topicsPaneOpen ? (
-    <>
-      {bookmarksDock === "Right" && (
-        <div
-          onMouseDown={startResize({
-            width: topicsWidth,
-            setWidth: setTopicsWidth,
-            direction: -1,
-            minWidth: 260,
-            maxWidth: window.innerWidth * 0.55,
-          })}
-          className="w-1 cursor-col-resize flex-shrink-0 border-l border-[var(--border-main)] bg-transparent transition-colors hover:bg-[var(--accent-blue)]/30"
-        />
-      )}
-      <div
-        className="flex-shrink-0 overflow-hidden"
-        style={{ width: `${topicsWidth}px`, minWidth: "260px" }}
-      >
-        <TopicCloudPane />
-      </div>
-      {bookmarksDock === "Left" && (
-        <div
-          onMouseDown={startResize({
-            width: topicsWidth,
-            setWidth: setTopicsWidth,
-            direction: 1,
-            minWidth: 260,
-            maxWidth: window.innerWidth * 0.55,
-          })}
-          className="w-1 cursor-col-resize flex-shrink-0 border-r border-[var(--border-main)] bg-transparent transition-colors hover:bg-[var(--accent-blue)]/30"
-        />
-      )}
-    </>
-  ) : null;
-
-  /** One right-docked pane with its resize handle. A pointer or focus inside
-   *  it makes it the pane in use, which is where a request from elsewhere —
-   *  "Ask about this file", a search of the catalogues — is sent. With more
-   *  than one open, the pane in use is marked. */
-  const rightDockedPane = ({
-    id,
-    width,
-    setWidth,
-    minWidth,
-    focused,
-    marked,
-    onFocus,
-    children,
-  }: {
-    id: string;
-    width: number;
-    setWidth: (width: number) => void;
-    minWidth: number;
-    focused: boolean;
-    marked: boolean;
-    onFocus: () => void;
-    children: ReactNode;
-  }) => (
-    <Fragment key={id}>
-      <div
-        onMouseDown={startResize({
-          width,
-          setWidth,
-          direction: -1,
-          minWidth,
-          maxWidth: window.innerWidth * 0.5,
-        })}
-        className="w-1 cursor-col-resize flex-shrink-0 bg-transparent hover:bg-[var(--accent-blue)]/30 border-l border-[var(--border-main)] transition-colors"
-      />
-      <div
-        onPointerDownCapture={onFocus}
-        onFocusCapture={onFocus}
-        className="relative flex-shrink-0 overflow-hidden"
-        style={{ width: `${width}px`, minWidth: `${minWidth}px` }}
-      >
-        {marked && focused && (
-          <div
-            aria-hidden="true"
-            className="pointer-events-none absolute inset-x-0 top-0 z-10 h-0.5 bg-[var(--accent-blue)]"
-          />
-        )}
-        {children}
-      </div>
-    </Fragment>
-  );
-
-  // Chat is right-dock-only for v1 (bookmarks already covers left, spec §7.1).
-  const chatColumns =
-    isTauri && chatPanesVisible
-      ? chatPanes.map((pane) =>
-          rightDockedPane({
-            id: pane.id,
-            width: chatWidths[pane.id] ?? 320,
-            setWidth: (width) => setChatWidths((widths) => ({ ...widths, [pane.id]: width })),
-            minWidth: 320,
-            focused: pane.id === focusedChatPane,
-            marked: chatPanes.length > 1,
-            onFocus: () => focusChatPane(pane.id),
-            children: <ChatPane pane={pane} onClose={() => closeChatPane(pane.id)} />,
-          }),
-        )
-      : null;
-
+  // Every pane docked beside the reader, in its default order: the order it
+  // takes until the user moves one.
+  const dockedPanes: DockedPane[] = [];
+  if (bookmarksPaneOpen) {
+    dockedPanes.push({
+      key: "bookmarks",
+      label: "bookmarks",
+      side: bookmarksDock,
+      width: bookmarksWidth,
+      setWidth: setBookmarksWidth,
+      minWidth: 240,
+      maxWidth: window.innerWidth * 0.5,
+      children: <BookmarksPane />,
+    });
+  }
+  if (topicsPaneOpen) {
+    dockedPanes.push({
+      key: "topics",
+      label: "topics",
+      side: bookmarksDock,
+      width: topicsWidth,
+      setWidth: setTopicsWidth,
+      minWidth: 260,
+      maxWidth: window.innerWidth * 0.55,
+      children: <TopicCloudPane />,
+    });
+  }
   // Right-dock only, like chat: the left dock is bookmarks' and the pane is a
   // companion to the file list, not a second reading column.
-  const catalogueColumns = cataloguePanesVisible
-    ? cataloguePanes.map((pane) =>
-        rightDockedPane({
-          id: pane.id,
-          width: catalogueWidths[pane.id] ?? 360,
-          setWidth: (width) => setCatalogueWidths((widths) => ({ ...widths, [pane.id]: width })),
-          minWidth: 300,
-          focused: pane.id === focusedCataloguePane,
-          marked: cataloguePanes.length > 1,
-          onFocus: () => focusCataloguePane(pane.id),
-          children: <CataloguePane pane={pane} />,
-        }),
-      )
-    : null;
+  if (cataloguePanesVisible) {
+    for (const pane of cataloguePanes) {
+      dockedPanes.push({
+        key: `catalogue:${pane.id}`,
+        label: "literature",
+        side: "Right",
+        width: catalogueWidths[pane.id] ?? 360,
+        setWidth: (width) => setCatalogueWidths((widths) => ({ ...widths, [pane.id]: width })),
+        minWidth: 300,
+        maxWidth: window.innerWidth * 0.5,
+        focused: pane.id === focusedCataloguePane,
+        marked: cataloguePanes.length > 1,
+        onFocus: () => focusCataloguePane(pane.id),
+        children: <CataloguePane pane={pane} />,
+      });
+    }
+  }
+  // Chat is right-dock-only for v1 (bookmarks already covers left, spec §7.1).
+  if (isTauri && chatPanesVisible) {
+    for (const pane of chatPanes) {
+      dockedPanes.push({
+        key: `chat:${pane.id}`,
+        label: "chat",
+        side: "Right",
+        width: chatWidths[pane.id] ?? 320,
+        setWidth: (width) => setChatWidths((widths) => ({ ...widths, [pane.id]: width })),
+        minWidth: 320,
+        maxWidth: window.innerWidth * 0.5,
+        focused: pane.id === focusedChatPane,
+        marked: chatPanes.length > 1,
+        onFocus: () => focusChatPane(pane.id),
+        children: <ChatPane pane={pane} onClose={() => closeChatPane(pane.id)} />,
+      });
+    }
+  }
+  if (isTauri && browserPaneOpen) {
+    dockedPanes.push({
+      key: "browser",
+      label: "browser",
+      side: "Right",
+      width: browserWidth,
+      setWidth: setBrowserWidth,
+      minWidth: 320,
+      maxWidth: window.innerWidth * 0.5,
+      children: <BrowserPane />,
+    });
+  }
+
+  /** Each side's panes in the order the user arranged them. */
+  const arrangedPanes = (side: BookmarkDock) =>
+    arrangePanes(dockedPanes.filter((pane) => pane.side === side), paneOrder);
+
+  /** Records `key` at `index` among `sideKeys`, the panes of its side as they
+   *  stand. The rest of the arrangement — the other side, and panes closed
+   *  since they were placed — keeps its places. */
+  const placePane = (sideKeys: string[], key: string, index: number) => {
+    const moved = movePane(sideKeys, key, index);
+    setPaneOrder((order) => [...order.filter((other) => !moved.includes(other)), ...moved]);
+  };
+
+  /** Where a pane dragged to `x` would land among its side's panes, and the
+   *  line that shows it; null where it would land where it already is. Asked
+   *  of the panes as they are laid out, since that is what the user sees. */
+  const paneLanding = (side: BookmarkDock, key: string, x: number) => {
+    const panes = Array.from(
+      dockRef.current?.querySelectorAll<HTMLElement>(`[data-dock-side="${side}"] [data-docked-pane]`) ?? [],
+    )
+      .map((element) => ({ key: element.dataset.dockedPane!, rect: element.getBoundingClientRect() }))
+      .sort((a, b) => a.rect.left - b.rect.left);
+    const keys = panes.map((pane) => pane.key);
+    const from = keys.indexOf(key);
+    const others = panes.filter((pane) => pane.key !== key);
+    if (from < 0 || others.length === 0) return null;
+    const index = others.filter((pane) => pane.rect.left + pane.rect.width / 2 < x).length;
+    if (index === from) return null;
+    const edge = index < others.length ? others[index].rect.left : others[others.length - 1].rect.right;
+    const { top, height } = panes[from].rect;
+    return { keys, index, line: { left: edge, top, height } };
+  };
+
+  /** Drag a pane by its grip to another place among its side's panes. */
+  const startPaneDrag = (side: BookmarkDock, key: string) => (event: React.PointerEvent<HTMLElement>) => {
+    if (event.button !== 0 || !event.isPrimary) return;
+    event.preventDefault();
+    const grip = event.currentTarget;
+    const pointerId = event.pointerId;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    let active = false;
+    let shown: number | null = null;
+
+    const aim = (x: number) => {
+      const landing = paneLanding(side, key, x);
+      shown = landing?.index ?? null;
+      setPaneDrag({ key, line: landing?.line ?? null });
+    };
+    const finish = () => {
+      window.removeEventListener("pointermove", move, true);
+      window.removeEventListener("pointerup", release, true);
+      window.removeEventListener("pointercancel", cancelPointer, true);
+      window.removeEventListener("keydown", keydown, true);
+      window.removeEventListener("blur", finish);
+      grip.removeEventListener("lostpointercapture", cancelPointer);
+      if (grip.hasPointerCapture(pointerId)) grip.releasePointerCapture(pointerId);
+      setPaneDrag(null);
+      if (active) {
+        document.body.style.cursor = "";
+        useBrowserStore.getState().setHeld(false);
+      }
+    };
+    const cancelPointer = (e: PointerEvent) => {
+      if (e.pointerId === pointerId) finish();
+    };
+    const keydown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        finish();
+      }
+    };
+    const move = (e: PointerEvent) => {
+      if (e.pointerId !== pointerId) return;
+      if ((e.buttons & 1) === 0) {
+        finish();
+        return;
+      }
+      if (!active && Math.hypot(e.clientX - startX, e.clientY - startY) < 4) return;
+      e.preventDefault();
+      if (!active) {
+        active = true;
+        document.body.style.cursor = "grabbing";
+        // The browser pane would take the pointer from the drag as it crossed it.
+        useBrowserStore.getState().setHeld(true);
+      }
+      aim(e.clientX);
+    };
+    const release = (e: PointerEvent) => {
+      if (e.pointerId !== pointerId) return;
+      // Only where the line was shown: a layout that moved under the pointer
+      // since cancels rather than surprises.
+      const landing = active ? paneLanding(side, key, e.clientX) : null;
+      const accepted = landing !== null && landing.index === shown;
+      finish();
+      if (accepted) placePane(landing.keys, key, landing.index);
+    };
+
+    grip.setPointerCapture(pointerId);
+    window.addEventListener("pointermove", move, true);
+    window.addEventListener("pointerup", release, true);
+    window.addEventListener("pointercancel", cancelPointer, true);
+    window.addEventListener("keydown", keydown, true);
+    window.addEventListener("blur", finish);
+    grip.addEventListener("lostpointercapture", cancelPointer);
+  };
+
+  /** One side's docked panes, each with its grip and resize handle. The panes
+   *  stay where they are in the document and are placed by their flex order,
+   *  so a move does not take a pane out of the page and put it back — which
+   *  would lose its focus and scroll position. A pointer or focus inside a
+   *  pane makes it the pane in use, which is where a request from elsewhere —
+   *  "Ask about this file", a search of the catalogues — is sent. With more
+   *  than one of a kind open, the pane in use is marked. */
+  const dockSide = (side: BookmarkDock) => {
+    const arranged = arrangedPanes(side);
+    if (arranged.length === 0) return null;
+    const keys = arranged.map((pane) => pane.key);
+    const handle = (pane: DockedPane) => (
+      <div
+        onMouseDown={startResize({
+          width: pane.width,
+          setWidth: pane.setWidth,
+          direction: side === "Right" ? -1 : 1,
+          minWidth: pane.minWidth,
+          maxWidth: pane.maxWidth,
+        })}
+        className={`w-1 cursor-col-resize flex-shrink-0 bg-transparent hover:bg-[var(--accent-blue)]/30 ${
+          side === "Right" ? "border-l" : "border-r"
+        } border-[var(--border-main)] transition-colors`}
+      />
+    );
+    return (
+      <div data-dock-side={side} className="flex min-h-0 flex-shrink-0">
+        {dockedPanes
+          .filter((pane) => pane.side === side)
+          .map((pane) => {
+            const at = keys.indexOf(pane.key);
+            return (
+              <div
+                key={pane.key}
+                data-docked-pane={pane.key}
+                className={`flex min-h-0 flex-shrink-0 ${paneDrag?.key === pane.key ? "opacity-50" : ""}`}
+                style={{ order: at }}
+              >
+                {side === "Right" && handle(pane)}
+                <div
+                  onPointerDownCapture={pane.onFocus}
+                  onFocusCapture={pane.onFocus}
+                  className="relative flex flex-shrink-0 flex-col overflow-hidden"
+                  style={{ width: `${pane.width}px`, minWidth: `${pane.minWidth}px` }}
+                >
+                  <Tooltip content="Drag to move this pane">
+                    <button
+                      type="button"
+                      aria-label={`Move ${pane.label} pane`}
+                      onPointerDown={startPaneDrag(side, pane.key)}
+                      onKeyDown={(event) => {
+                        const step = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
+                        if (step === 0) return;
+                        event.preventDefault();
+                        placePane(keys, pane.key, at + step);
+                      }}
+                      style={{ touchAction: "none" }}
+                      className="group flex h-2.5 w-full shrink-0 cursor-grab items-center justify-center bg-[var(--bg-sidebar)] focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--accent-blue)]"
+                    >
+                      <span className="h-[3px] w-8 rounded-full bg-[var(--border-strong)] transition-colors group-hover:bg-[var(--text-dim)]" />
+                    </button>
+                  </Tooltip>
+                  {pane.marked && pane.focused && (
+                    <div
+                      aria-hidden="true"
+                      className="pointer-events-none absolute inset-x-0 top-0 z-10 h-0.5 bg-[var(--accent-blue)]"
+                    />
+                  )}
+                  <div className="min-h-0 flex-1">{pane.children}</div>
+                </div>
+                {side === "Left" && handle(pane)}
+              </div>
+            );
+          })}
+      </div>
+    );
+  };
 
   return (
     <div
@@ -836,8 +969,20 @@ export default function App() {
         />
       )}
       <SearchBar sourceSlot={sourceSlot} settingsSlot={settingsSlot} />
+      {paneDrag?.line && (
+        <div
+          aria-hidden="true"
+          data-testid="pane-drop-line"
+          className="pointer-events-none fixed z-50 w-0.5 -translate-x-1/2 bg-[var(--accent-blue)]"
+          style={{
+            left: `${paneDrag.line.left}px`,
+            top: `${paneDrag.line.top}px`,
+            height: `${paneDrag.line.height}px`,
+          }}
+        />
+      )}
 
-      <div className="flex flex-1 min-h-0 overflow-hidden">
+      <div ref={dockRef} className="flex flex-1 min-h-0 overflow-hidden">
         <div
           id="file-sidebar"
           className={sidebarCollapsed ? "hidden" : "flex-shrink-0 flex flex-col min-h-0 bg-[var(--bg-sidebar)]"}
@@ -878,28 +1023,13 @@ export default function App() {
           </button>
         </div>
 
-        {bookmarksDock === "Left" && bookmarksColumn}
-        {bookmarksDock === "Left" && topicsColumn}
+        {dockSide("Left")}
 
         <div className="flex-1 min-h-0 min-w-0 overflow-hidden bg-[var(--bg-app)]">
           <PreviewPane />
         </div>
 
-        {bookmarksDock === "Right" && bookmarksColumn}
-        {bookmarksDock === "Right" && topicsColumn}
-        {catalogueColumns}
-        {chatColumns}
-        {isTauri && browserPaneOpen &&
-          rightDockedPane({
-            id: "browser-pane",
-            width: browserWidth,
-            setWidth: setBrowserWidth,
-            minWidth: 320,
-            focused: false,
-            marked: false,
-            onFocus: () => {},
-            children: <BrowserPane />,
-          })}
+        {dockSide("Right")}
       </div>
     </div>
   );

@@ -11,6 +11,7 @@ import { useViewerStore } from "./stores/useViewerStore";
 import { useWorkspaceStore } from "./stores/useWorkspaceStore";
 import { ToastProvider } from "./components/Toast";
 import { api, source } from "./services";
+import { capturePointer, pointerEvent } from "./test/pointerDrag";
 
 // Mock services and hooks at top level
 vi.mock("./services", () => ({
@@ -140,6 +141,24 @@ const viewerSessionActions = {
 /** A pane entry as App reads it; the pane itself is stubbed above. */
 function chatPane(id: string) {
   return { id, session: null, opening: false, contextFiles: [], activeDoc: null } as any;
+}
+
+/** The docked panes on one side, left to right as the layout places them. */
+function dockedPanes(side: "Left" | "Right") {
+  return Array.from(document.querySelectorAll<HTMLElement>(`[data-dock-side="${side}"] [data-docked-pane]`))
+    .sort((a, b) => Number(a.style.order) - Number(b.style.order))
+    .map((element) => element.dataset.dockedPane);
+}
+
+/** jsdom lays nothing out: each docked pane is given a 300px column, placed
+ *  by its flex order from x = 1000. */
+function layOutDockedPanes() {
+  for (const element of document.querySelectorAll<HTMLElement>("[data-docked-pane]")) {
+    element.getBoundingClientRect = () => {
+      const left = 1000 + Number(element.style.order) * 300;
+      return { left, right: left + 300, width: 300, top: 40, bottom: 840, height: 800, x: left, y: 40 } as DOMRect;
+    };
+  }
 }
 
 describe("App", () => {
@@ -653,6 +672,101 @@ describe("App", () => {
     await vi.waitFor(() => expect(source.readClipboardFiles).toHaveBeenCalledTimes(1));
     expect(source.importFiles).not.toHaveBeenCalled();
   });
+  describe("docked pane arrangement", () => {
+    beforeEach(() => {
+      useChatStore.setState({ panesVisible: true, panes: [chatPane("chat-1"), chatPane("chat-2")] });
+      useCatalogueStore.setState({ panesVisible: true, panes: [{ id: "cat-1" } as any] });
+    });
+
+    it("lays the panes out in their default order", () => {
+      render(<ToastProvider><App /></ToastProvider>);
+      expect(dockedPanes("Right")).toEqual(["catalogue:cat-1", "chat:chat-1", "chat:chat-2"]);
+    });
+
+    it("moves a pane with the arrow keys on its grip", () => {
+      render(<ToastProvider><App /></ToastProvider>);
+      const [grip] = screen.getAllByRole("button", { name: "Move literature pane" });
+      fireEvent.keyDown(grip, { key: "ArrowRight" });
+      expect(dockedPanes("Right")).toEqual(["chat:chat-1", "catalogue:cat-1", "chat:chat-2"]);
+      fireEvent.keyDown(grip, { key: "ArrowRight" });
+      expect(dockedPanes("Right")).toEqual(["chat:chat-1", "chat:chat-2", "catalogue:cat-1"]);
+      fireEvent.keyDown(grip, { key: "ArrowRight" });
+      expect(dockedPanes("Right")).toEqual(["chat:chat-1", "chat:chat-2", "catalogue:cat-1"]);
+    });
+
+    it("moves a pane dragged by its grip to where the line showed it would land", () => {
+      render(<ToastProvider><App /></ToastProvider>);
+      layOutDockedPanes();
+      const grip = screen.getAllByRole("button", { name: "Move chat pane" })[1];
+      capturePointer(grip);
+
+      pointerEvent(grip, "pointerdown", { clientX: 1750, clientY: 45 });
+      pointerEvent(window, "pointermove", { clientX: 1100, clientY: 45 });
+      const line = screen.getByTestId("pane-drop-line");
+      expect(line.style.left).toBe("1000px");
+      expect(document.querySelector('[data-docked-pane="chat:chat-2"]')).toHaveClass("opacity-50");
+      pointerEvent(window, "pointerup", { clientX: 1100, clientY: 45, buttons: 0 });
+
+      expect(dockedPanes("Right")).toEqual(["chat:chat-2", "catalogue:cat-1", "chat:chat-1"]);
+      expect(screen.queryByTestId("pane-drop-line")).not.toBeInTheDocument();
+      expect(document.querySelector('[data-docked-pane="chat:chat-2"]')).not.toHaveClass("opacity-50");
+    });
+
+    it("shows no line and moves nothing for a drag that stays in the pane's own place", () => {
+      render(<ToastProvider><App /></ToastProvider>);
+      layOutDockedPanes();
+      const [grip] = screen.getAllByRole("button", { name: "Move literature pane" });
+      capturePointer(grip);
+
+      pointerEvent(grip, "pointerdown", { clientX: 1150, clientY: 45 });
+      pointerEvent(window, "pointermove", { clientX: 1250, clientY: 45 });
+      expect(screen.queryByTestId("pane-drop-line")).not.toBeInTheDocument();
+      pointerEvent(window, "pointerup", { clientX: 1250, clientY: 45, buttons: 0 });
+
+      expect(dockedPanes("Right")).toEqual(["catalogue:cat-1", "chat:chat-1", "chat:chat-2"]);
+    });
+
+    it("cancels a drag on Escape", () => {
+      render(<ToastProvider><App /></ToastProvider>);
+      layOutDockedPanes();
+      const [grip] = screen.getAllByRole("button", { name: "Move literature pane" });
+      capturePointer(grip);
+
+      pointerEvent(grip, "pointerdown", { clientX: 1150, clientY: 45 });
+      pointerEvent(window, "pointermove", { clientX: 1800, clientY: 45 });
+      expect(screen.getByTestId("pane-drop-line")).toBeInTheDocument();
+      fireEvent.keyDown(window, { key: "Escape" });
+      pointerEvent(window, "pointerup", { clientX: 1800, clientY: 45, buttons: 0 });
+
+      expect(screen.queryByTestId("pane-drop-line")).not.toBeInTheDocument();
+      expect(dockedPanes("Right")).toEqual(["catalogue:cat-1", "chat:chat-1", "chat:chat-2"]);
+    });
+
+    it("opens a new chat beside the other chats after the user arranged the panes", () => {
+      render(<ToastProvider><App /></ToastProvider>);
+      const [grip] = screen.getAllByRole("button", { name: "Move literature pane" });
+      fireEvent.keyDown(grip, { key: "ArrowRight" });
+      fireEvent.keyDown(grip, { key: "ArrowRight" });
+
+      act(() => {
+        useChatStore.setState({ panes: [chatPane("chat-1"), chatPane("chat-2"), chatPane("chat-3")] });
+      });
+      expect(dockedPanes("Right")).toEqual(["chat:chat-1", "chat:chat-2", "chat:chat-3", "catalogue:cat-1"]);
+    });
+
+    it("keeps one side's arrangement when panes on the other side move", () => {
+      useSettingsStore.setState({ bookmarksDock: "Left" });
+      useBookmarksStore.setState({ paneOpen: true });
+      render(<ToastProvider><App /></ToastProvider>);
+      fireEvent.keyDown(screen.getAllByRole("button", { name: "Move literature pane" })[0], { key: "ArrowRight" });
+      act(() => {
+        useBookmarksStore.setState({ paneOpen: false });
+      });
+      expect(dockedPanes("Left")).toEqual([]);
+      expect(dockedPanes("Right")).toEqual(["chat:chat-1", "catalogue:cat-1", "chat:chat-2"]);
+    });
+  });
+
   describe("wilkes:// links that name a workspace", () => {
     const CORPUS = {
       id: "workspace-2",
