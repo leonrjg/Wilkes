@@ -47,8 +47,7 @@ interface DockedPane {
   /** What the pane is, for its grip's label. */
   label: string;
   side: BookmarkDock;
-  width: number;
-  setWidth: (width: number) => void;
+  /** The width it opens at, and the narrowest it can be made. */
   minWidth: number;
   maxWidth: number;
   focused?: boolean;
@@ -129,15 +128,12 @@ export default function App() {
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(320);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [bookmarksWidth, setBookmarksWidth] = useState(320);
-  const [topicsWidth, setTopicsWidth] = useState(340);
-  // Per pane: a second pane opens at the default width, and resizing one does
-  // not resize the others.
-  const [catalogueWidths, setCatalogueWidths] = useState<Record<string, number>>({});
+  // The widths the user dragged the docked panes to, by pane key. A pane not
+  // named here opens at its minimum width, and resizing one does not resize
+  // the others.
+  const [paneWidths, setPaneWidths] = useState<Record<string, number>>({});
   const browserPaneOpen = useBrowserStore((s) => s.paneOpen);
   const toggleBrowserPane = useBrowserStore((s) => s.togglePane);
-  const [browserWidth, setBrowserWidth] = useState(480);
-  const [chatWidths, setChatWidths] = useState<Record<string, number>>({});
   // The arrangement of the docked panes the user last made, as pane keys.
   const [paneOrder, setPaneOrder] = useState<string[]>([]);
   // The pane being dragged by its grip, and the line showing where it would
@@ -704,8 +700,6 @@ export default function App() {
       key: "bookmarks",
       label: "bookmarks",
       side: bookmarksDock,
-      width: bookmarksWidth,
-      setWidth: setBookmarksWidth,
       minWidth: 240,
       maxWidth: window.innerWidth * 0.5,
       children: <BookmarksPane />,
@@ -716,8 +710,6 @@ export default function App() {
       key: "topics",
       label: "topics",
       side: bookmarksDock,
-      width: topicsWidth,
-      setWidth: setTopicsWidth,
       minWidth: 260,
       maxWidth: window.innerWidth * 0.55,
       children: <TopicCloudPane />,
@@ -731,8 +723,6 @@ export default function App() {
         key: `catalogue:${pane.id}`,
         label: "literature",
         side: "Right",
-        width: catalogueWidths[pane.id] ?? 360,
-        setWidth: (width) => setCatalogueWidths((widths) => ({ ...widths, [pane.id]: width })),
         minWidth: 300,
         maxWidth: window.innerWidth * 0.5,
         focused: pane.id === focusedCataloguePane,
@@ -749,8 +739,6 @@ export default function App() {
         key: `chat:${pane.id}`,
         label: "chat",
         side: "Right",
-        width: chatWidths[pane.id] ?? 320,
-        setWidth: (width) => setChatWidths((widths) => ({ ...widths, [pane.id]: width })),
         minWidth: 320,
         maxWidth: window.innerWidth * 0.5,
         focused: pane.id === focusedChatPane,
@@ -765,8 +753,6 @@ export default function App() {
       key: "browser",
       label: "browser",
       side: "Right",
-      width: browserWidth,
-      setWidth: setBrowserWidth,
       minWidth: 320,
       maxWidth: window.innerWidth * 0.5,
       children: <BrowserPane />,
@@ -890,11 +876,12 @@ export default function App() {
     const arranged = arrangedPanes(side);
     if (arranged.length === 0) return null;
     const keys = arranged.map((pane) => pane.key);
+    const widthOf = (pane: DockedPane) => paneWidths[pane.key] ?? pane.minWidth;
     const handle = (pane: DockedPane) => (
       <div
         onMouseDown={startResize({
-          width: pane.width,
-          setWidth: pane.setWidth,
+          width: widthOf(pane),
+          setWidth: (width) => setPaneWidths((widths) => ({ ...widths, [pane.key]: width })),
           direction: side === "Right" ? -1 : 1,
           minWidth: pane.minWidth,
           maxWidth: pane.maxWidth,
@@ -922,7 +909,7 @@ export default function App() {
                   onPointerDownCapture={pane.onFocus}
                   onFocusCapture={pane.onFocus}
                   className="relative flex flex-shrink-0 flex-col overflow-hidden"
-                  style={{ width: `${pane.width}px`, minWidth: `${pane.minWidth}px` }}
+                  style={{ width: `${widthOf(pane)}px`, minWidth: `${pane.minWidth}px` }}
                 >
                   <Tooltip content="Drag to move this pane">
                     <button

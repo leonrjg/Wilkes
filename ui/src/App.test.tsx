@@ -683,6 +683,21 @@ describe("App", () => {
       expect(dockedPanes("Right")).toEqual(["catalogue:cat-1", "chat:chat-1", "chat:chat-2"]);
     });
 
+    it("opens each pane at its minimum width, and widens only the one resized", () => {
+      render(<ToastProvider><App /></ToastProvider>);
+      const group = (key: string) => document.querySelector<HTMLElement>(`[data-docked-pane="${key}"]`)!;
+      const [handle, column] = Array.from(group("chat:chat-1").children) as HTMLElement[];
+      expect(column.style.width).toBe("320px");
+      expect((group("catalogue:cat-1").children[1] as HTMLElement).style.width).toBe("300px");
+
+      fireEvent.mouseDown(handle, { clientX: 1000 });
+      fireEvent.mouseMove(document, { clientX: 900 });
+      fireEvent.mouseUp(document);
+
+      expect(column.style.width).toBe("420px");
+      expect((group("chat:chat-2").children[1] as HTMLElement).style.width).toBe("320px");
+    });
+
     it("moves a pane with the arrow keys on its grip", () => {
       render(<ToastProvider><App /></ToastProvider>);
       const [grip] = screen.getAllByRole("button", { name: "Move literature pane" });
