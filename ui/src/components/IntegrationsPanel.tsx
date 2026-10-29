@@ -11,6 +11,8 @@ interface IntegrationsPanelProps {
   api: SearchApi;
   settings: Settings;
   onUpdate: (patch: Partial<Settings>) => Promise<void> | void;
+  /** Sends a message to the chat, when there is one. */
+  onSendToChat?: (message: string) => void;
 }
 
 /** The custom tab is not a provider, so it is not a row. */
@@ -38,6 +40,7 @@ export default function IntegrationsPanel({
   api,
   settings,
   onUpdate,
+  onSendToChat,
 }: IntegrationsPanelProps) {
   const [active, setActive] = useState<string>(ZOTERO_ROW.key);
   const [providers, setProviders] = useState<LiteratureProviderInfo[]>([]);
@@ -187,6 +190,7 @@ export default function IntegrationsPanel({
             onUpdate={onUpdate}
             providers={providers}
             extending={extending}
+            onSendToChat={onSendToChat}
           />
         )}
       </div>

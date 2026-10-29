@@ -2,6 +2,11 @@ import { render, screen, fireEvent, act, within, waitFor } from "@testing-librar
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import SettingsModal from "./SettingsModal";
 import { useGenerationStore } from "../stores/useGenerationStore";
+import { useChatStore } from "../stores/useChatStore";
+
+const integrationsPanel = vi.hoisted(() => ({
+  props: null as { onSendToChat?: (message: string) => void } | null,
+}));
 
 // Mock sub-components
 vi.mock("./SemanticPanel", () => ({ default: () => <div data-testid="semantic-panel">SemanticPanel</div> }));
@@ -9,7 +14,12 @@ vi.mock("./GenerationPanel", () => ({ default: () => <div data-testid="generatio
 vi.mock("./ChunkingPanel", () => ({ default: () => <div data-testid="chunking-panel">ChunkingPanel</div> }));
 vi.mock("./DataPanel", () => ({ default: () => <div data-testid="data-panel">DataPanel</div> }));
 vi.mock("./ExtensionsPanel", () => ({ default: () => <div data-testid="extensions-panel">ExtensionsPanel</div> }));
-vi.mock("./IntegrationsPanel", () => ({ default: () => <div data-testid="integrations-panel">IntegrationsPanel</div> }));
+vi.mock("./IntegrationsPanel", () => ({
+  default: (props: { onSendToChat?: (message: string) => void }) => {
+    integrationsPanel.props = props;
+    return <div data-testid="integrations-panel">IntegrationsPanel</div>;
+  },
+}));
 vi.mock("./LogsPanel", () => ({ default: () => <div data-testid="logs-panel">LogsPanel</div> }));
 vi.mock("./WorkersPanel", () => ({ default: () => <div data-testid="workers-panel">WorkersPanel</div> }));
 
@@ -151,6 +161,31 @@ describe("SettingsModal", () => {
     expect(mockApi.literatureProviders).toHaveBeenCalledTimes(providerReads + 1);
     unmount();
     expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it("closes to hand an integration to the chat, and offers no chat when there is none", async () => {
+    const openPaneAndSend = vi.fn().mockResolvedValue(undefined);
+    const onClose = vi.fn();
+    const chat = useChatStore.getState();
+    useChatStore.setState({ backendsLoaded: true, hasAvailableBackend: true, openPaneAndSend });
+    try {
+      await act(async () => {
+        render(<SettingsModal {...defaultProps} onClose={onClose} />);
+      });
+      await waitFor(() => expect(integrationsPanel.props?.onSendToChat).toBeDefined());
+      act(() => integrationsPanel.props!.onSendToChat!("change it"));
+      expect(onClose).toHaveBeenCalledOnce();
+      expect(openPaneAndSend).toHaveBeenCalledWith("change it");
+
+      act(() => useChatStore.setState({ hasAvailableBackend: false }));
+      expect(integrationsPanel.props?.onSendToChat).toBeUndefined();
+    } finally {
+      useChatStore.setState({
+        backendsLoaded: chat.backendsLoaded,
+        hasAvailableBackend: chat.hasAvailableBackend,
+        openPaneAndSend: chat.openPaneAndSend,
+      });
+    }
   });
 
   it("renders when open", async () => {

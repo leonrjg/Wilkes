@@ -206,7 +206,8 @@ pub async fn custom_integration_probe(
 }
 
 /// A stored custom integration as an agent reads it. Secrets are named, never
-/// valued: the agent edits the manifest, and the user holds the credentials.
+/// valued, and the manifest is not there at all: an agent sees a manifest's
+/// text only when the user hands it over to ask for a change.
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
 pub struct StoredIntegration {
     pub id: String,
@@ -216,57 +217,25 @@ pub struct StoredIntegration {
     pub name: Option<String>,
     pub enabled: bool,
     pub secrets_set: Vec<String>,
-    /// Only when one integration was asked for.
-    pub manifest: Option<String>,
 }
 
-/// Every stored custom integration, or the one `id` names with its manifest.
-pub fn stored_integrations(
-    integrations: &IntegrationsSettings,
-    id: Option<&str>,
-) -> anyhow::Result<Vec<StoredIntegration>> {
-    let stored = |config: &CustomIntegrationConfig, manifest: bool| {
-        let mut secrets_set: Vec<String> = config.secrets.keys().cloned().collect();
-        secrets_set.sort_unstable();
-        StoredIntegration {
-            id: config.id.clone(),
-            provider: format!("custom:{}", config.id),
-            name: config.name.clone(),
-            enabled: config.enabled,
-            secrets_set,
-            manifest: manifest.then(|| config.manifest.clone()),
-        }
-    };
-    match id {
-        None => Ok(integrations
-            .custom
-            .iter()
-            .map(|config| stored(config, false))
-            .collect()),
-        Some(id) => {
-            let id = id.strip_prefix("custom:").unwrap_or(id);
-            let config = integrations
-                .custom
-                .iter()
-                .find(|config| config.id == id)
-                .ok_or_else(|| {
-                    let known: Vec<&str> = integrations
-                        .custom
-                        .iter()
-                        .map(|config| config.id.as_str())
-                        .collect();
-                    anyhow::anyhow!(
-                        "no custom integration '{id}'; the stored ones are: {}",
-                        if known.is_empty() {
-                            "none".to_string()
-                        } else {
-                            known.join(", ")
-                        }
-                    )
-                })?;
-            Ok(vec![stored(config, true)])
-        }
-    }
+/// Every stored custom integration.
+pub fn stored_integrations(integrations: &IntegrationsSettings) -> Vec<StoredIntegration> {
+    integrations
+        .custom
+        .iter()
+        .map(|config: &CustomIntegrationConfig| {
+            let mut secrets_set: Vec<String> = config.secrets.keys().cloned().collect();
+            secrets_set.sort_unstable();
+            StoredIntegration {
+                id: config.id.clone(),
+                provider: format!("custom:{}", config.id),
+                name: config.name.clone(),
+                enabled: config.enabled,
+                secrets_set,
+            }
+        })
+        .collect()
 }
 
 /// The secrets stored for the integration `manifest` would replace, when it
@@ -627,19 +596,14 @@ steps = [
     }
 
     #[test]
-    fn stored_integrations_name_secrets_without_their_values() {
+    fn stored_integrations_name_secrets_without_their_values_or_the_manifest() {
         let settings = stored(MANIFEST, &[("crossref_token", "t0ken")]);
-        let listed = stored_integrations(&settings, None).unwrap();
+        let listed = stored_integrations(&settings);
         assert_eq!(listed[0].provider, "custom:crossref");
         assert_eq!(listed[0].secrets_set, vec!["crossref_token"]);
-        assert!(listed[0].manifest.is_none());
-        let one = stored_integrations(&settings, Some("custom:crossref")).unwrap();
-        assert_eq!(one[0].manifest.as_deref(), Some(MANIFEST));
-        assert!(!serde_json::to_string(&one).unwrap().contains("t0ken"));
-        let error = stored_integrations(&settings, Some("other"))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("crossref"), "{error}");
+        let text = serde_json::to_string(&listed).unwrap();
+        assert!(!text.contains("t0ken"), "{text}");
+        assert!(!text.contains("api.crossref.org"), "{text}");
     }
 
     #[tokio::test]

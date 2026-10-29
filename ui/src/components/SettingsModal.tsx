@@ -27,6 +27,7 @@ import {Tool} from "react-feather";
 import { isTauri } from "../services";
 import type { AgentBackend, MetadataSourcePreference } from "../lib/types";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useChatStore } from "../stores/useChatStore";
 
 const CHAT_BACKENDS: { value: AgentBackend; label: string }[] = [
   { value: "ClaudeCode", label: "Claude Code" },
@@ -199,6 +200,17 @@ export default function SettingsModal({
     | "technical";
 
   const [activeTab, setActiveTab] = useState<SettingsTab>("general");
+  const chatBackendsLoaded = useChatStore((s) => s.backendsLoaded);
+  const hasAvailableChatBackend = useChatStore((s) => s.hasAvailableBackend);
+  const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
+  const chatAvailable = isTauri && chatBackendsLoaded && hasAvailableChatBackend;
+  /** Settings covers the window, so it closes for the chat to be seen. */
+  const sendToChat = (message: string) => {
+    onClose();
+    openChatPaneAndSend(message).catch((e) =>
+      console.error("Sending an integration to the chat failed:", e),
+    );
+  };
   const [settings, setSettings] = useState<Settings | null>(null);
   const [literatureProviders, setLiteratureProviders] = useState<LiteratureProviderInfo[]>([]);
   const [maxDownloadMbDraft, setMaxDownloadMbDraft] = useState("");
@@ -1052,7 +1064,12 @@ export default function SettingsModal({
 
             <div className={activeTab === "integrations" ? "block min-h-full" : "hidden"}>
               {settings && (
-                <IntegrationsPanel api={api} settings={settings} onUpdate={handleUpdateSettings} />
+                <IntegrationsPanel
+                  api={api}
+                  settings={settings}
+                  onUpdate={handleUpdateSettings}
+                  onSendToChat={chatAvailable ? sendToChat : undefined}
+                />
               )}
             </div>
 

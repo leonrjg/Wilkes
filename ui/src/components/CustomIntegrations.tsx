@@ -29,6 +29,42 @@ interface CustomIntegrationsProps {
   /** A provider the user asked to extend from its own tab: the editor opens
    *  on a manifest that takes that provider's capabilities. */
   extending?: LiteratureProviderInfo | null;
+  /** Sends a message to the chat. Absent when there is no chat to send to,
+   *  and then a row offers no "Edit with chat". */
+  onSendToChat?: (message: string) => void;
+}
+
+/** The longest run of backticks in `text`, plus one, so a fence around it
+ *  cannot be closed early by the text itself. */
+function fenceFor(text: string): string {
+  const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
+/**
+ * The message that hands one integration's manifest to the chat.
+ *
+ * This is the only way an agent sees a stored manifest's text: the MCP tools
+ * list integrations without it. The user decides that a manifest is to be
+ * changed, and the text reaches the conversation because they sent it.
+ */
+export function chatEditMessage(
+  config: CustomIntegrationConfig,
+  name: string,
+  change: string,
+): string {
+  const fence = fenceFor(config.manifest);
+  return [
+    `Change the custom integration "${name}" (id \`${config.id}\`): ${change}`,
+    "",
+    "Its current manifest:",
+    "",
+    fence,
+    config.manifest,
+    fence,
+    "",
+    "Read the manifest format with read_custom_integrations (authoring_guide=true), check the change with probe_custom_integration, and save it with save_custom_integration under the same id.",
+  ].join("\n");
 }
 
 const INITIAL_PROBE_QUERY = "graph neural networks";
@@ -100,6 +136,7 @@ export default function CustomIntegrations({
   onUpdate,
   providers = [],
   extending = null,
+  onSendToChat,
 }: CustomIntegrationsProps) {
   const configured = useMemo(
     () => settings.integrations?.custom ?? [],
@@ -130,6 +167,9 @@ export default function CustomIntegrations({
   const [declaredNames, setDeclaredNames] = useState<Record<string, string>>({});
   /** Which row is being renamed, and to what. */
   const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null);
+  /** Which row's manifest is being handed to the chat, and the change asked
+   *  for. */
+  const [asking, setAsking] = useState<{ id: string; value: string } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -317,6 +357,14 @@ export default function CustomIntegrations({
     if (ok) setRenaming(null);
   };
 
+  const sendToChat = (config: CustomIntegrationConfig) => {
+    if (asking === null || !onSendToChat) return;
+    const change = asking.value.trim();
+    if (!change) return;
+    onSendToChat(chatEditMessage(config, displayName(config), change));
+    setAsking(null);
+  };
+
   const setEnabled = async (config: CustomIntegrationConfig, enabled: boolean) => {
     await writeCustom(
       configured.map((existing) =>
@@ -407,6 +455,39 @@ export default function CustomIntegrations({
                   Cancel
                 </button>
               </form>
+            ) : asking?.id === config.id ? (
+              <form
+                className="flex flex-1 items-center gap-1.5"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  sendToChat(config);
+                }}
+              >
+                <input
+                  type="text"
+                  autoFocus
+                  aria-label={`Change to ask for in ${config.id}`}
+                  placeholder="What should change?"
+                  value={asking.value}
+                  onChange={(e) => setAsking({ id: config.id, value: e.target.value })}
+                  onKeyDown={(e) => e.key === "Escape" && setAsking(null)}
+                  className={INPUT_CLASS}
+                />
+                <button
+                  type="submit"
+                  disabled={!asking.value.trim()}
+                  className={GHOST_BUTTON_CLASS}
+                >
+                  Send to chat
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAsking(null)}
+                  className={GHOST_BUTTON_CLASS}
+                >
+                  Cancel
+                </button>
+              </form>
             ) : (
               <>
                 <label className="flex items-center gap-2.5 cursor-pointer group">
@@ -437,9 +518,10 @@ export default function CustomIntegrations({
                   </button>
                   <button
                     type="button"
-                    onClick={() =>
-                      setRenaming({ id: config.id, value: config.name ?? "" })
-                    }
+                    onClick={() => {
+                      setAsking(null);
+                      setRenaming({ id: config.id, value: config.name ?? "" });
+                    }}
                     className={GHOST_BUTTON_CLASS}
                   >
                     Rename
@@ -451,6 +533,18 @@ export default function CustomIntegrations({
                   >
                     Edit
                   </button>
+                  {onSendToChat && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRenaming(null);
+                        setAsking({ id: config.id, value: "" });
+                      }}
+                      className={GHOST_BUTTON_CLASS}
+                    >
+                      Edit with chat
+                    </button>
+                  )}
                   {extendable(config) && (
                     <button
                       type="button"

@@ -262,14 +262,12 @@ impl wilkes_agent::search::SearchService for AppContext {
         self.get_settings().await.integrations
     }
 
-    async fn custom_integrations(
-        self: Arc<Self>,
-        id: Option<String>,
-    ) -> Result<serde_json::Value, String> {
+    async fn custom_integrations(self: Arc<Self>) -> Result<serde_json::Value, String> {
         let integrations = self.get_settings().await.integrations;
-        crate::commands::integrations::custom::stored_integrations(&integrations, id.as_deref())
-            .and_then(|stored| Ok(serde_json::to_value(stored)?))
-            .map_err(|e| format!("{e:#}"))
+        serde_json::to_value(crate::commands::integrations::custom::stored_integrations(
+            &integrations,
+        ))
+        .map_err(|e| format!("{e:#}"))
     }
 
     async fn probe_custom_integration(
@@ -10997,11 +10995,8 @@ title = "title[0]"
             .iter()
             .any(|(name, _)| name == "integrations-updated"));
 
-        let listed = Arc::clone(&ctx)
-            .custom_integrations(Some("crossref".to_string()))
-            .await
-            .unwrap();
-        assert_eq!(listed[0]["manifest"], manifest);
+        let listed = Arc::clone(&ctx).custom_integrations().await.unwrap();
+        assert_eq!(listed[0]["provider"], "custom:crossref");
     }
 
     async fn enable_generation(ctx: &Arc<AppContext>, model: &str) {

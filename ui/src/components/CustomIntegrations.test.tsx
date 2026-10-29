@@ -848,4 +848,50 @@ describe("CustomIntegrations", () => {
     await waitFor(() => expect(onUpdate).toHaveBeenCalled());
     expect(onUpdate.mock.calls[0][0].integrations.custom[0].enabled).toBe(true);
   });
+
+  it("hands a row's manifest to the chat only when the user asks for a change", async () => {
+    const onSendToChat = vi.fn();
+    const configured: CustomIntegrationConfig = {
+      id: "crossref",
+      enabled: true,
+      manifest: 'id = "crossref"\n# ``` inside the manifest',
+      secrets: { token: "t0ken" },
+    };
+    render(
+      <CustomIntegrations
+        api={apiWith()}
+        settings={settings([configured])}
+        onUpdate={vi.fn()}
+        onSendToChat={onSendToChat}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit with chat" }));
+    const send = screen.getByRole("button", { name: "Send to chat" });
+    expect(send).toBeDisabled();
+    fireEvent.change(screen.getByPlaceholderText("What should change?"), {
+      target: { value: "add a year filter" },
+    });
+    fireEvent.click(send);
+
+    expect(onSendToChat).toHaveBeenCalledTimes(1);
+    const message: string = onSendToChat.mock.calls[0][0];
+    expect(message).toContain("add a year filter");
+    expect(message).toContain("`crossref`");
+    // The fence outlasts the backticks in the manifest, so the text arrives whole.
+    expect(message).toContain('````\nid = "crossref"\n# ``` inside the manifest\n````');
+    expect(message).not.toContain("t0ken");
+    expect(screen.queryByRole("button", { name: "Send to chat" })).not.toBeInTheDocument();
+  });
+
+  it("offers no chat edit when there is no chat", () => {
+    render(
+      <CustomIntegrations
+        api={apiWith()}
+        settings={settings([{ id: "crossref", enabled: true, manifest: "", secrets: {} }])}
+        onUpdate={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Edit with chat" })).not.toBeInTheDocument();
+  });
 });

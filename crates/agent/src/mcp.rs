@@ -978,9 +978,6 @@ struct SaveLiteratureResultParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReadCustomIntegrationsParams {
-    /// A custom integration's id, with or without the custom: prefix, to read
-    /// its manifest. Omit to list every custom integration without manifests.
-    id: Option<String>,
     /// Also return the guide to the manifest format: what a manifest may
     /// declare and how. Read it before writing or editing one.
     #[serde(default, deserialize_with = "deserialize_optional_bool")]
@@ -1667,7 +1664,7 @@ impl WilkesMcp {
         }
     }
     #[tool(
-        description = "Read the custom literature integrations the user stored, each a manifest describing a web service Wilkes can search and fetch from. Omit id to list them (id, provider id for literature_search, enabled, which secrets are set); pass id to also get its manifest text. Set authoring_guide=true to get the manifest format's guide, which you need before writing or editing a manifest. Secret values are never returned."
+        description = "List the custom literature integrations the user stored, each a manifest describing a web service Wilkes can search and fetch from: id, provider id for literature_search, enabled, and which secrets are set. Neither manifest text nor secret values are returned; to change an integration, the user gives you its manifest. Set authoring_guide=true to get the manifest format's guide, which you need before writing or editing a manifest."
     )]
     async fn read_custom_integrations(
         &self,
@@ -1677,7 +1674,7 @@ impl WilkesMcp {
             let integrations = self
                 .integrations_service()
                 .await?
-                .custom_integrations(params.id)
+                .custom_integrations()
                 .await?;
             let mut response = serde_json::json!({ "integrations": integrations });
             if params.authoring_guide.unwrap_or(false) {
@@ -2796,17 +2793,11 @@ mod tests {
         async fn integrations(self: Arc<Self>) -> IntegrationsSettings {
             self.integrations.lock().unwrap().clone()
         }
-        async fn custom_integrations(
-            self: Arc<Self>,
-            id: Option<String>,
-        ) -> Result<serde_json::Value, String> {
+        async fn custom_integrations(self: Arc<Self>) -> Result<serde_json::Value, String> {
             let saved = self.saved_manifests.lock().unwrap();
             Ok(serde_json::json!(saved
                 .iter()
-                .map(|(manifest, _)| serde_json::json!({
-                    "provider": "custom:fake",
-                    "manifest": id.as_ref().map(|_| manifest),
-                }))
+                .map(|_| serde_json::json!({ "provider": "custom:fake" }))
                 .collect::<Vec<_>>()))
         }
         async fn save_custom_integration(
@@ -4911,7 +4902,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
     }
 
     #[tokio::test]
-    async fn a_saved_manifest_is_read_back_with_its_text_and_the_authoring_guide() {
+    async fn a_saved_manifest_is_listed_with_the_authoring_guide_but_not_its_text() {
         let root = tempdir().unwrap();
         let service = fake_search_with_root(root.path().into());
         let mcp = WilkesMcp::new(
@@ -4933,17 +4924,22 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
 
         let read = mcp
             .read_custom_integrations(Parameters(ReadCustomIntegrationsParams {
-                id: Some("fake".into()),
                 authoring_guide: Some(true),
             }))
             .await
             .structured_content
             .unwrap();
-        assert_eq!(read["integrations"][0]["manifest"], "id = \"fake\"");
+        assert_eq!(read["integrations"][0]["provider"], "custom:fake");
+        assert!(read["integrations"][0].get("manifest").is_none());
         assert_eq!(
             read["authoring_guide"],
             wilkes_core::integrations::custom::manifest::authoring_prompt()
         );
+        // There is no way to name one integration and ask for its manifest.
+        assert!(serde_json::from_value::<ReadCustomIntegrationsParams>(
+            serde_json::json!({ "id": "fake" })
+        )
+        .is_err());
     }
 
     #[tokio::test]

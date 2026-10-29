@@ -112,13 +112,10 @@ pub trait SearchService: Send + Sync {
         IntegrationsSettings::default()
     }
 
-    /// The custom integrations the user stored, or the one `id` names with its
-    /// manifest.
-    async fn custom_integrations(
-        self: Arc<Self>,
-        id: Option<String>,
-    ) -> Result<serde_json::Value, String> {
-        let _ = id;
+    /// The custom integrations the user stored, without their manifests. An
+    /// agent is shown a manifest's text only when the user hands it over to
+    /// ask for a change, never because it asked for it.
+    async fn custom_integrations(self: Arc<Self>) -> Result<serde_json::Value, String> {
         Err("Custom integrations are not available in this session".into())
     }
 
