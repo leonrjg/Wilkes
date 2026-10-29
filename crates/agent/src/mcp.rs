@@ -1664,7 +1664,7 @@ impl WilkesMcp {
         }
     }
     #[tool(
-        description = "List the custom literature integrations the user stored, each a manifest describing a web service Wilkes can search and fetch from: id, provider id for literature_search, enabled, and which secrets are set. Neither manifest text nor secret values are returned; to change an integration, the user gives you its manifest. Set authoring_guide=true to get the manifest format's guide, which you need before writing or editing a manifest."
+        description = "List the custom literature integrations the user stored, each a manifest describing a web service Wilkes can search and fetch from: id, provider id for literature_search, name and enabled. Neither manifest text nor secrets are returned; to change an integration, the user gives you its manifest. Set authoring_guide=true to get the manifest format's guide, which you need before writing or editing a manifest."
     )]
     async fn read_custom_integrations(
         &self,

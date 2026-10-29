@@ -205,9 +205,9 @@ pub async fn custom_integration_probe(
     )
 }
 
-/// A stored custom integration as an agent reads it. Secrets are named, never
-/// valued, and the manifest is not there at all: an agent sees a manifest's
-/// text only when the user hands it over to ask for a change.
+/// A stored custom integration as an agent reads it. Neither its secrets nor
+/// its manifest are there: an agent sees a manifest's text only when the user
+/// hands it over to ask for a change.
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
 pub struct StoredIntegration {
     pub id: String,
@@ -216,7 +216,6 @@ pub struct StoredIntegration {
     /// What the user renamed it to, when they did.
     pub name: Option<String>,
     pub enabled: bool,
-    pub secrets_set: Vec<String>,
 }
 
 /// Every stored custom integration.
@@ -224,16 +223,11 @@ pub fn stored_integrations(integrations: &IntegrationsSettings) -> Vec<StoredInt
     integrations
         .custom
         .iter()
-        .map(|config: &CustomIntegrationConfig| {
-            let mut secrets_set: Vec<String> = config.secrets.keys().cloned().collect();
-            secrets_set.sort_unstable();
-            StoredIntegration {
-                id: config.id.clone(),
-                provider: format!("custom:{}", config.id),
-                name: config.name.clone(),
-                enabled: config.enabled,
-                secrets_set,
-            }
+        .map(|config: &CustomIntegrationConfig| StoredIntegration {
+            id: config.id.clone(),
+            provider: format!("custom:{}", config.id),
+            name: config.name.clone(),
+            enabled: config.enabled,
         })
         .collect()
 }
@@ -596,12 +590,12 @@ steps = [
     }
 
     #[test]
-    fn stored_integrations_name_secrets_without_their_values_or_the_manifest() {
+    fn stored_integrations_show_neither_secrets_nor_the_manifest() {
         let settings = stored(MANIFEST, &[("crossref_token", "t0ken")]);
         let listed = stored_integrations(&settings);
         assert_eq!(listed[0].provider, "custom:crossref");
-        assert_eq!(listed[0].secrets_set, vec!["crossref_token"]);
         let text = serde_json::to_string(&listed).unwrap();
+        assert!(!text.contains("crossref_token"), "{text}");
         assert!(!text.contains("t0ken"), "{text}");
         assert!(!text.contains("api.crossref.org"), "{text}");
     }
