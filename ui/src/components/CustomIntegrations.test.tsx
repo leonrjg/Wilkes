@@ -296,6 +296,81 @@ describe("CustomIntegrations", () => {
     expect(onUpdate).not.toHaveBeenCalled();
   });
 
+  it("names a program a manifest runs, and allows it only when the user says so", async () => {
+    const summary = (allowed: boolean) => ({
+      id: "mangadex",
+      name: "MangaDex",
+      origins: ["https://api.mangadex.org"],
+      programs: [{ program: "mangadex-dl", allowed }],
+      programs_editable: true,
+      capabilities: ["search", "resolve_download"],
+      required_secrets: [],
+      optional_secrets: [],
+      secrets: [],
+      problems: [],
+    });
+    const customIntegrationSummary = vi
+      .fn()
+      .mockResolvedValueOnce(summary(false))
+      .mockResolvedValueOnce(summary(true));
+    const onUpdate = vi.fn();
+    render(
+      <CustomIntegrations
+        api={apiWith({ customIntegrationSummary })}
+        settings={settings()}
+        onUpdate={onUpdate}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Add integration"));
+    fireEvent.click(screen.getByText("Read manifest"));
+    const allow = (await screen.findByLabelText("Allow running mangadex-dl")) as HTMLInputElement;
+    expect(screen.getByText("mangadex-dl")).toBeInTheDocument();
+    // Reading the manifest allowed nothing.
+    expect(allow.checked).toBe(false);
+    expect(onUpdate).not.toHaveBeenCalled();
+
+    fireEvent.click(allow);
+    await waitFor(() =>
+      expect(onUpdate).toHaveBeenCalledWith({
+        integrations: expect.objectContaining({ allowed_programs: ["mangadex-dl"] }),
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText("Allow running mangadex-dl") as HTMLInputElement).checked,
+      ).toBe(true),
+    );
+  });
+
+  it("says a server's programs are its operator's to allow", async () => {
+    render(
+      <CustomIntegrations
+        api={apiWith({
+          customIntegrationSummary: vi.fn().mockResolvedValue({
+            id: "mangadex",
+            name: "MangaDex",
+            origins: ["https://api.mangadex.org"],
+            programs: [{ program: "mangadex-dl", allowed: false }],
+            programs_editable: false,
+            capabilities: ["search", "resolve_download"],
+            required_secrets: [],
+            optional_secrets: [],
+            secrets: [],
+            problems: [],
+          }),
+        })}
+        settings={settings()}
+        onUpdate={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Add integration"));
+    fireEvent.click(screen.getByText("Read manifest"));
+    expect(await screen.findByText(/Its operator allows programs with WILKES_ALLOWED_PROGRAMS/)).toBeInTheDocument();
+    expect(screen.queryByLabelText("Allow running mangadex-dl")).toBeNull();
+  });
+
   it("probes with the editable example query and invalidates an old verdict", async () => {
     const customIntegrationProbe = vi.fn().mockResolvedValue(CLEAN_PROBE);
     const api = apiWith({ customIntegrationProbe });

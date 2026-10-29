@@ -15,6 +15,11 @@ pub struct Config {
     pub port: u16,
     pub data_dir: PathBuf,
     pub dist_dir: PathBuf,
+    /// Programs an integration's manifest may run, from
+    /// `WILKES_ALLOWED_PROGRAMS`, separated as `PATH` is. The server's
+    /// settings are any client's to edit, so which programs run is the
+    /// operator's to say here and not a setting. Unset allows none.
+    pub allowed_programs: Vec<String>,
 }
 
 fn env_or_default(env: &dyn ConfigEnv, key: &str, default: &str) -> String {
@@ -29,6 +34,15 @@ pub fn parse_config_from(args: &[String], env: &dyn ConfigEnv) -> Config {
         .unwrap_or(2000);
     let mut data_dir = PathBuf::from(env_or_default(env, "WILKES_DATA_DIR", "/data"));
     let mut dist_dir = PathBuf::from(env_or_default(env, "WILKES_DIST_DIR", "./dist"));
+    let allowed_programs = env
+        .var("WILKES_ALLOWED_PROGRAMS")
+        .map(|list| {
+            std::env::split_paths(&list)
+                .map(|program| program.to_string_lossy().trim().to_string())
+                .filter(|program| !program.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut i = 1;
     while i < args.len() {
@@ -69,6 +83,7 @@ pub fn parse_config_from(args: &[String], env: &dyn ConfigEnv) -> Config {
         port,
         data_dir,
         dist_dir,
+        allowed_programs,
     }
 }
 
@@ -106,6 +121,18 @@ mod tests {
         assert_eq!(config.port, 2000);
         assert_eq!(config.data_dir, PathBuf::from("/data"));
         assert_eq!(config.dist_dir, PathBuf::from("./dist"));
+        assert!(config.allowed_programs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allowed_programs_are_listed_the_way_path_is() {
+        let env = TestEnv(std::collections::HashMap::from([(
+            "WILKES_ALLOWED_PROGRAMS".to_string(),
+            "mangadex-dl::/opt/bin/fetch".to_string(),
+        )]));
+        let config = parse_config_from(&["bin".to_string()], &env);
+        assert_eq!(config.allowed_programs, ["mangadex-dl", "/opt/bin/fetch"]);
     }
 
     #[test]

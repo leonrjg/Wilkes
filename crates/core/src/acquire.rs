@@ -1,4 +1,5 @@
-//! Fetching a file named by a URL into a library root.
+//! Fetching a file named by a URL into a library root, and running a program
+//! a manifest names into a directory of its own.
 //!
 //! Lives in core rather than in the MCP server because there are now two
 //! callers — the `download` tool an agent drives, and the HTTP route Underdog
@@ -7,7 +8,9 @@
 //! *where may it land*, and *is this already here*.
 
 use crate::http_history::LoggedRequest;
+use crate::types::ProgramRun;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use crate::path as wilkes_path;
 
@@ -589,10 +592,292 @@ pub(crate) fn find_file_with_content(
     Ok(None)
 }
 
+/// What a program left in the directory made for it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgramOutput {
+    /// The directory's name, which the files keep when they are imported.
+    pub folder: String,
+    pub directory: String,
+    /// Every file it wrote, in path order.
+    pub paths: Vec<String>,
+}
+
+/// How much of a failed program's error output is reported. The end is where
+/// a program says why it stopped.
+const PROGRAM_ERROR_LINES: usize = 20;
+
+/// Run what a manifest resolved a result to, into a new directory under
+/// `staging` named after `folder`.
+///
+/// The one place a manifest's program runs, and so the one place that asks
+/// whether it may: `allowed` is the user's list, and a program not on it by
+/// exactly the name the manifest uses is refused before anything starts. The
+/// program gets no shell, no input and the new directory as its working
+/// directory. Everything it leaves there is the answer, each file held to the
+/// same size limit as a download. A run that fails, or leaves something that
+/// cannot be imported, leaves nothing behind.
+///
+/// Dropping the returned future kills the program.
+pub async fn run_into_staging(
+    staging: &Path,
+    folder: &str,
+    run: &ProgramRun,
+    allowed: &[String],
+    max_download_bytes: u64,
+) -> Result<ProgramOutput, String> {
+    if !allowed.iter().any(|program| *program == run.program) {
+        tracing::warn!(program = %run.program, "run refused: the program is not allowed");
+        return Err(format!(
+            "'{}' is not allowed to run. Allow it by name in the integration's settings to download with it.",
+            run.program
+        ));
+    }
+    let folder = wilkes_path::sanitize_file_name(folder)?;
+    tokio::fs::create_dir_all(staging)
+        .await
+        .map_err(|error| format!("Cannot prepare {}: {error}", staging.display()))?;
+    let (folder, directory) = new_directory(staging, &folder).await?;
+    let output_dir = directory.to_string_lossy().into_owned();
+    let args: Vec<String> = run.args.iter().map(|arg| arg.write(&output_dir)).collect();
+
+    // The arguments are not logged: a step may have fetched a token into one.
+    tracing::info!(program = %run.program, directory = %output_dir, "running a manifest program");
+    let outcome = run_program(&run.program, &args, &directory, max_download_bytes).await;
+    match outcome {
+        Ok(paths) => {
+            tracing::info!(program = %run.program, files = paths.len(), "manifest program finished");
+            Ok(ProgramOutput {
+                folder,
+                directory: output_dir,
+                paths: paths.iter().map(|path| display_path(path)).collect(),
+            })
+        }
+        Err(message) => {
+            tracing::warn!(program = %run.program, "manifest program failed: {message}");
+            if let Err(error) = tokio::fs::remove_dir_all(&directory).await {
+                tracing::warn!(directory = %output_dir, "could not remove a failed run's directory: {error}");
+            }
+            Err(message)
+        }
+    }
+}
+
+/// A directory under `parent` that did not exist, named `name` or, when that
+/// is taken, `name (2)` and on.
+async fn new_directory(parent: &Path, name: &str) -> Result<(String, PathBuf), String> {
+    for attempt in 1..=1000u32 {
+        let candidate = match attempt {
+            1 => name.to_string(),
+            n => format!("{name} ({n})"),
+        };
+        let path = parent.join(&candidate);
+        match tokio::fs::create_dir(&path).await {
+            Ok(()) => return Ok((candidate, path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Cannot create {}: {error}", path.display())),
+        }
+    }
+    Err(format!(
+        "No free directory name for '{name}' in {}",
+        parent.display()
+    ))
+}
+
+async fn run_program(
+    program: &str,
+    args: &[String],
+    directory: &Path,
+    max_download_bytes: u64,
+) -> Result<Vec<PathBuf>, String> {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let output = command.output().await.map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            format!("'{program}' is not installed, or is not on this application's PATH")
+        }
+        _ => format!("Could not start '{program}': {error}"),
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let said = if stderr.trim().is_empty() {
+            stdout
+        } else {
+            stderr
+        };
+        let lines: Vec<&str> = said.lines().collect();
+        let tail = lines[lines.len().saturating_sub(PROGRAM_ERROR_LINES)..].join("\n");
+        return Err(format!("'{program}' failed ({}):\n{tail}", output.status));
+    }
+    let paths = files_under(directory)?;
+    if paths.is_empty() {
+        return Err(format!("'{program}' finished without writing a file"));
+    }
+    for path in &paths {
+        let bytes = std::fs::metadata(path)
+            .map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?
+            .len();
+        if bytes > max_download_bytes {
+            return Err(format!(
+                "'{program}' wrote {}, which is {bytes} bytes; the limit is {max_download_bytes}",
+                path.display()
+            ));
+        }
+    }
+    Ok(paths)
+}
+
+/// Every regular file under `directory`, in path order. A link is refused
+/// rather than followed or left out: following it would import a file the
+/// program never wrote, and leaving it out would drop part of the answer
+/// without saying so.
+fn files_under(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    let mut directories = vec![directory.to_path_buf()];
+    while let Some(current) = directories.pop() {
+        let entries = std::fs::read_dir(&current)
+            .map_err(|error| format!("Failed to inspect {}: {error}", current.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "Failed to inspect an entry in {}: {error}",
+                    current.display()
+                )
+            })?;
+            let file_type = entry.file_type().map_err(|error| {
+                format!("Failed to inspect {}: {error}", entry.path().display())
+            })?;
+            if file_type.is_dir() {
+                directories.push(entry.path());
+            } else if file_type.is_file() {
+                files.push(entry.path());
+            } else {
+                return Err(format!(
+                    "the program left {}, which is not a regular file",
+                    entry.path().display()
+                ));
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn shell_run(script: &str) -> ProgramRun {
+        use crate::types::ProgramArg;
+        ProgramRun {
+            program: "/bin/sh".to_string(),
+            args: vec![
+                ProgramArg(vec!["-c".to_string()]),
+                ProgramArg(vec![script.to_string()]),
+                ProgramArg(vec!["sh".to_string()]),
+                ProgramArg(vec![String::new(), String::new()]),
+            ],
+        }
+    }
+
+    #[cfg(unix)]
+    fn allowed() -> Vec<String> {
+        vec!["/bin/sh".to_string()]
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_leaves_its_files_in_a_directory_of_its_own() {
+        let staging = tempdir().unwrap();
+        std::fs::create_dir(staging.path().join("Book")).unwrap();
+        let run =
+            shell_run(r#"mkdir -p "$1/vol" && printf a > "$1/vol/1.pdf" && printf b > "$1/2.pdf""#);
+
+        let output = run_into_staging(staging.path(), "Book", &run, &allowed(), 1024)
+            .await
+            .unwrap();
+
+        // The name was taken, so the run got the next one, and nothing it did
+        // reached the directory that was already there.
+        assert_eq!(output.folder, "Book (2)");
+        let directory = staging.path().join("Book (2)");
+        assert_eq!(
+            output.paths,
+            vec![
+                display_path(&directory.join("2.pdf")),
+                display_path(&directory.join("vol").join("1.pdf")),
+            ]
+        );
+        assert_eq!(
+            std::fs::read_dir(staging.path().join("Book"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_program_not_allowed_by_name_never_starts() {
+        let staging = tempdir().unwrap();
+        let run = shell_run(r#"printf a > "$1/x.pdf""#);
+        let error = run_into_staging(staging.path(), "Book", &run, &["sh".to_string()], 1024)
+            .await
+            .unwrap_err();
+        assert!(error.contains("'/bin/sh' is not allowed to run"), "{error}");
+        assert!(!staging.path().join("Book").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_run_says_why_and_leaves_nothing() {
+        let staging = tempdir().unwrap();
+        let run = shell_run(r#"printf a > "$1/x.pdf"; echo "no such manga" >&2; exit 3"#);
+        let error = run_into_staging(staging.path(), "Book", &run, &allowed(), 1024)
+            .await
+            .unwrap_err();
+        assert!(error.contains("no such manga"), "{error}");
+        assert!(!staging.path().join("Book").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_is_held_to_the_download_limit_and_must_write_something() {
+        let staging = tempdir().unwrap();
+        let big = shell_run(r#"printf 0123456789 > "$1/x.pdf""#);
+        let error = run_into_staging(staging.path(), "Book", &big, &allowed(), 9)
+            .await
+            .unwrap_err();
+        assert!(error.contains("the limit is 9"), "{error}");
+
+        let nothing = shell_run("true");
+        let error = run_into_staging(staging.path(), "Book", &nothing, &allowed(), 9)
+            .await
+            .unwrap_err();
+        assert!(error.contains("without writing a file"), "{error}");
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_that_leaves_a_link_is_refused() {
+        let staging = tempdir().unwrap();
+        let run = shell_run(r#"ln -s /etc/hosts "$1/hosts""#);
+        let error = run_into_staging(staging.path(), "Book", &run, &allowed(), 1024)
+            .await
+            .unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+    }
 
     #[tokio::test]
     async fn download_rejects_a_filename_with_a_path_in_it() {

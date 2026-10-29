@@ -33,17 +33,17 @@ use self::expr::{Evaluator, Projected};
 use self::manifest::{
     lookup_field_type, placeholders, query_parts, search_field_type, Bases, BrowseCapability,
     FieldSpec, FieldType, FilterSpec, LookupCapability, Manifest, Missing, ParamValue,
-    ReferencesCapability, ResolverStep, ResponseFormat, SearchCapability, SecretSlot, ValueRule,
-    BROWSE_FILTERS, BROWSE_QUERY, BROWSE_SORT, MAX_FILTER_VALUES, MAX_SUGGESTIONS,
-    MIN_SUGGEST_CHARS,
+    ReferencesCapability, ResolverStep, ResponseFormat, RunSpec, SearchCapability, SecretSlot,
+    UrlTemplate, ValueRule, BROWSE_FILTERS, BROWSE_QUERY, BROWSE_SORT, MAX_FILTER_VALUES,
+    MAX_SUGGESTIONS, MIN_SUGGEST_CHARS,
 };
 use crate::integrations::{LiteratureSource, ProviderCapabilities};
 use crate::metadata::doi::normalize_doi;
 use crate::network::{ProviderHttpClient, ProviderHttpErrorKind};
 use crate::types::{
-    BrowsePage, BrowseRequest, CustomIntegrationConfig, FilterSuggestion, IntegrationState,
-    IntegrationStatus, LiteratureAcquisition, LiteratureSearchResult, ProviderWork,
-    ResolvedLiteratureDownload,
+    BrowsePage, BrowseRequest, CustomIntegrationConfig, DownloadPlan, FilterSuggestion,
+    IntegrationState, IntegrationStatus, LiteratureAcquisition, LiteratureSearchResult, ProgramArg,
+    ProgramRun, ProviderWork, ResolvedLiteratureDownload,
 };
 
 /// How much of a probe's raw response is shown back to the user. Enough to see
@@ -279,6 +279,9 @@ impl CustomSource {
                 let resolver_error = if self.manifest.capabilities.resolve_download.is_some() {
                     match projection.results.first() {
                         Some(result) => match self.resolve_manifest_download(result).await {
+                            // A program is not run to probe it: a draft's
+                            // program is not yet one the user has allowed.
+                            // That its arguments can be written is the check.
                             Ok(Some(_)) => None,
                             // Not a fault in the manifest, and not evidence
                             // for it either: no step was seen through to a URL.
@@ -1099,23 +1102,28 @@ impl CustomSource {
     async fn resolve_manifest_download(
         &self,
         result: &LiteratureSearchResult,
-    ) -> anyhow::Result<Option<ResolvedLiteratureDownload>> {
+    ) -> anyhow::Result<Option<DownloadPlan>> {
         let Some(resolve) = &self.manifest.capabilities.resolve_download else {
-            return Ok(result
-                .pdf_url
-                .as_ref()
-                .map(|url| ResolvedLiteratureDownload {
+            return Ok(result.pdf_url.as_ref().map(|url| {
+                DownloadPlan::Fetch(ResolvedLiteratureDownload {
                     url: url.clone(),
                     filename: None,
-                }));
+                })
+            }));
         };
 
         let mut values = result_values(result);
-        let alternatives = resolve.url.alternatives();
+        // Validation holds exactly one of `url` and `run`; a list of URLs is
+        // the only output that can be known before every step has run.
+        let alternatives = resolve
+            .url
+            .as_ref()
+            .map_or(&[][..], UrlTemplate::alternatives);
+        let chooses = resolve.url.as_ref().is_some_and(UrlTemplate::chooses);
         for (index, step) in resolve.steps.iter().enumerate() {
             // A manifest that lists where the file may be needs no more
             // requests once one of those places is known.
-            if resolve.url.chooses() && writable(alternatives, &values).is_some() {
+            if chooses && writable(alternatives, &values).is_some() {
                 break;
             }
             let path = substitute_values(&step.path, &values, Substitution::UrlComponent)
@@ -1156,11 +1164,14 @@ impl CustomSource {
             }
         }
 
+        if let Some(run) = &resolve.run {
+            return run_plan(run, &values).map(|run| Some(DownloadPlan::Run(run)));
+        }
         let template = match writable(alternatives, &values) {
             Some(template) => template,
             // One template names the value it lacks when it is written below;
             // several have no single value to name.
-            None if !resolve.url.chooses() => &alternatives[0],
+            None if !chooses => &alternatives[0],
             None => anyhow::bail!(
                 "resolve_download.url: none of its templates can be written from what is known: {}",
                 alternatives.join(", ")
@@ -1192,10 +1203,10 @@ impl CustomSource {
                     .map_err(|error| anyhow::anyhow!("resolve_download.filename: {error}"))
             })
             .transpose()?;
-        Ok(Some(ResolvedLiteratureDownload {
+        Ok(Some(DownloadPlan::Fetch(ResolvedLiteratureDownload {
             url: url.to_string(),
             filename,
-        }))
+        })))
     }
 
     fn extract_step(
@@ -1710,6 +1721,41 @@ fn result_values(result: &LiteratureSearchResult) -> HashMap<String, String> {
     values
 }
 
+/// A manifest's run with every value it names written in, but the directory
+/// it writes to, which only the runner knows.
+///
+/// Each argument is written alone: a value fills the argument its placeholder
+/// is in and cannot become a second one, since no shell ever splits them. A
+/// value that would begin an argument with `-` is refused rather than passed,
+/// because the program would read it as an option the author never wrote.
+fn run_plan(run: &RunSpec, values: &HashMap<String, String>) -> anyhow::Result<ProgramRun> {
+    let marker = format!("{{{}}}", manifest::RUN_OUTPUT_DIR);
+    let args = run
+        .args
+        .iter()
+        .enumerate()
+        .map(|(index, template)| {
+            let pieces = template
+                .split(marker.as_str())
+                .map(|piece| substitute_values(piece, values, Substitution::Raw))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| anyhow::anyhow!("resolve_download.run.args[{index}]: {error}"))?;
+            let starts_with_value = template.starts_with('{') && !template.starts_with(&marker);
+            if starts_with_value && pieces[0].starts_with('-') {
+                anyhow::bail!(
+                    "resolve_download.run.args[{index}]: the value written there starts with '-', which {} would read as an option",
+                    run.program
+                );
+            }
+            Ok(ProgramArg(pieces))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(ProgramRun {
+        program: run.program.clone(),
+        args,
+    })
+}
+
 /// The first template every placeholder of which has a value.
 fn writable<'a>(templates: &'a [String], values: &HashMap<String, String>) -> Option<&'a String> {
     templates.iter().find(|template| {
@@ -1954,7 +2000,7 @@ impl LiteratureSource for CustomSource {
     async fn resolve_download(
         &self,
         result: &LiteratureSearchResult,
-    ) -> anyhow::Result<Option<ResolvedLiteratureDownload>> {
+    ) -> anyhow::Result<Option<DownloadPlan>> {
         self.resolve_manifest_download(result).await
     }
 
@@ -2164,6 +2210,92 @@ filename = "{title}"
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    fn fetched(plan: DownloadPlan) -> ResolvedLiteratureDownload {
+        match plan {
+            DownloadPlan::Fetch(download) => download,
+            DownloadPlan::Run(run) => panic!("expected a URL, got a run of {}", run.program),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resolver_that_runs_a_program_writes_each_argument_from_the_result() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", Matcher::Regex("^/scidb/".to_string()))
+            .with_status(200)
+            .with_body(ANNA_BODY)
+            .create_async()
+            .await;
+        let from = "url = \"/scidb?doi={doi}\"\nfilename = \"{title}\"";
+        assert!(ANNA_DOI_MANIFEST.contains(from));
+        let manifest = ANNA_DOI_MANIFEST.replace(
+            from,
+            r#"run = { program = "fetch", args = ["{doi}", "--out", "{output_dir}/{id}", "--name={title}"] }"#,
+        );
+        let anna = source(&manifest, &server.url(), &[]);
+        let book = anna
+            .search("10.1234/example", 1, 1)
+            .await
+            .unwrap()
+            .remove(0);
+
+        let Some(DownloadPlan::Run(run)) = anna.resolve_download(&book).await.unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(run.program, "fetch");
+        assert_eq!(
+            run.args
+                .iter()
+                .map(|arg| arg.write("/staging/1"))
+                .collect::<Vec<_>>(),
+            [
+                "10.1234/example",
+                "--out",
+                "/staging/1/deadbeef",
+                "--name=Graph: Networks",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_run_refuses_a_value_that_would_be_read_as_an_option() {
+        let run = RunSpec {
+            program: "fetch".to_string(),
+            args: vec!["{title}".to_string(), "--name={title}".to_string()],
+        };
+        let values = |title: &str| HashMap::from([("title".to_string(), title.to_string())]);
+
+        // Inside an argument a leading dash is the value's own text.
+        let plan = run_plan(
+            &RunSpec {
+                args: vec!["--name={title}".to_string()],
+                ..run.clone()
+            },
+            &values("-rf"),
+        )
+        .unwrap();
+        assert_eq!(plan.args[0].write("/out"), "--name=-rf");
+
+        let error = run_plan(&run, &values("--exec=sh"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("args[0]") && error.contains("starts with '-'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_value_that_reads_output_dir_is_not_where_the_program_writes() {
+        let run = RunSpec {
+            program: "fetch".to_string(),
+            args: vec!["{output_dir}/{title}".to_string()],
+        };
+        let values = HashMap::from([("title".to_string(), "{output_dir}".to_string())]);
+        let plan = run_plan(&run, &values).unwrap();
+        assert_eq!(plan.args[0].write("/out"), "/out/{output_dir}");
     }
 
     #[tokio::test]
@@ -3768,7 +3900,7 @@ doi = "doi"
         assert_eq!(book.file_size.as_deref(), Some("2.4MB"));
         assert_eq!(book.acquisition, LiteratureAcquisition::Provider);
 
-        let download = anna.resolve_download(book).await.unwrap().unwrap();
+        let download = fetched(anna.resolve_download(book).await.unwrap().unwrap());
         assert_eq!(download.url, "https://files.example.test/book");
         assert_eq!(download.filename.as_deref(), Some("Graph_ Networks.PDF"));
         search.assert_async().await;
@@ -3810,7 +3942,9 @@ doi = "doi"
             .await;
         let anna = source(&page_resolver(md5_field), &server.url(), &[]);
         let book = anna.search("graph networks", 1, 1).await.unwrap().remove(0);
-        anna.resolve_download(&book).await
+        anna.resolve_download(&book)
+            .await
+            .map(|plan| plan.map(fetched))
     }
 
     const PAGE_WITH_FILE: &str =
@@ -3896,7 +4030,7 @@ doi = "doi"
         let book = anna.search("graph networks", 1, 1).await.unwrap().remove(0);
         let resolved = anna.resolve_download(&book).await;
         page.assert_async().await;
-        resolved
+        resolved.map(|plan| plan.map(fetched))
     }
 
     /// The result already holds a place the file may be, so nothing is asked.
@@ -4018,7 +4152,7 @@ doi = "doi"
         );
         let anna = source(&manifest, &search_server.url(), &[("anna_key", "secret")]);
         let book = anna.search("graph networks", 1, 1).await.unwrap().remove(0);
-        let download = anna.resolve_download(&book).await.unwrap().unwrap();
+        let download = fetched(anna.resolve_download(&book).await.unwrap().unwrap());
 
         assert_eq!(
             download.url,
@@ -4079,7 +4213,7 @@ doi = "doi"
             .remove(0);
         assert_eq!(result.doi.as_deref(), Some("10.1234/example"));
 
-        let download = anna.resolve_download(&result).await.unwrap().unwrap();
+        let download = fetched(anna.resolve_download(&result).await.unwrap().unwrap());
         assert_eq!(
             download.url,
             format!("{}/scidb?doi=10.1234%2Fexample", server.url())

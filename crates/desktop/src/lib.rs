@@ -2041,14 +2041,18 @@ async fn literature_search(
         .map_err(|error| error.to_string())
 }
 
+/// Fetches one provider result into the workspace's uploads directory, by URL
+/// or by the program its manifest names. Importing it is the separate step
+/// `catalogue_acquire` leaves too. A download's bytes arrive on
+/// `catalogue-download-progress`.
 #[tauri::command]
-async fn literature_resolve_download(
+async fn literature_acquire(
     app: AppHandle,
     provider: String,
     result: wilkes_core::types::LiteratureSearchResult,
-) -> Result<wilkes_core::types::ResolvedLiteratureDownload, String> {
+) -> Result<wilkes_api::commands::integrations::literature::LiteratureAcquired, String> {
     app_context(&app)
-        .literature_resolve_download(provider, result)
+        .literature_acquire(provider, result)
         .await
         .map_err(|error| error.to_string())
 }
@@ -2563,7 +2567,7 @@ pub fn run() {
             load_generation_model,
             literature_providers,
             literature_search,
-            literature_resolve_download,
+            literature_acquire,
             literature_browse,
             literature_filter_suggest,
             literature_compose,

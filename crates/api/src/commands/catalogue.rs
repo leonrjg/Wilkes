@@ -624,6 +624,32 @@ impl AppContext {
         .await
     }
 
+    /// Fetches one result a literature provider returned, however its
+    /// provider says it is fetched, reporting a download's bytes on
+    /// `catalogue-download-progress`. See
+    /// [`crate::commands::integrations::literature::acquire`].
+    pub async fn literature_acquire(
+        &self,
+        provider: String,
+        result: wilkes_core::types::LiteratureSearchResult,
+    ) -> Result<
+        crate::commands::integrations::literature::LiteratureAcquired,
+        crate::commands::integrations::literature::LiteratureRequestError,
+    > {
+        let settings = self.get_settings().await;
+        let tx = forward::<DownloadProgress>(self.emitter(), DOWNLOAD_PROGRESS_EVENT);
+        crate::commands::integrations::literature::acquire(
+            &settings.integrations,
+            Some(&self.catalogue_dir),
+            &self.data_dir.join("uploads"),
+            settings.max_download_bytes,
+            Some(tx),
+            provider,
+            result,
+        )
+        .await
+    }
+
     /// Fetches a candidate, reporting bytes on `catalogue-download-progress`.
     pub async fn catalogue_acquire(
         &self,

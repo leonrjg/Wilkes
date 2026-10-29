@@ -5372,6 +5372,7 @@ impl AppContext {
         crate::commands::integrations::custom::custom_integration_summary(
             manifest,
             &settings.integrations,
+            &crate::commands::integrations::literature::allowed_programs(&settings.integrations),
         )
     }
 
@@ -5431,24 +5432,6 @@ impl AppContext {
             limit,
             providers,
             page,
-        )
-        .await
-    }
-
-    pub async fn literature_resolve_download(
-        &self,
-        provider: String,
-        result: wilkes_core::types::LiteratureSearchResult,
-    ) -> Result<
-        wilkes_core::types::ResolvedLiteratureDownload,
-        crate::commands::integrations::literature::LiteratureRequestError,
-    > {
-        let settings = self.get_settings().await;
-        crate::commands::integrations::literature::resolve_download(
-            &settings.integrations,
-            Some(&self.catalogue_dir),
-            provider,
-            result,
         )
         .await
     }
@@ -6193,6 +6176,18 @@ impl AppContext {
             let before = get_scoped_settings(&self.settings_path, &self.workspace_path)
                 .await
                 .unwrap_or_default();
+            // Where the host fixed the programs a manifest may run, no client
+            // changes the stored list. One sent back as it was is no change.
+            if let Some(programs) = patch.pointer("/integrations/allowed_programs") {
+                let allowlist = crate::commands::integrations::literature::allowed_programs(
+                    &before.integrations,
+                );
+                anyhow::ensure!(
+                    allowlist.editable
+                        || *programs == serde_json::json!(before.integrations.allowed_programs),
+                    "The programs integrations may run are fixed by this server's WILKES_ALLOWED_PROGRAMS and cannot be changed here"
+                );
+            }
             let updated =
                 update_scoped_settings(&self.settings_path, &self.workspace_path, patch).await?;
             (before, updated)

@@ -29,8 +29,9 @@ use serde::{Deserialize, Serialize};
 use crate::catalogue::{mirrored_sources, CatalogueStore};
 
 use crate::types::{
-    BrowsePage, BrowseRequest, BuiltinProviderState, FilterSuggestion, IntegrationStatus,
-    IntegrationsSettings, LiteratureSearchResult, ProviderWork, ResolvedLiteratureDownload,
+    BrowsePage, BrowseRequest, BuiltinProviderState, DownloadPlan, FilterSuggestion,
+    IntegrationStatus, IntegrationsSettings, LiteratureSearchResult, ProviderWork,
+    ResolvedLiteratureDownload,
 };
 
 pub mod builtin;
@@ -135,21 +136,20 @@ pub trait LiteratureSource: Send + Sync {
         anyhow::bail!("{} does not offer references", self.name())
     }
 
-    /// Resolve a selected result to a direct file URL. Providers that already
-    /// put that URL in `pdf_url` need nothing more; a manifest may declare a
-    /// bounded, credentialed resolver that runs only after the user chooses a
-    /// result.
+    /// Resolve a selected result to how its file is fetched. Providers that
+    /// already put a URL in `pdf_url` need nothing more; a manifest may
+    /// declare a bounded, credentialed resolver that runs only after the user
+    /// chooses a result, and that ends in a URL or a program to run.
     async fn resolve_download(
         &self,
         result: &LiteratureSearchResult,
-    ) -> anyhow::Result<Option<ResolvedLiteratureDownload>> {
-        Ok(result
-            .pdf_url
-            .as_ref()
-            .map(|url| ResolvedLiteratureDownload {
+    ) -> anyhow::Result<Option<DownloadPlan>> {
+        Ok(result.pdf_url.as_ref().map(|url| {
+            DownloadPlan::Fetch(ResolvedLiteratureDownload {
                 url: url.clone(),
                 filename: None,
-            }))
+            })
+        }))
     }
 
     /// Whether the service is reachable and usable right now.
@@ -848,7 +848,10 @@ title = "t"
             .literature_for_search("custom:openalex-files")
             .unwrap();
         let work = source.search("graphs", 1, 1).await.unwrap().remove(0);
-        let download = source.resolve_download(&work).await.unwrap().unwrap();
+        let download = match source.resolve_download(&work).await.unwrap().unwrap() {
+            DownloadPlan::Fetch(download) => download,
+            DownloadPlan::Run(run) => panic!("expected a URL, got a run of {}", run.program),
+        };
 
         assert_eq!(download.url, "https://files.test/x.pdf");
         search.assert_async().await;

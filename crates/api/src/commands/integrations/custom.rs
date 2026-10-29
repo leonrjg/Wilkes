@@ -20,6 +20,8 @@ use wilkes_core::integrations::custom::manifest::{authoring_prompt, Manifest, Se
 use wilkes_core::integrations::custom::{CustomSource, ProbeReport};
 use wilkes_core::types::IntegrationsSettings;
 
+use super::literature::ProgramAllowlist;
+
 /// What a manifest declares, for the import dialog to show before anything is
 /// saved.
 ///
@@ -33,6 +35,14 @@ pub struct ManifestSummary {
     pub name: String,
     /// All declared request origins, deduplicated in declaration order.
     pub origins: Vec<String>,
+    /// Every program the manifest may run to fetch a file, and whether this
+    /// installation allows it. Shown beside the origins for the same reason:
+    /// it is what importing the manifest would let it do.
+    #[serde(default)]
+    pub programs: Vec<ProgramSummary>,
+    /// Whether the user may allow a program here, or the host fixed the list.
+    #[serde(default)]
+    pub programs_editable: bool,
     pub capabilities: Vec<String>,
     /// Secrets the manifest names and the user must supply before it can send
     /// a request.
@@ -61,6 +71,12 @@ pub struct ManifestSummary {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ProgramSummary {
+    pub program: String,
+    pub allowed: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ExtendsSummary {
     pub provider: String,
     /// What the base calls itself.
@@ -77,6 +93,7 @@ pub fn custom_integration_authoring_prompt() -> String {
 pub fn custom_integration_summary(
     manifest: String,
     integrations: &IntegrationsSettings,
+    allowlist: &ProgramAllowlist,
 ) -> ManifestSummary {
     match Manifest::resolve(&manifest, integrations) {
         Ok(resolved) => {
@@ -95,6 +112,15 @@ pub fn custom_integration_summary(
                 id: manifest.id.clone(),
                 name: manifest.name.clone(),
                 origins: manifest.origins(),
+                programs: manifest
+                    .programs()
+                    .into_iter()
+                    .map(|program| ProgramSummary {
+                        allowed: allowlist.programs.contains(&program),
+                        program,
+                    })
+                    .collect(),
+                programs_editable: allowlist.editable,
                 capabilities: manifest
                     .capabilities
                     .declared()
@@ -142,6 +168,8 @@ pub fn custom_integration_summary(
                 id: String::new(),
                 name: String::new(),
                 origins: Vec::new(),
+                programs: Vec::new(),
+                programs_editable: allowlist.editable,
                 capabilities: Vec::new(),
                 required_secrets: Vec::new(),
                 optional_secrets: Vec::new(),
@@ -172,6 +200,38 @@ pub async fn custom_integration_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::integrations::literature::allowed_programs;
+
+    /// The summary as the application asks for it, with the installation's
+    /// own answer to which programs may run.
+    fn custom_integration_summary(
+        manifest: String,
+        integrations: &IntegrationsSettings,
+    ) -> ManifestSummary {
+        super::custom_integration_summary(manifest, integrations, &allowed_programs(integrations))
+    }
+
+    #[test]
+    fn summary_names_each_program_and_whether_the_user_allowed_it() {
+        let manifest = format!(
+            "{MANIFEST}\n[capabilities.resolve_download]\nrun = {{ program = \"mangadex-dl\", args = [\"{{id}}\"] }}\n"
+        );
+        let mut settings = IntegrationsSettings::default();
+        let summary = custom_integration_summary(manifest.clone(), &settings);
+        assert!(summary.problems.is_empty(), "{:?}", summary.problems);
+        assert!(summary.programs_editable);
+        assert_eq!(
+            summary.programs,
+            vec![ProgramSummary {
+                program: "mangadex-dl".to_string(),
+                allowed: false,
+            }]
+        );
+
+        settings.allowed_programs.push("mangadex-dl".to_string());
+        let summary = custom_integration_summary(manifest, &settings);
+        assert!(summary.programs[0].allowed);
+    }
 
     const MANIFEST: &str = r#"
 manifest_version = 2

@@ -23,7 +23,7 @@ import type {
   ProviderWork,
   LiteratureSearchResponse,
   LiteratureSearchResult,
-  ResolvedLiteratureDownload,
+  LiteratureAcquired,
   EmbedDone,
   EmbedError,
   EmbedProgress,
@@ -634,14 +634,11 @@ export class TauriSearchApi implements SearchApi {
     return invoke<ProviderWork>("literature_provider_lookup", { provider, doi });
   }
 
-  async literatureResolveDownload(
+  async literatureAcquire(
     provider: string,
     result: LiteratureSearchResult,
-  ): Promise<ResolvedLiteratureDownload> {
-    return invoke<ResolvedLiteratureDownload>("literature_resolve_download", {
-      provider,
-      result,
-    });
+  ): Promise<LiteratureAcquired> {
+    return invoke<LiteratureAcquired>("literature_acquire", { provider, result });
   }
 
   async catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse> {

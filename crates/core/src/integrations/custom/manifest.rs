@@ -866,13 +866,15 @@ pub struct ReferencesResolve {
     pub doi: String,
 }
 
-/// A finite, acyclic resolver from one selected result to a downloadable URL.
+/// A finite, acyclic resolver from one selected result to a file.
 ///
 /// Every step is a GET to a literal, manifest-declared origin: the primary
 /// base by default, or the step's override. Its named fields become
 /// placeholders available only to later steps and to the final output. The
-/// final URL is returned to Wilkes' existing downloader; this capability never
-/// writes a byte itself.
+/// output is one of two things, and exactly one: a URL, returned to Wilkes'
+/// existing downloader, or a program run (see [`RunSpec`]) that writes the
+/// files itself into a directory Wilkes chose. This capability never writes a
+/// byte itself either way.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveDownloadCapability {
@@ -880,12 +882,51 @@ pub struct ResolveDownloadCapability {
     pub steps: Vec<ResolverStep>,
     /// A template using result fields and values extracted by prior steps, or
     /// several in order of preference. See [`UrlTemplate`].
-    pub url: UrlTemplate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<UrlTemplate>,
+    /// A program that fetches the file itself, for a service whose files are
+    /// assembled by a downloader of its own rather than served at one URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunSpec>,
     /// Optional caller-chosen filename. When absent, the downloader derives
-    /// one from the URL and response content type.
+    /// one from the URL and response content type. A program names its own
+    /// files, so this is for `url` only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
 }
+
+/// One invocation of a program on this machine.
+///
+/// A manifest that names a program asks to run code, which a description of a
+/// service otherwise never does, so three things bound it:
+///
+/// 1. **The program is a literal**, named before the manifest is saved like an
+///    origin is, and it runs only once the user has allowed that exact name.
+///    The manifest cannot allow it; see [`Manifest::programs`].
+/// 2. **Arguments are a list, never a command line.** No shell reads them.
+///    Each is a template whose values fill that one argument and nothing
+///    else, and a value that would begin an argument with `-` is refused,
+///    because the program would read it as an option no author wrote.
+/// 3. **The program writes into a directory Wilkes made for it**, given as
+///    `{output_dir}` and as the working directory. What it leaves there is
+///    what is imported, through the same staging step as any download.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RunSpec {
+    /// A command found on `PATH`, or an absolute path to one.
+    pub program: String,
+    /// Each a template over result fields, values extracted by prior steps,
+    /// and `{output_dir}`.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// Where a program writes. Known only when it runs, so it is the one value an
+/// argument may name that no result or step supplies.
+pub const RUN_OUTPUT_DIR: &str = "output_dir";
+/// Enough for any downloader's flags, few enough that a manifest stays a
+/// description of one call.
+pub const MAX_RUN_ARGS: usize = 64;
 
 /// Where the file is: one template, or the first of several that can be
 /// written.
@@ -1426,6 +1467,29 @@ language  = { label = "Language", clause = "{value}", modes = ["any"], options =
 reviews   = { label = "Reviews only", clause = "reviews_only" }
 "#;
 
+const AUTHORING_RUN_EXAMPLE: &str = r#"manifest_version = 2
+id = "mangadex"
+name = "MangaDex"
+
+[http]
+base_url = "https://api.mangadex.org"
+
+[capabilities.search]
+path = "/manga?title={query}&limit={limit}&offset={offset}"
+items = "data"
+
+[capabilities.search.fields]
+id = "id"
+title = "not_null(attributes.title.en, values(attributes.title)[0])"
+description = "attributes.description.en"
+year = "attributes.year"
+landing_page_url = "join('', ['https://mangadex.org/title/', id])"
+
+# The files are assembled by the service's own downloader, which writes them itself.
+[capabilities.resolve_download]
+run = { program = "mangadex-dl", args = ["{landing_page_url}", "--path", "{output_dir}", "--save-as", "pdf-single", "--cover", "none", "--no-track", "--progress-bar-layout", "none"] }
+"#;
+
 const AUTHORING_EXTENDS_EXAMPLE: &str = r#"manifest_version = 2
 id = "openalex-files"
 name = "OpenAlex with downloads"
@@ -1509,6 +1573,7 @@ Return exactly one TOML manifest and no Markdown fence or commentary outside it.
 
 Safety and fidelity rules:
 - Use only HTTP(S) GET requests. Search is one request. Download resolution is on demand after selection and may use only the finite steps declared below.
+- Where the service's files are fetched by a command-line downloader of its own, rather than served at one URL, resolve_download may run that program instead of naming a URL. Name the program exactly as it is installed and write only the arguments its documentation gives. It runs only after the user allows that program by name, so prefer a URL whenever one exists.
 - Never put a credential value in the manifest. Declare `{ secret = "symbolic_name" }`; write a plain string only for public fixed values. `optional = true` leaves the header or parameter off the request when the user has set no value.
 - A resolver step may set a literal `base_url` to use another HTTP(S) origin. It cannot contain placeholders. Every contacted origin is declared and shown before save.
 - `http.headers` and `http.query` are sent to the primary origin and same-origin resolver steps. They are never copied to a cross-origin step; repeat any header or parameter that origin needs under that step's `headers` or `query`.
@@ -1630,7 +1695,15 @@ doi = "expression"                    # JMESPath over one record yielding its DO
 url = "{result_or_step_value}"        # required; HTTP(S) or relative to http.base_url. Or a list in order of preference,
                                       # url = ["{pdf_url}", "{step_value}"]: the first whose values are all known is used, and
                                       # steps run only while none is, so a result that already holds the URL costs no request
-filename = "{title}.{file_format}"   # optional; sanitized before download
+filename = "{title}.{file_format}"   # optional, url only; sanitized before download
+# Or, instead of url and filename, a program that writes the files itself:
+run = { program = "downloader", args = ["{landing_page_url}", "--out", "{output_dir}"] }
+# program: a command name found on PATH, or an absolute path; a literal, shown before save, and run only once the user
+# allows it by name. args: a list, never a shell command line; each is one argument, a template over result values,
+# step values and {output_dir}, the empty directory the program writes into (also its working directory). A value that
+# would start an argument with "-" is refused. Everything the program leaves in {output_dir} is imported, so pass the
+# flags that keep it to the documents: no cover images, logs or tracking databases. It runs non-interactively, with
+# no input, so pass whatever flag the program needs to not prompt.
 
 steps = [                             # optional; one inline table per step, in order; never a header per step
   # base_url: optional literal HTTP(S) base, defaults to http.base_url. path: result values plus outputs from earlier steps.
@@ -1662,7 +1735,7 @@ JMESPath selects keys (`a.b`), indices (`a[0]`, `a[-1]`), projections (`a[*].b`)
     .unwrap();
     writeln!(
         prompt,
-        "Resolver steps are acyclic, pinned to their declared origins, and limited to {MAX_RESOLVER_STEPS}. A lookup has at most {MAX_LOOKUP_PATHS} requests. References resolve at most {MAX_REFERENCE_CHUNK} identifiers per request. There are no loops, branches, arbitrary expressions, POST requests, browser JavaScript, or writes."
+        "Resolver steps are acyclic, pinned to their declared origins, and limited to {MAX_RESOLVER_STEPS}. A run takes at most {MAX_RUN_ARGS} arguments. A lookup has at most {MAX_LOOKUP_PATHS} requests. References resolve at most {MAX_REFERENCE_CHUNK} identifiers per request. There are no loops, branches, arbitrary expressions, POST requests, browser JavaScript, shell command lines, or writes."
     )
     .unwrap();
     prompt.push_str("\nValid JSON example:\n\n");
@@ -1673,6 +1746,8 @@ JMESPath selects keys (`a.b`), indices (`a[0]`, `a[-1]`), projections (`a[*].b`)
     prompt.push_str(AUTHORING_FULL_EXAMPLE);
     prompt.push_str("\nValid example with a parameter per filter and a required keyword:\n\n");
     prompt.push_str(AUTHORING_PARAMETERS_EXAMPLE);
+    prompt.push_str("\nValid example whose files are fetched by the service's own downloader:\n\n");
+    prompt.push_str(AUTHORING_RUN_EXAMPLE);
     prompt.push_str("\nValid example extending a provider to add a download step:\n\n");
     prompt.push_str(AUTHORING_EXTENDS_EXAMPLE);
     prompt.push_str(
@@ -2032,24 +2107,45 @@ impl Manifest {
             }
         }
 
-        let alternatives = resolve.url.alternatives();
-        if resolve.url.chooses()
-            && !(MIN_URL_ALTERNATIVES..=MAX_URL_ALTERNATIVES).contains(&alternatives.len())
-        {
-            problems.push(format!(
-                "resolve_download.url lists {} templates; a list is {MIN_URL_ALTERNATIVES} to {MAX_URL_ALTERNATIVES}, and one template is written as a string",
-                alternatives.len()
-            ));
+        match (&resolve.url, &resolve.run) {
+            (Some(_), Some(_)) => problems.push(
+                "resolve_download sets both url and run; the file is fetched one way".to_string(),
+            ),
+            (None, None) => problems.push(
+                "resolve_download sets neither url nor run, so it says nowhere the file comes from"
+                    .to_string(),
+            ),
+            _ => {}
         }
-        for template in alternatives {
-            problems.extend(template_problems_owned(
-                "resolve_download.url",
-                template,
-                &available,
-                false,
-            ));
-            if template.trim().is_empty() {
-                problems.push("resolve_download.url cannot be empty".to_string());
+        if let Some(url) = &resolve.url {
+            let alternatives = url.alternatives();
+            if url.chooses()
+                && !(MIN_URL_ALTERNATIVES..=MAX_URL_ALTERNATIVES).contains(&alternatives.len())
+            {
+                problems.push(format!(
+                    "resolve_download.url lists {} templates; a list is {MIN_URL_ALTERNATIVES} to {MAX_URL_ALTERNATIVES}, and one template is written as a string",
+                    alternatives.len()
+                ));
+            }
+            for template in alternatives {
+                problems.extend(template_problems_owned(
+                    "resolve_download.url",
+                    template,
+                    &available,
+                    false,
+                ));
+                if template.trim().is_empty() {
+                    problems.push("resolve_download.url cannot be empty".to_string());
+                }
+            }
+        }
+        if let Some(run) = &resolve.run {
+            problems.extend(run_problems(run, &available));
+            if resolve.filename.is_some() {
+                problems.push(
+                    "resolve_download.filename is for url; a program names the files it writes"
+                        .to_string(),
+                );
             }
         }
         if let Some(filename) = &resolve.filename {
@@ -2086,6 +2182,18 @@ impl Manifest {
             }
         }
         origins
+    }
+
+    /// Every program this manifest may run, for the import dialog to show
+    /// beside its origins. Running one is not the manifest's to allow: the
+    /// user allows it by name, apart from any manifest.
+    pub fn programs(&self) -> Vec<String> {
+        self.capabilities
+            .resolve_download
+            .iter()
+            .filter_map(|resolve| resolve.run.as_ref())
+            .map(|run| run.program.clone())
+            .collect()
     }
 
     /// Every secret this manifest names, once each, in declaration order, as
@@ -2864,6 +2972,57 @@ fn template_problems(field: &str, template: &str, allowed: &[&str]) -> Vec<Strin
     problems
 }
 
+fn run_problems(run: &RunSpec, available: &[String]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let program = run.program.as_str();
+    if program.trim().is_empty() {
+        problems.push("resolve_download.run.program cannot be empty".to_string());
+    } else if program.contains(['{', '}']) {
+        problems.push(
+            "resolve_download.run.program must be a literal name, without placeholders: it is what the user allows"
+                .to_string(),
+        );
+    } else if program.trim() != program || program.chars().any(char::is_control) {
+        problems.push(format!(
+            "resolve_download.run.program '{program}' has surrounding space or a control character"
+        ));
+    } else if !is_program_name(program) {
+        problems.push(format!(
+            "resolve_download.run.program '{program}' must be a command name or an absolute path"
+        ));
+    }
+    if run.args.len() > MAX_RUN_ARGS {
+        problems.push(format!(
+            "resolve_download.run has {} args; the limit is {MAX_RUN_ARGS}",
+            run.args.len()
+        ));
+    }
+    let mut allowed = available.to_vec();
+    allowed.push(RUN_OUTPUT_DIR.to_string());
+    for (index, arg) in run.args.iter().enumerate() {
+        problems.extend(template_problems_owned(
+            &format!("resolve_download.run.args[{index}]"),
+            arg,
+            &allowed,
+            false,
+        ));
+        if arg.chars().any(char::is_control) {
+            problems.push(format!(
+                "resolve_download.run.args[{index}] contains a control character"
+            ));
+        }
+    }
+    problems
+}
+
+/// A bare command (`mangadex-dl`), looked up on `PATH`, or an absolute path to
+/// one. A relative path would name a different program from every directory
+/// it ran in.
+pub fn is_program_name(program: &str) -> bool {
+    let path = std::path::Path::new(program);
+    path.is_absolute() || (path.components().count() == 1 && !program.contains(['/', '\\']))
+}
+
 fn template_problems_owned(
     field: &str,
     template: &str,
@@ -3602,7 +3761,7 @@ url = "{id}"
             Manifest::parse(&AUTHORING_HTML_EXAMPLE.replace(from, &format!("url = {url}")))
         };
         let listed = with_url(r#"["{pdf_url}", "{download_url}"]"#).unwrap();
-        let url = listed.capabilities.resolve_download.unwrap().url;
+        let url = listed.capabilities.resolve_download.unwrap().url.unwrap();
         assert!(url.chooses());
         assert_eq!(url.alternatives(), ["{pdf_url}", "{download_url}"]);
 
@@ -3628,6 +3787,65 @@ url = "{id}"
             let error = with_url(url).unwrap_err().to_string();
             assert!(error.contains(expected), "{url}: {error}");
         }
+    }
+
+    #[test]
+    fn a_resolver_runs_a_program_it_names_literally_with_arguments_it_lists() {
+        let run = |line: &str| {
+            let from = r#"run = { program = "mangadex-dl", args = ["{landing_page_url}", "--path", "{output_dir}", "--save-as", "pdf-single", "--cover", "none", "--no-track", "--progress-bar-layout", "none"] }"#;
+            assert!(AUTHORING_RUN_EXAMPLE.contains(from));
+            Manifest::parse(&AUTHORING_RUN_EXAMPLE.replace(from, line))
+        };
+        let manifest =
+            run(r#"run = { program = "/opt/bin/fetch", args = ["--into={output_dir}/{id}"] }"#)
+                .unwrap();
+        assert_eq!(manifest.programs(), vec!["/opt/bin/fetch"]);
+
+        for (line, expected) in [
+            (
+                r#"run = { program = "", args = [] }"#,
+                "run.program cannot be empty",
+            ),
+            (
+                r#"run = { program = "{id}", args = [] }"#,
+                "must be a literal name, without placeholders",
+            ),
+            (
+                r#"run = { program = "bin/fetch", args = [] }"#,
+                "must be a command name or an absolute path",
+            ),
+            (
+                r#"run = { program = " fetch", args = [] }"#,
+                "surrounding space or a control character",
+            ),
+            (
+                r#"run = { program = "fetch", args = ["{nowhere}"] }"#,
+                "resolve_download.run.args[0]: '{nowhere}' is not available here",
+            ),
+            (
+                r#"run = { program = "fetch", args = [] }
+filename = "{title}.pdf""#,
+                "resolve_download.filename is for url",
+            ),
+            (
+                r#"run = { program = "fetch", args = [] }
+url = "{pdf_url}""#,
+                "sets both url and run",
+            ),
+            ("", "sets neither url nor run"),
+        ] {
+            let error = run(line).unwrap_err().to_string();
+            assert!(error.contains(expected), "{line}: {error}");
+        }
+        let too_many = format!(
+            "run = {{ program = \"fetch\", args = [{}] }}",
+            vec!["\"x\""; MAX_RUN_ARGS + 1].join(", ")
+        );
+        let error = run(&too_many).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("the limit is {MAX_RUN_ARGS}")),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3693,6 +3911,8 @@ url = "{id}"
         Manifest::parse(AUTHORING_HTML_EXAMPLE).unwrap();
         Manifest::parse(AUTHORING_FULL_EXAMPLE).unwrap();
         Manifest::parse(AUTHORING_PARAMETERS_EXAMPLE).unwrap();
+        let run = Manifest::parse(AUTHORING_RUN_EXAMPLE).unwrap();
+        assert_eq!(run.programs(), vec!["mangadex-dl"]);
         // The one that extends is read where there is something to extend.
         let resolved = Manifest::resolve(
             AUTHORING_EXTENDS_EXAMPLE,
@@ -3740,6 +3960,8 @@ url = "{id}"
         assert!(prompt.contains(AUTHORING_HTML_EXAMPLE));
         assert!(prompt.contains(AUTHORING_FULL_EXAMPLE));
         assert!(prompt.contains(AUTHORING_EXTENDS_EXAMPLE));
+        assert!(prompt.contains(AUTHORING_RUN_EXAMPLE));
+        assert!(prompt.contains(&format!("at most {MAX_RUN_ARGS} arguments")));
         assert!(prompt.contains("base_url = \"https://other-origin.test\""));
         assert!(prompt.contains("never copied to a cross-origin step"));
         assert!(prompt.contains(&format!("limited to {MAX_RESOLVER_STEPS}")));

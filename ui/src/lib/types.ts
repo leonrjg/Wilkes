@@ -1001,6 +1001,9 @@ export interface IntegrationsSettings {
    *  provider with no entry is off and uses its manifest's own origin. */
   builtin?: Record<string, BuiltinProviderState>;
   custom?: CustomIntegrationConfig[];
+  /** Programs a manifest may run, by the exact name it gives them. Never set
+   *  by importing a manifest: the user allows each one. */
+  allowed_programs?: string[];
 }
 
 /** What a draft manifest declares, shown before anything is saved: importing
@@ -1009,6 +1012,12 @@ export interface ManifestSummary {
   id: string;
   name: string;
   origins: string[];
+  /** Every program the manifest may run to fetch a file, and whether this
+   *  installation allows it. Shown beside the origins: importing a manifest
+   *  that names one is a decision about what may run here. */
+  programs?: { program: string; allowed: boolean }[];
+  /** Whether a program may be allowed here, or the host fixed the list. */
+  programs_editable?: boolean;
   capabilities: string[];
   /** Secrets the user must supply before the manifest can send a request. */
   required_secrets: string[];
@@ -1095,9 +1104,14 @@ export interface LiteratureSearchResult {
   acquisition: "none" | "direct" | "provider" | "course";
 }
 
-export interface ResolvedLiteratureDownload {
-  url: string;
-  filename: string | null;
+/** What adding one provider result put in Wilkes's staging area, for the
+ *  import step to move into the library. */
+export interface LiteratureAcquired {
+  /** Every file, in the order they are imported. */
+  paths: string[];
+  /** The folder they keep in the library: set when the provider's program
+   *  wrote several files, which belong together; null for one file. */
+  folder: string | null;
 }
 
 /** What one literature provider answered to a search of every enabled

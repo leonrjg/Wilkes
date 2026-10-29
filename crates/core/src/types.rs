@@ -3059,6 +3059,13 @@ pub struct IntegrationsSettings {
     /// and a second configuration channel for the same question is exactly the
     /// duplication this feature exists to remove.
     pub custom: Vec<CustomIntegrationConfig>,
+    /// Programs a manifest may run to fetch a file, by the exact name a
+    /// manifest gives them. The user's to grant, and never a manifest's:
+    /// importing one that names a program does not put it here. A host that
+    /// fixes the list for itself (the server, from its environment) answers
+    /// with its own and refuses edits to this one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_programs: Vec<String>,
 }
 
 /// The user's part of a shipped provider.
@@ -3084,6 +3091,8 @@ struct IntegrationsSettingsWire {
     builtin: std::collections::BTreeMap<String, BuiltinProviderState>,
     #[serde(default)]
     custom: Vec<CustomIntegrationConfig>,
+    #[serde(default)]
+    allowed_programs: Vec<String>,
     #[serde(default)]
     semantic_scholar: Option<LegacyRemoteSettings>,
     #[serde(default)]
@@ -3176,6 +3185,7 @@ impl From<IntegrationsSettingsWire> for IntegrationsSettings {
             zotero: wire.zotero,
             builtin,
             custom,
+            allowed_programs: wire.allowed_programs,
         }
     }
 }
@@ -3440,6 +3450,40 @@ pub enum LiteratureAcquisition {
 pub struct ResolvedLiteratureDownload {
     pub url: String,
     pub filename: Option<String>,
+}
+
+/// How a selected result becomes files: a URL for the one existing
+/// downloader, or a program a manifest names that writes them itself.
+///
+/// Deliberately not serializable. A program and its arguments are produced
+/// from a saved manifest and run by the backend that produced them; no client
+/// ever receives one, so no client request can hand one back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadPlan {
+    Fetch(ResolvedLiteratureDownload),
+    Run(ProgramRun),
+}
+
+/// One program invocation, with every value but the output directory written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramRun {
+    /// As the manifest names it, which is the name the user allows.
+    pub program: String,
+    pub args: Vec<ProgramArg>,
+}
+
+/// One argument, as the pieces between its `{output_dir}`s.
+///
+/// Held in pieces rather than as a string with the placeholder left in, so a
+/// result value that happens to read `{output_dir}` stays that text and is
+/// never taken for where the program writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramArg(pub Vec<String>);
+
+impl ProgramArg {
+    pub fn write(&self, output_dir: &str) -> String {
+        self.0.join(output_dir)
+    }
 }
 
 /// A literature result kept for later: a work the user has found but does not

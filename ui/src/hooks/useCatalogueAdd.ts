@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { api, source } from "../services";
+import { source } from "../services";
 import type { DesktopSourceApi } from "../services/api";
 import type { LiteratureSearchResult } from "../lib/types";
 import { type AddStage, paperKey, useCatalogueStore } from "../stores/useCatalogueStore";
@@ -33,6 +33,7 @@ export function useCatalogueAdd() {
   const readOnly = useActiveWorkspaceReadOnly();
   const acquire = useCatalogueStore((s) => s.acquire);
   const acquireCourse = useCatalogueStore((s) => s.acquireCourse);
+  const acquireFromProvider = useCatalogueStore((s) => s.acquireFromProvider);
   const adding = useCatalogueStore((s) => s.adding);
   const acquired = useCatalogueStore((s) => s.acquired);
   const setAddStage = useCatalogueStore((s) => s.setAddStage);
@@ -120,10 +121,12 @@ export function useCatalogueAdd() {
    *
    * What adding does travels on the result: a course is many files and a
    * document describing them, a direct result is one file at a URL the
-   * provider already gave, and anything else is resolved first — only after
-   * selection, because a provider's resolver may spend a credential and search
-   * itself never does that once per displayed row. Every single file then
-   * goes through the same staging downloader.
+   * provider already gave, and anything else is resolved and fetched by the
+   * backend in one call — only after selection, because a provider's resolver
+   * may spend a credential and search itself never does that once per
+   * displayed row. That call may run a program the provider's manifest names,
+   * which can write several files; they arrive with the folder they keep.
+   * Whichever way, everything lands in staging and is then imported.
    */
   const add = useCallback(
     async (provider: string, work: LiteratureSearchResult): Promise<string | null> => {
@@ -143,27 +146,29 @@ export function useCatalogueAdd() {
           return installed[0] ?? null;
         });
       }
-      return runAdd(provider, work, async () => {
-        // Resolving is a request of its own, and a credentialed resolver is
-        // not a fast one. It is named as its own stage rather than spent
-        // before the row has said anything is happening.
-        const direct = acquisition === "direct" && work.pdf_url !== null;
-        setAddStage(key, direct ? "fetching" : "resolving");
-        const resolved = direct
-          ? { url: work.pdf_url as string, filename: null }
-          : await api.literatureResolveDownload(provider, work);
-        setAddStage(key, "fetching");
-        const staged = await acquire({
-          key,
-          url: resolved.url,
-          filename: resolved.filename ?? undefined,
+      if (acquisition === "direct" && work.pdf_url !== null) {
+        const url = work.pdf_url;
+        return runAdd(provider, work, async () => {
+          setAddStage(key, "fetching");
+          const staged = await acquire({ key, url });
+          setAddStage(key, "importing");
+          const installed = await install([staged]);
+          return installed[0] ?? null;
         });
+      }
+      return runAdd(provider, work, async () => {
+        // Resolving and fetching are one backend call, and a credentialed
+        // resolver or a program is not a fast one. It is named as its own
+        // stage rather than spent before the row has said anything is
+        // happening.
+        setAddStage(key, "resolving");
+        const fetched = await acquireFromProvider(key, provider, work);
         setAddStage(key, "importing");
-        const installed = await install([staged]);
+        const installed = await install(fetched.paths, fetched.folder);
         return installed[0] ?? null;
       });
     },
-    [canAdd, acquire, acquireCourse, install, runAdd, setAddStage],
+    [canAdd, acquire, acquireCourse, acquireFromProvider, install, runAdd, setAddStage],
   );
 
   return {

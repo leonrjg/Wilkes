@@ -16,7 +16,7 @@ import type {
   CatalogueSyncResponse,
   LiteratureProviderInfo,
   LiteratureSearchResponse,
-  ResolvedLiteratureDownload,
+  LiteratureAcquired,
   BookmarkClustersResult,
   ChunkTopicsQuery,
   ChunkTopicsResult,
@@ -337,12 +337,14 @@ export interface SearchApi {
     provider: string,
     doi: string,
   ): Promise<import("../lib/types").ProviderWork>;
-  /** Resolve a selected provider result to a direct file URL. No bytes are
-   *  written until the returned plan is passed to catalogueAcquire. */
-  literatureResolveDownload(
+  /** Fetch a selected provider result into Wilkes's staging area, however its
+   *  provider says it is fetched: a URL, or a program its manifest names. The
+   *  backend resolves and fetches in one call, so no program or argument ever
+   *  passes through here. Importing the files is the caller's next step. */
+  literatureAcquire(
     provider: string,
     result: import("../lib/types").LiteratureSearchResult,
-  ): Promise<ResolvedLiteratureDownload>;
+  ): Promise<LiteratureAcquired>;
   /** Refreshes the named providers, or every one of them when none is named.
    *  All four is a minutes-long call; name one at a time to show progress. */
   catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse>;

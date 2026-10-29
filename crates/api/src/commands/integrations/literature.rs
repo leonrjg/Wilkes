@@ -14,10 +14,12 @@ use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
+use wilkes_core::acquire::{run_into_staging, DownloadProgress};
 use wilkes_core::catalogue::{mirrored_sources, CatalogueStore};
 use wilkes_core::generate::tasks::browse_request::{compose_browse_request, BrowseComposition};
 use wilkes_core::generate::Generator;
@@ -28,8 +30,8 @@ use wilkes_core::integrations::{builtin, IntegrationRegistry, ProviderCapabiliti
 use wilkes_core::metadata::cache::MetadataCache;
 use wilkes_core::metadata::doi::normalize_doi;
 use wilkes_core::types::{
-    BrowseRequest, FilterValue, IntegrationStatus, IntegrationsSettings, LiteratureSearchResult,
-    MirrorStatus, ProviderWork, ResolvedLiteratureDownload,
+    BrowseRequest, DownloadPlan, FilterValue, IntegrationStatus, IntegrationsSettings,
+    LiteratureSearchResult, MirrorStatus, ProviderWork,
 };
 
 /// Works per provider when the caller does not say. The pane lists every
@@ -306,20 +308,77 @@ pub async fn search_all(
     Ok(LiteratureSearchResponse { query, providers })
 }
 
-/// Resolve one selected result on demand. This never downloads the file: the
-/// returned plan goes through the catalogue downloader, keeping one owner for
-/// filesystem writes and their size/duplicate checks.
-pub async fn resolve_download(
+/// What adding one provider result put in the staging area, for the import
+/// step to move into the library.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiteratureAcquired {
+    /// Every file, in the order they are imported.
+    pub paths: Vec<String>,
+    /// The folder they keep in the library: present when a program wrote
+    /// several, which belong together; absent for one file.
+    pub folder: Option<String>,
+}
+
+/// Programs this process allows whatever its settings say, when its host
+/// fixed them. Process-wide because it is the host's configuration, read once
+/// from its environment before any workspace opens, like its address.
+static FIXED_ALLOWED_PROGRAMS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Fix the programs a manifest may run for the life of this process. Called
+/// by a host whose settings any client may edit, so that allowing a program
+/// is the operator's act and not a client's. Once only.
+pub fn fix_allowed_programs(programs: Vec<String>) -> anyhow::Result<()> {
+    FIXED_ALLOWED_PROGRAMS
+        .set(programs)
+        .map_err(|_| anyhow::anyhow!("the allowed programs were already fixed"))
+}
+
+/// The programs a manifest may run, and whether the user may change which.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgramAllowlist {
+    pub programs: Vec<String>,
+    pub editable: bool,
+}
+
+/// The one answer to which programs may run: the host's fixed list where it
+/// fixed one, otherwise the user's in settings.
+pub fn allowed_programs(settings: &IntegrationsSettings) -> ProgramAllowlist {
+    match FIXED_ALLOWED_PROGRAMS.get() {
+        Some(programs) => ProgramAllowlist {
+            programs: programs.clone(),
+            editable: false,
+        },
+        None => ProgramAllowlist {
+            programs: settings.allowed_programs.clone(),
+            editable: true,
+        },
+    }
+}
+
+/// Fetch one selected result into `staging`, resolving it on demand.
+///
+/// The provider says how: a URL goes through the catalogue downloader, the
+/// one owner of fetching into staging and of its size and duplicate checks;
+/// a program the manifest names runs there, if it is allowed. Both end in the
+/// staging area and nowhere else — moving files into a library is the import
+/// step's. Resolution and fetching are one call so that a program and its
+/// arguments never leave this process: a client asks for a result, and can
+/// name nothing that would run.
+#[allow(clippy::too_many_arguments)]
+pub async fn acquire(
     settings: &IntegrationsSettings,
     mirror_dir: Option<&Path>,
+    staging: &Path,
+    max_download_bytes: u64,
+    progress: Option<mpsc::Sender<DownloadProgress>>,
     provider: String,
     result: LiteratureSearchResult,
-) -> Result<ResolvedLiteratureDownload, LiteratureRequestError> {
+) -> Result<LiteratureAcquired, LiteratureRequestError> {
     let registry = IntegrationRegistry::from_settings(settings, mirror_dir);
     let source = registry
         .literature_for_search(&provider)
         .map_err(|error| LiteratureRequestError(error.to_string()))?;
-    source
+    let plan = source
         .resolve_download(&result)
         .await
         .map_err(|error| LiteratureRequestError(error.to_string()))?
@@ -329,7 +388,45 @@ pub async fn resolve_download(
                 source.name(),
                 result.id
             ))
-        })
+        })?;
+    match plan {
+        DownloadPlan::Fetch(download) => {
+            let fetched = crate::commands::catalogue::acquire(
+                staging,
+                download.url,
+                download.filename,
+                progress,
+                max_download_bytes,
+            )
+            .await
+            .map_err(|error| LiteratureRequestError(error.to_string()))?;
+            Ok(LiteratureAcquired {
+                paths: vec![fetched.path],
+                folder: None,
+            })
+        }
+        DownloadPlan::Run(run) => {
+            let folder = result
+                .title
+                .as_deref()
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or(&result.id);
+            let output = run_into_staging(
+                staging,
+                folder,
+                &run,
+                &allowed_programs(settings).programs,
+                max_download_bytes,
+            )
+            .await
+            .map_err(LiteratureRequestError)?;
+            let several = output.paths.len() > 1;
+            Ok(LiteratureAcquired {
+                paths: output.paths,
+                folder: several.then_some(output.folder),
+            })
+        }
+    }
 }
 
 /// A provider's listing by filter and sort, answered in the same shape as one
@@ -988,13 +1085,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolving_a_builtin_result_returns_its_direct_url_without_downloading() {
-        let settings = enabled(&["openalex"]);
-        let resolved = resolve_download(&settings, None, "openalex".to_string(), direct_result())
-            .await
-            .unwrap();
-        assert_eq!(resolved.url, "https://example.test/paper.pdf");
-        assert!(resolved.filename.is_none());
+    async fn acquiring_a_result_that_names_a_program_not_allowed_runs_nothing() {
+        let mut settings = IntegrationsSettings::default();
+        settings
+            .custom
+            .push(wilkes_core::types::CustomIntegrationConfig {
+                id: "runner".to_string(),
+                name: None,
+                enabled: true,
+                manifest: r#"manifest_version = 2
+id = "runner"
+name = "Runner"
+
+[http]
+base_url = "https://runner.test"
+
+[capabilities.search]
+path = "/search?q={query}"
+
+[capabilities.search.fields]
+id = "id"
+title = "title"
+
+[capabilities.resolve_download]
+run = { program = "fetch-it", args = ["{id}", "{output_dir}"] }
+"#
+                .to_string(),
+                secrets: Default::default(),
+            });
+        let staging = tempfile::tempdir().unwrap();
+        let error = acquire(
+            &settings,
+            None,
+            staging.path(),
+            1024,
+            None,
+            "custom:runner".to_string(),
+            direct_result(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.0.contains("'fetch-it' is not allowed to run"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
     }
 
     #[test]

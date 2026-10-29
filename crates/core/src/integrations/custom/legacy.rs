@@ -280,7 +280,8 @@ fn convert(legacy: V1Manifest) -> anyhow::Result<Manifest> {
                                 })
                             })
                             .collect::<anyhow::Result<Vec<_>>>()?,
-                        url: UrlTemplate::One(resolve.url),
+                        url: Some(UrlTemplate::One(resolve.url)),
+                        run: None,
                         filename: resolve.filename,
                     })
                 })

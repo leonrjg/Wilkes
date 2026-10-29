@@ -247,6 +247,26 @@ export default function CustomIntegrations({
     }
   };
 
+  // Allowing a program is the user's act, apart from importing the manifest
+  // that names it: saving a manifest never allows anything. The summary is
+  // read again so what it says is allowed is the backend's answer.
+  const setProgramAllowed = async (program: string, allowed: boolean) => {
+    const current = settings.integrations.allowed_programs ?? [];
+    const next = allowed
+      ? [...current.filter((name) => name !== program), program]
+      : current.filter((name) => name !== program);
+    setSaveError(null);
+    setBusy(true);
+    try {
+      await onUpdate({ integrations: { ...settings.integrations, allowed_programs: next } });
+      if (draft !== null) setSummary(await api.customIntegrationSummary(draft));
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const writeCustom = async (next: CustomIntegrationConfig[]) => {
     setSaveError(null);
     try {
@@ -551,6 +571,38 @@ export default function CustomIntegrations({
                     {summary.origins.join(", ")}
                   </dd>
                 </div>
+                {/* A program is code this machine runs, so it is named as
+                    plainly as an origin, and runs only once allowed by name. */}
+                {(summary.programs ?? []).map(({ program, allowed }) => (
+                  <div key={program} className="flex gap-2">
+                    <dt className="text-[var(--text-dim)]">Runs</dt>
+                    <dd className="space-y-1">
+                      <div className="font-mono text-[var(--text-main)]">{program}</div>
+                      {summary.programs_editable ? (
+                        <label className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={allowed}
+                            disabled={busy}
+                            aria-label={`Allow running ${program}`}
+                            onChange={(e) => setProgramAllowed(program, e.target.checked)}
+                            className={CHECKBOX_CLASS}
+                          />
+                          <span>
+                            Allow this program to run on this computer when a result
+                            is added. Any integration naming it may then run it.
+                          </span>
+                        </label>
+                      ) : (
+                        <div>
+                          {allowed
+                            ? "Allowed by this server's WILKES_ALLOWED_PROGRAMS."
+                            : "Not allowed on this server. Its operator allows programs with WILKES_ALLOWED_PROGRAMS."}
+                        </div>
+                      )}
+                    </dd>
+                  </div>
+                ))}
                 <div className="flex gap-2">
                   <dt className="text-[var(--text-dim)]">Capabilities</dt>
                   <dd>{summary.capabilities.join(", ") || "none"}</dd>

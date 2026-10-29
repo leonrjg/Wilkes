@@ -26,7 +26,7 @@ vi.mock("../services", () => ({
     literatureFilterSuggest: vi.fn(),
     literatureCompose: vi.fn(),
     literatureComposeCancel: vi.fn(() => Promise.resolve()),
-    literatureResolveDownload: vi.fn(),
+    literatureAcquire: vi.fn(),
     listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
   },
   source: {
@@ -247,7 +247,7 @@ function catalogue(id: string, name: string, grain: CatalogueGrain): LiteratureP
 const providers = api.literatureProviders as unknown as ReturnType<typeof vi.fn>;
 const literature = api.literatureSearch as unknown as ReturnType<typeof vi.fn>;
 const browse = api.literatureBrowse as unknown as ReturnType<typeof vi.fn>;
-const resolveDownload = api.literatureResolveDownload as unknown as ReturnType<typeof vi.fn>;
+const literatureAcquire = api.literatureAcquire as unknown as ReturnType<typeof vi.fn>;
 const composeCall = api.literatureCompose as unknown as ReturnType<typeof vi.fn>;
 const composeCancel = api.literatureComposeCancel as unknown as ReturnType<typeof vi.fn>;
 const acquire = api.catalogueAcquire as unknown as ReturnType<typeof vi.fn>;
@@ -1395,7 +1395,7 @@ describe("CataloguePane", () => {
     expect(await screen.findByText("Added")).toBeTruthy();
   });
 
-  it("resolves a provider download only after selection and preserves its filename", async () => {
+  it("fetches a provider result only after selection, in one backend call", async () => {
     const providerWork: LiteratureSearchResult = {
       ...WORK,
       id: "A1",
@@ -1410,14 +1410,9 @@ describe("CataloguePane", () => {
       query: "resolved book",
       providers: [{ provider: "anna", name: "Anna", results: [providerWork], error: null }],
     });
-    resolveDownload.mockResolvedValue({
-      url: "https://files.example.invalid/resolved",
-      filename: "Resolved Book.epub",
-    });
-    acquire.mockResolvedValue({
-      path: "/uploads/Resolved Book.epub",
-      bytes: 10,
-      already_present: false,
+    literatureAcquire.mockResolvedValue({
+      paths: ["/uploads/Resolved Book.epub"],
+      folder: null,
     });
 
     render(<CataloguePane pane={pane()} />);
@@ -1425,15 +1420,11 @@ describe("CataloguePane", () => {
     // What a provider reported about the file is named in the row's one line
     // of facts, so the user knows what an Add would fetch before clicking it.
     expect(await screen.findByText(/English · epub · 2 MB/)).toBeTruthy();
-    expect(resolveDownload).not.toHaveBeenCalled();
+    expect(literatureAcquire).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByLabelText("Add Resolved Book to library"));
     await waitFor(() => {
-      expect(resolveDownload).toHaveBeenCalledWith("anna", providerWork);
-      expect(acquire).toHaveBeenCalledWith(
-        "https://files.example.invalid/resolved",
-        "Resolved Book.epub",
-      );
+      expect(literatureAcquire).toHaveBeenCalledWith("anna", providerWork);
       expect(importFiles).toHaveBeenCalledWith(
         ["/uploads/Resolved Book.epub"],
         "/library",
@@ -1441,12 +1432,46 @@ describe("CataloguePane", () => {
         undefined,
       );
     });
+    // The backend fetched it: no URL came back to be fetched again from here.
+    expect(acquire).not.toHaveBeenCalled();
   });
 
-  /// A resolver is a request of its own, and a credentialed one is not fast.
-  /// It used to run before anything was marked as adding, so the row sat
-  /// completely inert — no spinner, no disabled button — until bytes moved.
-  it("reports the resolve before any byte has moved", async () => {
+  /// A provider whose manifest runs a downloader may get several files back,
+  /// which arrive with the folder they keep in the library.
+  it("imports every file a provider's program wrote into its folder", async () => {
+    const providerWork: LiteratureSearchResult = {
+      ...WORK,
+      id: "M1",
+      title: "Long Manga",
+      pdf_url: null,
+      acquisition: "provider",
+    };
+    literature.mockResolvedValue({
+      query: "long manga",
+      providers: [{ provider: "custom:mangadex", name: "MangaDex", results: [providerWork], error: null }],
+    });
+    literatureAcquire.mockResolvedValue({
+      paths: ["/uploads/Long Manga/Vol. 1.pdf", "/uploads/Long Manga/Vol. 2.pdf"],
+      folder: "Long Manga",
+    });
+
+    render(<CataloguePane pane={pane()} />);
+    submit("long manga");
+    fireEvent.click(await screen.findByLabelText("Add Long Manga to library"));
+    await waitFor(() =>
+      expect(importFiles).toHaveBeenCalledWith(
+        ["/uploads/Long Manga/Vol. 1.pdf", "/uploads/Long Manga/Vol. 2.pdf"],
+        "/library",
+        "move",
+        "Long Manga",
+      ),
+    );
+  });
+
+  /// Resolving and fetching is a request of its own, and a credentialed one
+  /// is not fast. It used to run before anything was marked as adding, so the
+  /// row sat completely inert — no spinner, no disabled button.
+  it("reports the add before the backend has answered", async () => {
     const providerWork: LiteratureSearchResult = {
       ...WORK,
       id: "A1",
@@ -1458,21 +1483,20 @@ describe("CataloguePane", () => {
       query: "resolved book",
       providers: [{ provider: "anna", name: "Anna", results: [providerWork], error: null }],
     });
-    let finishResolve = (_: { url: string; filename: string | null }) => {};
-    resolveDownload.mockImplementation(() => new Promise((resolve) => (finishResolve = resolve)));
+    let finish = (_: { paths: string[]; folder: string | null }) => {};
+    literatureAcquire.mockImplementation(() => new Promise((resolve) => (finish = resolve)));
 
     render(<CataloguePane pane={pane()} />);
     submit("resolved book");
     fireEvent.click(await screen.findByLabelText("Add Resolved Book to library"));
     expect(await screen.findByText("Finding a copy…")).toBeTruthy();
     expect(screen.getByRole("progressbar")).toBeTruthy();
-    expect(acquire).not.toHaveBeenCalled();
+    expect(importFiles).not.toHaveBeenCalled();
 
-    acquire.mockResolvedValue({ path: "/uploads/r.pdf", bytes: 10, already_present: false });
     await act(async () => {
-      finishResolve({ url: "https://files.example.invalid/r", filename: null });
+      finish({ paths: ["/uploads/r.pdf"], folder: null });
     });
-    await waitFor(() => expect(acquire).toHaveBeenCalled());
+    await waitFor(() => expect(importFiles).toHaveBeenCalled());
     expect(await screen.findByText("Added")).toBeTruthy();
   });
 
@@ -1490,12 +1514,12 @@ describe("CataloguePane", () => {
       query: "resolved book",
       providers: [{ provider: "anna", name: "Anna", results: [providerWork], error: null }],
     });
-    resolveDownload.mockRejectedValue(new Error("membership required"));
+    literatureAcquire.mockRejectedValue(new Error("'mangadex-dl' is not allowed to run"));
 
     render(<CataloguePane pane={pane()} />);
     submit("resolved book");
     fireEvent.click(await screen.findByLabelText("Add Resolved Book to library"));
-    expect(await screen.findByText(/membership required/)).toBeTruthy();
+    expect(await screen.findByText(/is not allowed to run/)).toBeTruthy();
     expect(held().adding).toEqual({});
   });
 

@@ -452,6 +452,15 @@ interface CatalogueStore {
     key: string,
     courseUrl: string,
   ) => Promise<{ folder: string; paths: string[] }>;
+  /** Fetches a result its provider resolves on demand — by a URL it finds, or
+   *  by a program its manifest names — in one backend call. Returns the paths
+   *  to import and, when they belong together, the folder they keep. Raises
+   *  if it could not be fetched. */
+  acquireFromProvider: (
+    key: string,
+    provider: string,
+    work: LiteratureSearchResult,
+  ) => Promise<{ folder?: string; paths: string[] }>;
   reset: () => void;
 }
 
@@ -1346,6 +1355,12 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
       });
       throw error;
     }
+  },
+
+  acquireFromProvider: async (key, provider, work) => {
+    const acquired = await api.literatureAcquire(provider, work);
+    set((state) => ({ acquired: { ...state.acquired, [key]: acquired.paths[0] } }));
+    return { folder: acquired.folder ?? undefined, paths: acquired.paths };
   },
 
   acquireCourse: async (key, courseUrl) => {

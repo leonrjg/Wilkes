@@ -23,7 +23,8 @@ use tracing::{error, info};
 use wilkes_core::acquire::download_to_root;
 use wilkes_core::integrations::IntegrationRegistry;
 use wilkes_core::types::{
-    IntegrationsSettings, LiteratureAcquisition, LiteratureSearchResult, ResolvedLiteratureDownload,
+    DownloadPlan, IntegrationsSettings, LiteratureAcquisition, LiteratureSearchResult,
+    ResolvedLiteratureDownload,
 };
 
 use crate::{
@@ -418,7 +419,16 @@ impl WilkesMcp {
             .literature_for_search(provider)
             .map_err(|error| error.to_string())?;
         match source.resolve_download(result).await {
-            Ok(Some(download)) => Ok(download),
+            Ok(Some(DownloadPlan::Fetch(download))) => Ok(download),
+            // This tool writes one fetched file into the root. A program
+            // writes files of its own, which reach a library only through the
+            // application's staging and import, so it is not run from here.
+            Ok(Some(DownloadPlan::Run(run))) => Err(format!(
+                "{} fetches result '{}' by running '{}', which this tool does not do. Ask the user to add it from the Wilkes catalogue instead.",
+                source.name(),
+                result.id,
+                run.program
+            )),
             Ok(None) => Err(format!(
                 "{} did not provide a downloadable file for result '{}'",
                 source.name(),
