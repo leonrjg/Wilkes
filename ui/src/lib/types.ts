@@ -1104,14 +1104,14 @@ export interface LiteratureSearchResult {
   acquisition: "none" | "direct" | "provider" | "course";
 }
 
-/** What adding one provider result put in Wilkes's staging area, for the
- *  import step to move into the library. */
-export interface LiteratureAcquired {
-  /** Every file, in the order they are imported. */
-  paths: string[];
-  /** The folder they keep in the library: set when the provider's program
-   *  wrote several files, which belong together; null for one file. */
+/** What acquiring one provider result put in a root, however its files were
+ *  made: here, Wilkes's staging area on the way to an import. */
+export interface AcquiredFiles {
+  /** The folder under the root the files are in, when several came back
+   *  together, and the folder they keep in the library; null for one file. */
   folder: string | null;
+  /** Each file as a download reports it, in path order. */
+  files: CatalogueDownload[];
 }
 
 /** What one literature provider answered to a search of every enabled

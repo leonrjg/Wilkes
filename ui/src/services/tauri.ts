@@ -23,7 +23,7 @@ import type {
   ProviderWork,
   LiteratureSearchResponse,
   LiteratureSearchResult,
-  LiteratureAcquired,
+  AcquiredFiles,
   EmbedDone,
   EmbedError,
   EmbedProgress,
@@ -637,8 +637,8 @@ export class TauriSearchApi implements SearchApi {
   async literatureAcquire(
     provider: string,
     result: LiteratureSearchResult,
-  ): Promise<LiteratureAcquired> {
-    return invoke<LiteratureAcquired>("literature_acquire", { provider, result });
+  ): Promise<AcquiredFiles> {
+    return invoke<AcquiredFiles>("literature_acquire", { provider, result });
   }
 
   async catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse> {

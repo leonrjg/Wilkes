@@ -21,11 +21,12 @@
 //! surface — and stays what it was.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::acquire::{acquire_plan, AcquiredFiles, DownloadProgress};
 use crate::catalogue::{mirrored_sources, CatalogueStore};
 
 use crate::types::{
@@ -158,6 +159,93 @@ pub trait LiteratureSource: Send + Sync {
     /// asks this *before* enabling, so a short-circuit on `enabled` would
     /// answer "disabled" and the integration could never be switched on.
     async fn status(&self, enabled: bool) -> anyhow::Result<IntegrationStatus>;
+}
+
+/// Programs this process allows whatever its settings say, when its host
+/// fixed them. Process-wide because it is the host's configuration, read once
+/// from its environment before any workspace opens, like its address.
+static FIXED_ALLOWED_PROGRAMS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Fix the programs a manifest may run for the life of this process. Called
+/// by a host whose settings any client may edit, so that allowing a program
+/// is the operator's act and not a client's. Once only.
+pub fn fix_allowed_programs(programs: Vec<String>) -> anyhow::Result<()> {
+    FIXED_ALLOWED_PROGRAMS
+        .set(programs)
+        .map_err(|_| anyhow::anyhow!("the allowed programs were already fixed"))
+}
+
+/// The programs a manifest may run, and whether the user may change which.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgramAllowlist {
+    pub programs: Vec<String>,
+    pub editable: bool,
+}
+
+/// The one answer to which programs may run: the host's fixed list where it
+/// fixed one, otherwise the user's in settings.
+pub fn allowed_programs(settings: &IntegrationsSettings) -> ProgramAllowlist {
+    match FIXED_ALLOWED_PROGRAMS.get() {
+        Some(programs) => ProgramAllowlist {
+            programs: programs.clone(),
+            editable: false,
+        },
+        None => ProgramAllowlist {
+            programs: settings.allowed_programs.clone(),
+            editable: true,
+        },
+    }
+}
+
+/// Put the files of one provider result into `root`, resolving it on demand.
+///
+/// What every entrypoint that adds a provider's result calls, whichever root
+/// it names: how the provider says the files are made — a URL, or a program
+/// its manifest runs — is decided and carried out here, and the caller learns
+/// only where the files now are. Resolution and fetching are one call so a
+/// program and its arguments never leave this process. `saved_as` is the
+/// caller's own name for what is stored; see [`acquire_plan`].
+pub async fn acquire_result(
+    settings: &IntegrationsSettings,
+    mirror_dir: Option<&Path>,
+    provider: &str,
+    result: &LiteratureSearchResult,
+    root: &Path,
+    saved_as: Option<String>,
+    progress: Option<tokio::sync::mpsc::Sender<DownloadProgress>>,
+    max_download_bytes: u64,
+) -> Result<AcquiredFiles, String> {
+    let registry = IntegrationRegistry::from_settings(settings, mirror_dir);
+    let source = registry
+        .literature_for_search(provider)
+        .map_err(|error| error.to_string())?;
+    let plan = source
+        .resolve_download(result)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "{} did not provide a downloadable file for result '{}'",
+                source.name(),
+                result.id
+            )
+        })?;
+    // Several files keep the work's name as their folder.
+    let name = result
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or(&result.id);
+    acquire_plan(
+        root,
+        plan,
+        name,
+        saved_as,
+        &allowed_programs(settings).programs,
+        progress,
+        max_download_bytes,
+    )
+    .await
 }
 
 /// The shipped manifests as this installation reaches them: each beside the

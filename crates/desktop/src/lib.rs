@@ -2050,7 +2050,7 @@ async fn literature_acquire(
     app: AppHandle,
     provider: String,
     result: wilkes_core::types::LiteratureSearchResult,
-) -> Result<wilkes_api::commands::integrations::literature::LiteratureAcquired, String> {
+) -> Result<wilkes_core::acquire::AcquiredFiles, String> {
     app_context(&app)
         .literature_acquire(provider, result)
         .await

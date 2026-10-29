@@ -16,7 +16,7 @@ import type {
   CatalogueSyncResponse,
   LiteratureProviderInfo,
   LiteratureSearchResponse,
-  LiteratureAcquired,
+  AcquiredFiles,
   BookmarkClustersResult,
   ChunkTopicsQuery,
   ChunkTopicsResult,
@@ -344,7 +344,7 @@ export interface SearchApi {
   literatureAcquire(
     provider: string,
     result: import("../lib/types").LiteratureSearchResult,
-  ): Promise<LiteratureAcquired>;
+  ): Promise<AcquiredFiles>;
   /** Refreshes the named providers, or every one of them when none is named.
    *  All four is a minutes-long call; name one at a time to show progress. */
   catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse>;

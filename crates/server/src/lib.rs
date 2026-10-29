@@ -818,10 +818,7 @@ struct LiteratureAcquireBody {
 async fn literature_acquire_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<LiteratureAcquireBody>,
-) -> Result<
-    Json<wilkes_api::commands::integrations::literature::LiteratureAcquired>,
-    (StatusCode, Json<ErrorBody>),
-> {
+) -> Result<Json<wilkes_core::acquire::AcquiredFiles>, (StatusCode, Json<ErrorBody>)> {
     state
         .context()
         .literature_acquire(body.provider, body.result)

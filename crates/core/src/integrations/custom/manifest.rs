@@ -909,8 +909,9 @@ pub struct ResolveDownloadCapability {
 ///    else, and a value that would begin an argument with `-` is refused,
 ///    because the program would read it as an option no author wrote.
 /// 3. **The program writes into a directory Wilkes made for it**, given as
-///    `{output_dir}` and as the working directory. What it leaves there is
-///    what is imported, through the same staging step as any download.
+///    `{output_dir}` and as the working directory, apart from any library.
+///    What it leaves there reaches the root a download would, under the same
+///    rules; see `crate::integrations::acquire_result`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RunSpec {

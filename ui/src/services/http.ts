@@ -17,7 +17,7 @@ import type {
   ProviderWork,
   LiteratureSearchResponse,
   LiteratureSearchResult,
-  LiteratureAcquired,
+  AcquiredFiles,
   EmbedDone,
   EmbedError,
   EmbedProgress,
@@ -959,14 +959,14 @@ export class HttpSearchApi implements SearchApi {
   async literatureAcquire(
     provider: string,
     result: LiteratureSearchResult,
-  ): Promise<LiteratureAcquired> {
+  ): Promise<AcquiredFiles> {
     const res = await fetch("/api/literature/acquire", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ provider, result }),
     });
     if (!res.ok) throw await responseError(res, "literatureAcquire");
-    return res.json() as Promise<LiteratureAcquired>;
+    return res.json() as Promise<AcquiredFiles>;
   }
 
   async catalogueSync(providers?: string[]): Promise<CatalogueSyncResponse> {

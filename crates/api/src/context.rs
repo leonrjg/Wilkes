@@ -5372,7 +5372,7 @@ impl AppContext {
         crate::commands::integrations::custom::custom_integration_summary(
             manifest,
             &settings.integrations,
-            &crate::commands::integrations::literature::allowed_programs(&settings.integrations),
+            &wilkes_core::integrations::allowed_programs(&settings.integrations),
         )
     }
 
@@ -6179,9 +6179,7 @@ impl AppContext {
             // Where the host fixed the programs a manifest may run, no client
             // changes the stored list. One sent back as it was is no change.
             if let Some(programs) = patch.pointer("/integrations/allowed_programs") {
-                let allowlist = crate::commands::integrations::literature::allowed_programs(
-                    &before.integrations,
-                );
+                let allowlist = wilkes_core::integrations::allowed_programs(&before.integrations);
                 anyhow::ensure!(
                     allowlist.editable
                         || *programs == serde_json::json!(before.integrations.allowed_programs),

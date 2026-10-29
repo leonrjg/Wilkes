@@ -633,7 +633,7 @@ impl AppContext {
         provider: String,
         result: wilkes_core::types::LiteratureSearchResult,
     ) -> Result<
-        crate::commands::integrations::literature::LiteratureAcquired,
+        wilkes_core::acquire::AcquiredFiles,
         crate::commands::integrations::literature::LiteratureRequestError,
     > {
         let settings = self.get_settings().await;

@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
+  AcquiredFiles,
   BrowseControls,
   CatalogueGrain,
   FilterControl,
@@ -1411,8 +1412,8 @@ describe("CataloguePane", () => {
       providers: [{ provider: "anna", name: "Anna", results: [providerWork], error: null }],
     });
     literatureAcquire.mockResolvedValue({
-      paths: ["/uploads/Resolved Book.epub"],
       folder: null,
+      files: [{ path: "/uploads/Resolved Book.epub", bytes: 10, already_present: false }],
     });
 
     render(<CataloguePane pane={pane()} />);
@@ -1451,8 +1452,11 @@ describe("CataloguePane", () => {
       providers: [{ provider: "custom:mangadex", name: "MangaDex", results: [providerWork], error: null }],
     });
     literatureAcquire.mockResolvedValue({
-      paths: ["/uploads/Long Manga/Vol. 1.pdf", "/uploads/Long Manga/Vol. 2.pdf"],
       folder: "Long Manga",
+      files: [
+        { path: "/uploads/Long Manga/Vol. 1.pdf", bytes: 10, already_present: false },
+        { path: "/uploads/Long Manga/Vol. 2.pdf", bytes: 10, already_present: false },
+      ],
     });
 
     render(<CataloguePane pane={pane()} />);
@@ -1483,7 +1487,7 @@ describe("CataloguePane", () => {
       query: "resolved book",
       providers: [{ provider: "anna", name: "Anna", results: [providerWork], error: null }],
     });
-    let finish = (_: { paths: string[]; folder: string | null }) => {};
+    let finish = (_: AcquiredFiles) => {};
     literatureAcquire.mockImplementation(() => new Promise((resolve) => (finish = resolve)));
 
     render(<CataloguePane pane={pane()} />);
@@ -1494,7 +1498,7 @@ describe("CataloguePane", () => {
     expect(importFiles).not.toHaveBeenCalled();
 
     await act(async () => {
-      finish({ paths: ["/uploads/r.pdf"], folder: null });
+      finish({ folder: null, files: [{ path: "/uploads/r.pdf", bytes: 10, already_present: false }] });
     });
     await waitFor(() => expect(importFiles).toHaveBeenCalled());
     expect(await screen.findByText("Added")).toBeTruthy();

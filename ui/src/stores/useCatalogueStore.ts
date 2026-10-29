@@ -1359,8 +1359,9 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
 
   acquireFromProvider: async (key, provider, work) => {
     const acquired = await api.literatureAcquire(provider, work);
-    set((state) => ({ acquired: { ...state.acquired, [key]: acquired.paths[0] } }));
-    return { folder: acquired.folder ?? undefined, paths: acquired.paths };
+    const paths = acquired.files.map((file) => file.path);
+    set((state) => ({ acquired: { ...state.acquired, [key]: paths[0] } }));
+    return { folder: acquired.folder ?? undefined, paths };
   },
 
   acquireCourse: async (key, courseUrl) => {

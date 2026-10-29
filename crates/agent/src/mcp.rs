@@ -20,12 +20,9 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
-use wilkes_core::acquire::download_to_root;
-use wilkes_core::integrations::IntegrationRegistry;
-use wilkes_core::types::{
-    DownloadPlan, IntegrationsSettings, LiteratureAcquisition, LiteratureSearchResult,
-    ResolvedLiteratureDownload,
-};
+use wilkes_core::acquire::{download_to_root, AcquiredFiles};
+use wilkes_core::integrations::{acquire_result, IntegrationRegistry};
+use wilkes_core::types::{IntegrationsSettings, LiteratureAcquisition, LiteratureSearchResult};
 
 use crate::{
     context::{ActiveDoc, ContextFile},
@@ -409,35 +406,6 @@ impl WilkesMcp {
             })
     }
 
-    async fn resolve_literature_download(
-        &self,
-        provider: &str,
-        result: &LiteratureSearchResult,
-    ) -> Result<ResolvedLiteratureDownload, String> {
-        let registry = self.literature_registry().await;
-        let source = registry
-            .literature_for_search(provider)
-            .map_err(|error| error.to_string())?;
-        match source.resolve_download(result).await {
-            Ok(Some(DownloadPlan::Fetch(download))) => Ok(download),
-            // This tool writes one fetched file into the root. A program
-            // writes files of its own, which reach a library only through the
-            // application's staging and import, so it is not run from here.
-            Ok(Some(DownloadPlan::Run(run))) => Err(format!(
-                "{} fetches result '{}' by running '{}', which this tool does not do. Ask the user to add it from the Wilkes catalogue instead.",
-                source.name(),
-                result.id,
-                run.program
-            )),
-            Ok(None) => Err(format!(
-                "{} did not provide a downloadable file for result '{}'",
-                source.name(),
-                result.id
-            )),
-            Err(error) => Err(error.to_string()),
-        }
-    }
-
     fn with_literature_results(mut self, cache: LiteratureResultCache) -> Self {
         self.literature_results = cache;
         self
@@ -739,14 +707,22 @@ impl WilkesMcp {
     /// through the active workspace's service because it is the installation's
     /// and every workspace names the same one.
     async fn literature_registry(&self) -> IntegrationRegistry {
-        let mirror = match self.scope(None).await {
+        IntegrationRegistry::from_settings(
+            &self.integrations().await,
+            self.literature_mirror().await.as_deref(),
+        )
+    }
+
+    /// The installation's catalogue mirror, found through the active
+    /// workspace's service because every workspace names the same one.
+    async fn literature_mirror(&self) -> Option<PathBuf> {
+        match self.scope(None).await {
             Ok(scope) => scope.search().and_then(|search| search.catalogue_mirror()),
             Err(error) => {
                 info!(%error, "mcp: catalogue mirror unavailable");
                 None
             }
-        };
-        IntegrationRegistry::from_settings(&self.integrations().await, mirror.as_deref())
+        }
     }
 
     /// Literature and provider settings are global rather than per-workspace,
@@ -995,7 +971,8 @@ struct DownloadParams {
     /// The id of a result returned by literature_search for provider. Wilkes
     /// locates the file itself; no URL is needed.
     result_id: Option<String>,
-    /// File name inside the current Wilkes root. Must not contain directories.
+    /// File name inside the current Wilkes root, or the folder's name when a
+    /// result comes back as several files. Must not contain directories.
     filename: Option<String>,
     /// Workspace id to read, from list_context. Omit for the workspace that is
     /// active in Wilkes. Naming one does not switch the app to it.
@@ -1543,7 +1520,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Download a file into the current Wilkes root of the active workspace, or of the workspace named by workspace. Use only when the user asks to import or download a file. Name the file either by a url the user gave you, or by provider and result_id of a literature_search result whose downloadable is true; Wilkes finds the file itself. Pass filename to choose the saved name; existing files are never overwritten. Refused for a workspace list_context reports as read_only, which another application owns."
+        description = "Download a file into the current Wilkes root of the active workspace, or of the workspace named by workspace. Use only when the user asks to import or download a file. Name the file either by a url the user gave you, or by provider and result_id of a literature_search result whose downloadable is true; Wilkes finds the file itself. A result may come back as several files, in a folder of their own; the answer lists every file. Pass filename to choose the saved name, or the folder's when there are several; existing files are never overwritten. Refused for a workspace list_context reports as read_only, which another application owns."
     )]
     async fn download(&self, Parameters(params): Parameters<DownloadParams>) -> CallToolResult {
         let scope = match self.scope(params.workspace.as_deref()).await {
@@ -1561,23 +1538,49 @@ impl WilkesMcp {
                 return CallToolResult::error(vec![ContentBlock::text(message)]);
             }
         };
-        // The result a download names, kept so a saved one can be marked as
-        // in the library once the file is there.
-        let (url, resolved_filename, named) = match (params.url, params.provider, params.result_id)
-        {
-            (Some(url), None, None) => (url, None, None),
+        let max_download_bytes = match scope.search() {
+            Some(search) => search.max_download_bytes().await,
+            // A standalone chat session has no application settings service.
+            None => wilkes_core::types::DEFAULT_MAX_DOWNLOAD_BYTES,
+        };
+        // No progress sink: an MCP call is one request and one reply, with
+        // nowhere to render a bar between them.
+        let (acquired, named) = match (params.url, params.provider, params.result_id) {
+            (Some(url), None, None) => (
+                download_to_root(
+                    &root,
+                    wilkes_core::acquire::DownloadParams {
+                        url,
+                        filename: params.filename,
+                    },
+                    None,
+                    max_download_bytes,
+                )
+                .await
+                .map(|file| AcquiredFiles {
+                    folder: None,
+                    files: vec![file],
+                }),
+                None,
+            ),
+            // The result is kept so a saved one can be marked as in the
+            // library once its files are there.
             (None, Some(provider), Some(result_id)) => {
-                let resolved = match self.cached_literature_result(&provider, &result_id) {
-                    Ok(result) => self
-                        .resolve_literature_download(&provider, &result)
-                        .await
-                        .map(|resolved| (resolved, result)),
-                    Err(message) => Err(message),
-                };
-                match resolved {
-                    Ok((resolved, result)) => {
-                        (resolved.url, resolved.filename, Some((provider, result)))
-                    }
+                match self.cached_literature_result(&provider, &result_id) {
+                    Ok(result) => (
+                        acquire_result(
+                            &self.integrations().await,
+                            self.literature_mirror().await.as_deref(),
+                            &provider,
+                            &result,
+                            &root,
+                            params.filename,
+                            None,
+                            max_download_bytes,
+                        )
+                        .await,
+                        Some((provider, result)),
+                    ),
                     Err(message) => {
                         return CallToolResult::error(vec![ContentBlock::text(message)])
                     }
@@ -1589,36 +1592,21 @@ impl WilkesMcp {
                 )])
             }
         };
-        let max_download_bytes = match scope.search() {
-            Some(search) => search.max_download_bytes().await,
-            // A standalone chat session has no application settings service.
-            None => wilkes_core::types::DEFAULT_MAX_DOWNLOAD_BYTES,
-        };
-        // No progress sink: an MCP call is one request and one reply, with
-        // nowhere to render a bar between them.
-        match download_to_root(
-            &root,
-            wilkes_core::acquire::DownloadParams {
-                url,
-                filename: params.filename.or(resolved_filename),
-            },
-            None,
-            max_download_bytes,
-        )
-        .await
-        {
-            Ok(response) => {
-                if let (Some((provider, result)), Some(search)) = (named, scope.search()) {
-                    // The file is in the library whether or not the mark is
+        match acquired {
+            Ok(acquired) => {
+                if let (Some((provider, result)), Some(search), Some(first)) =
+                    (named, scope.search(), acquired.files.first())
+                {
+                    // The files are in the library whether or not the mark is
                     // written, so a failure here is reported, not returned.
                     if let Err(message) = search
-                        .mark_literature_acquired(provider, result, PathBuf::from(&response.path))
+                        .mark_literature_acquired(provider, result, PathBuf::from(&first.path))
                         .await
                     {
                         error!("marking a saved work as acquired failed: {message}");
                     }
                 }
-                structured(response)
+                structured(acquired)
             }
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
@@ -3362,6 +3350,95 @@ mod tests {
             search["inputSchema"]["properties"]["case_sensitive"]["type"],
             "boolean"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn downloading_a_result_its_manifest_runs_a_program_for_puts_the_file_in_the_root() {
+        let root = tempdir().unwrap();
+        let mut integrations = IntegrationsSettings::default();
+        integrations.allowed_programs.push("/bin/sh".to_string());
+        integrations
+            .custom
+            .push(wilkes_core::types::CustomIntegrationConfig {
+                id: "runner".to_string(),
+                name: None,
+                enabled: true,
+                manifest: r#"manifest_version = 2
+id = "runner"
+name = "Runner"
+
+[http]
+base_url = "https://runner.test"
+
+[capabilities.search]
+path = "/search?q={query}"
+
+[capabilities.search.fields]
+id = "id"
+title = "title"
+
+[capabilities.resolve_download]
+run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh", "{output_dir}"] }
+"#
+                .to_string(),
+                secrets: Default::default(),
+            });
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(single_workspace(fake_search_with_root(root.path().into()))),
+            Some(integrations),
+        );
+        mcp.literature_results.lock().unwrap().insert(
+            ("custom:runner".to_string(), "M1".to_string()),
+            LiteratureSearchResult {
+                id: "M1".to_string(),
+                doi: None,
+                title: Some("A manga".to_string()),
+                year: None,
+                publication_date: None,
+                venue: None,
+                citation_count: None,
+                is_open_access: false,
+                pdf_url: None,
+                landing_page_url: None,
+                image_url: None,
+                open_access_status: None,
+                license: None,
+                authors: None,
+                publisher: None,
+                language: None,
+                file_format: None,
+                file_size: None,
+                summary: None,
+                subject: None,
+                kind: None,
+                pages: None,
+                recall_score: None,
+                acquisition: LiteratureAcquisition::Provider,
+            },
+        );
+
+        let reply = mcp
+            .download(Parameters(DownloadParams {
+                url: None,
+                provider: Some("custom:runner".to_string()),
+                result_id: Some("M1".to_string()),
+                filename: None,
+                workspace: None,
+            }))
+            .await;
+
+        assert_ne!(reply.is_error, Some(true), "{reply:?}");
+        let saved = root.path().join("M1.pdf");
+        assert_eq!(std::fs::read(&saved).unwrap(), b"manga");
+        assert_eq!(
+            reply.structured_content.unwrap()["files"][0]["path"],
+            saved.display().to_string()
+        );
+        // The run's own directory is not in the library.
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     #[tokio::test]

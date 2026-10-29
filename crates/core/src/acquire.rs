@@ -8,7 +8,7 @@
 //! *where may it land*, and *is this already here*.
 
 use crate::http_history::LoggedRequest;
-use crate::types::ProgramRun;
+use crate::types::{DownloadPlan, ProgramRun};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -478,6 +478,21 @@ pub async fn download_to_root(
             done: true,
         },
     );
+    store_in_root(root, &target, &bytes, url.as_str())
+}
+
+/// Write `bytes` to `target` under `root`, unless they are already there.
+///
+/// The rules every file that reaches a root keeps, fetched or written by a
+/// program: the user's file is never overwritten, and content already in the
+/// root under any name is reported where it is rather than written twice.
+/// `source` says in the log where the bytes came from.
+fn store_in_root(
+    root: &Path,
+    target: &Path,
+    bytes: &[u8],
+    source: &str,
+) -> Result<DownloadResponse, String> {
     // The name is checked here rather than before the request, because
     // whether an existing file is a collision depends on what is in it. A
     // caller that fetches the same record twice — an acquisition retried after
@@ -489,21 +504,21 @@ pub async fn download_to_root(
     if target.exists() {
         let existing = std::fs::read(&target)
             .map_err(|error| format!("Failed to read {}: {error}", target.display()))?;
-        if Sha256::digest(&existing) == Sha256::digest(&bytes) {
+        if Sha256::digest(&existing) == Sha256::digest(bytes) {
             tracing::info!(
-                url = %url,
+                source = %source,
                 path = %target.display(),
                 bytes = bytes.len(),
                 "download already present under the same name; nothing written"
             );
             return Ok(DownloadResponse {
-                path: display_path(&target),
+                path: display_path(target),
                 bytes: bytes.len(),
                 already_present: true,
             });
         }
         tracing::warn!(
-            url = %url,
+            source = %source,
             path = %target.display(),
             "download refused: a different file already has that name"
         );
@@ -512,9 +527,9 @@ pub async fn download_to_root(
             target.display()
         ));
     }
-    if let Some(existing) = find_file_with_content(root, &target, &bytes)? {
+    if let Some(existing) = find_file_with_content(root, target, bytes)? {
         tracing::info!(
-            url = %url,
+            source = %source,
             path = %existing.display(),
             bytes = bytes.len(),
             "download already present under another name; nothing written"
@@ -525,18 +540,18 @@ pub async fn download_to_root(
             already_present: true,
         });
     }
-    std::fs::write(&target, &bytes).map_err(|error| {
+    std::fs::write(target, bytes).map_err(|error| {
         tracing::warn!(path = %target.display(), "download could not be saved: {error}");
         format!("Failed to save {}: {error}", target.display())
     })?;
     tracing::info!(
-        url = %url,
+        source = %source,
         path = %target.display(),
         bytes = bytes.len(),
         "download saved"
     );
     Ok(DownloadResponse {
-        path: display_path(&target),
+        path: display_path(target),
         bytes: bytes.len(),
         already_present: false,
     })
@@ -592,39 +607,75 @@ pub(crate) fn find_file_with_content(
     Ok(None)
 }
 
-/// What a program left in the directory made for it.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProgramOutput {
-    /// The directory's name, which the files keep when they are imported.
-    pub folder: String,
-    pub directory: String,
-    /// Every file it wrote, in path order.
-    pub paths: Vec<String>,
+/// What acquiring one result put in a root, however its files were made.
+#[derive(Clone, Debug, Serialize)]
+pub struct AcquiredFiles {
+    /// The folder under the root the files are in, when several came back
+    /// together. None for one file, which is in the root itself.
+    pub folder: Option<String>,
+    /// Each file as a download reports it, in path order.
+    pub files: Vec<DownloadResponse>,
 }
 
 /// How much of a failed program's error output is reported. The end is where
 /// a program says why it stopped.
 const PROGRAM_ERROR_LINES: usize = 20;
 
-/// Run what a manifest resolved a result to, into a new directory under
-/// `staging` named after `folder`.
+/// Put the files a plan names into `root`.
 ///
-/// The one place a manifest's program runs, and so the one place that asks
-/// whether it may: `allowed` is the user's list, and a program not on it by
-/// exactly the name the manifest uses is refused before anything starts. The
-/// program gets no shell, no input and the new directory as its working
-/// directory. Everything it leaves there is the answer, each file held to the
-/// same size limit as a download. A run that fails, or leaves something that
-/// cannot be imported, leaves nothing behind.
+/// The one way a resolved result reaches a root, whichever entrypoint asked
+/// and whichever root it named: a library's, or Wilkes's own uploads on the
+/// way to an import. A URL is fetched by [`download_to_root`]. A program runs
+/// in a directory of its own outside `root`, which is how a program's work
+/// stays apart from what is already there and is gone however the run ends;
+/// what it wrote is then stored in `root` under the rules a download is, one
+/// file at a time. Several files go into a folder named `name`.
 ///
-/// Dropping the returned future kills the program.
-pub async fn run_into_staging(
-    staging: &Path,
-    folder: &str,
+/// `saved_as` is a caller's own choice of name, which wins over the plan's:
+/// the name of the one file, or the folder of several.
+///
+/// A program runs only when it is on `allowed` by exactly the name its
+/// manifest uses. Dropping the returned future kills it.
+pub(crate) async fn acquire_plan(
+    root: &Path,
+    plan: DownloadPlan,
+    name: &str,
+    saved_as: Option<String>,
+    allowed: &[String],
+    progress: Option<mpsc::Sender<DownloadProgress>>,
+    max_download_bytes: u64,
+) -> Result<AcquiredFiles, String> {
+    match plan {
+        DownloadPlan::Fetch(download) => {
+            let file = download_to_root(
+                root,
+                DownloadParams {
+                    url: download.url,
+                    filename: saved_as.or(download.filename),
+                },
+                progress,
+                max_download_bytes,
+            )
+            .await?;
+            Ok(AcquiredFiles {
+                folder: None,
+                files: vec![file],
+            })
+        }
+        DownloadPlan::Run(run) => {
+            run_into_root(root, &run, name, saved_as, allowed, max_download_bytes).await
+        }
+    }
+}
+
+async fn run_into_root(
+    root: &Path,
     run: &ProgramRun,
+    name: &str,
+    saved_as: Option<String>,
     allowed: &[String],
     max_download_bytes: u64,
-) -> Result<ProgramOutput, String> {
+) -> Result<AcquiredFiles, String> {
     if !allowed.iter().any(|program| *program == run.program) {
         tracing::warn!(program = %run.program, "run refused: the program is not allowed");
         return Err(format!(
@@ -632,55 +683,72 @@ pub async fn run_into_staging(
             run.program
         ));
     }
-    let folder = wilkes_path::sanitize_file_name(folder)?;
-    tokio::fs::create_dir_all(staging)
-        .await
-        .map_err(|error| format!("Cannot prepare {}: {error}", staging.display()))?;
-    let (folder, directory) = new_directory(staging, &folder).await?;
-    let output_dir = directory.to_string_lossy().into_owned();
+    if !root.is_dir() {
+        let message = format!("Current Wilkes root does not exist: {}", root.display());
+        tracing::warn!("run refused: {message}");
+        return Err(message);
+    }
+    let workspace = tempfile::Builder::new()
+        .prefix("wilkes-run-")
+        .tempdir()
+        .map_err(|error| format!("Cannot prepare a directory for '{}': {error}", run.program))?;
+    let output_dir = workspace.path().to_string_lossy().into_owned();
     let args: Vec<String> = run.args.iter().map(|arg| arg.write(&output_dir)).collect();
-
     // The arguments are not logged: a step may have fetched a token into one.
-    tracing::info!(program = %run.program, directory = %output_dir, "running a manifest program");
-    let outcome = run_program(&run.program, &args, &directory, max_download_bytes).await;
-    match outcome {
-        Ok(paths) => {
-            tracing::info!(program = %run.program, files = paths.len(), "manifest program finished");
-            Ok(ProgramOutput {
-                folder,
-                directory: output_dir,
-                paths: paths.iter().map(|path| display_path(path)).collect(),
-            })
-        }
-        Err(message) => {
+    tracing::info!(program = %run.program, "running a manifest program");
+    let written = run_program(&run.program, &args, workspace.path(), max_download_bytes)
+        .await
+        .inspect_err(|message| {
             tracing::warn!(program = %run.program, "manifest program failed: {message}");
-            if let Err(error) = tokio::fs::remove_dir_all(&directory).await {
-                tracing::warn!(directory = %output_dir, "could not remove a failed run's directory: {error}");
-            }
-            Err(message)
-        }
-    }
-}
+        })?;
 
-/// A directory under `parent` that did not exist, named `name` or, when that
-/// is taken, `name (2)` and on.
-async fn new_directory(parent: &Path, name: &str) -> Result<(String, PathBuf), String> {
-    for attempt in 1..=1000u32 {
-        let candidate = match attempt {
-            1 => name.to_string(),
-            n => format!("{name} ({n})"),
-        };
-        let path = parent.join(&candidate);
-        match tokio::fs::create_dir(&path).await {
-            Ok(()) => return Ok((candidate, path)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("Cannot create {}: {error}", path.display())),
+    // Every name is settled before anything is stored, so a run is refused
+    // whole rather than after some of its files are in the root.
+    let mut named = Vec::with_capacity(written.len());
+    for path in &written {
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let safe = wilkes_path::sanitize_file_name(&file_name)
+            .map_err(|error| format!("'{}' wrote an unusable name: {error}", run.program))?;
+        if named.iter().any(|(_, seen)| *seen == safe) {
+            return Err(format!(
+                "'{}' wrote two files named '{safe}', which cannot both go into one folder",
+                run.program
+            ));
         }
+        named.push((path, safe));
     }
-    Err(format!(
-        "No free directory name for '{name}' in {}",
-        parent.display()
-    ))
+    let (folder, destination) = match named.len() {
+        1 => {
+            if let Some(saved_as) = &saved_as {
+                named[0].1 = wilkes_path::sanitize_file_name(saved_as)?;
+            }
+            (None, root.to_path_buf())
+        }
+        _ => {
+            let folder = wilkes_path::sanitize_file_name(saved_as.as_deref().unwrap_or(name))?;
+            let destination = root.join(&folder);
+            tokio::fs::create_dir_all(&destination)
+                .await
+                .map_err(|error| format!("Cannot create {}: {error}", destination.display()))?;
+            (Some(folder), destination)
+        }
+    };
+    let mut files = Vec::with_capacity(named.len());
+    for (path, safe) in named {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+        files.push(store_in_root(
+            root,
+            &destination.join(safe),
+            &bytes,
+            &run.program,
+        )?);
+    }
+    tracing::info!(program = %run.program, files = files.len(), "manifest program finished");
+    Ok(AcquiredFiles { folder, files })
 }
 
 async fn run_program(
@@ -736,7 +804,7 @@ async fn run_program(
 }
 
 /// Every regular file under `directory`, in path order. A link is refused
-/// rather than followed or left out: following it would import a file the
+/// rather than followed or left out: following it would store a file the
 /// program never wrote, and leaving it out would drop part of the answer
 /// without saying so.
 fn files_under(directory: &Path) -> Result<Vec<PathBuf>, String> {
@@ -777,9 +845,9 @@ mod tests {
     use tempfile::tempdir;
 
     #[cfg(unix)]
-    fn shell_run(script: &str) -> ProgramRun {
+    fn shell_run(script: &str) -> DownloadPlan {
         use crate::types::ProgramArg;
-        ProgramRun {
+        DownloadPlan::Run(ProgramRun {
             program: "/bin/sh".to_string(),
             args: vec![
                 ProgramArg(vec!["-c".to_string()]),
@@ -787,7 +855,7 @@ mod tests {
                 ProgramArg(vec!["sh".to_string()]),
                 ProgramArg(vec![String::new(), String::new()]),
             ],
-        }
+        })
     }
 
     #[cfg(unix)]
@@ -796,87 +864,158 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn acquire_run(root: &Path, script: &str, max: u64) -> Result<AcquiredFiles, String> {
+        acquire_plan(root, shell_run(script), "Book", None, &allowed(), None, max).await
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
-    async fn a_run_leaves_its_files_in_a_directory_of_its_own() {
-        let staging = tempdir().unwrap();
-        std::fs::create_dir(staging.path().join("Book")).unwrap();
-        let run =
-            shell_run(r#"mkdir -p "$1/vol" && printf a > "$1/vol/1.pdf" && printf b > "$1/2.pdf""#);
+    async fn several_files_a_program_writes_reach_the_root_in_a_folder_of_their_own() {
+        let root = tempdir().unwrap();
+        let output = acquire_run(
+            root.path(),
+            r#"mkdir -p "$1/vol" && printf a > "$1/vol/1.pdf" && printf b > "$1/2.pdf""#,
+            1024,
+        )
+        .await
+        .unwrap();
 
-        let output = run_into_staging(staging.path(), "Book", &run, &allowed(), 1024)
-            .await
-            .unwrap();
-
-        // The name was taken, so the run got the next one, and nothing it did
-        // reached the directory that was already there.
-        assert_eq!(output.folder, "Book (2)");
-        let directory = staging.path().join("Book (2)");
+        assert_eq!(output.folder.as_deref(), Some("Book"));
+        let folder = root.path().join("Book");
+        let paths: Vec<&str> = output.files.iter().map(|file| file.path.as_str()).collect();
+        // Path order of what the program wrote: "2.pdf" sorts before "vol/".
         assert_eq!(
-            output.paths,
-            vec![
-                display_path(&directory.join("2.pdf")),
-                display_path(&directory.join("vol").join("1.pdf")),
+            paths,
+            [
+                display_path(&folder.join("2.pdf")),
+                display_path(&folder.join("1.pdf")),
             ]
         );
+        assert_eq!(std::fs::read(folder.join("1.pdf")).unwrap(), b"a");
+        // Nothing of the run's own directory is left in the root.
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_file_a_program_writes_is_stored_like_a_download() {
+        let root = tempdir().unwrap();
+        std::fs::write(root.path().join("old.pdf"), b"same").unwrap();
+        std::fs::write(root.path().join("taken.pdf"), b"theirs").unwrap();
+
+        // Content already in the root is reported where it is.
+        let output = acquire_run(root.path(), r#"printf same > "$1/new.pdf""#, 1024)
+            .await
+            .unwrap();
+        assert_eq!(output.folder, None);
+        assert!(output.files[0].already_present);
         assert_eq!(
-            std::fs::read_dir(staging.path().join("Book"))
-                .unwrap()
-                .count(),
-            0
+            output.files[0].path,
+            display_path(&root.path().join("old.pdf"))
         );
+        assert!(!root.path().join("new.pdf").exists());
+
+        // And the user's file is never overwritten.
+        let error = acquire_run(root.path(), r#"printf mine > "$1/taken.pdf""#, 1024)
+            .await
+            .unwrap_err();
+        assert!(error.contains("Refusing to overwrite"), "{error}");
+        assert_eq!(
+            std::fs::read(root.path().join("taken.pdf")).unwrap(),
+            b"theirs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_callers_name_is_the_one_file_or_the_folder_of_several() {
+        async fn named(root: &Path, script: &str) -> AcquiredFiles {
+            acquire_plan(
+                root,
+                shell_run(script),
+                "Book",
+                Some("Chosen.pdf".to_string()),
+                &allowed(),
+                None,
+                1024,
+            )
+            .await
+            .unwrap()
+        }
+        let one_root = tempdir().unwrap();
+        let one = named(one_root.path(), r#"printf a > "$1/x.pdf""#).await;
+        assert_eq!(one.folder, None);
+        assert_eq!(
+            one.files[0].path,
+            display_path(&one_root.path().join("Chosen.pdf"))
+        );
+
+        let several_root = tempdir().unwrap();
+        let several = named(
+            several_root.path(),
+            r#"printf b > "$1/1.pdf" && printf c > "$1/2.pdf""#,
+        )
+        .await;
+        assert_eq!(several.folder.as_deref(), Some("Chosen.pdf"));
+        assert!(several_root
+            .path()
+            .join("Chosen.pdf")
+            .join("2.pdf")
+            .exists());
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn a_program_not_allowed_by_name_never_starts() {
-        let staging = tempdir().unwrap();
-        let run = shell_run(r#"printf a > "$1/x.pdf""#);
-        let error = run_into_staging(staging.path(), "Book", &run, &["sh".to_string()], 1024)
-            .await
-            .unwrap_err();
+        let root = tempdir().unwrap();
+        let error = acquire_plan(
+            root.path(),
+            shell_run(r#"printf a > "$1/x.pdf""#),
+            "Book",
+            None,
+            &["sh".to_string()],
+            None,
+            1024,
+        )
+        .await
+        .unwrap_err();
         assert!(error.contains("'/bin/sh' is not allowed to run"), "{error}");
-        assert!(!staging.path().join("Book").exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn a_failed_run_says_why_and_leaves_nothing() {
-        let staging = tempdir().unwrap();
-        let run = shell_run(r#"printf a > "$1/x.pdf"; echo "no such manga" >&2; exit 3"#);
-        let error = run_into_staging(staging.path(), "Book", &run, &allowed(), 1024)
-            .await
-            .unwrap_err();
-        assert!(error.contains("no such manga"), "{error}");
-        assert!(!staging.path().join("Book").exists());
+        let root = tempdir().unwrap();
+        let error = acquire_run(
+            root.path(),
+            r#"printf a > "$1/x.pdf"; echo "no such work" >&2; exit 3"#,
+            1024,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("no such work"), "{error}");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_run_is_held_to_the_download_limit_and_must_write_something() {
-        let staging = tempdir().unwrap();
-        let big = shell_run(r#"printf 0123456789 > "$1/x.pdf""#);
-        let error = run_into_staging(staging.path(), "Book", &big, &allowed(), 9)
-            .await
-            .unwrap_err();
-        assert!(error.contains("the limit is 9"), "{error}");
-
-        let nothing = shell_run("true");
-        let error = run_into_staging(staging.path(), "Book", &nothing, &allowed(), 9)
-            .await
-            .unwrap_err();
-        assert!(error.contains("without writing a file"), "{error}");
-        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_run_that_leaves_a_link_is_refused() {
-        let staging = tempdir().unwrap();
-        let run = shell_run(r#"ln -s /etc/hosts "$1/hosts""#);
-        let error = run_into_staging(staging.path(), "Book", &run, &allowed(), 1024)
-            .await
-            .unwrap_err();
-        assert!(error.contains("not a regular file"), "{error}");
+    async fn a_run_is_refused_whole_before_any_file_is_stored() {
+        let root = tempdir().unwrap();
+        for (script, max, expected) in [
+            (r#"printf 0123456789 > "$1/x.pdf""#, 9, "the limit is 9"),
+            ("true", 9, "without writing a file"),
+            (r#"ln -s /etc/hosts "$1/hosts""#, 1024, "not a regular file"),
+            (
+                r#"mkdir "$1/a" "$1/b" && printf 1 > "$1/a/x.pdf" && printf 2 > "$1/b/x.pdf""#,
+                1024,
+                "two files named 'x.pdf'",
+            ),
+        ] {
+            let error = acquire_run(root.path(), script, max).await.unwrap_err();
+            assert!(error.contains(expected), "{script}: {error}");
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]

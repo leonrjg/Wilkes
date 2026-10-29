@@ -20,7 +20,7 @@ use wilkes_core::integrations::custom::manifest::{authoring_prompt, Manifest, Se
 use wilkes_core::integrations::custom::{CustomSource, ProbeReport};
 use wilkes_core::types::IntegrationsSettings;
 
-use super::literature::ProgramAllowlist;
+use wilkes_core::integrations::ProgramAllowlist;
 
 /// What a manifest declares, for the import dialog to show before anything is
 /// saved.
@@ -200,7 +200,7 @@ pub async fn custom_integration_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::integrations::literature::allowed_programs;
+    use wilkes_core::integrations::allowed_programs;
 
     /// The summary as the application asks for it, with the installation's
     /// own answer to which programs may run.

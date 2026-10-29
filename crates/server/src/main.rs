@@ -47,9 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let config = parse_config();
 
     let settings_path = config.data_dir.join("settings.json");
-    wilkes_api::commands::integrations::literature::fix_allowed_programs(
-        config.allowed_programs.clone(),
-    )?;
+    wilkes_core::integrations::fix_allowed_programs(config.allowed_programs.clone())?;
 
     let (events_tx, _) = broadcast::channel::<(String, serde_json::Value)>(1024);
     let emitter: Arc<dyn wilkes_api::context::EventEmitter> = Arc::new(BroadcastEmitter {
