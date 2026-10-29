@@ -82,13 +82,15 @@ const BUILTINS: &[&str] = &[
 /// Evaluates expressions with the manifest's function set.
 ///
 /// Built per base URL because `absolute_url` resolves against it, and a
-/// resolver step on another origin resolves against *that* origin.
+/// resolver step on another origin resolves against *that* origin. A manifest
+/// with no `[http]` has none, and `absolute_url` then says so rather than
+/// guessing one.
 pub struct Evaluator {
     runtime: Runtime,
 }
 
 impl Evaluator {
-    pub fn new(base_url: &Url) -> Self {
+    pub fn new(base_url: Option<&Url>) -> Self {
         let mut runtime = Runtime::new();
         runtime.register_builtin_functions();
         register(
@@ -165,17 +167,23 @@ impl Evaluator {
             vec![ArgumentType::Any],
             |args, ctx| text_in_text_out(args, ctx, "a string", |text| Ok(strip_html(text))),
         );
-        let base = base_url.clone();
+        let base = base_url.cloned();
         register(
             &mut runtime,
             "absolute_url",
             vec![ArgumentType::Any],
-            move |args, ctx| {
-                text_in_text_out(args, ctx, "a URL", |text| {
+            move |args, ctx| match &base {
+                Some(base) => text_in_text_out(args, ctx, "a URL", |text| {
                     base.join(text)
                         .map(|url| url.to_string())
                         .map_err(|_| "not a URL".to_string())
-                })
+                }),
+                None => text_in_text_out(
+                    args,
+                    ctx,
+                    "an origin to resolve against, which a manifest with no [http] does not have",
+                    |_| Err(String::new()),
+                ),
             },
         );
         register(
@@ -497,7 +505,7 @@ impl std::fmt::Display for TypeMismatch {
 pub fn project(
     field_type: FieldType,
     raw: &Value,
-    base_url: &Url,
+    base_url: Option<&Url>,
 ) -> Result<Projected, TypeMismatch> {
     match field_type {
         FieldType::Text => Ok(Projected::Text(as_str(raw)?.to_string())),
@@ -531,10 +539,14 @@ pub fn project(
                 // Relative is not an error the user cannot fix: it is exactly
                 // what `absolute_url` is for, so the message says so.
                 Err(_) => Err(TypeMismatch {
-                    expected: format!(
-                        "an absolute URL (wrap it in absolute_url(...) to resolve against {})",
-                        base_url.as_str()
-                    ),
+                    expected: match base_url {
+                        Some(base_url) => format!(
+                            "an absolute URL (wrap it in absolute_url(...) to resolve against {})",
+                            base_url.as_str()
+                        ),
+                        None => "an absolute URL (the manifest declares no [http] origin to resolve one against)"
+                            .to_string(),
+                    },
                     found: format!("\"{text}\""),
                 }),
             }
@@ -600,7 +612,7 @@ mod tests {
     }
 
     fn eval(expression: &str, value: Value) -> Result<Option<Value>, String> {
-        Evaluator::new(&base()).eval(expression, &value)
+        Evaluator::new(Some(&base())).eval(expression, &value)
     }
 
     #[test]
@@ -829,25 +841,26 @@ mod tests {
 
     #[test]
     fn project_is_strict_about_types() {
-        let error = project(FieldType::Text, &json!(2021), &base()).unwrap_err();
+        let error = project(FieldType::Text, &json!(2021), Some(&base())).unwrap_err();
         assert_eq!(error.expected, "a string");
         assert_eq!(error.found, "a number");
         assert_eq!(
-            project(FieldType::Integer, &json!(3), &base()).unwrap(),
+            project(FieldType::Integer, &json!(3), Some(&base())).unwrap(),
             Projected::Integer(3)
         );
-        assert!(project(FieldType::Integer, &json!("3"), &base()).is_err());
+        assert!(project(FieldType::Integer, &json!("3"), Some(&base())).is_err());
         assert!(matches!(
-            project(FieldType::Object, &json!({"a": 1}), &base()).unwrap(),
+            project(FieldType::Object, &json!({"a": 1}), Some(&base())).unwrap(),
             Projected::Object(_)
         ));
     }
 
     #[test]
     fn a_relative_url_says_which_function_fixes_it() {
-        let error = project(FieldType::Url, &json!("/papers/1.pdf"), &base()).unwrap_err();
+        let error = project(FieldType::Url, &json!("/papers/1.pdf"), Some(&base())).unwrap_err();
         assert!(error.expected.contains("absolute_url"), "{error}");
-        let error = project(FieldType::Url, &json!("javascript:alert(1)"), &base()).unwrap_err();
+        let error =
+            project(FieldType::Url, &json!("javascript:alert(1)"), Some(&base())).unwrap_err();
         assert!(error.expected.contains("http or https"), "{error}");
     }
 }

@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 /// Explicit because `reqwest`'s default is no timeout at all: a provider that
 /// accepts a connection and then never answers would otherwise hold the
 /// request — and, for a search the user is waiting on, the UI — forever.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Cap on a single provider response body.
 ///
@@ -23,7 +23,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// provider answer is metadata about at most a few hundred records; anything
 /// past this is a misconfigured URL pointed at a bulk dump, and reading it
 /// into memory is the failure, not the symptom of one.
-const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct RetryPolicy {

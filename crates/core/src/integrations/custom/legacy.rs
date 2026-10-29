@@ -237,21 +237,23 @@ fn convert(legacy: V1Manifest) -> anyhow::Result<Manifest> {
         manifest_version: MANIFEST_VERSION,
         id: legacy.id,
         name: legacy.name,
-        http: HttpSpec {
+        http: Some(HttpSpec {
             base_url: legacy.http.base_url,
             headers,
             query,
-        },
+        }),
         capabilities: Capabilities {
-            health: capabilities
-                .health
-                .map(|health| HealthCapability { path: health.path }),
+            health: capabilities.health.map(|health| HealthCapability {
+                path: Some(health.path),
+                run: None,
+            }),
             search: capabilities
                 .search
                 .map(|search| -> anyhow::Result<SearchCapability> {
                     let format = search.response_format;
                     Ok(SearchCapability {
-                        path: search.path,
+                        path: Some(search.path),
+                        run: None,
                         response_format: format,
                         items: search
                             .items
@@ -272,7 +274,8 @@ fn convert(legacy: V1Manifest) -> anyhow::Result<Manifest> {
                                 let (headers, query) = convert_params(&step.params)?;
                                 Ok(ResolverStep {
                                     base_url: step.base_url,
-                                    path: step.path,
+                                    path: Some(step.path),
+                                    run: None,
                                     response_format: step.response_format,
                                     headers,
                                     query,
@@ -522,7 +525,7 @@ mod tests {
     use url::Url;
 
     fn eval(expression: &str, value: serde_json::Value) -> Option<serde_json::Value> {
-        Evaluator::new(&Url::parse("https://example.test").unwrap())
+        Evaluator::new(Some(&Url::parse("https://example.test").unwrap()))
             .eval(expression, &value)
             .unwrap()
     }
@@ -600,11 +603,11 @@ authors = { path = "author", coerce = "join" }
 
         assert_eq!(manifest.manifest_version, 2);
         assert_eq!(
-            manifest.http.query.get("mailto"),
+            manifest.http.as_ref().unwrap().query.get("mailto"),
             Some(&ParamValue::Literal("team@example.com".into()))
         );
         assert!(matches!(
-            manifest.http.headers.get("Crossref-Plus-API-Token"),
+            manifest.http.as_ref().unwrap().headers.get("Crossref-Plus-API-Token"),
             Some(ParamValue::Secret(secret)) if secret.secret == "crossref_token" && !secret.optional
         ));
         let search = manifest.capabilities.search.unwrap();
@@ -638,7 +641,7 @@ authors = { path = "author", coerce = "join" }
     fn the_converted_selectors_select_what_the_old_ones_did() {
         let manifest = Manifest::parse(&upgrade(CROSSREF_V1).unwrap().unwrap()).unwrap();
         let search = manifest.capabilities.search.unwrap();
-        let evaluator = Evaluator::new(&Url::parse("https://api.crossref.org").unwrap());
+        let evaluator = Evaluator::new(Some(&Url::parse("https://api.crossref.org").unwrap()));
         let record = json!({
             "DOI": "10.1145/ABC",
             "published": {"date-parts": [[2021, 4]]},

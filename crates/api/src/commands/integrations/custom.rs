@@ -193,8 +193,13 @@ pub async fn custom_integration_probe(
     query: String,
     integrations: &IntegrationsSettings,
 ) -> anyhow::Result<ProbeReport> {
+    // A search that is a run runs only once its program is allowed, here as
+    // anywhere.
     Ok(
         CustomSource::from_draft(&manifest, secrets, None, integrations)?
+            .with_allowed_programs(
+                wilkes_core::integrations::allowed_programs(integrations).programs,
+            )
             .probe(&query)
             .await,
     )

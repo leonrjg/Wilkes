@@ -568,7 +568,8 @@ export default function CustomIntegrations({
                 <div className="flex gap-2">
                   <dt className="text-[var(--text-dim)]">Origins</dt>
                   <dd className="text-[var(--text-main)]">
-                    {summary.origins.join(", ")}
+                    {/* A manifest whose every request is a program reaches none. */}
+                    {summary.origins.join(", ") || "none"}
                   </dd>
                 </div>
                 {/* A program is code this machine runs, so it is named as

@@ -10,7 +10,6 @@
 use crate::http_history::LoggedRequest;
 use crate::types::{DownloadPlan, ProgramRun};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use crate::path as wilkes_path;
 
@@ -617,10 +616,6 @@ pub struct AcquiredFiles {
     pub files: Vec<DownloadResponse>,
 }
 
-/// How much of a failed program's error output is reported. The end is where
-/// a program says why it stopped.
-const PROGRAM_ERROR_LINES: usize = 20;
-
 /// Put the files a plan names into `root`.
 ///
 /// The one way a resolved result reaches a root, whichever entrypoint asked
@@ -676,13 +671,6 @@ async fn run_into_root(
     allowed: &[String],
     max_download_bytes: u64,
 ) -> Result<AcquiredFiles, String> {
-    if !allowed.iter().any(|program| *program == run.program) {
-        tracing::warn!(program = %run.program, "run refused: the program is not allowed");
-        return Err(format!(
-            "'{}' is not allowed to run. Allow it by name in the integration's settings to download with it.",
-            run.program
-        ));
-    }
     if !root.is_dir() {
         let message = format!("Current Wilkes root does not exist: {}", root.display());
         tracing::warn!("run refused: {message}");
@@ -692,23 +680,30 @@ async fn run_into_root(
         .prefix("wilkes-run-")
         .tempdir()
         .map_err(|error| format!("Cannot prepare a directory for '{}': {error}", run.program))?;
-    let output_dir = workspace.path().to_string_lossy().into_owned();
-    let args: Vec<String> = run.args.iter().map(|arg| arg.write(&output_dir)).collect();
-    // The arguments are not logged: a step may have fetched a token into one.
-    tracing::info!(program = %run.program, "running a manifest program");
-    let written = run_program(
-        &run.program,
-        &args,
-        &run.env,
+    crate::program::run(
+        run,
         workspace.path(),
-        max_download_bytes,
+        allowed,
+        crate::program::Stdout::Discard,
+        None,
     )
-    .await
-    // What a failing program says may repeat what it was given.
-    .map_err(|message| redact(message, &run.secrets))
-    .inspect_err(|message| {
-        tracing::warn!(program = %run.program, "manifest program failed: {message}");
-    })?;
+    .await?;
+    let written = files_under(workspace.path())?;
+    if written.is_empty() {
+        return Err(format!("'{}' finished without writing a file", run.program));
+    }
+    for path in &written {
+        let bytes = std::fs::metadata(path)
+            .map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?
+            .len();
+        if bytes > max_download_bytes {
+            return Err(format!(
+                "'{}' wrote {}, which is {bytes} bytes; the limit is {max_download_bytes}",
+                run.program,
+                path.display()
+            ));
+        }
+    }
 
     // Every name is settled before anything is stored, so a run is refused
     // whole rather than after some of its files are in the root.
@@ -757,77 +752,6 @@ async fn run_into_root(
     }
     tracing::info!(program = %run.program, files = files.len(), "manifest program finished");
     Ok(AcquiredFiles { folder, files })
-}
-
-/// `message` with every secret value in it masked, longest first so that a
-/// value holding another is masked whole.
-fn redact(mut message: String, secrets: &[String]) -> String {
-    let mut secrets: Vec<&str> = secrets
-        .iter()
-        .map(String::as_str)
-        .filter(|value| !value.is_empty())
-        .collect();
-    secrets
-        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-    secrets.dedup();
-    for secret in secrets {
-        message = message.replace(secret, "***");
-    }
-    message
-}
-
-async fn run_program(
-    program: &str,
-    args: &[String],
-    env: &[(String, String)],
-    directory: &Path,
-    max_download_bytes: u64,
-) -> Result<Vec<PathBuf>, String> {
-    let mut command = tokio::process::Command::new(program);
-    command
-        .args(args)
-        .envs(env.iter().map(|(name, value)| (name, value)))
-        .current_dir(directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
-    let output = command.output().await.map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => {
-            format!("'{program}' is not installed, or is not on this application's PATH")
-        }
-        _ => format!("Could not start '{program}': {error}"),
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let said = if stderr.trim().is_empty() {
-            stdout
-        } else {
-            stderr
-        };
-        let lines: Vec<&str> = said.lines().collect();
-        let tail = lines[lines.len().saturating_sub(PROGRAM_ERROR_LINES)..].join("\n");
-        return Err(format!("'{program}' failed ({}):\n{tail}", output.status));
-    }
-    let paths = files_under(directory)?;
-    if paths.is_empty() {
-        return Err(format!("'{program}' finished without writing a file"));
-    }
-    for path in &paths {
-        let bytes = std::fs::metadata(path)
-            .map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?
-            .len();
-        if bytes > max_download_bytes {
-            return Err(format!(
-                "'{program}' wrote {}, which is {bytes} bytes; the limit is {max_download_bytes}",
-                path.display()
-            ));
-        }
-    }
-    Ok(paths)
 }
 
 /// Every regular file under `directory`, in path order. A link is refused
@@ -903,7 +827,7 @@ mod tests {
         let root = tempdir().unwrap();
         let output = acquire_run(
             root.path(),
-            r#"mkdir -p "$1/vol" && printf a > "$1/vol/1.pdf" && printf b > "$1/2.pdf""#,
+            r#"/bin/mkdir -p "$1/vol" && printf a > "$1/vol/1.pdf" && printf b > "$1/2.pdf""#,
             1024,
         )
         .await
@@ -1076,9 +1000,13 @@ mod tests {
         for (script, max, expected) in [
             (r#"printf 0123456789 > "$1/x.pdf""#, 9, "the limit is 9"),
             ("true", 9, "without writing a file"),
-            (r#"ln -s /etc/hosts "$1/hosts""#, 1024, "not a regular file"),
             (
-                r#"mkdir "$1/a" "$1/b" && printf 1 > "$1/a/x.pdf" && printf 2 > "$1/b/x.pdf""#,
+                r#"/bin/ln -s /etc/hosts "$1/hosts""#,
+                1024,
+                "not a regular file",
+            ),
+            (
+                r#"/bin/mkdir "$1/a" "$1/b" && printf 1 > "$1/a/x.pdf" && printf 2 > "$1/b/x.pdf""#,
                 1024,
                 "two files named 'x.pdf'",
             ),

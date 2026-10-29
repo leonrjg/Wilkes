@@ -58,7 +58,10 @@ pub struct Manifest {
     /// built-in.
     pub id: String,
     pub name: String,
-    pub http: HttpSpec,
+    /// The origin `path` requests go to. A manifest whose every request is a
+    /// program's run reaches no origin and declares none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpSpec>,
     #[serde(default)]
     pub capabilities: Capabilities,
 }
@@ -293,14 +296,59 @@ impl Capabilities {
         }
     }
 
-    /// Names of the secrets these capabilities declare themselves, which is
-    /// only ever in a resolver step.
+    /// Names of the secrets these capabilities declare themselves: a resolver
+    /// step's, and any run's.
     fn secret_names(&self) -> Vec<&str> {
-        self.resolve_download
-            .iter()
-            .flat_map(ResolveDownloadCapability::secrets)
+        self.secrets()
             .map(|secret| secret.secret.as_str())
             .collect()
+    }
+
+    /// Every secret these capabilities declare, in declaration order: resolver
+    /// steps' headers and query, then every run's arguments and environment.
+    fn secrets(&self) -> impl Iterator<Item = &SecretRef> {
+        self.resolve_download
+            .iter()
+            .flat_map(|resolve| &resolve.steps)
+            .flat_map(|step| step.headers.values().chain(step.query.values()))
+            .filter_map(ParamValue::secret)
+            .chain(self.runs().into_iter().flat_map(RunSpec::secrets))
+    }
+
+    /// Every program run these capabilities declare, wherever it stands in for
+    /// a request or fetches a download.
+    pub fn runs(&self) -> Vec<&RunSpec> {
+        let mut runs: Vec<&RunSpec> = Vec::new();
+        if let Some(health) = &self.health {
+            runs.extend(&health.run);
+        }
+        if let Some(search) = &self.search {
+            runs.extend(&search.run);
+        }
+        if let Some(browse) = &self.browse {
+            runs.extend(&browse.run);
+            runs.extend(browse.filters.values().filter_map(|filter| {
+                match filter.suggest.as_ref()?.as_ref() {
+                    RequestRef::Run(run) => Some(run),
+                    RequestRef::Path(_) => None,
+                }
+            }));
+        }
+        if let Some(lookup) = &self.lookup {
+            runs.extend(lookup.paths.iter().filter_map(|request| match request {
+                Request::Run(run) => Some(run),
+                Request::Path(_) => None,
+            }));
+        }
+        if let Some(references) = &self.references {
+            runs.extend(&references.run);
+            runs.extend(&references.resolve.run);
+        }
+        if let Some(resolve) = &self.resolve_download {
+            runs.extend(resolve.steps.iter().filter_map(|step| step.run.as_ref()));
+            runs.extend(&resolve.run);
+        }
+        runs
     }
 }
 
@@ -329,7 +377,11 @@ impl ResponseFormat {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HealthCapability {
-    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// A program whose exiting successfully is the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunSpec>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -339,7 +391,12 @@ pub struct SearchCapability {
     /// and `{page}` (1-based) or `{offset}` (`(page - 1) * limit`) when the
     /// service can be read past its first page. A path using neither is a
     /// search that has one page.
-    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// A program whose output is the response, in place of `path`. Its
+    /// arguments take the same placeholders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunSpec>,
     /// How selectors in this capability are interpreted. Omitted means JSON.
     #[serde(default)]
     pub response_format: ResponseFormat,
@@ -357,7 +414,12 @@ impl SearchCapability {
     /// to start. A caller must not ask for a second page of one that cannot,
     /// because the service would answer the first again.
     pub fn paged(&self) -> bool {
-        self.path.contains("{page}") || self.path.contains("{offset}")
+        let request = request_of(&self.path, &self.run);
+        request.names("page") || request.names("offset")
+    }
+
+    pub fn request(&self) -> RequestRef<'_> {
+        request_of(&self.path, &self.run)
     }
 }
 
@@ -378,7 +440,14 @@ pub struct BrowseCapability {
     /// filter, and `{filters}` for every filter it does not name. A query
     /// parameter none of whose placeholders has a value is left off the
     /// request. A path without `{query}` is a listing that takes no keyword.
-    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// A program whose output is the listing, in place of `path`. Its
+    /// arguments take the same placeholders, and an argument, or a group of
+    /// them written as a list, none of whose placeholders has a value is left
+    /// off as a query parameter is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunSpec>,
     /// The listing cannot be asked without a keyword.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub query_required: bool,
@@ -515,10 +584,10 @@ pub struct FilterSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<ValueType>,
     /// The value is chosen from the service's suggestions for what was typed.
-    /// A path relative to `base_url`, using `{query}` and optionally `{limit}`;
-    /// the response is read as `browse.suggest` says.
+    /// A path relative to `base_url`, or a program's run, using `{query}` and
+    /// optionally `{limit}`; the response is read as `browse.suggest` says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub suggest: Option<String>,
+    pub suggest: Option<Request>,
     /// The value is taken from a search result: the named result field of a
     /// row the user is looking at ("works citing this one").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -762,9 +831,13 @@ impl BrowseCapability {
         }
     }
 
-    /// Whether the path says where `placeholder` is written.
+    /// Whether the request says where `placeholder` is written.
     pub fn names(&self, placeholder: &str) -> bool {
-        self.path.contains(&format!("{{{placeholder}}}"))
+        self.request().names(placeholder)
+    }
+
+    pub fn request(&self) -> RequestRef<'_> {
+        request_of(&self.path, &self.run)
     }
 
     /// The strings a value of `filter` may not carry: what this service's
@@ -816,8 +889,9 @@ pub struct LookupCapability {
     /// holds none (an empty result, a 404) moves on to the next, and any other
     /// failure stops the lookup. At most [`MAX_LOOKUP_PATHS`]. More than one
     /// exists because a service may know a work under a different field when
-    /// its DOI index does not.
-    pub paths: Vec<String>,
+    /// its DOI index does not. An entry may be a program's run instead, whose
+    /// output is the response and whose printing nothing is no record.
+    pub paths: Vec<Request>,
     /// Where the record is in a response: a JMESPath expression. A `null`
     /// result means "no record here". Omitted means the body is the record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -836,7 +910,10 @@ pub struct LookupCapability {
 #[serde(deny_unknown_fields)]
 pub struct ReferencesCapability {
     /// The work, by `{doi}`.
-    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunSpec>,
     /// A JMESPath expression over that response yielding an array of the
     /// identifiers the work references. `null` or empty means none.
     pub ids: String,
@@ -848,8 +925,12 @@ pub struct ReferencesCapability {
 pub struct ReferencesResolve {
     /// Path for one chunk. `{ids}` is the chunk's identifiers, each
     /// percent-encoded and joined by `join` (which stays literal: for most
-    /// services it is the OR operator), and `{count}` is how many.
-    pub path: String,
+    /// services it is the OR operator), and `{count}` is how many. A run's
+    /// identifiers are written as they are, joined by `join`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunSpec>,
     pub join: String,
     /// Identifiers per request, 1 to [`MAX_REFERENCE_CHUNK`].
     pub chunk: usize,
@@ -893,34 +974,113 @@ pub struct ResolveDownloadCapability {
     pub filename: Option<String>,
 }
 
-impl ResolveDownloadCapability {
-    /// Every secret this capability names, in declaration order: its steps'
-    /// headers and query, then its run's arguments and environment.
-    pub fn secrets(&self) -> impl Iterator<Item = &SecretRef> {
-        let steps = self
-            .steps
-            .iter()
-            .flat_map(|step| step.headers.values().chain(step.query.values()))
-            .filter_map(ParamValue::secret);
-        let run = self.run.iter().flat_map(|run| {
-            run.args
-                .iter()
-                .filter_map(|arg| match arg {
-                    RunArg::Secret(secret) => Some(secret),
-                    RunArg::Template(_) => None,
-                })
-                .chain(run.env.values().filter_map(ParamValue::secret))
-        });
-        steps.chain(run)
-    }
-}
-
 impl ParamValue {
     fn secret(&self) -> Option<&SecretRef> {
         match self {
             Self::Secret(secret) => Some(secret),
             Self::Literal(_) => None,
         }
+    }
+}
+
+/// A request written where a list or a single value holds one: a path, or a
+/// program's run as a table.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum Request {
+    Path(String),
+    Run(RunSpec),
+}
+
+impl Request {
+    pub fn as_ref(&self) -> RequestRef<'_> {
+        match self {
+            Self::Path(path) => RequestRef::Path(path),
+            Self::Run(run) => RequestRef::Run(run),
+        }
+    }
+}
+
+/// What one request a manifest declares is: a GET of a path against an
+/// origin, or a program's run whose output is the response.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RequestRef<'a> {
+    Path(&'a str),
+    Run(&'a RunSpec),
+}
+
+impl<'a> RequestRef<'a> {
+    /// The texts its placeholders are written in.
+    pub fn templates(self) -> Vec<&'a str> {
+        match self {
+            Self::Path(path) => vec![path],
+            Self::Run(run) => run.templates(),
+        }
+    }
+
+    /// Whether it says where `placeholder` is written.
+    pub fn names(self, placeholder: &str) -> bool {
+        let marker = format!("{{{placeholder}}}");
+        self.templates().iter().any(|text| text.contains(&marker))
+    }
+}
+
+/// The request a capability declares in a `path` and `run` pair. Validation
+/// holds exactly one of the two before any manifest reaches the engine.
+fn request_of<'a>(path: &'a Option<String>, run: &'a Option<RunSpec>) -> RequestRef<'a> {
+    match (path, run) {
+        (Some(path), _) => RequestRef::Path(path),
+        (None, Some(run)) => RequestRef::Run(run),
+        (None, None) => unreachable!("validation refuses a request with neither path nor run"),
+    }
+}
+
+impl HealthCapability {
+    pub fn request(&self) -> RequestRef<'_> {
+        request_of(&self.path, &self.run)
+    }
+}
+
+impl ReferencesCapability {
+    pub fn request(&self) -> RequestRef<'_> {
+        request_of(&self.path, &self.run)
+    }
+}
+
+impl ReferencesResolve {
+    pub fn request(&self) -> RequestRef<'_> {
+        request_of(&self.path, &self.run)
+    }
+}
+
+impl ResolverStep {
+    pub fn request(&self) -> RequestRef<'_> {
+        request_of(&self.path, &self.run)
+    }
+}
+
+impl RunSpec {
+    /// Every template among its arguments, those in groups included.
+    pub fn templates(&self) -> Vec<&str> {
+        self.args
+            .iter()
+            .flat_map(|arg| match arg {
+                RunArg::Template(template) => vec![template.as_str()],
+                RunArg::Group(group) => group.iter().map(String::as_str).collect(),
+                RunArg::Secret(_) => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// The secrets its arguments and environment name.
+    pub fn secrets(&self) -> impl Iterator<Item = &SecretRef> {
+        self.args
+            .iter()
+            .filter_map(|arg| match arg {
+                RunArg::Secret(secret) => Some(secret),
+                _ => None,
+            })
+            .chain(self.env.values().filter_map(ParamValue::secret))
     }
 }
 
@@ -965,6 +1125,9 @@ pub struct RunSpec {
 #[serde(untagged)]
 pub enum RunArg {
     Template(String),
+    /// Arguments that go together, such as a flag and its value: browse
+    /// leaves the group off whole when none of its placeholders has a value.
+    Group(Vec<String>),
     Secret(SecretRef),
 }
 
@@ -1019,7 +1182,12 @@ pub struct ResolverStep {
     /// the manifest is saved. When absent, this step uses `http.base_url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// A program whose output is this step's response, in place of `path`.
+    /// It reaches no origin, so it takes no `base_url`, `headers` or `query`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunSpec>,
     #[serde(default)]
     pub response_format: ResponseFormat,
     /// Headers used by this step alone. A download credential therefore need
@@ -1539,6 +1707,38 @@ filename = "{title}.pdf"
 run = { program = "archive-get", args = ["{id}", "--format", "pdf", "--out", "{output_dir}/{filename}"], env = { ARCHIVE_TOKEN = { secret = "archive_token", label = "Archive token" } } }
 "#;
 
+const AUTHORING_CLI_EXAMPLE: &str = r#"manifest_version = 2
+id = "example-tool"
+name = "Example catalogue reached through its command-line client"
+
+[capabilities.health]
+run = { program = "catalog", args = ["ping"] }
+
+[capabilities.search]
+run = { program = "catalog", args = ["search", "{query}", "--limit", "{limit}", "--page", "{page}", "--json"], env = { CATALOG_TOKEN = { secret = "catalog_token", label = "Catalogue token" } } }
+items = "items"
+
+[capabilities.search.fields]
+id = "id"
+title = "title"
+year = "year"
+landing_page_url = "url"
+
+[capabilities.browse]
+run = { program = "catalog", args = ["list", ["--query", "{query}"], ["--sort", "{sort}"], ["--year", "{year}"], "--limit", "{limit}", "--page", "{page}", "--json"], env = { CATALOG_TOKEN = { secret = "catalog_token", label = "Catalogue token" } } }
+
+[capabilities.browse.sort]
+default = "newest"
+options = [["newest", "Newest"], ["title", "Title"]]
+
+[capabilities.browse.filters]
+year = { label = "Year", clause = "{value}", value = "integer" }
+
+[capabilities.resolve_download]
+filename = "{title}.pdf"
+run = { program = "catalog", args = ["fetch", "{id}", "--out", "{output_dir}/{filename}"], env = { CATALOG_TOKEN = { secret = "catalog_token", label = "Catalogue token" } } }
+"#;
+
 const AUTHORING_EXTENDS_EXAMPLE: &str = r#"manifest_version = 2
 id = "openalex-files"
 name = "OpenAlex with downloads"
@@ -1621,8 +1821,8 @@ Cover everything the service offers that the schema below can express. A manifes
 Return exactly one TOML manifest and no Markdown fence or commentary outside it. Return `UNSUPPORTED: ` followed by the exact missing capability, and no manifest, only when search itself cannot be represented by the bounded schema below. When search fits and something else the service offers does not, write the manifest with everything that does fit and open it with one `# NOT REPRESENTED: ` comment line per thing left out, naming it and the schema limit that stops it. Nothing the service offers is left out silently.
 
 Safety and fidelity rules:
-- Use only HTTP(S) GET requests. Search is one request. Download resolution is on demand after selection and may use only the finite steps declared below.
-- When the source material fetches or produces files with a command-line program (a downloader, a service's own client, a converter), resolve_download may run that program instead of naming a URL. Name the program exactly as it is installed and write only the arguments its documentation gives. It runs only after the user allows that program by name. A credential the program needs goes in run.env when the program reads one from its environment, or otherwise as a whole `{ secret = "name" }` argument; never in a template.
+- Every request is an HTTP(S) GET of a `path`, or a `run` of a command-line program whose output is read as that request's response (see "Requests that are programs" below). Search is one request. Download resolution is on demand after selection and may use only the finite steps declared below.
+- When the source material reaches the service through a command-line program (a service's own client, a downloader, a converter), write those requests as runs. Name the program exactly as it is installed and write only the arguments its documentation gives. It runs only after the user allows that program by name. A credential the program needs goes in run.env when the program reads one from its environment, or otherwise as a whole `{ secret = "name" }` argument; never in a template.
 - Never put a credential value in the manifest. Declare `{ secret = "symbolic_name" }`; write a plain string only for public fixed values. `optional = true` leaves the header or parameter off the request when the user has set no value.
 - A resolver step may set a literal `base_url` to use another HTTP(S) origin. It cannot contain placeholders. Every contacted origin is declared and shown before save.
 - `http.headers` and `http.query` are sent to the primary origin and same-origin resolver steps. They are never copied to a cross-origin step; repeat any header or parameter that origin needs under that step's `headers` or `query`.
@@ -1637,7 +1837,7 @@ id = "lowercase-slug"                 # required; a-z, 0-9, - or _; at most 64 c
 name = "Human-readable name"          # required
 extends = { provider = "openalex", capabilities = ["search", "browse"] }   # optional; see "Extending a provider" below
 
-[http]                                # required, unless the manifest extends a provider: then it is that provider's and is left out
+[http]                                # required when any request is a path; left out when every request is a run, and when the manifest extends a provider (then it is that provider's)
 base_url = "https://one-origin.test"  # required; http or https
 
 [http.headers]                        # optional; primary-origin requests, including same-origin resolver steps
@@ -1766,6 +1966,17 @@ steps = [                             # optional; one inline table per step, in 
   { base_url = "https://other-origin.test", path = "/resolve?id={id}", response_format = "json", query = { param = { secret = "symbolic_secret_name" } }, fields = { new_value = "expression" } },
 ]
 
+Requests that are programs:
+Wherever the schema above takes a request's `path` (health, search, browse, references, references.resolve, a resolver step), it may take `run` instead, never both. Where it takes a request as a value (a filter's `suggest`, each entry of lookup.paths), the value may be a run's table itself: `suggest = { program = "tool", args = ["suggest", "{query}"] }`.
+run = { program = "tool", args = ["search", "{query}", "--limit", "{limit}"], env = { TOOL_TOKEN = { secret = "token" } } }
+- What the program prints to standard output is the response, read as that capability's response_format says; a program that exits unsuccessfully is a failed request. It runs with no input and no shell, for at most as long as an HTTP request may take.
+- Its arguments take the same placeholders the path would, each written whole into the one argument it is in, never URL-encoded; a value that would start an argument with "-" is refused. references.resolve's {ids} are joined by `join` as they are.
+- health: the program exiting successfully is the service answering; what it prints is not read.
+- lookup: a run that prints nothing has no record, as a 404 does, and the next entry is asked.
+- browse: an argument may be a list of arguments that go together, such as `["--sort", "{sort}"]`. An argument, or such a group, none of whose placeholders has a value is left off whole, as an unset query parameter is; one where some have a value is written with the others empty. The argument holding {filters} ends with it, after nothing but a literal lead such as "--filter=".
+- A resolver step that is a run reaches no origin, so it takes no base_url, headers or query.
+- Relative URLs a program prints resolve against http.base_url, so with no [http] every URL it prints must be absolute, and absolute_url has nothing to resolve against.
+
 Extending a provider:
 `extends` takes whole capabilities from a provider that already exists, named as Wilkes names it: one it ships with (`openalex`, `semantic_scholar`) or one the user wrote (`custom:<id>`). Use it when the service is already described and only something is to be added, such as a download step for its results.
 - `capabilities` lists every capability taken; nothing is taken that is not listed. A listed capability is not also declared, and there is no partial merge.
@@ -1800,6 +2011,10 @@ JMESPath selects keys (`a.b`), indices (`a[0]`, `a[-1]`), projections (`a[*].b`)
     prompt.push_str(AUTHORING_PARAMETERS_EXAMPLE);
     prompt.push_str("\nValid example whose files are written by a command-line program:\n\n");
     prompt.push_str(AUTHORING_RUN_EXAMPLE);
+    prompt.push_str(
+        "\nValid example whose every request is a command-line program, with no [http]:\n\n",
+    );
+    prompt.push_str(AUTHORING_CLI_EXAMPLE);
     prompt.push_str("\nValid example extending a provider to add a download step:\n\n");
     prompt.push_str(AUTHORING_EXTENDS_EXAMPLE);
     prompt.push_str(
@@ -1855,11 +2070,6 @@ impl Manifest {
         } = written;
 
         let (Some(extends), Some(base)) = (extends, base) else {
-            let http = http.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "manifest declares no [http]; one that extends no provider names its own origin"
-                )
-            })?;
             let manifest = Manifest {
                 manifest_version,
                 id,
@@ -1996,8 +2206,11 @@ impl Manifest {
             problems.push("name cannot be empty".to_string());
         }
 
-        problems.extend(base_url_problems("base_url", &self.http.base_url));
-        problems.extend(param_problems("http", &self.http.headers, &self.http.query));
+        if let Some(http) = &self.http {
+            problems.extend(base_url_problems("base_url", &http.base_url));
+            problems.extend(param_problems("http", &http.headers, &http.query));
+        }
+        let http = self.http.is_some();
 
         let capabilities = &self.capabilities;
         if capabilities.health.is_none()
@@ -2011,18 +2224,24 @@ impl Manifest {
         }
 
         if let Some(health) = &capabilities.health {
-            problems.extend(template_problems(
-                "health.path",
-                &health.path,
-                HEALTH_PLACEHOLDERS,
+            problems.extend(request_problems(
+                "health",
+                health.path.as_deref(),
+                health.run.as_ref(),
+                &owned(HEALTH_PLACEHOLDERS),
+                Groups::Refused,
+                http,
             ));
         }
 
         if let Some(search) = &capabilities.search {
-            problems.extend(template_problems(
-                "search.path",
-                &search.path,
-                SEARCH_PATH_PLACEHOLDERS,
+            problems.extend(request_problems(
+                "search",
+                search.path.as_deref(),
+                search.run.as_ref(),
+                &owned(SEARCH_PATH_PLACEHOLDERS),
+                Groups::Refused,
+                http,
             ));
             match (&search.response_format, &search.items) {
                 (ResponseFormat::Html, None) => {
@@ -2055,13 +2274,13 @@ impl Manifest {
         }
 
         if let Some(browse) = &capabilities.browse {
-            problems.extend(browse_problems(browse));
+            problems.extend(browse_problems(browse, http));
         }
         if let Some(lookup) = &capabilities.lookup {
-            problems.extend(lookup_problems(lookup));
+            problems.extend(lookup_problems(lookup, http));
         }
         if let Some(references) = &capabilities.references {
-            problems.extend(references_problems(references));
+            problems.extend(references_problems(references, http));
         }
         if let Some(resolve) = &capabilities.resolve_download {
             problems.extend(self.resolve_download_problems(resolve));
@@ -2122,12 +2341,22 @@ impl Manifest {
             if let Some(base_url) = &step.base_url {
                 problems.extend(base_url_problems(&format!("{label}.base_url"), base_url));
             }
-            problems.extend(template_problems_owned(
-                &format!("{label}.path"),
-                &step.path,
+            // A step with its own origin needs none from [http].
+            problems.extend(request_problems(
+                &label,
+                step.path.as_deref(),
+                step.run.as_ref(),
                 &available,
-                true,
+                Groups::Refused,
+                self.http.is_some() || step.base_url.is_some(),
             ));
+            if step.run.is_some()
+                && (step.base_url.is_some() || !step.headers.is_empty() || !step.query.is_empty())
+            {
+                problems.push(format!(
+                    "{label}: base_url, headers and query are for a path; a run reaches no origin, so give the program what it needs in run.args or run.env"
+                ));
+            }
             problems.extend(param_problems(&label, &step.headers, &step.query));
             if step.fields.is_empty() {
                 problems.push(format!("{label}.fields cannot be empty"));
@@ -2192,7 +2421,11 @@ impl Manifest {
             }
         }
         if let Some(run) = &resolve.run {
-            problems.extend(run_problems(run, &available, resolve.filename.is_some()));
+            problems.extend(download_run_problems(
+                run,
+                &available,
+                resolve.filename.is_some(),
+            ));
         }
         if let Some(filename) = &resolve.filename {
             problems.extend(template_problems_owned(
@@ -2212,7 +2445,7 @@ impl Manifest {
     /// for the import dialog to show before anything is saved.
     pub fn origins(&self) -> Vec<String> {
         let mut origins = Vec::new();
-        let candidates = std::iter::once(self.http.base_url.as_str()).chain(
+        let candidates = self.http.iter().map(|http| http.base_url.as_str()).chain(
             self.capabilities
                 .resolve_download
                 .iter()
@@ -2234,12 +2467,13 @@ impl Manifest {
     /// beside its origins. Running one is not the manifest's to allow: the
     /// user allows it by name, apart from any manifest.
     pub fn programs(&self) -> Vec<String> {
-        self.capabilities
-            .resolve_download
-            .iter()
-            .filter_map(|resolve| resolve.run.as_ref())
-            .map(|run| run.program.clone())
-            .collect()
+        let mut programs: Vec<String> = Vec::new();
+        for run in self.capabilities.runs() {
+            if !programs.contains(&run.program) {
+                programs.push(run.program.clone());
+            }
+        }
+        programs
     }
 
     /// Whether every origin and program this manifest reaches is one
@@ -2265,16 +2499,10 @@ impl Manifest {
         let mut slots: Vec<SecretSlot> = Vec::new();
         let secrets = self
             .http
-            .headers
-            .values()
-            .chain(self.http.query.values())
+            .iter()
+            .flat_map(|http| http.headers.values().chain(http.query.values()))
             .filter_map(ParamValue::secret)
-            .chain(
-                self.capabilities
-                    .resolve_download
-                    .iter()
-                    .flat_map(ResolveDownloadCapability::secrets),
-            );
+            .chain(self.capabilities.secrets());
         for secret in secrets {
             match slots.iter_mut().find(|slot| slot.name == secret.secret) {
                 Some(existing) => existing.optional &= secret.optional,
@@ -2510,54 +2738,89 @@ pub fn query_parts(path: &str) -> (&str, Vec<&str>) {
     }
 }
 
-fn browse_problems(browse: &BrowseCapability) -> Vec<String> {
+fn browse_problems(browse: &BrowseCapability, http: bool) -> Vec<String> {
     let mut allowed: Vec<String> = BROWSE_PAGING_PLACEHOLDERS
         .iter()
         .chain(&[BROWSE_QUERY, BROWSE_SORT, BROWSE_FILTERS])
         .map(|name| name.to_string())
         .collect();
     allowed.extend(browse.filters.keys().cloned());
-    let mut problems = template_problems_owned("browse.path", &browse.path, &allowed, true);
+    let mut problems = request_problems(
+        "browse",
+        browse.path.as_deref(),
+        browse.run.as_ref(),
+        &allowed,
+        Groups::Allowed,
+        http,
+    );
+    if browse.path.is_some() == browse.run.is_some() {
+        return problems;
+    }
+    let request = match browse.path {
+        Some(_) => "browse.path",
+        None => "browse.run",
+    };
 
     if browse.names("page") && browse.names("offset") {
-        problems.push(
-            "browse.path names both {page} and {offset}; a listing starts in one place".to_string(),
-        );
-    }
-    // What a caller may leave unset is written where it can be left off.
-    let (before_query, parameters) = query_parts(&browse.path);
-    for name in placeholders(before_query) {
-        if !BROWSE_PAGING_PLACEHOLDERS.contains(&name) && allowed.iter().any(|a| a == name) {
-            problems.push(format!(
-                "browse.path: '{{{name}}}' belongs in the query string, where it is left off when unset"
-            ));
-        }
+        problems.push(format!(
+            "{request} names both {{page}} and {{offset}}; a listing starts in one place"
+        ));
     }
     // A fixed clause beside the joined ones would be lost with them when no
-    // filter is set, so the parameter holds the joined clauses and no more.
+    // filter is set, so what holds the joined clauses holds no more.
     let joined = format!("{{{BROWSE_FILTERS}}}");
-    for parameter in &parameters {
-        let value = parameter
-            .split_once('=')
-            .map_or(*parameter, |(_, value)| value);
-        if parameter.contains(&joined) && value != joined {
-            problems.push(format!(
-                "browse.path: '{parameter}' must be a parameter whose whole value is {joined}"
-            ));
+    match browse.request() {
+        RequestRef::Path(path) => {
+            // What a caller may leave unset is written where it can be left off.
+            let (before_query, parameters) = query_parts(path);
+            for name in placeholders(before_query) {
+                if !BROWSE_PAGING_PLACEHOLDERS.contains(&name) && allowed.iter().any(|a| a == name)
+                {
+                    problems.push(format!(
+                        "browse.path: '{{{name}}}' belongs in the query string, where it is left off when unset"
+                    ));
+                }
+            }
+            for parameter in &parameters {
+                let value = parameter
+                    .split_once('=')
+                    .map_or(*parameter, |(_, value)| value);
+                if parameter.contains(&joined) && value != joined {
+                    problems.push(format!(
+                        "browse.path: '{parameter}' must be a parameter whose whole value is {joined}"
+                    ));
+                }
+            }
+        }
+        // An argument is left off whole when it has nothing to say, so the
+        // one holding the joined clauses holds a literal lead at most.
+        RequestRef::Run(run) => {
+            for arg in run
+                .templates()
+                .into_iter()
+                .filter(|arg| arg.contains(&joined))
+            {
+                let lead = arg.strip_suffix(&joined).filter(|lead| !lead.contains('{'));
+                if lead.is_none_or(|lead| lead.contains(&browse.filter_separator)) {
+                    problems.push(format!(
+                        "browse.run: '{arg}' must end with {joined}, after nothing but a literal lead such as '--filter='"
+                    ));
+                }
+            }
         }
     }
     if browse.query_required && !browse.names(BROWSE_QUERY) {
-        problems.push(
-            "browse.query_required needs {query} in browse.path to say where the keyword goes"
-                .to_string(),
-        );
+        problems.push(format!(
+            "browse.query_required needs {{query}} in {request} to say where the keyword goes"
+        ));
     }
     match (&browse.sort, browse.names(BROWSE_SORT)) {
-        (Some(_), false) => problems.push(
-            "browse.sort is declared but browse.path has no {sort} to write it to".to_string(),
-        ),
-        (None, true) => problems
-            .push("browse.path names {sort} but browse.sort declares no options".to_string()),
+        (Some(_), false) => problems.push(format!(
+            "browse.sort is declared but {request} has no {{sort}} to write it to"
+        )),
+        (None, true) => problems.push(format!(
+            "{request} names {{sort}} but browse.sort declares no options"
+        )),
         _ => {}
     }
     let unnamed = browse
@@ -2566,14 +2829,13 @@ fn browse_problems(browse: &BrowseCapability) -> Vec<String> {
         .filter(|name| !browse.names(name))
         .count();
     match (unnamed, browse.names(BROWSE_FILTERS)) {
-        (0, true) => problems.push(
-            "browse.path names {filters} but every filter is written by name, so nothing goes there"
-                .to_string(),
-        ),
+        (0, true) => problems.push(format!(
+            "{request} names {{filters}} but every filter is written by name, so nothing goes there"
+        )),
         (1.., false) => {
             for name in browse.filters.keys().filter(|name| !browse.names(name)) {
                 problems.push(format!(
-                    "browse.filters.{name} is written nowhere: browse.path names neither {{{name}}} nor {{filters}}"
+                    "browse.filters.{name} is written nowhere: {request} names neither {{{name}}} nor {{filters}}"
                 ));
             }
         }
@@ -2783,13 +3045,20 @@ fn browse_problems(browse: &BrowseCapability) -> Vec<String> {
             }
             problems.extend(option_problems(&label, options));
         }
-        if let Some(path) = &spec.suggest {
-            problems.extend(template_problems(
-                &format!("{label}.suggest"),
-                path,
-                SUGGEST_PLACEHOLDERS,
-            ));
-            if !path.contains("{query}") {
+        if let Some(suggest) = &spec.suggest {
+            let suggest_label = format!("{label}.suggest");
+            problems.extend(match suggest {
+                Request::Path(path) => {
+                    path_problems(&suggest_label, path, &owned(SUGGEST_PLACEHOLDERS), http)
+                }
+                Request::Run(run) => run_problems(
+                    &suggest_label,
+                    run,
+                    &owned(SUGGEST_PLACEHOLDERS),
+                    Groups::Refused,
+                ),
+            });
+            if !suggest.as_ref().names("query") {
                 problems.push(format!("{label}.suggest must contain {{query}}"));
             }
             if browse.suggest.is_none() {
@@ -2859,7 +3128,7 @@ fn clause_problems(label: &str, field: &str, clause: &str, takes_value: bool) ->
     problems
 }
 
-fn lookup_problems(lookup: &LookupCapability) -> Vec<String> {
+fn lookup_problems(lookup: &LookupCapability, http: bool) -> Vec<String> {
     let mut problems = Vec::new();
     if lookup.paths.is_empty() {
         problems.push("lookup.paths needs at least one request".to_string());
@@ -2870,10 +3139,15 @@ fn lookup_problems(lookup: &LookupCapability) -> Vec<String> {
             lookup.paths.len()
         ));
     }
-    for (index, path) in lookup.paths.iter().enumerate() {
+    for (index, request) in lookup.paths.iter().enumerate() {
         let label = format!("lookup.paths[{index}]");
-        problems.extend(template_problems(&label, path, LOOKUP_PLACEHOLDERS));
-        if !path.contains("{doi}") {
+        problems.extend(match request {
+            Request::Path(path) => path_problems(&label, path, &owned(LOOKUP_PLACEHOLDERS), http),
+            Request::Run(run) => {
+                run_problems(&label, run, &owned(LOOKUP_PLACEHOLDERS), Groups::Refused)
+            }
+        });
+        if !request.as_ref().names("doi") {
             problems.push(format!("{label} must contain {{doi}}"));
         }
     }
@@ -2911,22 +3185,32 @@ fn lookup_problems(lookup: &LookupCapability) -> Vec<String> {
     problems
 }
 
-fn references_problems(references: &ReferencesCapability) -> Vec<String> {
-    let mut problems =
-        template_problems("references.path", &references.path, REFERENCES_PLACEHOLDERS);
-    if !references.path.contains("{doi}") {
+fn references_problems(references: &ReferencesCapability, http: bool) -> Vec<String> {
+    let mut problems = request_problems(
+        "references",
+        references.path.as_deref(),
+        references.run.as_ref(),
+        &owned(REFERENCES_PLACEHOLDERS),
+        Groups::Refused,
+        http,
+    );
+    if (references.path.is_some() || references.run.is_some()) && !references.request().names("doi")
+    {
         problems.push("references.path must contain {doi}".to_string());
     }
     if let Err(error) = expr::check(&references.ids) {
         problems.push(format!("references.ids: {error}"));
     }
     let resolve = &references.resolve;
-    problems.extend(template_problems(
-        "references.resolve.path",
-        &resolve.path,
-        REFERENCES_RESOLVE_PLACEHOLDERS,
+    problems.extend(request_problems(
+        "references.resolve",
+        resolve.path.as_deref(),
+        resolve.run.as_ref(),
+        &owned(REFERENCES_RESOLVE_PLACEHOLDERS),
+        Groups::Refused,
+        http,
     ));
-    if !resolve.path.contains("{ids}") {
+    if (resolve.path.is_some() || resolve.run.is_some()) && !resolve.request().names("ids") {
         problems.push("references.resolve.path must contain {ids}".to_string());
     }
     if resolve.join.is_empty() {
@@ -3022,6 +3306,10 @@ fn placeholder_problems(field: &str, template: &str, allowed: &[&str]) -> Vec<St
     problems
 }
 
+fn owned(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| name.to_string()).collect()
+}
+
 fn template_problems(field: &str, template: &str, allowed: &[&str]) -> Vec<String> {
     let mut problems = placeholder_problems(field, template, allowed);
     if !template.starts_with('/') {
@@ -3030,31 +3318,134 @@ fn template_problems(field: &str, template: &str, allowed: &[&str]) -> Vec<Strin
     problems
 }
 
-fn run_problems(run: &RunSpec, available: &[String], has_filename: bool) -> Vec<String> {
+/// Where a request's arguments may leave one off: only browse, where a value
+/// may be unset. Everywhere else every placeholder has a value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Groups {
+    Allowed,
+    Refused,
+}
+
+/// Problems with one request a manifest declares as a `path` and `run` pair.
+/// `allowed` is what its placeholders may name; `http` whether there is an
+/// origin for a path to go to.
+fn request_problems(
+    label: &str,
+    path: Option<&str>,
+    run: Option<&RunSpec>,
+    allowed: &[String],
+    groups: Groups,
+    http: bool,
+) -> Vec<String> {
+    match (path, run) {
+        (Some(_), Some(_)) => vec![format!(
+            "{label} sets both path and run; a request is one or the other"
+        )],
+        (None, None) => vec![format!("{label} sets neither path nor run")],
+        (Some(path), None) => path_problems(&format!("{label}.path"), path, allowed, http),
+        (None, Some(run)) => run_problems(&format!("{label}.run"), run, allowed, groups),
+    }
+}
+
+/// A path requested from `http.base_url`.
+fn path_problems(label: &str, path: &str, allowed: &[String], http: bool) -> Vec<String> {
+    let mut problems = template_problems_owned(label, path, allowed, true);
+    if !http {
+        problems.push(format!(
+            "{label} is requested from http.base_url, but the manifest declares no [http]"
+        ));
+    }
+    problems
+}
+
+/// A program and its arguments, wherever a run is declared.
+fn run_problems(label: &str, run: &RunSpec, allowed: &[String], groups: Groups) -> Vec<String> {
     let mut problems = Vec::new();
     let program = run.program.as_str();
     if program.trim().is_empty() {
-        problems.push("resolve_download.run.program cannot be empty".to_string());
+        problems.push(format!("{label}.program cannot be empty"));
     } else if program.contains(['{', '}']) {
-        problems.push(
-            "resolve_download.run.program must be a literal name, without placeholders: it is what the user allows"
-                .to_string(),
-        );
+        problems.push(format!(
+            "{label}.program must be a literal name, without placeholders: it is what the user allows"
+        ));
     } else if program.trim() != program || program.chars().any(char::is_control) {
         problems.push(format!(
-            "resolve_download.run.program '{program}' has surrounding space or a control character"
+            "{label}.program '{program}' has surrounding space or a control character"
         ));
     } else if !is_program_name(program) {
         problems.push(format!(
-            "resolve_download.run.program '{program}' must be a command name or an absolute path"
+            "{label}.program '{program}' must be a command name or an absolute path"
         ));
     }
-    if run.args.len() > MAX_RUN_ARGS {
+    let count: usize = run
+        .args
+        .iter()
+        .map(|arg| match arg {
+            RunArg::Group(group) => group.len(),
+            _ => 1,
+        })
+        .sum();
+    if count > MAX_RUN_ARGS {
         problems.push(format!(
-            "resolve_download.run has {} args; the limit is {MAX_RUN_ARGS}",
-            run.args.len()
+            "{label} has {count} args; the limit is {MAX_RUN_ARGS}"
         ));
     }
+    let template = |problems: &mut Vec<String>, label: &str, arg: &str| {
+        problems.extend(template_problems_owned(label, arg, allowed, false));
+        if arg.chars().any(char::is_control) {
+            problems.push(format!("{label} contains a control character"));
+        }
+    };
+    for (index, arg) in run.args.iter().enumerate() {
+        let label = format!("{label}.args[{index}]");
+        match arg {
+            RunArg::Template(arg) => template(&mut problems, &label, arg),
+            RunArg::Group(group) => {
+                if groups == Groups::Refused {
+                    problems.push(format!(
+                        "{label}: a group of arguments is for browse, where a value may be unset; here every value is known, so write each argument alone"
+                    ));
+                }
+                if group.is_empty() {
+                    problems.push(format!("{label} is an empty group"));
+                }
+                for (member, arg) in group.iter().enumerate() {
+                    template(&mut problems, &format!("{label}[{member}]"), arg);
+                }
+            }
+            RunArg::Secret(secret) => {
+                if secret.secret.trim().is_empty() {
+                    problems.push(format!("{label} names an empty secret"));
+                }
+                // Left off, it would shift every argument after it.
+                if secret.optional {
+                    problems.push(format!(
+                        "{label}: an argument cannot be left off when its secret is unset; name an optional secret in run.env instead"
+                    ));
+                }
+            }
+        }
+    }
+    for (name, value) in &run.env {
+        let label = format!("{label}.env.{name}");
+        if !is_env_name(name) {
+            problems.push(format!(
+                "{label}: a variable name is letters, digits and '_', not starting with a digit"
+            ));
+        }
+        if let ParamValue::Secret(secret) = value {
+            if secret.secret.trim().is_empty() {
+                problems.push(format!("{label} names an empty secret"));
+            }
+        }
+    }
+    problems
+}
+
+/// The run that fetches a download, which alone writes files: it may name
+/// where it writes and, when one is declared, the filename.
+fn download_run_problems(run: &RunSpec, available: &[String], has_filename: bool) -> Vec<String> {
+    let mut problems = Vec::new();
     let mut allowed = available.to_vec();
     let mut written_for_run = vec![RUN_OUTPUT_DIR];
     if has_filename {
@@ -3072,48 +3463,17 @@ fn run_problems(run: &RunSpec, available: &[String], has_filename: bool) -> Vec<
     }
     // Declared and passed to nothing, a filename would name no file.
     let filename = format!("{{{RUN_FILENAME}}}");
-    let names_filename =
-        |arg: &RunArg| matches!(arg, RunArg::Template(arg) if arg.contains(&filename));
-    if has_filename && !run.args.iter().any(names_filename) {
+    if has_filename && !run.templates().iter().any(|arg| arg.contains(&filename)) {
         problems.push(format!(
             "resolve_download.filename is declared but no run argument names {filename}, so the program never receives it"
         ));
     }
-    for (index, arg) in run.args.iter().enumerate() {
-        let label = format!("resolve_download.run.args[{index}]");
-        match arg {
-            RunArg::Template(arg) => {
-                problems.extend(template_problems_owned(&label, arg, &allowed, false));
-                if arg.chars().any(char::is_control) {
-                    problems.push(format!("{label} contains a control character"));
-                }
-            }
-            RunArg::Secret(secret) => {
-                if secret.secret.trim().is_empty() {
-                    problems.push(format!("{label} names an empty secret"));
-                }
-                // Left off, it would shift every argument after it.
-                if secret.optional {
-                    problems.push(format!(
-                        "{label}: an argument cannot be left off when its secret is unset; name an optional secret in run.env instead"
-                    ));
-                }
-            }
-        }
-    }
-    for (name, value) in &run.env {
-        let label = format!("resolve_download.run.env.{name}");
-        if !is_env_name(name) {
-            problems.push(format!(
-                "{label}: a variable name is letters, digits and '_', not starting with a digit"
-            ));
-        }
-        if let ParamValue::Secret(secret) = value {
-            if secret.secret.trim().is_empty() {
-                problems.push(format!("{label} names an empty secret"));
-            }
-        }
-    }
+    problems.extend(run_problems(
+        "resolve_download.run",
+        run,
+        &allowed,
+        Groups::Refused,
+    ));
     problems
 }
 
@@ -3227,13 +3587,62 @@ title = "h2"
     }
 
     #[test]
+    fn a_request_is_a_path_or_a_run_and_a_path_needs_an_origin() {
+        let base = |http: &str, search: &str, rest: &str| {
+            format!(
+                "manifest_version = 2\nid = \"x\"\nname = \"X\"\n{http}\n[capabilities.search]\n{search}\n[capabilities.search.fields]\nid = \"id\"\ntitle = \"title\"\n{rest}"
+            )
+        };
+        let http = "[http]\nbase_url = \"https://x.test\"";
+        let run = r#"run = { program = "fetch", args = ["--q", "{query}"] }"#;
+
+        // A run needs no origin, and its program is named with the others.
+        let cli = Manifest::parse(&base(
+            "",
+            run,
+            "[capabilities.lookup]\npaths = [{ program = \"fetch\", args = [\"{doi}\"] }, { program = \"other\", args = [\"{doi}\"] }]\n[capabilities.lookup.fields]\nid = \"id\"",
+        ))
+        .unwrap();
+        assert_eq!(cli.origins(), Vec::<String>::new());
+        assert_eq!(cli.programs(), ["fetch", "other"]);
+
+        for (source, expected) in [
+            (base(http, &format!("path = \"/s?q={{query}}\"\n{run}"), ""), "search sets both path and run"),
+            (base(http, "", ""), "search sets neither path nor run"),
+            (
+                base("", "path = \"/s?q={query}\"", ""),
+                "search.path is requested from http.base_url, but the manifest declares no [http]",
+            ),
+            (
+                base("", r#"run = { program = "fetch", args = [["--q", "{query}"]] }"#, ""),
+                "search.run.args[0]: a group of arguments is for browse",
+            ),
+            (
+                base("", run, "[capabilities.lookup]\npaths = [{ program = \"fetch\", args = [\"x\"] }]\n[capabilities.lookup.fields]\nid = \"id\""),
+                "lookup.paths[0] must contain {doi}",
+            ),
+            (
+                base("", run, "[capabilities.resolve_download]\nurl = \"{u}\"\nsteps = [{ run = { program = \"fetch\", args = [\"{id}\"] }, headers = { A = \"b\" }, fields = { u = \"url\" } }]"),
+                "base_url, headers and query are for a path",
+            ),
+            (
+                base("", run, "[capabilities.browse]\nrun = { program = \"fetch\", args = [\"--f=a,{filters}\"] }\n[capabilities.browse.filters]\noa = { label = \"OA\", clause = \"oa\" }"),
+                "browse.run: '--f=a,{filters}' must end with {filters}",
+            ),
+        ] {
+            let error = Manifest::parse(&source).unwrap_err().to_string();
+            assert!(error.contains(expected), "{source}\n{error}");
+        }
+    }
+
+    #[test]
     fn parses_a_toml_manifest() {
         let manifest = Manifest::parse(CROSSREF).unwrap();
         assert_eq!(manifest.id, "crossref");
         assert_eq!(manifest.origins(), vec!["https://api.crossref.org"]);
         assert!(manifest.required_secrets().is_empty());
         assert_eq!(
-            manifest.http.query.get("mailto"),
+            manifest.http.as_ref().unwrap().query.get("mailto"),
             Some(&ParamValue::Literal("team@example.com".to_string()))
         );
     }
@@ -4073,6 +4482,9 @@ url = "{pdf_url}""#,
         Manifest::parse(AUTHORING_PARAMETERS_EXAMPLE).unwrap();
         let run = Manifest::parse(AUTHORING_RUN_EXAMPLE).unwrap();
         assert_eq!(run.programs(), vec!["archive-get"]);
+        let cli = Manifest::parse(AUTHORING_CLI_EXAMPLE).unwrap();
+        assert!(cli.http.is_none());
+        assert_eq!(cli.programs(), vec!["catalog"]);
         // The one that extends is read where there is something to extend.
         let resolved = Manifest::resolve(
             AUTHORING_EXTENDS_EXAMPLE,
@@ -4121,6 +4533,7 @@ url = "{pdf_url}""#,
         assert!(prompt.contains(AUTHORING_FULL_EXAMPLE));
         assert!(prompt.contains(AUTHORING_EXTENDS_EXAMPLE));
         assert!(prompt.contains(AUTHORING_RUN_EXAMPLE));
+        assert!(prompt.contains(AUTHORING_CLI_EXAMPLE));
         assert!(prompt.contains(&format!("at most {MAX_RUN_ARGS} arguments")));
         assert!(prompt.contains("base_url = \"https://other-origin.test\""));
         assert!(prompt.contains("never copied to a cross-origin step"));

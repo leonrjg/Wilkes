@@ -267,7 +267,10 @@ fn shipped(
             .map(str::trim)
             .filter(|base_url| !base_url.is_empty())
         {
-            manifest.http.base_url = base_url.to_string();
+            // A shipped manifest always has an origin; a mirror replaces it.
+            if let Some(http) = manifest.http.as_mut() {
+                http.base_url = base_url.to_string();
+            }
         }
         (manifest, state)
     })
@@ -420,13 +423,14 @@ impl IntegrationRegistry {
             }
         }
 
+        let programs = allowed_programs(settings).programs;
         for (manifest, state) in shipped(settings) {
             let id = manifest.id.clone();
             match CustomSource::build(manifest, state.secrets, None, Standing::BuiltIn) {
                 Ok(source) => literature.push(RegisteredLiteratureSource {
                     enabled: state.enabled,
                     builtin: true,
-                    source: Arc::new(source),
+                    source: Arc::new(source.with_allowed_programs(programs.clone())),
                 }),
                 // Reachable only through a base URL the user typed that is not
                 // a URL. Dropping the provider silently would leave one that
@@ -447,7 +451,7 @@ impl IntegrationRegistry {
                     literature.push(RegisteredLiteratureSource {
                         enabled: config.enabled,
                         builtin: false,
-                        source: Arc::new(source),
+                        source: Arc::new(source.with_allowed_programs(programs.clone())),
                     })
                 }
                 Ok(_) => {}
@@ -961,7 +965,10 @@ path = "/ping"
             custom("plain-more", derived, &[]),
         ]);
         let resolved = Manifest::resolve(derived, &settings).unwrap();
-        assert_eq!(resolved.manifest.http.base_url, "https://plain.test");
+        assert_eq!(
+            resolved.manifest.http.as_ref().unwrap().base_url,
+            "https://plain.test"
+        );
         assert_eq!(
             resolved.manifest.capabilities.declared(),
             vec!["search", "health"]
@@ -1063,10 +1070,13 @@ path = "/ping"
             .unwrap_err()
             .to_string();
         assert!(error.contains("extends 'openalex'"), "{error}");
-        // And one that extends nothing still names its own origin.
-        let error = Manifest::parse("manifest_version = 2\nid = \"x\"\nname = \"X\"\n")
-            .unwrap_err()
-            .to_string();
+        // And one that extends nothing names its own origin when a request
+        // of its own goes to one.
+        let error = Manifest::parse(
+            "manifest_version = 2\nid = \"x\"\nname = \"X\"\n[capabilities.health]\npath = \"/ping\"\n",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("declares no [http]"), "{error}");
     }
 

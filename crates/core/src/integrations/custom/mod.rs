@@ -33,9 +33,9 @@ use self::expr::{Evaluator, Projected};
 use self::manifest::{
     lookup_field_type, placeholders, query_parts, search_field_type, Bases, BrowseCapability,
     FieldSpec, FieldType, FilterSpec, LookupCapability, Manifest, Missing, ParamValue,
-    ReferencesCapability, ResolverStep, ResponseFormat, RunArg, RunSpec, SearchCapability,
-    SecretSlot, UrlTemplate, ValueRule, BROWSE_FILTERS, BROWSE_QUERY, BROWSE_SORT,
-    MAX_FILTER_VALUES, MAX_SUGGESTIONS, MIN_SUGGEST_CHARS,
+    ReferencesCapability, RequestRef, ResolverStep, ResponseFormat, RunArg, RunSpec,
+    SearchCapability, SecretSlot, UrlTemplate, ValueRule, BROWSE_FILTERS, BROWSE_QUERY,
+    BROWSE_SORT, MAX_FILTER_VALUES, MAX_SUGGESTIONS, MIN_SUGGEST_CHARS,
 };
 use crate::integrations::{LiteratureSource, ProviderCapabilities};
 use crate::metadata::doi::normalize_doi;
@@ -77,11 +77,14 @@ pub struct CustomSource {
     /// capability's path onto. Kept separately from `base_url` because a
     /// `Url` re-adds the slash when it is printed, and `base + "/works"` would
     /// then request `//works` — a different path that a server is entitled to
-    /// treat as a different resource.
-    base: String,
+    /// treat as a different resource. None for a manifest with no `[http]`,
+    /// whose every request is a run.
+    base: Option<String>,
     /// The same base as a parsed URL, for the origin check and for
     /// `absolute_url` to resolve against.
-    base_url: Url,
+    base_url: Option<Url>,
+    /// The programs this installation allows a manifest to run.
+    allowed_programs: Vec<String>,
     secrets: HashMap<String, String>,
     /// The secrets this provider asks its own settings for. For one that
     /// extends another, the manifest names more than these: the rest are set
@@ -155,8 +158,11 @@ impl CustomSource {
         standing: Standing,
     ) -> anyhow::Result<Self> {
         manifest.validate()?;
-        let base = manifest.http.base_url.trim_end_matches('/').to_string();
-        let base_url = Url::parse(&base)?;
+        let base = manifest
+            .http
+            .as_ref()
+            .map(|http| http.base_url.trim_end_matches('/').to_string());
+        let base_url = base.as_deref().map(Url::parse).transpose()?;
         let display_name = name
             .map(|name| name.trim().to_string())
             .filter(|name| !name.is_empty())
@@ -172,8 +178,17 @@ impl CustomSource {
             manifest,
             base,
             base_url,
+            allowed_programs: Vec::new(),
             secrets,
         })
+    }
+
+    /// The same source, allowed to run these programs. A source runs none
+    /// until told which it may: the list is the installation's, from
+    /// [`crate::integrations::allowed_programs`].
+    pub fn with_allowed_programs(mut self, programs: Vec<String>) -> Self {
+        self.allowed_programs = programs;
+        self
     }
 
     pub fn declares_search(&self) -> bool {
@@ -237,36 +252,41 @@ impl CustomSource {
             );
         };
 
-        let request = match self.request(&substitute(
-            &search.path,
-            &[
-                ("query", query),
-                ("limit", &PROBE_LIMIT.to_string()),
-                ("page", "1"),
-                ("offset", "0"),
-            ],
-        )) {
-            Ok(request) => request,
-            Err(error) => {
-                return ProbeReport::failed(
-                    &self.id,
-                    "search",
-                    String::new(),
-                    self.redact_error(error.to_string()),
-                )
+        let values = search_values(query, PROBE_LIMIT, 1);
+        let (redacted, body) = match search.request() {
+            RequestRef::Path(path) => {
+                let request = match self.request(&substitute(path, &pairs(&values))) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ProbeReport::failed(
+                            &self.id,
+                            "search",
+                            String::new(),
+                            self.redact_error(error.to_string()),
+                        )
+                    }
+                };
+                let redacted = request.redacted_url.clone();
+                let body = self
+                    .http
+                    .get_bytes(request.url, &request.headers)
+                    .await
+                    .map_err(|error| error.to_string());
+                (redacted, body)
             }
+            // A probe of a search that is a run runs it: what it prints is
+            // the evidence. It runs only once its program is allowed.
+            RequestRef::Run(run) => (
+                self.shown(run, &values),
+                self.output(run, &values, Unset::Refused)
+                    .await
+                    .map_err(|error| error.to_string()),
+            ),
         };
-        let redacted = request.redacted_url.clone();
-
-        let body = match self.http.get_bytes(request.url, &request.headers).await {
+        let body = match body {
             Ok(body) => body,
             Err(error) => {
-                return ProbeReport::failed(
-                    &self.id,
-                    "search",
-                    redacted,
-                    self.redact_error(error.to_string()),
-                )
+                return ProbeReport::failed(&self.id, "search", redacted, self.redact_error(error))
             }
         };
         let raw = String::from_utf8_lossy(&body);
@@ -362,7 +382,7 @@ impl CustomSource {
         limit: usize,
         record_limit: Option<usize>,
     ) -> anyhow::Result<Projection> {
-        let evaluator = Evaluator::new(&self.base_url);
+        let evaluator = Evaluator::new(self.base_url.as_ref());
         let items = records_in(&evaluator, search.items.as_deref(), body, "items")?;
 
         let records_seen = record_limit.map_or(items.len(), |cap| items.len().min(cap));
@@ -410,7 +430,7 @@ impl CustomSource {
         if items.is_empty() {
             anyhow::bail!("items selector '{items_path}' matched nothing in the response");
         }
-        let evaluator = Evaluator::new(&self.base_url);
+        let evaluator = Evaluator::new(self.base_url.as_ref());
         let records_seen = record_limit.map_or(items.length(), |cap| items.length().min(cap));
         let mut results = Vec::with_capacity(records_seen);
         let mut issues = Vec::new();
@@ -664,7 +684,7 @@ impl CustomSource {
                 None => return Ok(None),
             };
         }
-        expr::project(field_type, &raw, &self.base_url)
+        expr::project(field_type, &raw, self.base_url.as_ref())
             .map(Some)
             .map_err(|error| error.to_string())
     }
@@ -729,18 +749,14 @@ impl CustomSource {
             "{} search has one page: its path names neither {{page}} nor {{offset}}",
             self.manifest.name
         );
-        let offset = (page - 1) * limit;
-
-        let request = self.request(&substitute(
-            &search.path,
-            &[
-                ("query", query),
-                ("limit", &limit.to_string()),
-                ("page", &page.to_string()),
-                ("offset", &offset.to_string()),
-            ],
-        ))?;
-        let body = self.fetch(request).await?;
+        let values = search_values(query, limit, page);
+        let body = match search.request() {
+            RequestRef::Path(path) => {
+                self.fetch(self.request(&substitute(path, &pairs(&values)))?)
+                    .await?
+            }
+            RequestRef::Run(run) => self.output(run, &values, Unset::Refused).await?,
+        };
         // A non-paginated response is the only chance to read these records.
         // Keep the request limit for URL substitution and mapped input fields,
         // but only truncate records when another page can be requested.
@@ -774,8 +790,21 @@ impl CustomSource {
 
         let written = browse_parameters(browse, request, query)
             .map_err(|problem| anyhow::anyhow!("{name} browse: {problem}"))?;
-        let prepared = self.request(&browse_path(&browse.path, limit, page, &written))?;
-        let body = self.fetch(prepared).await?;
+        let body = match browse.request() {
+            RequestRef::Path(path) => {
+                self.fetch(self.request(&browse_path(path, limit, page, &written))?)
+                    .await?
+            }
+            RequestRef::Run(run) => {
+                let mut values = search_values(query.unwrap_or(""), limit, page);
+                // The keyword is one of what a caller may leave unset.
+                if query.is_none() {
+                    values.remove(BROWSE_QUERY);
+                }
+                values.extend(written);
+                self.output(run, &values, Unset::LeftOff).await?
+            }
+        };
         let projection =
             self.project_response(search, &body, query.unwrap_or(""), limit, Some(limit))?;
         self.warn_unmapped(&projection);
@@ -796,7 +825,7 @@ impl CustomSource {
     fn total_in(&self, expression: &str, body: &[u8]) -> anyhow::Result<Option<u64>> {
         let value: Value = serde_json::from_slice(body)
             .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
-        let evaluator = Evaluator::new(&self.base_url);
+        let evaluator = Evaluator::new(self.base_url.as_ref());
         match evaluator
             .eval(expression, &value)
             .map_err(|error| anyhow::anyhow!("browse.total: {error}"))?
@@ -833,7 +862,7 @@ impl CustomSource {
             .filters
             .get(filter)
             .ok_or_else(|| anyhow::anyhow!("'{filter}' is not a filter {name} offers"))?;
-        let (Some(path), Some(reading)) = (&spec.suggest, &browse.suggest) else {
+        let (Some(request), Some(reading)) = (&spec.suggest, &browse.suggest) else {
             anyhow::bail!("{name}'s filter '{filter}' has no suggestions");
         };
         let text = text.trim();
@@ -842,14 +871,20 @@ impl CustomSource {
             "a suggestion needs at least {MIN_SUGGEST_CHARS} characters"
         );
 
-        let prepared = self.request(&substitute(
-            path,
-            &[("query", text), ("limit", &MAX_SUGGESTIONS.to_string())],
-        ))?;
-        let body = self.fetch(prepared).await?;
+        let values = HashMap::from([
+            ("query".to_string(), text.to_string()),
+            ("limit".to_string(), MAX_SUGGESTIONS.to_string()),
+        ]);
+        let body = match request.as_ref() {
+            RequestRef::Path(path) => {
+                self.fetch(self.request(&substitute(path, &pairs(&values)))?)
+                    .await?
+            }
+            RequestRef::Run(run) => self.output(run, &values, Unset::Refused).await?,
+        };
         let value: Value = serde_json::from_slice(&body)
             .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
-        let evaluator = Evaluator::new(&self.base_url);
+        let evaluator = Evaluator::new(self.base_url.as_ref());
         let items = records_in(
             &evaluator,
             reading.items.as_deref(),
@@ -910,19 +945,32 @@ impl CustomSource {
     async fn run_lookup(&self, doi: &str) -> anyhow::Result<ProviderWork> {
         let doi = normalize_doi(doi).ok_or_else(|| anyhow::anyhow!("Invalid DOI: {doi}"))?;
         let lookup = self.lookup_capability()?;
-        let evaluator = Evaluator::new(&self.base_url);
+        let evaluator = Evaluator::new(self.base_url.as_ref());
 
-        for path in &lookup.paths {
-            let request = self.request(&substitute(path, &[("doi", &doi)]))?;
-            let body = match self.http.get_bytes(request.url, &request.headers).await {
-                Ok(body) => body,
-                // "No record under this key" — the next request may know the
-                // work under another.
-                Err(error) if error.kind == ProviderHttpErrorKind::NotFound => continue,
-                Err(error) if error.kind == ProviderHttpErrorKind::RateLimited => {
-                    anyhow::bail!("{} rate limit reached", self.manifest.name)
+        for request in &lookup.paths {
+            let body = match request.as_ref() {
+                RequestRef::Path(path) => {
+                    let request = self.request(&substitute(path, &[("doi", &doi)]))?;
+                    match self.http.get_bytes(request.url, &request.headers).await {
+                        Ok(body) => body,
+                        // "No record under this key" — the next request may
+                        // know the work under another.
+                        Err(error) if error.kind == ProviderHttpErrorKind::NotFound => continue,
+                        Err(error) if error.kind == ProviderHttpErrorKind::RateLimited => {
+                            anyhow::bail!("{} rate limit reached", self.manifest.name)
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
-                Err(error) => return Err(error.into()),
+                RequestRef::Run(run) => {
+                    let values = HashMap::from([("doi".to_string(), doi.clone())]);
+                    let printed = self.output(run, &values, Unset::Refused).await?;
+                    // A program that prints nothing has no record: its 404.
+                    if printed.iter().all(u8::is_ascii_whitespace) {
+                        continue;
+                    }
+                    printed
+                }
             };
             let value: Value = serde_json::from_slice(&body)
                 .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
@@ -1005,12 +1053,20 @@ impl CustomSource {
     async fn run_references(&self, doi: &str) -> anyhow::Result<Vec<String>> {
         let doi = normalize_doi(doi).ok_or_else(|| anyhow::anyhow!("Invalid DOI: {doi}"))?;
         let references = self.references_capability()?;
-        let evaluator = Evaluator::new(&self.base_url);
+        let evaluator = Evaluator::new(self.base_url.as_ref());
 
-        let work = self
-            .request(&substitute(&references.path, &[("doi", &doi)]))
-            .map(|request| (request.url, request.headers))?;
-        let body = self.fetch_raw(work.0, &work.1).await?;
+        let body = match references.request() {
+            RequestRef::Path(path) => {
+                let work = self
+                    .request(&substitute(path, &[("doi", &doi)]))
+                    .map(|request| (request.url, request.headers))?;
+                self.fetch_raw(work.0, &work.1).await?
+            }
+            RequestRef::Run(run) => {
+                let values = HashMap::from([("doi".to_string(), doi.clone())]);
+                self.output(run, &values, Unset::Refused).await?
+            }
+        };
         let value: Value = serde_json::from_slice(&body)
             .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
         let identifiers = match evaluator
@@ -1037,19 +1093,30 @@ impl CustomSource {
         let mut dois = Vec::new();
         let mut without_doi = 0usize;
         for chunk in identifiers.chunks(resolve.chunk) {
-            // Each identifier is encoded; the separator is the service's OR
-            // operator and stays literal.
-            let joined = chunk
-                .iter()
-                .map(|id| urlencoding::encode(id).into_owned())
-                .collect::<Vec<_>>()
-                .join(&resolve.join);
-            let path = resolve
-                .path
-                .replace("{ids}", &joined)
-                .replace("{count}", &chunk.len().to_string());
-            let request = self.request(&path).map(|r| (r.url, r.headers))?;
-            let body = self.fetch_raw(request.0, &request.1).await?;
+            let body = match resolve.request() {
+                RequestRef::Path(path) => {
+                    // Each identifier is encoded; the separator is the
+                    // service's OR operator and stays literal.
+                    let joined = chunk
+                        .iter()
+                        .map(|id| urlencoding::encode(id).into_owned())
+                        .collect::<Vec<_>>()
+                        .join(&resolve.join);
+                    let path = path
+                        .replace("{ids}", &joined)
+                        .replace("{count}", &chunk.len().to_string());
+                    let request = self.request(&path).map(|r| (r.url, r.headers))?;
+                    self.fetch_raw(request.0, &request.1).await?
+                }
+                // A program takes the identifiers as they are.
+                RequestRef::Run(run) => {
+                    let values = HashMap::from([
+                        ("ids".to_string(), chunk.join(&resolve.join)),
+                        ("count".to_string(), chunk.len().to_string()),
+                    ]);
+                    self.output(run, &values, Unset::Refused).await?
+                }
+            };
             let value: Value = serde_json::from_slice(&body)
                 .map_err(|error| anyhow::anyhow!("response is not JSON: {error}"))?;
             let records = records_in(
@@ -1126,24 +1193,40 @@ impl CustomSource {
             if chooses && writable(alternatives, &values).is_some() {
                 break;
             }
-            let path = substitute_values(&step.path, &values, Substitution::UrlComponent)
-                .map_err(|error| anyhow::anyhow!("resolver step {}: {error}", index + 1))?;
-            let step_base_url = self.resolver_step_base_url(step).map_err(|error| {
-                anyhow::anyhow!("resolver step {} base_url: {error}", index + 1)
-            })?;
-            let step_base = step_base_url.as_str().trim_end_matches('/');
-            let inherit_global = step_base_url.origin() == self.base_url.origin();
-            let request = self.request_against(
-                step_base,
-                &step_base_url,
-                inherit_global,
-                &path,
-                &step.headers,
-                &step.query,
-            )?;
-            let body = self.http.get_bytes(request.url, &request.headers).await?;
+            let (body, step_base_url) = match step.request() {
+                RequestRef::Path(path) => {
+                    let path = substitute_values(path, &values, Substitution::UrlComponent)
+                        .map_err(|error| anyhow::anyhow!("resolver step {}: {error}", index + 1))?;
+                    let step_base_url = self.resolver_step_base_url(step).map_err(|error| {
+                        anyhow::anyhow!("resolver step {} base_url: {error}", index + 1)
+                    })?;
+                    let step_base = step_base_url.as_str().trim_end_matches('/');
+                    let inherit_global = self
+                        .base_url
+                        .as_ref()
+                        .is_some_and(|base_url| step_base_url.origin() == base_url.origin());
+                    let request = self.request_against(
+                        step_base,
+                        &step_base_url,
+                        inherit_global,
+                        &path,
+                        &step.headers,
+                        &step.query,
+                    )?;
+                    let body = self.http.get_bytes(request.url, &request.headers).await?;
+                    (body, Some(step_base_url))
+                }
+                // A program's relative URLs mean the primary origin's, as a
+                // field of a search result's do.
+                RequestRef::Run(run) => (
+                    self.output(run, &values, Unset::Refused)
+                        .await
+                        .map_err(|error| anyhow::anyhow!("resolver step {}: {error}", index + 1))?,
+                    self.base_url.clone(),
+                ),
+            };
             let extracted = self
-                .extract_step(step, &body, &step_base_url)
+                .extract_step(step, &body, step_base_url.as_ref())
                 .map_err(|error| {
                     anyhow::anyhow!("resolver step {} response: {error}", index + 1)
                 })?;
@@ -1184,7 +1267,7 @@ impl CustomSource {
                 values.insert(manifest::RUN_FILENAME.to_string(), filename);
             }
             return self
-                .run_plan(run, &values)
+                .run_plan(run, &values, Unset::Refused)
                 .map(|run| Some(DownloadPlan::Run(run)));
         }
         let template = match writable(alternatives, &values) {
@@ -1201,7 +1284,15 @@ impl CustomSource {
             .map_err(|error| anyhow::anyhow!("resolve_download.url: {error}"))?;
         let url = match Url::parse(&rendered) {
             Ok(url) => url,
-            Err(_) => self.base_url.join(&rendered)?,
+            Err(_) => self
+                .base_url
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "resolve_download.url '{rendered}' is relative, and the manifest declares no [http] origin to resolve it against"
+                    )
+                })?
+                .join(&rendered)?,
         };
         anyhow::ensure!(
             matches!(url.scheme(), "http" | "https"),
@@ -1227,14 +1318,29 @@ impl CustomSource {
         &self,
         run: &RunSpec,
         values: &HashMap<String, String>,
+        unset: Unset,
     ) -> anyhow::Result<ProgramRun> {
-        let marker = format!("{{{}}}", manifest::RUN_OUTPUT_DIR);
         let mut secrets = Vec::new();
         let mut args = Vec::with_capacity(run.args.len());
         for (index, arg) in run.args.iter().enumerate() {
-            let label = format!("resolve_download.run.args[{index}]");
-            let template = match arg {
-                RunArg::Template(template) => template,
+            let label = format!("run.args[{index}]");
+            match arg {
+                RunArg::Template(template) => {
+                    if unset == Unset::LeftOff && says_nothing(&[template], values) {
+                        continue;
+                    }
+                    args.push(write_arg(&label, template, values, unset, &run.program)?);
+                }
+                RunArg::Group(group) => {
+                    let members: Vec<&String> = group.iter().collect();
+                    if unset == Unset::LeftOff && says_nothing(&members, values) {
+                        continue;
+                    }
+                    for (member, template) in group.iter().enumerate() {
+                        let label = format!("{label}[{member}]");
+                        args.push(write_arg(&label, template, values, unset, &run.program)?);
+                    }
+                }
                 RunArg::Secret(secret) => {
                     let value = self
                         .param_value(&ParamValue::Secret(secret.clone()))
@@ -1245,28 +1351,14 @@ impl CustomSource {
                         })?;
                     secrets.push(value.clone());
                     args.push(ProgramArg(vec![value]));
-                    continue;
                 }
-            };
-            let pieces = template
-                .split(marker.as_str())
-                .map(|piece| substitute_values(piece, values, Substitution::Raw))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| anyhow::anyhow!("{label}: {error}"))?;
-            let starts_with_value = template.starts_with('{') && !template.starts_with(&marker);
-            if starts_with_value && pieces[0].starts_with('-') {
-                anyhow::bail!(
-                    "{label}: the value written there starts with '-', which {} would read as an option",
-                    run.program
-                );
             }
-            args.push(ProgramArg(pieces));
         }
         let mut env = Vec::with_capacity(run.env.len());
         for (name, value) in &run.env {
             let Some((value, secret)) = self
                 .param_value(value)
-                .map_err(|error| anyhow::anyhow!("resolve_download.run.env.{name}: {error}"))?
+                .map_err(|error| anyhow::anyhow!("run.env.{name}: {error}"))?
             else {
                 continue;
             };
@@ -1287,7 +1379,7 @@ impl CustomSource {
         &self,
         step: &ResolverStep,
         body: &[u8],
-        base_url: &Url,
+        base_url: Option<&Url>,
     ) -> anyhow::Result<Extracted> {
         // `absolute_url` resolves against the step's own base: a relative URL
         // in a response from another origin means *that* origin.
@@ -1318,23 +1410,25 @@ impl CustomSource {
     /// declared query parameters, the headers, and a copy of the URL with
     /// secrets removed for display.
     fn request<'a>(&'a self, path: &str) -> anyhow::Result<PreparedRequest<'a>> {
-        self.request_against(
-            &self.base,
-            &self.base_url,
-            true,
-            path,
-            &EMPTY_PARAMS,
-            &EMPTY_PARAMS,
-        )
+        let (Some(base), Some(base_url)) = (&self.base, &self.base_url) else {
+            anyhow::bail!("path '{path}' has no origin to go to: the manifest declares no [http]");
+        };
+        self.request_against(base, base_url, true, path, &EMPTY_PARAMS, &EMPTY_PARAMS)
     }
 
     fn resolver_step_base_url(&self, step: &ResolverStep) -> anyhow::Result<Url> {
-        Url::parse(
-            step.base_url
-                .as_deref()
-                .unwrap_or(&self.manifest.http.base_url),
-        )
-        .map_err(Into::into)
+        let base = step
+            .base_url
+            .as_deref()
+            .or(self
+                .manifest
+                .http
+                .as_ref()
+                .map(|http| http.base_url.as_str()))
+            .ok_or_else(|| {
+                anyhow::anyhow!("the step names no base_url and the manifest declares no [http]")
+            })?;
+        Url::parse(base).map_err(Into::into)
     }
 
     /// The value of one declared parameter, and whether it is a secret.
@@ -1360,6 +1454,47 @@ impl CustomSource {
         }
     }
 
+    /// What a request declared as a run prints, as the response a path
+    /// would answer: held to the same size and time a response is.
+    async fn output(
+        &self,
+        run: &RunSpec,
+        values: &HashMap<String, String>,
+        unset: Unset,
+    ) -> anyhow::Result<Vec<u8>> {
+        let plan = self.run_plan(run, values, unset)?;
+        // Its own working directory, so a program that leaves files behind
+        // leaves them nowhere anyone looks.
+        let directory = tempfile::tempdir()?;
+        crate::program::run(
+            &plan,
+            directory.path(),
+            &self.allowed_programs,
+            crate::program::Stdout::Keep {
+                max_bytes: crate::network::MAX_RESPONSE_BYTES,
+            },
+            Some(crate::network::REQUEST_TIMEOUT),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(self.redact_error(error)))
+    }
+
+    /// A run as a probe shows it in place of a URL: its program and its
+    /// arguments, with every secret removed.
+    fn shown(&self, run: &RunSpec, values: &HashMap<String, String>) -> String {
+        match self.run_plan(run, values, Unset::Refused) {
+            Ok(plan) => {
+                let mut shown = plan.program.clone();
+                for arg in &plan.args {
+                    shown.push(' ');
+                    shown.push_str(&arg.write("{output_dir}"));
+                }
+                self.redact_error(shown)
+            }
+            Err(_) => run.program.clone(),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn request_against<'a>(
         &'a self,
@@ -1378,9 +1513,9 @@ impl CustomSource {
             base_url.origin().ascii_serialization()
         );
 
-        let (global_headers, global_query) = match inherit_global {
-            true => (&self.manifest.http.headers, &self.manifest.http.query),
-            false => (&EMPTY_PARAMS, &EMPTY_PARAMS),
+        let (global_headers, global_query) = match (inherit_global, &self.manifest.http) {
+            (true, Some(http)) => (&http.headers, &http.query),
+            _ => (&EMPTY_PARAMS, &EMPTY_PARAMS),
         };
 
         // A step's header or parameter of the same name replaces the primary
@@ -1969,7 +2104,10 @@ impl LiteratureSource for CustomSource {
     }
 
     fn base_url(&self) -> &str {
-        &self.manifest.http.base_url
+        self.manifest
+            .http
+            .as_ref()
+            .map_or("", |http| http.base_url.as_str())
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -2065,7 +2203,23 @@ impl LiteratureSource for CustomSource {
         // Probed whether or not the integration is enabled: the settings form
         // asks this *before* enabling, so a short-circuit on `enabled` would
         // answer "disabled" and the integration could never be switched on.
-        let request = self.request(&health.path)?;
+        let path = match health.request() {
+            RequestRef::Path(path) => path,
+            // A program that runs to success is a service that answers; what
+            // it printed is not read.
+            RequestRef::Run(run) => {
+                return Ok(
+                    match self.output(run, &HashMap::new(), Unset::Refused).await {
+                        Ok(_) => status_of(
+                            IntegrationState::Ready,
+                            format!("{} answers.", self.manifest.name),
+                        ),
+                        Err(error) => status_of(IntegrationState::RemoteApiDown, error.to_string()),
+                    },
+                )
+            }
+        };
+        let request = self.request(path)?;
         match self.http.get_status(request.url, &request.headers).await {
             Ok(_) => Ok(status_of(
                 IntegrationState::Ready,
@@ -2084,6 +2238,93 @@ impl LiteratureSource for CustomSource {
             )),
         }
     }
+}
+
+/// What a run does with an argument whose placeholder has no value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unset {
+    /// Every value is known, so one that is not is the manifest asking for
+    /// something no result has: an error.
+    Refused,
+    /// Browse, where a caller may leave a value unset: an argument, or a group
+    /// of them, none of whose placeholders has a value is left off whole, and
+    /// one where some have a value is written with the others empty, as a
+    /// query parameter is.
+    LeftOff,
+}
+
+/// Whether every placeholder in these arguments is one with no value. An
+/// argument with no placeholder at all says something: itself.
+fn says_nothing(templates: &[&String], values: &HashMap<String, String>) -> bool {
+    let names: Vec<&str> = templates
+        .iter()
+        .flat_map(|template| placeholders(template))
+        .collect();
+    !names.is_empty() && names.iter().all(|name| !values.contains_key(*name))
+}
+
+/// One template argument, written in the pieces around its `{output_dir}`s.
+fn write_arg(
+    label: &str,
+    template: &str,
+    values: &HashMap<String, String>,
+    unset: Unset,
+    program: &str,
+) -> anyhow::Result<ProgramArg> {
+    let marker = format!("{{{}}}", manifest::RUN_OUTPUT_DIR);
+    let pieces = template
+        .split(marker.as_str())
+        .map(|piece| match unset {
+            Unset::Refused => substitute_values(piece, values, Substitution::Raw),
+            Unset::LeftOff => Ok(substitute_known(piece, values)),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| anyhow::anyhow!("{label}: {error}"))?;
+    let starts_with_value = template.starts_with('{') && !template.starts_with(&marker);
+    if starts_with_value && pieces[0].starts_with('-') {
+        anyhow::bail!(
+            "{label}: the value written there starts with '-', which {program} would read as an option"
+        );
+    }
+    Ok(ProgramArg(pieces))
+}
+
+/// `template` with each known placeholder written in and each unknown one
+/// written empty.
+fn substitute_known(template: &str, values: &HashMap<String, String>) -> String {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some((before, after)) = rest.split_once('{') {
+        out.push_str(before);
+        let Some((name, tail)) = after.split_once('}') else {
+            // Validation refuses an unclosed brace; write it as it is.
+            out.push('{');
+            rest = after;
+            continue;
+        };
+        out.push_str(values.get(name).map(String::as_str).unwrap_or_default());
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// What a search request's placeholders stand for.
+fn search_values(query: &str, limit: usize, page: usize) -> HashMap<String, String> {
+    HashMap::from([
+        ("query".to_string(), query.to_string()),
+        ("limit".to_string(), limit.to_string()),
+        ("page".to_string(), page.to_string()),
+        ("offset".to_string(), ((page - 1) * limit).to_string()),
+    ])
+}
+
+/// Values as the pairs [`substitute`] takes.
+fn pairs(values: &HashMap<String, String>) -> Vec<(&str, &str)> {
+    values
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect()
 }
 
 /// Replace `{name}` placeholders with percent-encoded values.
@@ -2320,7 +2561,7 @@ filename = "{title}.pdf""#,
             .iter()
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect();
-        anna.run_plan(&run, &values)
+        anna.run_plan(&run, &values, Unset::Refused)
     }
 
     fn template(arg: &str) -> RunArg {
@@ -2411,6 +2652,117 @@ filename = "{title}.pdf""#,
         .unwrap_err()
         .to_string();
         assert!(error.contains("secret 'api_key' has no value"), "{error}");
+    }
+
+    /// A manifest with no [http], whose every request is `/bin/sh` printing
+    /// a JSON record titled by what it was given.
+    #[cfg(unix)]
+    const CLI_MANIFEST: &str = r##"
+manifest_version = 2
+id = "cli"
+name = "CLI"
+
+[capabilities.health]
+run = { program = "/bin/sh", args = ["-c", "exit 0"] }
+
+[capabilities.search]
+run = { program = "/bin/sh", args = ["-c", "printf '%s%s%s' \"$PREFIX\" \"$*\" \"$SUFFIX\"", "sh", "{query}", "{limit}"], env = { PREFIX = '{"results":[{"id":"1","title":"', SUFFIX = '"}]}' } }
+items = "results"
+
+[capabilities.search.fields]
+id = "id"
+title = "title"
+
+[capabilities.browse]
+run = { program = "/bin/sh", args = ["-c", "printf '%s%s%s' \"$PREFIX\" \"$*\" \"$SUFFIX\"", "sh", ["--sort", "{sort}"], ["--year", "{year}"], "--page={page}"], env = { PREFIX = '{"results":[{"id":"1","title":"', SUFFIX = '"}]}' } }
+
+[capabilities.browse.sort]
+default = "cited"
+options = [["cited", "Most cited"], ["new", "Newest"]]
+
+[capabilities.browse.filters]
+year = { label = "Year", clause = "{value}", value = "integer" }
+
+[capabilities.lookup]
+paths = [
+  { program = "/bin/sh", args = ["-c", "exit 0", "sh", "{doi}"] },
+  { program = "/bin/sh", args = ["-c", "printf '%s%s%s' \"$PREFIX\" \"$1\" \"$SUFFIX\"", "sh", "{doi}"], env = { PREFIX = '{"id":"', SUFFIX = '"}' } },
+]
+
+[capabilities.lookup.fields]
+id = "id"
+"##;
+
+    #[cfg(unix)]
+    fn cli_source(allowed: &[&str]) -> CustomSource {
+        CustomSource::new(Manifest::parse(CLI_MANIFEST).unwrap(), HashMap::new())
+            .unwrap()
+            .with_allowed_programs(allowed.iter().map(|name| name.to_string()).collect())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_manifest_with_no_origin_searches_and_checks_health_by_running_programs() {
+        let cli = cli_source(&["/bin/sh"]);
+        assert_eq!(cli.base_url(), "");
+        let found = cli.search("graph theory", 5, 1).await.unwrap();
+        // Each value is one argument, however many words it holds.
+        assert_eq!(found[0].title.as_deref(), Some("graph theory 5"));
+
+        let status = cli.status(true).await.unwrap();
+        assert_eq!(status.state, IntegrationState::Ready, "{}", status.message);
+
+        let probe = cli.probe("graphs").await;
+        assert!(probe.ok, "{:?}", probe.error);
+        assert_eq!(
+            probe.request_url,
+            "/bin/sh -c printf '%s%s%s' \"$PREFIX\" \"$*\" \"$SUFFIX\" sh graphs 3"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_request_that_is_a_run_runs_only_when_its_program_is_allowed() {
+        let cli = cli_source(&[]);
+        let error = cli.search("graphs", 5, 1).await.unwrap_err().to_string();
+        assert!(error.contains("'/bin/sh' is not allowed to run"), "{error}");
+        let status = cli.status(true).await.unwrap();
+        assert_eq!(status.state, IntegrationState::RemoteApiDown);
+        assert!(!cli.probe("graphs").await.ok);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browse_leaves_off_an_argument_group_that_has_nothing_to_say() {
+        let cli = cli_source(&["/bin/sh"]);
+        let listing = |year: Option<&str>| BrowseRequest {
+            query: None,
+            filters: year
+                .map(|year| ("year".to_string(), FilterValue::One(year.to_string())))
+                .into_iter()
+                .collect(),
+            modes: Default::default(),
+            sort: Some("new".to_string()),
+            page: Some(2),
+            limit: Some(10),
+        };
+        let title = |page: BrowsePage| page.results[0].title.clone().unwrap();
+        assert_eq!(
+            title(cli.browse(&listing(None)).await.unwrap()),
+            "--sort new --page=2"
+        );
+        assert_eq!(
+            title(cli.browse(&listing(Some("2020"))).await.unwrap()),
+            "--sort new --year 2020 --page=2"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lookup_run_that_prints_nothing_has_no_record_and_the_next_is_asked() {
+        let cli = cli_source(&["/bin/sh"]);
+        let work = cli.lookup("10.1234/example").await.unwrap();
+        assert_eq!(work.work_id, "10.1234/example");
     }
 
     #[tokio::test]
@@ -2543,7 +2895,7 @@ image_url = { path = "img", attribute = "src", then = "absolute_url(@)" }
             .into_iter()
             .find(|manifest| manifest.id == id)
             .unwrap_or_else(|| panic!("no shipped manifest '{id}'"));
-        manifest.http.base_url = base_url.to_string();
+        manifest.http.as_mut().unwrap().base_url = base_url.to_string();
         CustomSource::build(manifest, secret_map(secrets), None, Standing::BuiltIn).unwrap()
     }
 
@@ -3818,7 +4170,7 @@ doi = "doi"
     fn semantic_scholar_query(request: &BrowseRequest, query: Option<&str>) -> String {
         let browse = semantic_scholar_browse();
         let written = browse_parameters(&browse, request, query).unwrap();
-        let path = browse_path(&browse.path, 10, 3, &written);
+        let path = browse_path(browse.path.as_deref().unwrap(), 10, 3, &written);
         let (_, query) = path.split_once('?').unwrap();
         query
             .split('&')

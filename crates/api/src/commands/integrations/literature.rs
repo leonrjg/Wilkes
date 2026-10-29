@@ -128,7 +128,8 @@ pub fn providers(
                 shipped
                     .iter()
                     .find(|manifest| manifest.id == entry.id())
-                    .map(|manifest| manifest.http.base_url.clone())
+                    .and_then(|manifest| manifest.http.as_ref())
+                    .map(|http| http.base_url.clone())
             }),
             capabilities: entry.source().capabilities(),
             secrets: entry.source().secret_slots(),
@@ -1401,7 +1402,7 @@ run = { program = "fetch-it", args = ["{id}", "{output_dir}"] }
         manifest.id = "derived".into();
         manifest.name = "Derived".into();
         let browse = manifest.capabilities.browse.as_mut().unwrap();
-        browse.path = "/works?filter={filters}&per-page={limit}&page={page}".into();
+        browse.path = Some("/works?filter={filters}&per-page={limit}&page={page}".into());
         browse.sort = None;
         let mut kind = browse.filters.shift_remove("type").unwrap();
         kind.modes.clear();
