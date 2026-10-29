@@ -266,6 +266,28 @@ export default function SettingsModal({
     }
   }, [isOpen, api]);
 
+  // An agent may save a manifest while this is open. The integrations held
+  // here are what the next integrations write is made from, so they are read
+  // again; every other setting and draft is left as it is.
+  useEffect(() => {
+    if (!isOpen) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    api.onIntegrationsUpdated(() => {
+      api.getSettings()
+        .then((nextSettings) => {
+          if (!active) return;
+          setSettings((current) => current ? { ...current, integrations: nextSettings.integrations } : current);
+        })
+        .catch(console.error);
+      api.literatureProviders().then(setLiteratureProviders).catch(console.error);
+    }).then((u) => { if (active) unlisten = u; else u(); });
+    return () => {
+      active = false;
+      if (unlisten) unlisten();
+    };
+  }, [isOpen, api]);
+
   useEffect(() => () => {
     if (customInstructionsSaveTimer.current) {
       clearTimeout(customInstructionsSaveTimer.current);

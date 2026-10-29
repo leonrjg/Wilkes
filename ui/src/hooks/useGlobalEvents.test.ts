@@ -14,6 +14,7 @@ vi.mock("../services", () => ({
     onManagerEvent: vi.fn().mockResolvedValue(vi.fn()),
     onFileListChanged: vi.fn().mockResolvedValue(vi.fn()),
     onResearchStateUpdated: vi.fn().mockResolvedValue(vi.fn()),
+    onIntegrationsUpdated: vi.fn().mockResolvedValue(vi.fn()),
     onFileMetadataUpdated: vi.fn().mockResolvedValue(vi.fn()),
     onBookmarkClusterLabelled: vi.fn().mockResolvedValue(vi.fn()),
     onChunkTopicLabelled: vi.fn().mockResolvedValue(vi.fn()),
@@ -52,6 +53,7 @@ describe("useGlobalEvents", () => {
   const handleIndexUpdated = vi.fn().mockResolvedValue(undefined);
   const handleIndexTerminated = vi.fn().mockResolvedValue(undefined);
   const refreshFileList = vi.fn();
+  const refreshSettings = vi.fn().mockResolvedValue({});
   const applyMetadataUpdates = vi.fn();
   const loadBookmarks = vi.fn().mockResolvedValue(undefined);
 
@@ -61,6 +63,7 @@ describe("useGlobalEvents", () => {
     (useSettingsStore.getState as any).mockReturnValue({
       directory: "/docs",
       refreshFileList,
+      refreshSettings,
       applyMetadataUpdates,
     });
     (useSemanticStore.getState as any).mockReturnValue({
@@ -84,6 +87,17 @@ describe("useGlobalEvents", () => {
     unmount();
     expect(stop).toHaveBeenCalledOnce();
     loadResearch.mockRestore();
+  });
+
+  it("reads settings again after an agent changes integrations, and unsubscribes", async () => {
+    let handler!: () => void;
+    const stop = vi.fn();
+    vi.mocked(api.onIntegrationsUpdated).mockImplementation(async (h) => { handler = h; return stop; });
+    const { unmount } = renderHook(() => useGlobalEvents());
+    await act(async () => { handler(); });
+    expect(refreshSettings).toHaveBeenCalled();
+    unmount();
+    expect(stop).toHaveBeenCalledOnce();
   });
 
   it("handles WorkerStarting event", async () => {

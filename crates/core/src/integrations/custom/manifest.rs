@@ -2242,6 +2242,20 @@ impl Manifest {
             .collect()
     }
 
+    /// Whether every origin and program this manifest reaches is one
+    /// `previous` already reached. Secrets the user stored for `previous` go
+    /// to this manifest without being asked for again only when it does: an
+    /// edit that names somewhere new could otherwise send them there.
+    pub fn reaches_no_further_than(&self, previous: &Manifest) -> bool {
+        let origins = previous.origins();
+        let programs = previous.programs();
+        self.origins().iter().all(|origin| origins.contains(origin))
+            && self
+                .programs()
+                .iter()
+                .all(|program| programs.contains(program))
+    }
+
     /// Every secret this manifest names, once each, in declaration order, as
     /// a settings form needs to render them.
     ///
@@ -3196,6 +3210,21 @@ items = '''article:has(a[href^="/work/"])'''
 id = { path = '''a[href^="/work/"]''', attribute = "href", capture = '''^/work/(.+)$''' }
 title = "h2"
 "#;
+
+    #[test]
+    fn a_manifest_reaches_no_further_than_one_naming_the_same_origins_and_programs() {
+        let previous = Manifest::parse(CROSSREF).unwrap();
+        let moved =
+            Manifest::parse(&CROSSREF.replace("api.crossref.org", "elsewhere.test")).unwrap();
+        let running = Manifest::parse(&format!(
+            "{CROSSREF}\n[capabilities.resolve_download]\nrun = {{ program = \"fetcher\", args = [\"{{id}}\"] }}\n"
+        ))
+        .unwrap();
+        assert!(previous.reaches_no_further_than(&previous));
+        assert!(!moved.reaches_no_further_than(&previous));
+        assert!(!running.reaches_no_further_than(&previous));
+        assert!(previous.reaches_no_further_than(&running));
+    }
 
     #[test]
     fn parses_a_toml_manifest() {

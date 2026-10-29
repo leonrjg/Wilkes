@@ -262,6 +262,38 @@ impl wilkes_agent::search::SearchService for AppContext {
         self.get_settings().await.integrations
     }
 
+    async fn custom_integrations(
+        self: Arc<Self>,
+        id: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        let integrations = self.get_settings().await.integrations;
+        crate::commands::integrations::custom::stored_integrations(&integrations, id.as_deref())
+            .and_then(|stored| Ok(serde_json::to_value(stored)?))
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    async fn probe_custom_integration(
+        self: Arc<Self>,
+        manifest: String,
+        query: String,
+    ) -> Result<wilkes_agent::search::IntegrationProbe, String> {
+        let integrations = self.get_settings().await.integrations;
+        crate::commands::integrations::custom::agent_probe(manifest, query, &integrations)
+            .await
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    async fn save_custom_integration(
+        self: Arc<Self>,
+        manifest: String,
+        enabled: Option<bool>,
+    ) -> Result<serde_json::Value, String> {
+        self.save_custom_integration_manifest(manifest, enabled)
+            .await
+            .and_then(|saved| Ok(serde_json::to_value(saved)?))
+            .map_err(|e| format!("{e:#}"))
+    }
+
     fn catalogue_mirror(&self) -> Option<PathBuf> {
         Some(self.catalogue_dir.clone())
     }
@@ -5374,6 +5406,29 @@ impl AppContext {
             &settings.integrations,
             &wilkes_core::integrations::allowed_programs(&settings.integrations),
         )
+    }
+
+    /// Store a manifest an agent wrote, as [`with_saved_manifest`] describes.
+    /// The interface has no screen that started the edit, so it is told.
+    ///
+    /// [`with_saved_manifest`]: crate::commands::integrations::custom::with_saved_manifest
+    pub async fn save_custom_integration_manifest(
+        self: &Arc<Self>,
+        manifest: String,
+        enabled: Option<bool>,
+    ) -> anyhow::Result<crate::commands::integrations::custom::SavedManifest> {
+        let integrations = self.get_settings().await.integrations;
+        let (next, saved) = crate::commands::integrations::custom::with_saved_manifest(
+            &integrations,
+            manifest,
+            enabled,
+            &wilkes_core::integrations::allowed_programs(&integrations),
+        )?;
+        self.update_settings(serde_json::json!({ "integrations": next }))
+            .await?;
+        self.events
+            .emit("integrations-updated", serde_json::json!({ "kind": "mcp" }));
+        Ok(saved)
     }
 
     /// Self-contained instructions for asking a model to translate service
@@ -10900,6 +10955,53 @@ mod tests {
             emitter,
         );
         ctx
+    }
+
+    #[tokio::test]
+    async fn a_manifest_an_agent_saves_reaches_the_settings_file_and_the_interface_is_told() {
+        use wilkes_agent::search::SearchService;
+        let dir = tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = generation_ctx(dir.path(), Arc::clone(&events));
+        let manifest = r#"
+manifest_version = 2
+id = "crossref"
+name = "Crossref"
+[http]
+base_url = "https://api.crossref.org"
+[capabilities.search]
+path = "/works?query.bibliographic={query}&rows={limit}"
+items = "message.items"
+[capabilities.search.fields]
+id = "DOI"
+title = "title[0]"
+"#;
+        let saved = Arc::clone(&ctx)
+            .save_custom_integration(manifest.to_string(), Some(true))
+            .await
+            .unwrap();
+        assert_eq!(saved["provider"], "custom:crossref");
+        assert_eq!(saved["added"], true);
+
+        let stored = get_settings(&dir.path().join("settings.json"))
+            .await
+            .unwrap()
+            .integrations
+            .custom;
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].enabled);
+        assert_eq!(stored[0].manifest, manifest);
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(name, _)| name == "integrations-updated"));
+
+        let listed = Arc::clone(&ctx)
+            .custom_integrations(Some("crossref".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(listed[0]["manifest"], manifest);
     }
 
     async fn enable_generation(ctx: &Arc<AppContext>, model: &str) {

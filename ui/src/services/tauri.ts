@@ -840,6 +840,10 @@ export class TauriSearchApi implements SearchApi {
     return listen("research-state-updated", () => handler());
   }
 
+  async onIntegrationsUpdated(handler: () => void): Promise<() => void> {
+    return listen("integrations-updated", () => handler());
+  }
+
   async onFileMetadataUpdated(
     handler: (updates: FileMetadataUpdate[]) => void,
   ): Promise<() => void> {

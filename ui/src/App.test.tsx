@@ -26,6 +26,7 @@ vi.mock("./services", () => ({
     onFileMetadataUpdated: vi.fn(() => Promise.resolve(() => {})),
     onFileListChanged: vi.fn(() => Promise.resolve(() => {})),
     onResearchStateUpdated: vi.fn(() => Promise.resolve(() => {})),
+    onIntegrationsUpdated: vi.fn(() => Promise.resolve(() => {})),
     onBookmarkClusterLabelled: vi.fn(() => Promise.resolve(() => {})),
     onChunkTopicLabelled: vi.fn(() => Promise.resolve(() => {})),
     onCatalogueDownloadProgress: vi.fn(() => Promise.resolve(() => {})),

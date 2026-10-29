@@ -68,6 +68,7 @@ pub(crate) const WILKES_MCP_TOOL_NAMES: &[&str] = &[
     "literature_search",
     "list_smart_collections",
     "read_library",
+    "read_custom_integrations",
 ];
 
 pub(crate) struct McpRuntime {
@@ -993,6 +994,54 @@ struct SaveLiteratureResultParams {
     workspace: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadCustomIntegrationsParams {
+    /// A custom integration's id, with or without the custom: prefix, to read
+    /// its manifest. Omit to list every custom integration without manifests.
+    id: Option<String>,
+    /// Also return the guide to the manifest format: what a manifest may
+    /// declare and how. Read it before writing or editing one.
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    #[schemars(with = "Option<bool>")]
+    authoring_guide: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ProbeCustomIntegrationParams {
+    /// The whole manifest, TOML or JSON, as it would be saved.
+    manifest: String,
+    /// What to search for.
+    query: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SaveCustomIntegrationParams {
+    /// The whole manifest, TOML or JSON. Its id says which integration it
+    /// adds or replaces.
+    manifest: String,
+    /// Whether the integration is switched on. Omit to keep what is stored;
+    /// a new integration is off unless this is true.
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    #[schemars(with = "Option<bool>")]
+    enabled: Option<bool>,
+}
+
+/// What a probe found, with results shown as `literature_search` shows them.
+#[derive(Debug, Serialize)]
+struct ProbeCustomIntegrationResponse {
+    ok: bool,
+    error: Option<String>,
+    /// Whether it ran with the secrets the user stored for this integration.
+    stored_secrets: bool,
+    request_url: String,
+    raw_response: String,
+    issues: Vec<wilkes_core::integrations::custom::ProjectionIssue>,
+    results: Vec<LiteratureResultView>,
+}
+
 #[derive(Debug, Serialize)]
 struct LiteratureSearchResponse {
     query: String,
@@ -1636,6 +1685,97 @@ impl WilkesMcp {
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
     }
+    #[tool(
+        description = "Read the custom literature integrations the user stored, each a manifest describing a web service Wilkes can search and fetch from. Omit id to list them (id, provider id for literature_search, enabled, which secrets are set); pass id to also get its manifest text. Set authoring_guide=true to get the manifest format's guide, which you need before writing or editing a manifest. Secret values are never returned."
+    )]
+    async fn read_custom_integrations(
+        &self,
+        Parameters(params): Parameters<ReadCustomIntegrationsParams>,
+    ) -> CallToolResult {
+        let result: Result<serde_json::Value, String> = async {
+            let integrations = self
+                .integrations_service()
+                .await?
+                .custom_integrations(params.id)
+                .await?;
+            let mut response = serde_json::json!({ "integrations": integrations });
+            if params.authoring_guide.unwrap_or(false) {
+                response["authoring_guide"] = serde_json::Value::String(
+                    wilkes_core::integrations::custom::manifest::authoring_prompt(),
+                );
+            }
+            Ok(response)
+        }
+        .await;
+        match result {
+            Ok(value) => structured(value),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        }
+    }
+
+    #[tool(
+        description = "Run a draft custom integration manifest's search once, without saving it, and report the request, the start of the raw response, the results it made of it and any field that did not project. Use it to check a manifest before save_custom_integration. A draft whose id is a stored integration runs with that integration's stored secrets only if it contacts no origin and runs no program the stored manifest does not; otherwise it runs without secrets (stored_secrets=false)."
+    )]
+    async fn probe_custom_integration(
+        &self,
+        Parameters(params): Parameters<ProbeCustomIntegrationParams>,
+    ) -> CallToolResult {
+        let result = async {
+            self.integrations_service()
+                .await?
+                .probe_custom_integration(params.manifest, params.query)
+                .await
+        }
+        .await;
+        match result {
+            Ok(probe) => structured(ProbeCustomIntegrationResponse {
+                ok: probe.report.ok,
+                error: probe.report.error,
+                stored_secrets: probe.stored_secrets,
+                request_url: probe.report.request_url,
+                raw_response: probe.report.raw_response,
+                issues: probe.report.issues,
+                results: probe
+                    .report
+                    .results
+                    .iter()
+                    .map(LiteratureResultView::from)
+                    .collect(),
+            }),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        }
+    }
+
+    #[tool(
+        description = "Add a custom literature integration, or replace the manifest of the one with the same id. Use only when the user asks to add or change an integration. Pass the whole manifest; an invalid one is refused with every problem. A replaced integration keeps the user's name for it, and keeps its stored secrets only if the new manifest contacts no origin and runs no program the old one did not. A new integration is off unless enabled=true. Saving never allows a program to run and never sets a secret: the answer lists missing_secrets and programs not yet allowed, which the user sets in Settings → Integrations."
+    )]
+    async fn save_custom_integration(
+        &self,
+        Parameters(params): Parameters<SaveCustomIntegrationParams>,
+    ) -> CallToolResult {
+        let result = async {
+            self.integrations_service()
+                .await?
+                .save_custom_integration(params.manifest, params.enabled)
+                .await
+        }
+        .await;
+        match result {
+            Ok(value) => structured(value),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        }
+    }
+}
+
+impl WilkesMcp {
+    /// The service custom integrations are read and written through. Always
+    /// the live settings, never the snapshot a chat started with: these tools
+    /// are about what is stored, which includes what they just stored.
+    async fn integrations_service(&self) -> Result<Arc<dyn SearchService>, String> {
+        self.scope(None)
+            .await?
+            .require_search("Custom integrations are not available in this session")
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1647,7 +1787,7 @@ impl ServerHandler for WilkesMcp {
                     .with_title("Wilkes")
                     .with_description("Document search, literature and research-library tools"),
             )
-            .with_instructions("Wilkes document context and literature tools. Context and search tools are read-only. The download, save_literature_result and edit_library tools write real library data and must only be used for user-requested changes. Managed read_only workspaces refuse writes.")
+            .with_instructions("Wilkes document context and literature tools. Context and search tools are read-only. The download, save_literature_result and edit_library tools write real library data, and save_custom_integration writes the user's integration settings; all must only be used for user-requested changes. Managed read_only workspaces refuse writes.")
     }
 }
 
@@ -2366,6 +2506,8 @@ mod tests {
         metadata: Mutex<Option<DocumentMetadata>>,
         /// (provider, result id, note) of every result saved.
         saved: Mutex<Vec<(String, String, Option<String>)>>,
+        /// (manifest, enabled) of every custom integration saved.
+        saved_manifests: Mutex<Vec<(String, Option<bool>)>>,
     }
 
     #[test]
@@ -2672,6 +2814,30 @@ mod tests {
                 .push((provider.clone(), work.id.clone(), note));
             Ok(serde_json::json!({"provider": provider, "work": work}))
         }
+        async fn custom_integrations(
+            self: Arc<Self>,
+            id: Option<String>,
+        ) -> Result<serde_json::Value, String> {
+            let saved = self.saved_manifests.lock().unwrap();
+            Ok(serde_json::json!(saved
+                .iter()
+                .map(|(manifest, _)| serde_json::json!({
+                    "provider": "custom:fake",
+                    "manifest": id.as_ref().map(|_| manifest),
+                }))
+                .collect::<Vec<_>>()))
+        }
+        async fn save_custom_integration(
+            self: Arc<Self>,
+            manifest: String,
+            enabled: Option<bool>,
+        ) -> Result<serde_json::Value, String> {
+            self.saved_manifests
+                .lock()
+                .unwrap()
+                .push((manifest, enabled));
+            Ok(serde_json::json!({"provider": "custom:fake", "added": true}))
+        }
 
         async fn default_root(self: Arc<Self>) -> Option<PathBuf> {
             self.default_root.clone()
@@ -2804,6 +2970,7 @@ mod tests {
     fn fake_search_with_root(root: PathBuf) -> Arc<FakeSearch> {
         Arc::new(FakeSearch {
             saved: Mutex::default(),
+            saved_manifests: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -3705,6 +3872,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         context.set_search_root(Some(current_root.to_string_lossy().into_owned()));
         let search = Arc::new(FakeSearch {
             saved: Mutex::default(),
+            saved_manifests: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -3920,6 +4088,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         let dir = tempdir().unwrap();
         let service = Arc::new(FakeSearch {
             saved: Mutex::default(),
+            saved_manifests: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -4163,6 +4332,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         let active = root.join("paper.md");
         let service = Arc::new(FakeSearch {
             saved: Mutex::default(),
+            saved_manifests: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -4210,6 +4380,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         let live_root = dir.path().join("live-ui-root");
         let service = Arc::new(FakeSearch {
             saved: Mutex::default(),
+            saved_manifests: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -4338,6 +4509,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         ));
         let service = Arc::new(FakeSearch {
             saved: Mutex::default(),
+            saved_manifests: Mutex::default(),
             read_only: false,
             last_query: Mutex::new(None),
             last_related_query: Mutex::new(None),
@@ -4799,6 +4971,51 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             .unwrap()
             .contains("MANAGED_WORKSPACE_PROTECTED"));
         assert!(service.saved.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_chat_reads_back_the_manifest_it_saved_rather_than_its_starting_snapshot() {
+        let root = tempdir().unwrap();
+        let service = fake_search_with_root(root.path().into());
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(single_workspace(service.clone())),
+            // A chat's snapshot, taken before anything was saved.
+            Some(IntegrationsSettings::default()),
+        );
+        let saved = mcp
+            .save_custom_integration(Parameters(SaveCustomIntegrationParams {
+                manifest: "id = \"fake\"".into(),
+                enabled: Some(true),
+            }))
+            .await;
+        assert_ne!(saved.is_error, Some(true));
+        assert_eq!(
+            *service.saved_manifests.lock().unwrap(),
+            vec![("id = \"fake\"".to_string(), Some(true))]
+        );
+
+        let read = mcp
+            .read_custom_integrations(Parameters(ReadCustomIntegrationsParams {
+                id: Some("fake".into()),
+                authoring_guide: Some(true),
+            }))
+            .await
+            .structured_content
+            .unwrap();
+        assert_eq!(read["integrations"][0]["manifest"], "id = \"fake\"");
+        assert_eq!(
+            read["authoring_guide"],
+            wilkes_core::integrations::custom::manifest::authoring_prompt()
+        );
+    }
+
+    #[test]
+    fn only_reading_custom_integrations_skips_the_prompt() {
+        assert!(WILKES_MCP_TOOL_NAMES.contains(&"read_custom_integrations"));
+        assert!(!WILKES_MCP_TOOL_NAMES.contains(&"probe_custom_integration"));
+        assert!(!WILKES_MCP_TOOL_NAMES.contains(&"save_custom_integration"));
     }
 
     #[tokio::test]

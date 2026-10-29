@@ -23,6 +23,7 @@ describe("SettingsModal", () => {
   const mockApi = {
     getSettings: vi.fn(),
     updateSettings: vi.fn(),
+    onIntegrationsUpdated: vi.fn((_handler: () => void) => Promise.resolve(() => {})),
     literatureProviders: vi.fn(() => Promise.resolve([])),
     listGenerationModels: vi.fn(() => Promise.resolve([])),
     isGenerationReady: vi.fn(() => Promise.resolve(false)),
@@ -130,6 +131,26 @@ describe("SettingsModal", () => {
       error: null,
     });
     mockApi.writeClipboard.mockResolvedValue(undefined);
+  });
+
+  it("reads integrations again when an agent changes them while open", async () => {
+    let handler!: () => void;
+    const stop = vi.fn();
+    mockApi.onIntegrationsUpdated.mockImplementation(async (h: () => void) => {
+      handler = h;
+      return stop;
+    });
+    let unmount!: () => void;
+    await act(async () => {
+      ({ unmount } = render(<SettingsModal {...defaultProps} />));
+    });
+    const settingsReads = mockApi.getSettings.mock.calls.length;
+    const providerReads = mockApi.literatureProviders.mock.calls.length;
+    await act(async () => { handler(); });
+    expect(mockApi.getSettings).toHaveBeenCalledTimes(settingsReads + 1);
+    expect(mockApi.literatureProviders).toHaveBeenCalledTimes(providerReads + 1);
+    unmount();
+    expect(stop).toHaveBeenCalledOnce();
   });
 
   it("renders when open", async () => {

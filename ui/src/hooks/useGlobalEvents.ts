@@ -19,6 +19,7 @@ export function useGlobalEvents() {
     let managerUnlisten: (() => void) | undefined;
     let fileListUnlisten: (() => void) | undefined;
     let researchUnlisten: (() => void) | undefined;
+    let integrationsUnlisten: (() => void) | undefined;
     let metadataUnlisten: (() => void) | undefined;
     let clusterLabelUnlisten: (() => void) | undefined;
     let topicLabelUnlisten: (() => void) | undefined;
@@ -111,6 +112,14 @@ export function useGlobalEvents() {
       ]).catch((error) => addToast(`Could not refresh the library: ${error}`, { type: "error" }));
     }).then((u) => { if (mounted) researchUnlisten = u; else u(); });
 
+    api.onIntegrationsUpdated(() => {
+      if (!mounted) return;
+      // An agent saved a manifest. Without this the settings held here stay
+      // as they were, and the next integrations write from them undoes it.
+      void useSettingsStore.getState().refreshSettings()
+        .catch((error) => addToast(`Could not refresh settings: ${error}`, { type: "error" }));
+    }).then((u) => { if (mounted) integrationsUnlisten = u; else u(); });
+
     api.onFileMetadataUpdated((updates) => {
       if (!mounted) return;
       useSettingsStore.getState().applyMetadataUpdates(updates);
@@ -162,6 +171,7 @@ export function useGlobalEvents() {
       if (managerUnlisten) managerUnlisten();
       if (fileListUnlisten) fileListUnlisten();
       if (researchUnlisten) researchUnlisten();
+      if (integrationsUnlisten) integrationsUnlisten();
       if (metadataUnlisten) metadataUnlisten();
       if (clusterLabelUnlisten) clusterLabelUnlisten();
       if (topicLabelUnlisten) topicLabelUnlisten();

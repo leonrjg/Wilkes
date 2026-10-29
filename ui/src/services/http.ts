@@ -822,6 +822,13 @@ export class HttpSearchApi implements SearchApi {
     return () => this.releaseEventSource("research-state-updated", listener);
   }
 
+  async onIntegrationsUpdated(handler: () => void): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = () => handler();
+    es.addEventListener("integrations-updated", listener);
+    return () => this.releaseEventSource("integrations-updated", listener);
+  }
+
   async onFileMetadataUpdated(
     handler: (updates: FileMetadataUpdate[]) => void,
   ): Promise<() => void> {

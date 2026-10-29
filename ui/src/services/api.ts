@@ -484,6 +484,9 @@ export interface SearchApi {
   onManagerEvent(handler: (event: string) => void): Promise<() => void>;
   onFileListChanged(handler: (event: FileListChanged) => void): Promise<() => void>;
   onResearchStateUpdated(handler: () => void): Promise<() => void>;
+  /** Integration settings were changed by an agent, with no screen of ours
+   *  having made the change. */
+  onIntegrationsUpdated(handler: () => void): Promise<() => void>;
   onFileMetadataUpdated(
     handler: (updates: FileMetadataUpdate[]) => void,
   ): Promise<() => void>;

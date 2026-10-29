@@ -112,6 +112,38 @@ pub trait SearchService: Send + Sync {
         IntegrationsSettings::default()
     }
 
+    /// The custom integrations the user stored, or the one `id` names with its
+    /// manifest, as settings hold them now rather than as a chat began.
+    async fn custom_integrations(
+        self: Arc<Self>,
+        id: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        let _ = id;
+        Err("Custom integrations are not available in this session".into())
+    }
+
+    /// Runs a draft manifest's search once. The service decides which stored
+    /// secrets, if any, the draft may use; the caller never supplies one.
+    async fn probe_custom_integration(
+        self: Arc<Self>,
+        manifest: String,
+        query: String,
+    ) -> Result<IntegrationProbe, String> {
+        let _ = (manifest, query);
+        Err("Custom integrations are not available in this session".into())
+    }
+
+    /// Stores `manifest` under its own id, adding an integration or replacing
+    /// the one of that id. `enabled` of `None` keeps what is stored.
+    async fn save_custom_integration(
+        self: Arc<Self>,
+        manifest: String,
+        enabled: Option<bool>,
+    ) -> Result<serde_json::Value, String> {
+        let _ = (manifest, enabled);
+        Err("Custom integrations are not available in this session".into())
+    }
+
     /// Where the installation's catalogue mirror lives, so the catalogues are
     /// providers here as they are everywhere else. `None` is a service with no
     /// mirror, which then offers none.
@@ -147,6 +179,16 @@ pub trait SearchService: Send + Sync {
         let _ = path;
         Err("Document metadata is not available in this session.".to_string())
     }
+}
+
+/// What a draft manifest's probe found.
+#[derive(Debug, Clone)]
+pub struct IntegrationProbe {
+    pub report: wilkes_core::integrations::custom::ProbeReport,
+    /// Whether it ran with the secrets stored for the integration it would
+    /// replace. It runs without them when it is new, when none are stored, or
+    /// when it reaches an origin or program the stored manifest did not.
+    pub stored_secrets: bool,
 }
 
 /// One Wilkes workspace as an MCP client sees it.
