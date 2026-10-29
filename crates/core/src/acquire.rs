@@ -696,11 +696,19 @@ async fn run_into_root(
     let args: Vec<String> = run.args.iter().map(|arg| arg.write(&output_dir)).collect();
     // The arguments are not logged: a step may have fetched a token into one.
     tracing::info!(program = %run.program, "running a manifest program");
-    let written = run_program(&run.program, &args, workspace.path(), max_download_bytes)
-        .await
-        .inspect_err(|message| {
-            tracing::warn!(program = %run.program, "manifest program failed: {message}");
-        })?;
+    let written = run_program(
+        &run.program,
+        &args,
+        &run.env,
+        workspace.path(),
+        max_download_bytes,
+    )
+    .await
+    // What a failing program says may repeat what it was given.
+    .map_err(|message| redact(message, &run.secrets))
+    .inspect_err(|message| {
+        tracing::warn!(program = %run.program, "manifest program failed: {message}");
+    })?;
 
     // Every name is settled before anything is stored, so a run is refused
     // whole rather than after some of its files are in the root.
@@ -751,15 +759,34 @@ async fn run_into_root(
     Ok(AcquiredFiles { folder, files })
 }
 
+/// `message` with every secret value in it masked, longest first so that a
+/// value holding another is masked whole.
+fn redact(mut message: String, secrets: &[String]) -> String {
+    let mut secrets: Vec<&str> = secrets
+        .iter()
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .collect();
+    secrets
+        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    secrets.dedup();
+    for secret in secrets {
+        message = message.replace(secret, "***");
+    }
+    message
+}
+
 async fn run_program(
     program: &str,
     args: &[String],
+    env: &[(String, String)],
     directory: &Path,
     max_download_bytes: u64,
 ) -> Result<Vec<PathBuf>, String> {
     let mut command = tokio::process::Command::new(program);
     command
         .args(args)
+        .envs(env.iter().map(|(name, value)| (name, value)))
         .current_dir(directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -855,6 +882,8 @@ mod tests {
                 ProgramArg(vec!["sh".to_string()]),
                 ProgramArg(vec![String::new(), String::new()]),
             ],
+            env: Vec::new(),
+            secrets: Vec::new(),
         })
     }
 
@@ -962,6 +991,48 @@ mod tests {
             .join("Chosen.pdf")
             .join("2.pdf")
             .exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_gets_its_variables_and_its_secrets_never_reach_the_error() {
+        let root = tempdir().unwrap();
+        let DownloadPlan::Run(mut run) = shell_run(
+            r#"printf "$TOKEN" > "$1/x.pdf"; [ "$2" = fail ] && { echo "bad key $TOKEN" >&2; exit 1; }; true"#,
+        ) else {
+            unreachable!()
+        };
+        run.env.push(("TOKEN".to_string(), "s3cret".to_string()));
+        run.secrets.push("s3cret".to_string());
+        let output = acquire_plan(
+            root.path(),
+            DownloadPlan::Run(run.clone()),
+            "Book",
+            None,
+            &allowed(),
+            None,
+            1024,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&output.files[0].path).unwrap(), b"s3cret");
+
+        run.args
+            .push(crate::types::ProgramArg(vec!["fail".to_string()]));
+        let other = tempdir().unwrap();
+        let error = acquire_plan(
+            other.path(),
+            DownloadPlan::Run(run),
+            "Book",
+            None,
+            &allowed(),
+            None,
+            1024,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("bad key ***"), "{error}");
+        assert!(!error.contains("s3cret"), "{error}");
     }
 
     #[cfg(unix)]

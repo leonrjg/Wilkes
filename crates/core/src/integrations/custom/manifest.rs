@@ -298,12 +298,8 @@ impl Capabilities {
     fn secret_names(&self) -> Vec<&str> {
         self.resolve_download
             .iter()
-            .flat_map(|resolve| &resolve.steps)
-            .flat_map(|step| step.headers.values().chain(step.query.values()))
-            .filter_map(|value| match value {
-                ParamValue::Secret(secret) => Some(secret.secret.as_str()),
-                ParamValue::Literal(_) => None,
-            })
+            .flat_map(ResolveDownloadCapability::secrets)
+            .map(|secret| secret.secret.as_str())
             .collect()
     }
 }
@@ -884,8 +880,9 @@ pub struct ResolveDownloadCapability {
     /// several in order of preference. See [`UrlTemplate`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<UrlTemplate>,
-    /// A program that fetches the file itself, for a service whose files are
-    /// assembled by a downloader of its own rather than served at one URL.
+    /// A program that writes the files itself, for whatever a command-line
+    /// tool does better than one GET: a downloader, a service's own client,
+    /// a converter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<RunSpec>,
     /// Optional caller-chosen filename, sanitized to one file name. With
@@ -894,6 +891,37 @@ pub struct ResolveDownloadCapability {
     /// arguments, for a program that takes the name of what it writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
+}
+
+impl ResolveDownloadCapability {
+    /// Every secret this capability names, in declaration order: its steps'
+    /// headers and query, then its run's arguments and environment.
+    pub fn secrets(&self) -> impl Iterator<Item = &SecretRef> {
+        let steps = self
+            .steps
+            .iter()
+            .flat_map(|step| step.headers.values().chain(step.query.values()))
+            .filter_map(ParamValue::secret);
+        let run = self.run.iter().flat_map(|run| {
+            run.args
+                .iter()
+                .filter_map(|arg| match arg {
+                    RunArg::Secret(secret) => Some(secret),
+                    RunArg::Template(_) => None,
+                })
+                .chain(run.env.values().filter_map(ParamValue::secret))
+        });
+        steps.chain(run)
+    }
+}
+
+impl ParamValue {
+    fn secret(&self) -> Option<&SecretRef> {
+        match self {
+            Self::Secret(secret) => Some(secret),
+            Self::Literal(_) => None,
+        }
+    }
 }
 
 /// One invocation of a program on this machine.
@@ -919,9 +947,25 @@ pub struct RunSpec {
     pub program: String,
     /// Each a template over result fields, values extracted by prior steps,
     /// `{output_dir}`, and `{filename}` when `resolve_download.filename` is
-    /// declared.
+    /// declared; or a whole argument that is a secret's value.
     #[serde(default)]
-    pub args: Vec<String>,
+    pub args: Vec<RunArg>,
+    /// Environment variables set for the program, beside the ones it
+    /// inherits: a literal, or a secret, as a header's value is. An optional
+    /// secret with no value leaves its variable unset.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, ParamValue>,
+}
+
+/// One argument: a template (`"{id}"`, `"--out"`), or a secret's value as
+/// the whole argument (`{ secret = "api_key" }`) for a program that takes a
+/// credential only as a flag. A secret is never a template's value, so one
+/// can never be written into the middle of an argument a result controls.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum RunArg {
+    Template(String),
+    Secret(SecretRef),
 }
 
 /// Where a program writes. Known only when it runs, so it is the one value an
@@ -1474,26 +1518,25 @@ reviews   = { label = "Reviews only", clause = "reviews_only" }
 "#;
 
 const AUTHORING_RUN_EXAMPLE: &str = r#"manifest_version = 2
-id = "mangadex"
-name = "MangaDex"
+id = "example-cli"
+name = "Example archive with a command-line client"
 
 [http]
-base_url = "https://api.mangadex.org"
+base_url = "https://api.archive.example.test"
 
 [capabilities.search]
-path = "/manga?title={query}&limit={limit}&offset={offset}"
-items = "data"
+path = "/items?q={query}&limit={limit}&page={page}"
+items = "items"
 
 [capabilities.search.fields]
 id = "id"
-title = "not_null(attributes.title.en, values(attributes.title)[0])"
-description = "attributes.description.en"
-year = "attributes.year"
-landing_page_url = "join('', ['https://mangadex.org/title/', id])"
+title = "title"
+landing_page_url = "url"
 
-# The files are assembled by the service's own downloader, which writes them itself.
+# The files are written by a command-line program, given the credential it reads from its environment.
 [capabilities.resolve_download]
-run = { program = "mangadex-dl", args = ["{landing_page_url}", "--path", "{output_dir}", "--save-as", "pdf-single", "--cover", "none", "--no-track", "--progress-bar-layout", "none"] }
+filename = "{title}.pdf"
+run = { program = "archive-get", args = ["{id}", "--format", "pdf", "--out", "{output_dir}/{filename}"], env = { ARCHIVE_TOKEN = { secret = "archive_token", label = "Archive token" } } }
 "#;
 
 const AUTHORING_EXTENDS_EXAMPLE: &str = r#"manifest_version = 2
@@ -1579,7 +1622,7 @@ Return exactly one TOML manifest and no Markdown fence or commentary outside it.
 
 Safety and fidelity rules:
 - Use only HTTP(S) GET requests. Search is one request. Download resolution is on demand after selection and may use only the finite steps declared below.
-- Where the service's files are fetched by a command-line downloader of its own, rather than served at one URL, resolve_download may run that program instead of naming a URL. Name the program exactly as it is installed and write only the arguments its documentation gives. It runs only after the user allows that program by name, so prefer a URL whenever one exists.
+- When the source material fetches or produces files with a command-line program (a downloader, a service's own client, a converter), resolve_download may run that program instead of naming a URL. Name the program exactly as it is installed and write only the arguments its documentation gives. It runs only after the user allows that program by name. A credential the program needs goes in run.env when the program reads one from its environment, or otherwise as a whole `{ secret = "name" }` argument; never in a template.
 - Never put a credential value in the manifest. Declare `{ secret = "symbolic_name" }`; write a plain string only for public fixed values. `optional = true` leaves the header or parameter off the request when the user has set no value.
 - A resolver step may set a literal `base_url` to use another HTTP(S) origin. It cannot contain placeholders. Every contacted origin is declared and shown before save.
 - `http.headers` and `http.query` are sent to the primary origin and same-origin resolver steps. They are never copied to a cross-origin step; repeat any header or parameter that origin needs under that step's `headers` or `query`.
@@ -1703,14 +1746,16 @@ url = "{result_or_step_value}"        # required; HTTP(S) or relative to http.ba
                                       # steps run only while none is, so a result that already holds the URL costs no request
 filename = "{title}.{file_format}"   # optional; sanitized to one file name before use
 # Or, instead of url, a program that writes the files itself:
-run = { program = "downloader", args = ["{landing_page_url}", "--out", "{output_dir}", "--name", "{filename}"] }
+run = { program = "tool", args = ["{landing_page_url}", "--out", "{output_dir}/{filename}", "--key", { secret = "api_key" }], env = { TOOL_TOKEN = { secret = "token", optional = true }, TOOL_MODE = "batch" } }
 # program: a command name found on PATH, or an absolute path; a literal, shown before save, and run only once the user
-# allows it by name. args: a list, never a shell command line; each is one argument, a template over result values,
+# allows it by name. args: a list, never a shell command line; each is one argument: a template over result values,
 # step values, {output_dir}, the empty directory the program writes into (also its working directory), and {filename},
-# the rendered filename above, which every run that declares one must pass to the program. A value that
-# would start an argument with "-" is refused. Everything the program leaves in {output_dir} is imported, so pass the
-# flags that keep it to the documents: no cover images, logs or tracking databases. It runs non-interactively, with
-# no input, so pass whatever flag the program needs to not prompt.
+# the rendered filename above, which every run that declares one must pass to the program; or { secret = "name" }, a
+# secret's value as the whole argument, which cannot be optional. A value that would start a template argument with "-"
+# is refused. env: variables set beside the ones the program inherits, each a literal or a secret as a header's value
+# is; an optional secret with no value leaves its variable unset. Everything the program leaves in {output_dir} is
+# imported, so pass the flags that keep it to the documents: no cover images, logs or tracking databases. It runs
+# non-interactively, with no input, so pass whatever flag the program needs to not prompt.
 
 steps = [                             # optional; one inline table per step, in order; never a header per step
   # base_url: optional literal HTTP(S) base, defaults to http.base_url. path: result values plus outputs from earlier steps.
@@ -1753,7 +1798,7 @@ JMESPath selects keys (`a.b`), indices (`a[0]`, `a[-1]`), projections (`a[*].b`)
     prompt.push_str(AUTHORING_FULL_EXAMPLE);
     prompt.push_str("\nValid example with a parameter per filter and a required keyword:\n\n");
     prompt.push_str(AUTHORING_PARAMETERS_EXAMPLE);
-    prompt.push_str("\nValid example whose files are fetched by the service's own downloader:\n\n");
+    prompt.push_str("\nValid example whose files are written by a command-line program:\n\n");
     prompt.push_str(AUTHORING_RUN_EXAMPLE);
     prompt.push_str("\nValid example extending a provider to add a download step:\n\n");
     prompt.push_str(AUTHORING_EXTENDS_EXAMPLE);
@@ -2204,21 +2249,19 @@ impl Manifest {
     /// use decides whether a request can be sent.
     pub fn secret_slots(&self) -> Vec<SecretSlot> {
         let mut slots: Vec<SecretSlot> = Vec::new();
-        let steps = self
-            .capabilities
-            .resolve_download
-            .iter()
-            .flat_map(|resolve| &resolve.steps);
-        let values = self
+        let secrets = self
             .http
             .headers
             .values()
             .chain(self.http.query.values())
-            .chain(steps.flat_map(|step| step.headers.values().chain(step.query.values())));
-        for value in values {
-            let ParamValue::Secret(secret) = value else {
-                continue;
-            };
+            .filter_map(ParamValue::secret)
+            .chain(
+                self.capabilities
+                    .resolve_download
+                    .iter()
+                    .flat_map(ResolveDownloadCapability::secrets),
+            );
+        for secret in secrets {
             match slots.iter_mut().find(|slot| slot.name == secret.secret) {
                 Some(existing) => existing.optional &= secret.optional,
                 None => slots.push(SecretSlot {
@@ -3015,28 +3058,58 @@ fn run_problems(run: &RunSpec, available: &[String], has_filename: bool) -> Vec<
     }
     // Declared and passed to nothing, a filename would name no file.
     let filename = format!("{{{RUN_FILENAME}}}");
-    if has_filename && !run.args.iter().any(|arg| arg.contains(&filename)) {
+    let names_filename =
+        |arg: &RunArg| matches!(arg, RunArg::Template(arg) if arg.contains(&filename));
+    if has_filename && !run.args.iter().any(names_filename) {
         problems.push(format!(
             "resolve_download.filename is declared but no run argument names {filename}, so the program never receives it"
         ));
     }
     for (index, arg) in run.args.iter().enumerate() {
-        problems.extend(template_problems_owned(
-            &format!("resolve_download.run.args[{index}]"),
-            arg,
-            &allowed,
-            false,
-        ));
-        if arg.chars().any(char::is_control) {
+        let label = format!("resolve_download.run.args[{index}]");
+        match arg {
+            RunArg::Template(arg) => {
+                problems.extend(template_problems_owned(&label, arg, &allowed, false));
+                if arg.chars().any(char::is_control) {
+                    problems.push(format!("{label} contains a control character"));
+                }
+            }
+            RunArg::Secret(secret) => {
+                if secret.secret.trim().is_empty() {
+                    problems.push(format!("{label} names an empty secret"));
+                }
+                // Left off, it would shift every argument after it.
+                if secret.optional {
+                    problems.push(format!(
+                        "{label}: an argument cannot be left off when its secret is unset; name an optional secret in run.env instead"
+                    ));
+                }
+            }
+        }
+    }
+    for (name, value) in &run.env {
+        let label = format!("resolve_download.run.env.{name}");
+        if !is_env_name(name) {
             problems.push(format!(
-                "resolve_download.run.args[{index}] contains a control character"
+                "{label}: a variable name is letters, digits and '_', not starting with a digit"
             ));
+        }
+        if let ParamValue::Secret(secret) = value {
+            if secret.secret.trim().is_empty() {
+                problems.push(format!("{label} names an empty secret"));
+            }
         }
     }
     problems
 }
 
-/// A bare command (`mangadex-dl`), looked up on `PATH`, or an absolute path to
+fn is_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A bare command (`archive-get`), looked up on `PATH`, or an absolute path to
 /// one. A relative path would name a different program from every directory
 /// it ran in.
 pub fn is_program_name(program: &str) -> bool {
@@ -3813,7 +3886,8 @@ url = "{id}"
     #[test]
     fn a_resolver_runs_a_program_it_names_literally_with_arguments_it_lists() {
         let run = |line: &str| {
-            let from = r#"run = { program = "mangadex-dl", args = ["{landing_page_url}", "--path", "{output_dir}", "--save-as", "pdf-single", "--cover", "none", "--no-track", "--progress-bar-layout", "none"] }"#;
+            let from = r#"filename = "{title}.pdf"
+run = { program = "archive-get", args = ["{id}", "--format", "pdf", "--out", "{output_dir}/{filename}"], env = { ARCHIVE_TOKEN = { secret = "archive_token", label = "Archive token" } } }"#;
             assert!(AUTHORING_RUN_EXAMPLE.contains(from));
             Manifest::parse(&AUTHORING_RUN_EXAMPLE.replace(from, line))
         };
@@ -3821,6 +3895,19 @@ url = "{id}"
             run(r#"run = { program = "/opt/bin/fetch", args = ["--into={output_dir}/{id}"] }"#)
                 .unwrap();
         assert_eq!(manifest.programs(), vec!["/opt/bin/fetch"]);
+        // Secrets reach a program as whole arguments or as variables, and the
+        // settings form asks for each.
+        let keyed = run(r#"run = { program = "fetch", args = ["--key", { secret = "api_key", label = "API key" }], env = { TOKEN = { secret = "token", optional = true }, MODE = "batch" } }"#)
+            .unwrap();
+        let slots: Vec<(String, bool)> = keyed
+            .secret_slots()
+            .into_iter()
+            .map(|slot| (slot.name, slot.optional))
+            .collect();
+        assert_eq!(
+            slots,
+            [("api_key".to_string(), false), ("token".to_string(), true)]
+        );
         // A program that takes the name of what it writes is given one.
         run(
             r#"run = { program = "fetch", args = ["{id}", "-o", "{output_dir}/{filename}"] }
@@ -3869,6 +3956,14 @@ url = "{pdf_url}""#,
                 "sets both url and run",
             ),
             ("", "sets neither url nor run"),
+            (
+                r#"run = { program = "fetch", args = ["--key", { secret = "api_key", optional = true }] }"#,
+                "args[1]: an argument cannot be left off when its secret is unset",
+            ),
+            (
+                r#"run = { program = "fetch", args = [], env = { "1BAD" = "x" } }"#,
+                "run.env.1BAD: a variable name is letters",
+            ),
         ] {
             let error = run(line).unwrap_err().to_string();
             assert!(error.contains(expected), "{line}: {error}");
@@ -3948,7 +4043,7 @@ url = "{pdf_url}""#,
         Manifest::parse(AUTHORING_FULL_EXAMPLE).unwrap();
         Manifest::parse(AUTHORING_PARAMETERS_EXAMPLE).unwrap();
         let run = Manifest::parse(AUTHORING_RUN_EXAMPLE).unwrap();
-        assert_eq!(run.programs(), vec!["mangadex-dl"]);
+        assert_eq!(run.programs(), vec!["archive-get"]);
         // The one that extends is read where there is something to extend.
         let resolved = Manifest::resolve(
             AUTHORING_EXTENDS_EXAMPLE,

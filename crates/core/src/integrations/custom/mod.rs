@@ -33,9 +33,9 @@ use self::expr::{Evaluator, Projected};
 use self::manifest::{
     lookup_field_type, placeholders, query_parts, search_field_type, Bases, BrowseCapability,
     FieldSpec, FieldType, FilterSpec, LookupCapability, Manifest, Missing, ParamValue,
-    ReferencesCapability, ResolverStep, ResponseFormat, RunSpec, SearchCapability, SecretSlot,
-    UrlTemplate, ValueRule, BROWSE_FILTERS, BROWSE_QUERY, BROWSE_SORT, MAX_FILTER_VALUES,
-    MAX_SUGGESTIONS, MIN_SUGGEST_CHARS,
+    ReferencesCapability, ResolverStep, ResponseFormat, RunArg, RunSpec, SearchCapability,
+    SecretSlot, UrlTemplate, ValueRule, BROWSE_FILTERS, BROWSE_QUERY, BROWSE_SORT,
+    MAX_FILTER_VALUES, MAX_SUGGESTIONS, MIN_SUGGEST_CHARS,
 };
 use crate::integrations::{LiteratureSource, ProviderCapabilities};
 use crate::metadata::doi::normalize_doi;
@@ -1183,7 +1183,9 @@ impl CustomSource {
             if let Some(filename) = filename {
                 values.insert(manifest::RUN_FILENAME.to_string(), filename);
             }
-            return run_plan(run, &values).map(|run| Some(DownloadPlan::Run(run)));
+            return self
+                .run_plan(run, &values)
+                .map(|run| Some(DownloadPlan::Run(run)));
         }
         let template = match writable(alternatives, &values) {
             Some(template) => template,
@@ -1210,6 +1212,75 @@ impl CustomSource {
             url: url.to_string(),
             filename,
         })))
+    }
+
+    /// A manifest's run with every value it names written in, but the
+    /// directory it writes to, which only the runner knows.
+    ///
+    /// Each argument is written alone: a value fills the argument its
+    /// placeholder is in and cannot become a second one, since no shell ever
+    /// splits them. A value that would begin an argument with `-` is refused
+    /// rather than passed, because the program would read it as an option the
+    /// author never wrote. A secret is the user's own value, so it is passed
+    /// as it is.
+    fn run_plan(
+        &self,
+        run: &RunSpec,
+        values: &HashMap<String, String>,
+    ) -> anyhow::Result<ProgramRun> {
+        let marker = format!("{{{}}}", manifest::RUN_OUTPUT_DIR);
+        let mut secrets = Vec::new();
+        let mut args = Vec::with_capacity(run.args.len());
+        for (index, arg) in run.args.iter().enumerate() {
+            let label = format!("resolve_download.run.args[{index}]");
+            let template = match arg {
+                RunArg::Template(template) => template,
+                RunArg::Secret(secret) => {
+                    let value = self
+                        .param_value(&ParamValue::Secret(secret.clone()))
+                        .map_err(|error| anyhow::anyhow!("{label}: {error}"))?
+                        .map(|(value, _)| value)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("{label}: secret '{}' has no value", secret.secret)
+                        })?;
+                    secrets.push(value.clone());
+                    args.push(ProgramArg(vec![value]));
+                    continue;
+                }
+            };
+            let pieces = template
+                .split(marker.as_str())
+                .map(|piece| substitute_values(piece, values, Substitution::Raw))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| anyhow::anyhow!("{label}: {error}"))?;
+            let starts_with_value = template.starts_with('{') && !template.starts_with(&marker);
+            if starts_with_value && pieces[0].starts_with('-') {
+                anyhow::bail!(
+                    "{label}: the value written there starts with '-', which {} would read as an option",
+                    run.program
+                );
+            }
+            args.push(ProgramArg(pieces));
+        }
+        let mut env = Vec::with_capacity(run.env.len());
+        for (name, value) in &run.env {
+            let Some((value, secret)) = self
+                .param_value(value)
+                .map_err(|error| anyhow::anyhow!("resolve_download.run.env.{name}: {error}"))?
+            else {
+                continue;
+            };
+            if secret {
+                secrets.push(value.clone());
+            }
+            env.push((name.clone(), value));
+        }
+        Ok(ProgramRun {
+            program: run.program.clone(),
+            args,
+            env,
+            secrets,
+        })
     }
 
     fn extract_step(
@@ -1724,41 +1795,6 @@ fn result_values(result: &LiteratureSearchResult) -> HashMap<String, String> {
     values
 }
 
-/// A manifest's run with every value it names written in, but the directory
-/// it writes to, which only the runner knows.
-///
-/// Each argument is written alone: a value fills the argument its placeholder
-/// is in and cannot become a second one, since no shell ever splits them. A
-/// value that would begin an argument with `-` is refused rather than passed,
-/// because the program would read it as an option the author never wrote.
-fn run_plan(run: &RunSpec, values: &HashMap<String, String>) -> anyhow::Result<ProgramRun> {
-    let marker = format!("{{{}}}", manifest::RUN_OUTPUT_DIR);
-    let args = run
-        .args
-        .iter()
-        .enumerate()
-        .map(|(index, template)| {
-            let pieces = template
-                .split(marker.as_str())
-                .map(|piece| substitute_values(piece, values, Substitution::Raw))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| anyhow::anyhow!("resolve_download.run.args[{index}]: {error}"))?;
-            let starts_with_value = template.starts_with('{') && !template.starts_with(&marker);
-            if starts_with_value && pieces[0].starts_with('-') {
-                anyhow::bail!(
-                    "resolve_download.run.args[{index}]: the value written there starts with '-', which {} would read as an option",
-                    run.program
-                );
-            }
-            Ok(ProgramArg(pieces))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(ProgramRun {
-        program: run.program.clone(),
-        args,
-    })
-}
-
 /// The first template every placeholder of which has a value.
 fn writable<'a>(templates: &'a [String], values: &HashMap<String, String>) -> Option<&'a String> {
     templates.iter().find(|template| {
@@ -2264,28 +2300,62 @@ filename = "{title}.pdf""#,
         );
     }
 
-    #[test]
-    fn a_run_refuses_a_value_that_would_be_read_as_an_option() {
+    /// A run's arguments written by a source holding `secrets`.
+    fn plan(
+        args: Vec<RunArg>,
+        env: &[(&str, ParamValue)],
+        values: &[(&str, &str)],
+        secrets: &[(&str, &str)],
+    ) -> anyhow::Result<ProgramRun> {
+        let anna = source(ANNA_DOI_MANIFEST, "https://anna.test", secrets);
         let run = RunSpec {
             program: "fetch".to_string(),
-            args: vec!["{title}".to_string(), "--name={title}".to_string()],
+            args,
+            env: env
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.clone()))
+                .collect(),
         };
-        let values = |title: &str| HashMap::from([("title".to_string(), title.to_string())]);
+        let values = values
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        anna.run_plan(&run, &values)
+    }
 
+    fn template(arg: &str) -> RunArg {
+        RunArg::Template(arg.to_string())
+    }
+
+    fn secret(name: &str, optional: bool) -> manifest::SecretRef {
+        manifest::SecretRef {
+            secret: name.to_string(),
+            optional,
+            label: None,
+            kind: None,
+        }
+    }
+
+    #[test]
+    fn a_run_refuses_a_value_that_would_be_read_as_an_option() {
         // Inside an argument a leading dash is the value's own text.
-        let plan = run_plan(
-            &RunSpec {
-                args: vec!["--name={title}".to_string()],
-                ..run.clone()
-            },
-            &values("-rf"),
+        let inside = plan(
+            vec![template("--name={title}")],
+            &[],
+            &[("title", "-rf")],
+            &[],
         )
         .unwrap();
-        assert_eq!(plan.args[0].write("/out"), "--name=-rf");
+        assert_eq!(inside.args[0].write("/out"), "--name=-rf");
 
-        let error = run_plan(&run, &values("--exec=sh"))
-            .unwrap_err()
-            .to_string();
+        let error = plan(
+            vec![template("{title}")],
+            &[],
+            &[("title", "--exec=sh")],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("args[0]") && error.contains("starts with '-'"),
             "{error}"
@@ -2294,13 +2364,53 @@ filename = "{title}.pdf""#,
 
     #[test]
     fn a_value_that_reads_output_dir_is_not_where_the_program_writes() {
-        let run = RunSpec {
-            program: "fetch".to_string(),
-            args: vec!["{output_dir}/{title}".to_string()],
-        };
-        let values = HashMap::from([("title".to_string(), "{output_dir}".to_string())]);
-        let plan = run_plan(&run, &values).unwrap();
-        assert_eq!(plan.args[0].write("/out"), "/out/{output_dir}");
+        let run = plan(
+            vec![template("{output_dir}/{title}")],
+            &[],
+            &[("title", "{output_dir}")],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(run.args[0].write("/out"), "/out/{output_dir}");
+    }
+
+    #[test]
+    fn a_run_is_given_secrets_as_whole_arguments_and_as_variables() {
+        let run = plan(
+            vec![template("--key"), RunArg::Secret(secret("api_key", false))],
+            &[
+                ("API_TOKEN", ParamValue::Secret(secret("token", false))),
+                ("MODE", ParamValue::Literal("batch".to_string())),
+                ("PROXY", ParamValue::Secret(secret("proxy", true))),
+            ],
+            &[],
+            &[("api_key", " key-1 "), ("token", "tok-2")],
+        )
+        .unwrap();
+        // A secret is passed as the user set it, trimmed as a header's is.
+        assert_eq!(run.args[1].write("/out"), "key-1");
+        // An optional secret with no value leaves its variable unset.
+        assert_eq!(
+            run.env,
+            [
+                ("API_TOKEN".to_string(), "tok-2".to_string()),
+                ("MODE".to_string(), "batch".to_string()),
+            ]
+        );
+        // Both are redacted from what the program says; the literal is not.
+        assert_eq!(run.secrets, ["key-1", "tok-2"]);
+        // And neither is in what the plan says of itself.
+        assert!(!format!("{run:?}").contains("key-1"));
+
+        let error = plan(
+            vec![RunArg::Secret(secret("api_key", false))],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("secret 'api_key' has no value"), "{error}");
     }
 
     #[tokio::test]

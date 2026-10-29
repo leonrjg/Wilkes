@@ -3465,11 +3465,27 @@ pub enum DownloadPlan {
 }
 
 /// One program invocation, with every value but the output directory written.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Its `Debug` names the program and nothing else: arguments and variables
+/// may hold a secret's value.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProgramRun {
     /// As the manifest names it, which is the name the user allows.
     pub program: String,
     pub args: Vec<ProgramArg>,
+    /// Variables set beside the ones the program inherits.
+    pub env: Vec<(String, String)>,
+    /// Every secret value the run carries, for redacting what the program
+    /// says back: a program that fails may echo its own arguments.
+    pub secrets: Vec<String>,
+}
+
+impl std::fmt::Debug for ProgramRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProgramRun")
+            .field("program", &self.program)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One argument, as the pieces between its `{output_dir}`s.
