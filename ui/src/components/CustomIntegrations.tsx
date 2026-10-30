@@ -70,40 +70,40 @@ export function chatEditMessage(
 const INITIAL_PROBE_QUERY = "graph neural networks";
 
 const STARTER_MANIFEST = `manifest_version = 2
-id = "anna-journals"
-name = "Anna journal search"
+id = "example-library"
+name = "Example library search"
 
 [http]
-## Replace this example host with the Anna mirror you use.
-base_url = "https://annas-archive.example"
+## Replace this example host with the service you search.
+base_url = "https://library.example"
 
 [http.headers]
 User-Agent = "Mozilla/5.0"
 
 [capabilities.search]
-path = "/search?q={query}&content=journal"
+path = "/search?q={query}"
 response_format = "html"
-items = '''div:has(> a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"])'''
+items = "article.result"
 
 [capabilities.search.fields]
-id = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", capture = '''^/md5/([0-9a-f]+)$''' }
-title = '''div.max-w-full a[href^="/md5/"]'''
-authors = { path = '''a[href^="/search"]:has(span[class="icon-[mdi--user-edit]"])''', all = true, then = "join(', ', @)" }
-publisher = '''a[href^="/search"]:has(span[class="icon-[mdi--company]"])'''
-language = { path = "div.text-gray-800", capture = '''^\\s*✅?\\s*([^\\[]+?)\\s*\\[''' }
-file_format = { path = "div.text-gray-800", capture = '''(?i)\\b(EPUB|PDF|MOBI|AZW3|AZW|DJVU|CBZ|CBR|FB2|DOCX?|TXT)\\b''' }
-file_size = { path = "div.text-gray-800", capture = '''(?i)(\\d+(?:\\.\\d+)?\\s*(?:MB|KB|GB|TB))''' }
-landing_page_url = { path = '''a[href^="/md5/"][class="custom-a block mr-2 sm:mr-4 hover:opacity-80"]''', attribute = "href", then = "absolute_url(@)" }
+id = { path = "a.details", attribute = "href", capture = '''^/items/([0-9a-z]+)$''' }
+title = "h2"
+authors = { path = "a.author", all = true, then = "join(', ', @)" }
+publisher = ".publisher"
+language = { path = ".metadata", capture = '''^\\s*([^\\[]+?)\\s*\\[''' }
+file_format = { path = ".metadata", capture = '''(?i)\\b(EPUB|PDF|DJVU)\\b''' }
+file_size = { path = ".metadata", capture = '''(?i)(\\d+(?:\\.\\d+)?\\s*(?:MB|KB|GB))''' }
+landing_page_url = { path = "a.details", attribute = "href", then = "absolute_url(@)" }
 
 [capabilities.resolve_download]
 url = "{download_url}"
 filename = "{title}.{file_format}"
 
-## One inline table per step. To resolve on a different Anna origin, add
-## base_url = "https://annas-archive.example" to the step. Primary-origin
+## One inline table per step. To resolve on a different origin, add
+## base_url = "https://downloads.library.example" to the step. Primary-origin
 ## headers and query parameters are not forwarded across that boundary.
 steps = [
-  { path = "/dyn/api/fast_download.json?md5={id}", response_format = "json", query = { key = { secret = "anna_key" } }, fields = { download_url = "download_url" } },
+  { path = "/api/download?id={id}", response_format = "json", query = { key = { secret = "member_key" } }, fields = { download_url = "download_url" } },
 ]
 
 ## For a DOI-specific provider, a field may carry the search input:

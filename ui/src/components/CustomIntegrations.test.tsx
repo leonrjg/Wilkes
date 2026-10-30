@@ -161,7 +161,7 @@ describe("CustomIntegrations", () => {
     expect(manifest).toContain('then = "absolute_url(@)"');
     expect(manifest).toContain("[capabilities.resolve_download]");
     expect(manifest).toContain("steps = [");
-    expect(manifest).toContain('base_url = "https://annas-archive.example"');
+    expect(manifest).toContain('base_url = "https://downloads.library.example"');
     // One header per map and one line per entry: no header per list item, and
     // none deeper than `[capabilities.search.fields]`. The starter is what a
     // user copies, so a header per entry here is one in every manifest after.
@@ -171,7 +171,7 @@ describe("CustomIntegrations", () => {
       .filter((match): match is RegExpExecArray => match !== null);
     expect(headers.filter((match) => match[1] === "[[")).toEqual([]);
     expect(headers.filter((match) => match[2].split(".").length > 3)).toEqual([]);
-    expect(manifest).toContain('key = { secret = "anna_key" }');
+    expect(manifest).toContain('key = { secret = "member_key" }');
     expect(manifest).toContain('input = "query"');
     expect(manifest).not.toContain("[[http.params]]");
     expect(manifest).not.toContain("coerce");
@@ -388,7 +388,7 @@ describe("CustomIntegrations", () => {
 
     await waitFor(() => {
       expect(customIntegrationProbe).toHaveBeenCalledWith(
-        expect.stringContaining('id = "anna-journals"'),
+        expect.stringContaining('id = "example-library"'),
         {},
         "protein folding",
       );
