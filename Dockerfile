@@ -27,6 +27,7 @@ ENV SCCACHE_DIR=/sccache
 # Stage 1: Compute the dependency recipe, including example targets Cargo discovers.
 FROM rust-base AS planner
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
 COPY crates/core/Cargo.toml crates/core/Cargo.toml
 COPY crates/api/Cargo.toml crates/api/Cargo.toml
 COPY crates/agent/Cargo.toml crates/agent/Cargo.toml
@@ -45,6 +46,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Stage 2: Cache dependencies (compiled into image layer, not a cache mount)
 FROM rust-base AS cacher
 COPY --from=planner /build/recipe.json recipe.json
+COPY vendor/ vendor/
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/root/.cache/dfbin \
@@ -55,6 +57,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 FROM rust-base AS rust-builder
 COPY --from=cacher /build/target target
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
 COPY crates/ crates/
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \

@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/core", "crates/api", "crates/agent", "crates/desktop", "crates/server", "crates/worker"]
+exclude = ["vendor/futures-util"]
 resolver = "2"
 
 [workspace.package]
@@ -10,6 +11,14 @@ version = "1.0.1"
 # when it moves.
 [workspace.dependencies]
 wilkes-chat = { git = "https://github.com/leonrjg/wilkes-chat", tag = "v0.1.5" }
+
+# futures-util 0.3.32 with a single change: `waker_vtable` in
+# stream/futures_unordered/task.rs is `#[inline(never)]`. Without it an open
+# chat holds a CPU core while idle, because a `FuturesUnordered` waker stops
+# matching its own clone and async-io wakes it on every poll. Drop this patch
+# once a futures-util release keeps that vtable at one address.
+[patch.crates-io]
+futures-util = { path = "vendor/futures-util" }
 
 # Cargo's stock `dev` is unoptimized and carries full debug info for every
 # dependency, which is most of what target/debug weighs. This does not touch

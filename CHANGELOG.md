@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- An open chat no longer uses more than a full CPU core while it sits idle.
 - CBZ comics open and scroll by loading individual page images, avoiding full-book
   PDF conversion and keeping only nearby images in the reader. They show the same
   page indicator and zoom controls as other documents.

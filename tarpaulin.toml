@@ -3,6 +3,7 @@ workspace = true
 target-dir = "target/tarpaulin"
 exclude-files = [
     "target/*",
+    "vendor/*",
 ]
 ignore-tests = true
 out = ["Lcov"]
