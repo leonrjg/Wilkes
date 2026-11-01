@@ -5,11 +5,16 @@ use std::sync::Arc;
 use super::super::Embedder;
 use super::aux_config;
 use crate::embed::installer::EmbedderInstaller;
+use crate::models::hf_hub::fetch_model_config;
 use crate::models::progress::{EmbedProgress, ProgressTx};
 use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
 use crate::worker::embedder::{WorkerEmbedder, WorkerEmbedderConfig};
-use crate::worker::ipc::{WorkerEvent, WorkerRequest, WorkerRole};
+use crate::worker::ipc::{UnmetNeeds, WorkerEvent, WorkerRequest, WorkerRole};
 use crate::worker::manager::{ManagerCommand, WorkerManager};
+use crate::worker::{
+    base_transformers, forget_model_env, record_model_env, recorded_model_env, EnvNeeds, ModelEnv,
+    TransformersSeries,
+};
 
 // ── Static model catalog ──────────────────────────────────────────────────────
 
@@ -131,16 +136,19 @@ async fn await_probe(
     while let Some(event) = reply_rx.recv().await {
         match event {
             WorkerEvent::Info { dimension, .. } => return Ok(dimension),
-            // Only the download: a probe is not an index build, and the
-            // worker's other progress would tell the interface one had begun.
-            // `try_send` because progress is a notification and the next one
-            // supersedes it; some callers probe with a channel nobody reads,
-            // and waiting on one of those would hang the probe.
-            WorkerEvent::Progress(progress @ EmbedProgress::Download(_)) => {
+            // Only the download and the environment: a probe is not an index
+            // build, and the worker's other progress would tell the interface
+            // one had begun. `try_send` because progress is a notification and
+            // the next one supersedes it; some callers probe with a channel
+            // nobody reads, and waiting on one of those would hang the probe.
+            WorkerEvent::Progress(
+                progress @ (EmbedProgress::Download(_) | EmbedProgress::Setup(_)),
+            ) => {
                 if let Err(e) = progress_tx.try_send(progress) {
-                    tracing::trace!("dropping download progress for '{model_id}': {e}");
+                    tracing::trace!("dropping probe progress for '{model_id}': {e}");
                 }
             }
+            WorkerEvent::Unmet(needs) => return Err(anyhow::Error::new(needs)),
             WorkerEvent::Error(err) => {
                 return Err(anyhow::anyhow!("Worker error probing model: {}", err))
             }
@@ -157,6 +165,98 @@ async fn await_probe(
     ))
 }
 
+/// What a model's `config.json` says about Transformers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ModelManifest {
+    /// The version it was saved with.
+    declared: Option<TransformersSeries>,
+    /// It ships its own code, which is written against that version. Without
+    /// any, its architecture ships with Transformers, which keeps it working
+    /// from one release to the next, so the version says nothing it needs.
+    custom_code: bool,
+}
+
+fn read_manifest(config: &str) -> Result<ModelManifest, String> {
+    #[derive(serde::Deserialize)]
+    struct ModelConfig {
+        auto_map: Option<serde_json::Value>,
+        transformers_version: Option<String>,
+    }
+
+    let config: ModelConfig =
+        serde_json::from_str(config).map_err(|e| format!("Unreadable config.json: {e}"))?;
+    Ok(ModelManifest {
+        declared: config
+            .transformers_version
+            .as_deref()
+            .map(TransformersSeries::parse)
+            .transpose()?,
+        custom_code: config.auto_map.is_some(),
+    })
+}
+
+/// The environment a manifest calls for, `None` being the base one. Custom code
+/// gets the series it was written for, on either side of the base one; whether
+/// that series can be had here is for the resolver to say, not this.
+fn needs_for(manifest: ModelManifest, base: TransformersSeries) -> Option<EnvNeeds> {
+    let series = manifest.declared.filter(|_| manifest.custom_code)?;
+    (series != base).then(|| EnvNeeds {
+        transformers: Some(series),
+        ..EnvNeeds::default()
+    })
+}
+
+/// `needs` with what a failed load asked for added, or `None` if that adds
+/// nothing and the failure stands. Asking for an unknown architecture means a
+/// newer Transformers; an older one could not know it either.
+fn refined_needs(
+    needs: Option<&EnvNeeds>,
+    unmet: &UnmetNeeds,
+    declared: Option<TransformersSeries>,
+    base: TransformersSeries,
+) -> Option<EnvNeeds> {
+    let mut refined = needs.cloned().unwrap_or_default();
+    refined.packages.extend(unmet.packages.iter().cloned());
+    if unmet.architecture {
+        let current = refined.transformers.unwrap_or(base);
+        refined.transformers = declared.filter(|d| *d > current).or(refined.transformers);
+    }
+    (refined != needs.cloned().unwrap_or_default()).then_some(refined)
+}
+
+/// The model's `config.json`, from wherever a load would find it. Waiting on
+/// the network is no process a cancel could kill, so the wait watches the seal.
+async fn model_config(manager: &WorkerManager, model_id: &str) -> anyhow::Result<Option<String>> {
+    let local = Path::new(model_id);
+    if local.is_dir() {
+        let path = local.join("config.json");
+        return match std::fs::read_to_string(&path) {
+            Ok(config) => Ok(Some(config)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("Reading {} failed: {e}", path.display())),
+        };
+    }
+
+    let cache = hf_hub::Cache::new(manager.paths().hub_cache());
+    if let Some(path) = cache
+        .repo(hf_hub::Repo::model(model_id.to_string()))
+        .get("config.json")
+    {
+        return std::fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("Reading {} failed: {e}", path.display()));
+    }
+
+    let id = model_id.to_string();
+    let fetch = tokio::task::spawn_blocking(move || fetch_model_config(&id));
+    tokio::select! {
+        fetched = fetch => fetched?,
+        () = manager.until_sealed() => Err(crate::worker::fault::WorkerFault::gone(
+            "the user cancelled while reading the model's config",
+        )),
+    }
+}
+
 // ── SBERTInstaller ───────────────────────────────────────────────────────────
 
 pub struct SBERTInstaller {
@@ -167,6 +267,11 @@ pub struct SBERTInstaller {
     /// the same kind of fact: what the machine this runs on can afford.
     pub batch_size: usize,
     pub dimension: std::sync::Mutex<Option<usize>>,
+    /// The Python environment found by `install()`, for the same reason
+    /// `dimension` is kept: `build()` has to hand on what the probe learned.
+    /// Stays `None` for a built-in model, which the base environment is
+    /// curated to run whatever its metadata declares.
+    python_env: std::sync::Mutex<Option<EnvNeeds>>,
 }
 
 impl SBERTInstaller {
@@ -182,7 +287,50 @@ impl SBERTInstaller {
             device,
             batch_size,
             dimension: std::sync::Mutex::new(None),
+            python_env: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The model's prefixes, from the cache the worker downloads into, which
+    /// is not the `data_dir` every installer is handed.
+    fn prefixes(&self) -> aux_config::EmbedderConfig {
+        aux_config::load_prefixes(&self.manager.paths().hub_cache(), self.model.model_id())
+    }
+
+    /// Ask a worker in `python_env` for the model's width.
+    async fn probe(
+        &self,
+        python_env: Option<EnvNeeds>,
+        progress_tx: &ProgressTx,
+    ) -> anyhow::Result<usize> {
+        let model_id = self.model.model_id();
+        let request = WorkerRequest {
+            batch_size: crate::worker::ipc::default_embed_batch_size(),
+            mode: "info".to_string(),
+            role: WorkerRole::Embed(EmbeddingEngine::SBERT),
+            model: model_id.to_string(),
+            model_dir: std::path::PathBuf::new(),
+            device: self.device.clone(),
+            texts: None,
+            generate: None,
+            recognize: None,
+            layout: None,
+            table: None,
+            python_env,
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(32);
+        let cmd = ManagerCommand::Submit {
+            req: Box::new(request),
+            reply: reply_tx,
+        };
+
+        self.manager
+            .send(cmd)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send info command to manager: {e}"))?;
+
+        await_probe(reply_rx, progress_tx, model_id).await
     }
 }
 
@@ -207,39 +355,72 @@ impl EmbedderInstaller for SBERTInstaller {
             return Ok(());
         }
 
-        // Otherwise, perform the Live Probe asynchronously.
-        let request = WorkerRequest {
-            batch_size: crate::worker::ipc::default_embed_batch_size(),
-            mode: "info".to_string(),
-            role: WorkerRole::Embed(EmbeddingEngine::SBERT),
-            model: model_id.to_string(),
-            model_dir: std::path::PathBuf::new(),
-            device: self.device.clone(),
-            texts: None,
-            generate: None,
-            recognize: None,
-            layout: None,
-            table: None,
+        // Otherwise, perform the Live Probe asynchronously, in the environment
+        // the model needs. What it needs is only known for sure by trying, so
+        // a probe that fails for want of something gets one more attempt with
+        // it. One: a model that is still missing something after that is told
+        // so, rather than an environment being built per guess.
+        let paths = self.manager.paths();
+        let base = base_transformers(paths).map_err(|e| anyhow::anyhow!(e))?;
+        let manifest = match model_config(&self.manager, model_id).await? {
+            Some(config) => read_manifest(&config)
+                .map_err(|e| anyhow::anyhow!("Cannot read what '{model_id}' requires: {e}"))?,
+            None => ModelManifest::default(),
+        };
+        let recorded = recorded_model_env(paths, model_id)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .filter(|record| record.declared == manifest.declared);
+        let mut python_env = match recorded {
+            Some(record) => record.needs,
+            None => needs_for(manifest, base),
         };
 
-        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(32);
-        let cmd = ManagerCommand::Submit {
-            req: Box::new(request),
-            reply: reply_tx,
+        let dimension = match self.probe(python_env.clone(), &progress_tx).await {
+            Ok(dimension) => dimension,
+            Err(failure) => {
+                let unmet = failure
+                    .downcast_ref::<UnmetNeeds>()
+                    .and_then(|unmet| {
+                        refined_needs(python_env.as_ref(), unmet, manifest.declared, base)
+                    })
+                    .ok_or(failure)?;
+                tracing::info!(
+                    "'{model_id}' needs more than its first environment had: trying {unmet:?}"
+                );
+                python_env = Some(unmet);
+                self.probe(python_env.clone(), &progress_tx).await?
+            }
         };
 
-        self.manager
-            .send(cmd)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send info command to manager: {e}"))?;
-
-        let dimension = await_probe(reply_rx, &progress_tx, model_id).await?;
+        record_model_env(
+            paths,
+            model_id,
+            ModelEnv {
+                declared: manifest.declared,
+                needs: python_env.clone(),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        *self.python_env.lock().unwrap() = python_env;
         *self.dimension.lock().unwrap() = Some(dimension);
         Ok(())
     }
 
+    /// Everything of a model's own: its weights and the record of what it
+    /// needs. Its environment stays, since other models may share it, and is
+    /// then the user's to remove.
     fn uninstall(&self, _data_dir: &Path) -> anyhow::Result<()> {
-        Ok(())
+        let model_id = self.model.model_id();
+        let paths = self.manager.paths();
+        let repo = paths
+            .hub_cache()
+            .join(format!("models--{}", model_id.replace('/', "--")));
+        match std::fs::remove_dir_all(&repo) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => anyhow::bail!("Cannot remove {}: {e}", repo.display()),
+        }
+        forget_model_env(paths, model_id).map_err(|e| anyhow::anyhow!(e))
     }
 
     fn build(&self, _data_dir: &Path) -> anyhow::Result<Arc<dyn Embedder>> {
@@ -263,7 +444,7 @@ impl EmbedderInstaller for SBERTInstaller {
                 )
             })?;
 
-        let prefixes = aux_config::load_prefixes(_data_dir, model_id);
+        let prefixes = self.prefixes();
         let artifact_revision =
             crate::embed::identity::artifact_revision_for_cache(_data_dir, model_id)?;
         let embedding_space_identity = crate::embed::EmbeddingSpaceIdentity::with_artifact_revision(
@@ -285,6 +466,7 @@ impl EmbedderInstaller for SBERTInstaller {
                 passage_prefix: prefixes.passage_prefix,
                 embedding_space_identity,
                 batch_size: self.batch_size,
+                python_env: self.python_env.lock().unwrap().clone(),
             },
         )))
     }
@@ -544,6 +726,220 @@ mod tests {
             .unwrap_err();
 
         assert!(format!("{err:#}").contains("the user cancelled"));
+    }
+
+    fn series(raw: &str) -> TransformersSeries {
+        TransformersSeries::parse(raw).unwrap()
+    }
+
+    fn on_series(raw: &str) -> Option<EnvNeeds> {
+        Some(EnvNeeds {
+            transformers: Some(series(raw)),
+            ..EnvNeeds::default()
+        })
+    }
+
+    #[test]
+    fn custom_code_gets_the_series_it_declares_on_either_side_of_the_base() {
+        let base = series("4.57");
+        let custom = |declared: &str| ModelManifest {
+            declared: Some(series(declared)),
+            custom_code: true,
+        };
+
+        assert_eq!(needs_for(custom("4.26.0"), base), on_series("4.26"));
+        assert_eq!(needs_for(custom("4.47.0.dev0"), base), on_series("4.47"));
+        assert_eq!(needs_for(custom("5.3.0"), base), on_series("5.3"));
+        assert_eq!(needs_for(custom("4.57.1"), base), None);
+    }
+
+    #[test]
+    fn a_model_with_no_custom_code_asks_for_nothing_up_front() {
+        let plain = read_manifest(r#"{"transformers_version": "4.30.0"}"#).unwrap();
+        assert_eq!(plain.declared, Some(series("4.30")));
+        assert_eq!(needs_for(plain, series("5.22")), None);
+
+        let undeclared = read_manifest(r#"{"auto_map": {"AutoModel": "m.M"}}"#).unwrap();
+        assert!(undeclared.custom_code);
+        assert_eq!(needs_for(undeclared, series("5.22")), None);
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_read_is_an_error_rather_than_no_requirement() {
+        assert!(read_manifest("not json").is_err());
+        assert!(read_manifest(r#"{"transformers_version": "recent"}"#).is_err());
+    }
+
+    fn unmet(packages: &[&str], architecture: bool) -> UnmetNeeds {
+        UnmetNeeds {
+            packages: packages.iter().map(|p| p.to_string()).collect(),
+            architecture,
+            detail: "failed".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_missing_package_is_added_to_whatever_environment_it_was_missing_from() {
+        let base = series("5.22");
+
+        let on_base = refined_needs(None, &unmet(&["timm"], false), None, base).unwrap();
+        assert_eq!(on_base.transformers, None);
+        assert!(on_base.packages.contains("timm"));
+
+        let current = on_series("4.47");
+        let refined =
+            refined_needs(current.as_ref(), &unmet(&["timm"], false), None, base).unwrap();
+        assert_eq!(refined.transformers, Some(series("4.47")));
+        assert!(refined.packages.contains("timm"));
+    }
+
+    #[test]
+    fn an_unknown_architecture_is_answered_by_the_newer_transformers_it_declares() {
+        let base = series("4.57");
+
+        let newer = refined_needs(None, &unmet(&[], true), Some(series("5.3")), base);
+        assert_eq!(newer.unwrap().transformers, Some(series("5.3")));
+
+        // Nothing newer to offer, so the failure stands.
+        assert_eq!(
+            refined_needs(None, &unmet(&[], true), Some(series("4.30")), base),
+            None
+        );
+        assert_eq!(refined_needs(None, &unmet(&[], true), None, base), None);
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_wants_for_something_says_what() {
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(32);
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(1);
+        reply_tx
+            .send(WorkerEvent::Unmet(unmet(&["timm"], false)))
+            .await
+            .unwrap();
+
+        let err = await_probe(reply_rx, &progress_tx, "org/model")
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.downcast_ref::<UnmetNeeds>().unwrap().packages, ["timm"]);
+    }
+
+    #[tokio::test]
+    async fn a_probe_passes_on_what_the_environment_setup_is_doing() {
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(32);
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(8);
+        reply_tx
+            .send(WorkerEvent::Progress(EmbedProgress::Setup(
+                "Installing Python 3.13".to_string(),
+            )))
+            .await
+            .unwrap();
+        reply_tx
+            .send(WorkerEvent::Info {
+                dimension: 8,
+                max_seq_length: 512,
+            })
+            .await
+            .unwrap();
+
+        await_probe(reply_rx, &progress_tx, "org/model")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Ok(EmbedProgress::Setup(message)) if message == "Installing Python 3.13"
+        ));
+    }
+
+    #[test]
+    fn uninstalling_removes_the_weights_and_the_record() {
+        let dir = tempdir().unwrap();
+        let requirements_path = dir.path().join("requirements.txt");
+        fs::write(&requirements_path, "transformers==5.22.1\n").unwrap();
+        let paths = crate::worker::manager::WorkerPaths {
+            python_override: None,
+            python_package_dir: dir.path().to_path_buf(),
+            requirements_path,
+            uv_bin: dir.path().join("uv"),
+            worker_bin: dir.path().join("worker"),
+            data_dir: dir.path().to_path_buf(),
+        };
+        let repo = paths.hub_cache().join("models--org--old-code");
+        fs::create_dir_all(repo.join("snapshots")).unwrap();
+        let record = ModelEnv {
+            declared: Some(series("4.47")),
+            needs: on_series("4.47"),
+        };
+        record_model_env(&paths, "org/old-code", record).unwrap();
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            paths.clone(),
+            crate::worker::ipc::WorkerKind::Embed,
+        );
+        let installer = SBERTInstaller::new(
+            EmbedderModel("org/old-code".to_string()),
+            manager,
+            "cpu".to_string(),
+            16,
+        );
+
+        installer.uninstall(dir.path()).unwrap();
+
+        assert!(!repo.exists());
+        assert!(recorded_model_env(&paths, "org/old-code")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn prefixes_are_read_from_where_the_worker_downloads_to() {
+        let dir = tempdir().unwrap();
+        let paths = crate::worker::manager::WorkerPaths::resolve(dir.path());
+        let repo = paths.hub_cache().join("models--org--prompted");
+        let snapshot = repo.join("snapshots").join("abc");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(repo.join("refs")).unwrap();
+        fs::write(repo.join("refs").join("main"), "abc").unwrap();
+        fs::write(
+            snapshot.join("config_sentence_transformers.json"),
+            r#"{"prompts": {"query": "ask: ", "passage": "text: "}}"#,
+        )
+        .unwrap();
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            paths,
+            crate::worker::ipc::WorkerKind::Embed,
+        );
+        let installer = SBERTInstaller::new(
+            EmbedderModel("org/prompted".to_string()),
+            manager,
+            "cpu".to_string(),
+            16,
+        );
+
+        let prefixes = installer.prefixes();
+
+        assert_eq!(prefixes.query_prefix, "ask: ");
+        assert_eq!(prefixes.passage_prefix, "text: ");
+    }
+
+    #[tokio::test]
+    async fn a_built_in_model_stays_in_the_base_environment() {
+        let dir = tempdir().unwrap();
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            crate::worker::manager::WorkerPaths::resolve(dir.path()),
+            crate::worker::ipc::WorkerKind::Embed,
+        );
+        let installer = SBERTInstaller::new(
+            EmbedderModel("nomic-ai/nomic-embed-text-v1".to_string()),
+            manager,
+            "cpu".to_string(),
+            16,
+        );
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+
+        installer.install(dir.path(), tx).await.unwrap();
+
+        assert_eq!(*installer.python_env.lock().unwrap(), None);
     }
 
     #[test]

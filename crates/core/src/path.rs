@@ -1,5 +1,4 @@
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 /// Checks if `path` is contained within `base`.
 ///
@@ -133,100 +132,22 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     ret
 }
 
-/// Resolves the Python 3 interpreter path.
-///
-/// It checks:
-/// 1. `WILKES_PYTHON` environment variable.
-/// 2. Common bundled paths relative to the current executable.
-/// 3. The system PATH for `python3` or `python`.
-fn python_probe_args() -> [&'static str; 2] {
-    ["-c", "import sys; print(sys.executable)"]
+/// The interpreter `WILKES_PYTHON` names, when one is. Environments are then
+/// built on it alone, instead of on a Python the app chooses and installs.
+pub fn python_override() -> Option<PathBuf> {
+    std::env::var_os("WILKES_PYTHON")
+        .filter(|python| !python.is_empty())
+        .map(PathBuf::from)
 }
 
-#[cfg(windows)]
-fn suppress_windows_console(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-
-    command.creation_flags(0x0800_0000);
-}
-
-#[cfg(not(windows))]
-fn suppress_windows_console(_command: &mut Command) {}
-
-fn python_candidate_is_usable(path: &Path) -> bool {
-    let mut command = Command::new(path);
-    suppress_windows_console(&mut command);
-    command
-        .args(python_probe_args())
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-pub fn resolve_python() -> anyhow::Result<PathBuf> {
-    let mut attempted = Vec::new();
-
-    // 1. Env override
-    if let Ok(s) = std::env::var("WILKES_PYTHON") {
-        if !s.is_empty() {
-            let p = PathBuf::from(s);
-            if p.exists() && python_candidate_is_usable(&p) {
-                return Ok(p);
-            }
-            attempted.push(p);
-        }
+/// The `uv` that builds Python environments, shipped beside the executable.
+/// `WILKES_UV` points at another one, for running outside a packaged build.
+pub fn resolve_uv() -> anyhow::Result<PathBuf> {
+    if let Some(uv) = std::env::var_os("WILKES_UV").filter(|uv| !uv.is_empty()) {
+        return Ok(PathBuf::from(uv));
     }
-
-    // 2. Bundled paths
-    let exe = std::env::current_exe()?;
-    let bundled = if cfg!(target_os = "macos") {
-        exe.parent().and_then(|p| p.parent()).map(|p| {
-            p.join("Resources")
-                .join("python")
-                .join("bin")
-                .join("python3")
-        })
-    } else if cfg!(target_os = "windows") {
-        exe.parent().map(|p| p.join("python").join("python.exe"))
-    } else {
-        // Linux / Docker
-        exe.parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("lib").join("python").join("bin").join("python3"))
-    };
-
-    if let Some(ref p) = bundled {
-        if p.exists() && python_candidate_is_usable(p) {
-            return Ok(p.clone());
-        }
-        attempted.push(p.clone());
-    }
-
-    // 3. System PATH
-    #[cfg(target_os = "windows")]
-    let system_names = ["python", "py", "python3"];
-
-    #[cfg(not(target_os = "windows"))]
-    let system_names = ["python3", "python"];
-
-    for name in system_names {
-        if let Ok(p) = which::which(name) {
-            if python_candidate_is_usable(&p) {
-                return Ok(p);
-            }
-            attempted.push(p);
-        }
-    }
-
-    let mut msg = "Python interpreter not found. Tried:\n".to_string();
-    for p in attempted {
-        msg.push_str(&format!("- {}\n", p.display()));
-    }
-    #[cfg(target_os = "windows")]
-    msg.push_str("- system PATH (python, py, python3)\n");
-    #[cfg(not(target_os = "windows"))]
-    msg.push_str("- system PATH (python3, python)\n");
-    anyhow::bail!("{}", msg);
+    let name = format!("uv{}", std::env::consts::EXE_SUFFIX);
+    Ok(std::env::current_exe()?.with_file_name(name))
 }
 
 /// Resolves the Python worker package directory.
@@ -264,62 +185,7 @@ pub fn resolve_python_package_dir() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
     use tempfile::tempdir;
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn write_fake_python(dir: &Path) -> PathBuf {
-        write_named_fake_python(dir, "fake-python", true)
-    }
-
-    fn write_named_fake_python(dir: &Path, stem: &str, success: bool) -> PathBuf {
-        #[cfg(windows)]
-        let path = dir.join(format!("{stem}.cmd"));
-        #[cfg(not(windows))]
-        let path = dir.join(stem);
-
-        #[cfg(windows)]
-        {
-            let body = if success {
-                "@echo off\r\nexit /b 0\r\n"
-            } else {
-                "@echo off\r\nexit /b 1\r\n"
-            };
-            std::fs::write(&path, body).unwrap();
-        }
-
-        #[cfg(not(windows))]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let body = if success {
-                "#!/bin/sh\nexit 0\n"
-            } else {
-                "#!/bin/sh\nexit 1\n"
-            };
-            std::fs::write(&path, body).unwrap();
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-        }
-
-        path
-    }
-
-    fn with_temp_env_var<T>(key: &str, value: Option<OsString>, f: impl FnOnce() -> T) -> T {
-        let previous = std::env::var_os(key);
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        let result = f();
-        match previous {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        result
-    }
 
     #[test]
     fn test_normalize_path_more() {
@@ -348,15 +214,6 @@ mod tests {
         let base = dir.path();
         let non_existent = base.join("ghost");
         assert!(!is_under(&non_existent, base));
-    }
-
-    #[test]
-    fn test_resolve_python_no_env_no_bundled() {
-        // Clear environment and simulate no bundled python
-        std::env::remove_var("WILKES_PYTHON");
-        // We can't easily simulate "no system python" without breaking everything
-        // but we can check it doesn't crash.
-        let _ = resolve_python();
     }
 
     #[test]
@@ -394,63 +251,9 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_python_invalid_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("WILKES_PYTHON", "/tmp/nonexistent_python_12345");
-        let result = resolve_python();
-        // It might still succeed if it falls back to system path,
-        // but we want to check that it didn't use the invalid env var immediately.
-        if let Ok(p) = result {
-            assert_ne!(p, PathBuf::from("/tmp/nonexistent_python_12345"));
-        }
-        std::env::remove_var("WILKES_PYTHON");
-    }
-
-    #[test]
     fn test_resolve_python_package_dir_not_found() {
         let result = resolve_python_package_dir();
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_resolve_python_with_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let dir = tempdir().unwrap();
-        let python_path = write_fake_python(dir.path());
-        std::env::set_var("WILKES_PYTHON", python_path.to_str().unwrap());
-
-        let result = resolve_python();
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), python_path);
-
-        std::env::remove_var("WILKES_PYTHON");
-    }
-
-    #[test]
-    fn test_python_candidate_is_usable_detects_failures() {
-        let dir = tempdir().unwrap();
-        let ok = write_named_fake_python(dir.path(), "python-ok", true);
-        let bad = write_named_fake_python(dir.path(), "python-bad", false);
-
-        assert!(python_candidate_is_usable(&ok));
-        assert!(!python_candidate_is_usable(&bad));
-    }
-
-    #[test]
-    fn test_resolve_python_skips_broken_path_candidate() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let dir = tempdir().unwrap();
-        let broken = write_named_fake_python(dir.path(), "python3", false);
-        let working = write_named_fake_python(dir.path(), "python", true);
-        let path = std::env::join_paths([dir.path()]).unwrap();
-
-        let resolved = with_temp_env_var("WILKES_PYTHON", None, || {
-            with_temp_env_var("PATH", Some(path), resolve_python)
-        })
-        .unwrap();
-
-        assert_eq!(resolved, working);
-        assert_ne!(resolved, broken);
     }
 
     #[test]

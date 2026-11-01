@@ -68,7 +68,7 @@ The demo is reset every hour.
   - Default model: `all-miniLM-L6-v2-onnx` 
 - [**Sentence Transformers**](https://www.sbert.net/) (SBERT) via Python
   - Default model: `e5-small-v2`
-  - This has the widest variety of models, but you need to have Python installed. The environment is automatically set up by the app.
+  - This has the widest variety of models. The app sets up the Python it needs by itself, along with a separate environment for any model that needs different packages. Settings → Workers lists them and removes them.
 - **Candle**
   - Default model: `all-miniLM-L6-v2`
 

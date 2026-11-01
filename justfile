@@ -39,9 +39,9 @@ clippy:
 ui-dev:
     npm --prefix ui run dev
 
-# Run the HTTP server in dev mode (requires a separate `just ui-build` or `just ui-dev`)
+# Run the HTTP server in dev mode (requires a separate `just ui-build` or `just ui-dev`, and `uv` on PATH)
 server-dev: ui-install
-    cargo run --bin wilkes-server -- --data-dir ./data --dist-dir ./ui/dist --port 3000
+    WILKES_UV="$(command -v uv)" cargo run --bin wilkes-server -- --data-dir ./data --dist-dir ./ui/dist --port 3000
 
 # Build the server binary for release
 server-build:

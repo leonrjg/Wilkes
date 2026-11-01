@@ -88,9 +88,21 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     libfontconfig1 \
     libfreetype6 \
-    python3 \
-    python3-venv \
     && rm -rf /var/lib/apt/lists/*
+
+# Builds the Python environments under /data. Pinned as in
+# scripts/prepare-sidecar.mjs. It installs the Pythons they run on, too.
+ARG UV_VERSION=0.11.28
+RUN case "$(dpkg --print-architecture)" in \
+      amd64) triple=x86_64-unknown-linux-gnu; sum=e490a6464492183c5d4534a5527fb4440f7f2bb2f228162ad7e4afe076dc0224 ;; \
+      arm64) triple=aarch64-unknown-linux-gnu; sum=03e9fe0a81b0718d0bc84625de3885df6cc3f89a8b6af6121d6b9f6113fb6533 ;; \
+      *) echo "no uv pinned for this architecture" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${triple}.tar.gz" -o /tmp/uv.tar.gz \
+    && echo "${sum}  /tmp/uv.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/uv.tar.gz -C /tmp \
+    && install -D -m 755 "/tmp/uv-${triple}/uv" /app/uv \
+    && rm -rf /tmp/uv.tar.gz "/tmp/uv-${triple}"
 
 RUN useradd -r -u 1001 -s /bin/false wilkes \
     && mkdir -p /app/dist /data /var/cache/fontconfig \

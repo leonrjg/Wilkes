@@ -37,6 +37,13 @@ def event_download_progress(bytes_received: int, total_bytes: int) -> dict:
         "done": False,
     }}}
 
+def event_unmet(packages: List[str], architecture: bool, detail: str) -> dict:
+    return {"Unmet": {
+        "packages": packages,
+        "architecture": architecture,
+        "detail": detail,
+    }}
+
 def event_done() -> dict:
     return {"Done": None}
 

@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 #: model that occupies 1.9 GB at rest.
 DEFAULT_BATCH_SIZE = 16
 
+#: Load weights at the precision they ship in. Below Transformers 5 the default
+#: is float32, which doubles a bfloat16 checkpoint: ReasonIR-8B needs some 30 GB
+#: that way and 15 GB this way, which is the difference between running on a
+#: 24 GB machine and not. Transformers 5 already does this, and still takes the
+#: old name, which is the only one its predecessors know.
+NATIVE_PRECISION = {"torch_dtype": "auto"}
+
 #: How often a model load looks at what has reached the cache.
 DOWNLOAD_POLL_SECONDS = 1.0
 
@@ -112,20 +119,25 @@ def get_model(model_id: str, device: str) -> Any:
                 model_id,
                 device=None if device == "auto" else device,
                 trust_remote_code=True,
-                model_kwargs={"attn_implementation": "sdpa"}
+                model_kwargs={"attn_implementation": "sdpa", **NATIVE_PRECISION}
             )
         except (ValueError, Exception):
             # Fallback to default attention if SDPA is not supported by this architecture
             model = SentenceTransformer(
                 model_id,
                 device=None if device == "auto" else device,
-                trust_remote_code=True
+                trust_remote_code=True,
+                model_kwargs=NATIVE_PRECISION
             )
     finally:
         # Joined, not just signalled: an event written after this request's
         # terminal event would be read as part of the next request.
         stop_watching.set()
         watcher.join()
+    # The host adds every prefix, because only it knows which side of a search
+    # a text is on. Left set, this would go in front of the host's, and a model
+    # that defaults to its document prompt would embed queries as documents.
+    model.default_prompt_name = None
     return model
 
 def safe_encode(model: Any, texts: List[str], **kwargs: Any) -> Any:

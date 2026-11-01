@@ -76,23 +76,25 @@ jobs:
           # to exist at compile time. For test/coverage CI we only need the file to
           # exist; we do not need to build the real worker binary here.
           target_triple="$(rustc -vV | awk '/^host: / { print $2 }')"
-          sidecar_path="crates/desktop/sidecars/wilkes-rust-worker-${target_triple}"
-          mkdir -p "$(dirname "$sidecar_path")"
-          printf '#!/bin/sh\nexit 0\n' > "$sidecar_path"
-          chmod +x "$sidecar_path"
+          for sidecar in wilkes-rust-worker uv; do
+            sidecar_path="crates/desktop/sidecars/${sidecar}-${target_triple}"
+            mkdir -p "$(dirname "$sidecar_path")"
+            printf '#!/bin/sh\nexit 0\n' > "$sidecar_path"
+            chmod +x "$sidecar_path"
+          done
 
       - name: Test with coverage
         run: cargo llvm-cov --workspace --locked --no-report
 
       - name: Write Rust coverage reports
         run: |
-          # Tauri copies the shell placeholder beside the instrumented binaries.
-          # Remove only that copy: llvm-cov requires native object files, and the
+          # Tauri copies the shell placeholders beside the instrumented binaries.
+          # Remove only those copies: llvm-cov requires native object files, and the
           # worker's compiled test binary in debug/deps still supplies its coverage.
           target_triple="$(rustc -vV | awk '/^host: / { print $2 }')"
           cmp "crates/desktop/sidecars/wilkes-rust-worker-${target_triple}" \
             target/llvm-cov-target/debug/wilkes-rust-worker
-          rm target/llvm-cov-target/debug/wilkes-rust-worker
+          rm target/llvm-cov-target/debug/wilkes-rust-worker target/llvm-cov-target/debug/uv
           cargo llvm-cov report --json --summary-only --output-path rust-coverage.json
           cargo llvm-cov report --cobertura --output-path rust-cobertura.xml
 

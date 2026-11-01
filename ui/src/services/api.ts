@@ -269,7 +269,9 @@ export interface SearchApi {
   clearHttpCalls(): Promise<void>;
   getLogs(): Promise<string[]>;
   clearLogs(): Promise<void>;
-  getPythonInfo(): Promise<string>;
+  getPythonEnvs(): Promise<import("../lib/types").PythonEnvInventory>;
+  removePythonEnvs(ids: string[]): Promise<void>;
+  removeCustomModel(engine: import("../lib/types").EmbeddingEngine, modelId: string): Promise<void>;
   getDataPaths(): Promise<DataPaths>;
   openPath(path: string): Promise<void>;
   revealPath(path: string): Promise<void>;

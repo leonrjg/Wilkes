@@ -1303,6 +1303,25 @@ export interface LiteratureSearchResponse {
  *  (`"openalex"`, `"custom:crossref"`). */
 export type MetadataSourcePreference = string;
 
+/** One built Python environment. See `python_env.rs`. */
+export interface PythonEnvInfo {
+  id: string;
+  is_base: boolean;
+  transformers: string;
+  python: string;
+  /** Packages it holds beyond the usual, because a model's code imports them. */
+  packages: string[];
+  size_bytes: number;
+  models: string[];
+  last_used_at: string | null;
+}
+
+export interface PythonEnvInventory {
+  envs: PythonEnvInfo[];
+  /** Everything the environments occupy, shared files counted once. */
+  total_bytes: number;
+}
+
 export interface WorkerStatus {
   active: boolean;
   /** "embed" or "generate". A sibling of `engine`, not a replacement. */
@@ -1536,7 +1555,8 @@ export interface IndexActivity {
 
 export type EmbedProgress =
   | { Download: DownloadProgress }
-  | { Build: IndexBuildProgress };
+  | { Build: IndexBuildProgress }
+  | { Setup: string };
 
 export type EmbedOperation = "Download" | "Build";
 

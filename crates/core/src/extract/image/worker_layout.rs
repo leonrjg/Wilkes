@@ -158,6 +158,7 @@ impl LayoutModel for WorkerLayout {
             recognize: None,
             layout: Some(LayoutRequest { image_paths }),
             table: None,
+            python_env: None,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -266,10 +267,10 @@ mod tests {
     fn test_manager() -> WorkerManager {
         crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths {
-                python_path: PathBuf::new(),
+                python_override: None,
                 python_package_dir: PathBuf::new(),
                 requirements_path: PathBuf::new(),
-                venv_dir: PathBuf::new(),
+                uv_bin: PathBuf::new(),
                 worker_bin: PathBuf::new(),
                 data_dir: PathBuf::new(),
             },

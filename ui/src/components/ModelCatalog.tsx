@@ -24,6 +24,9 @@ interface ModelCatalogProps<T extends CatalogModel> {
   toolbarContent?: ReactNode;
   onFilterChange: (filter: string) => void;
   onSelect: (model: T) => void;
+  /** Offered only on the models this returns true for. */
+  canRemove?: (model: T) => boolean;
+  onRemove?: (model: T) => void;
 }
 
 export function formatModelBytes(bytes: number): string {
@@ -50,6 +53,8 @@ export default function ModelCatalog<T extends CatalogModel>({
   toolbarContent,
   onFilterChange,
   onSelect,
+  canRemove,
+  onRemove,
 }: ModelCatalogProps<T>) {
   const search = filter.trim().toLowerCase();
   const filtered = search
@@ -107,12 +112,12 @@ export default function ModelCatalog<T extends CatalogModel>({
         {sorted.map((model) => {
           const selected = selectedModelId === model.model_id;
           return (
+            <div key={`${catalogKey}:${model.model_id}`} className="group relative">
             <button
-              key={`${catalogKey}:${model.model_id}`}
               disabled={disabled}
               type="button"
               onClick={() => onSelect(model)}
-              className={`flex flex-col rounded-lg p-2 text-left transition-all ${
+              className={`flex w-full flex-col rounded-lg p-2 text-left transition-all ${
                 selected
                   ? "bg-[var(--bg-active)] ring-1 ring-[var(--accent-blue)]/50"
                   : "border border-transparent hover:bg-[var(--bg-active)]/50"
@@ -168,6 +173,18 @@ export default function ModelCatalog<T extends CatalogModel>({
                 </span>
               )}
             </button>
+            {onRemove && canRemove?.(model) && !selected && (
+              <button
+                type="button"
+                disabled={disabled}
+                aria-label={`Remove ${model.display_name}`}
+                onClick={() => onRemove(model)}
+                className="absolute bottom-1 right-1 rounded px-1 text-[9px] text-[var(--text-dim)] opacity-0 transition-opacity hover:text-red-400 focus:opacity-100 group-hover:opacity-100 disabled:hidden"
+              >
+                Remove
+              </button>
+            )}
+            </div>
           );
         })}
       </div>

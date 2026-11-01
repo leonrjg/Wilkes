@@ -415,11 +415,23 @@ describe("TauriSearchApi", () => {
     expect(invoke).toHaveBeenCalledWith("reveal_path", { path: "/some/path" });
   });
 
-  it("should call get_python_info", async () => {
-    (invoke as any).mockResolvedValue("/usr/bin/python");
-    const result = await api.getPythonInfo();
-    expect(invoke).toHaveBeenCalledWith("get_python_info");
-    expect(result).toBe("/usr/bin/python");
+  it("should call get_python_envs", async () => {
+    const inventory = { envs: [], total_bytes: 0 };
+    (invoke as any).mockResolvedValue(inventory);
+    expect(await api.getPythonEnvs()).toBe(inventory);
+    expect(invoke).toHaveBeenCalledWith("get_python_envs");
+  });
+
+  it("should call remove_python_envs", async () => {
+    (invoke as any).mockResolvedValue(undefined);
+    await api.removePythonEnvs(["abc"]);
+    expect(invoke).toHaveBeenCalledWith("remove_python_envs", { ids: ["abc"] });
+  });
+
+  it("should call remove_custom_model", async () => {
+    (invoke as any).mockResolvedValue(undefined);
+    await api.removeCustomModel("SBERT", "org/model");
+    expect(invoke).toHaveBeenCalledWith("remove_custom_model", { engine: "SBERT", modelId: "org/model" });
   });
 
   it("should call cancel_search", async () => {

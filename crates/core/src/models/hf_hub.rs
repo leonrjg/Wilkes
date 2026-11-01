@@ -62,6 +62,35 @@ where
     Ok(info.siblings)
 }
 
+/// How long a model's `config.json` gets. A small file, so this only has to
+/// tell a slow connection from a dead one.
+const MODEL_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Fetch `config.json` for `model_id` at the repo's default branch. `None` means
+/// the repository answered and publishes no such file, which is ordinary for a
+/// repository that is not a Transformers model.
+pub fn fetch_model_config(model_id: &str) -> anyhow::Result<Option<String>> {
+    let url = format!("https://huggingface.co/{model_id}/resolve/main/config.json");
+    let guard = crate::http_history::CallGuard::start("Hugging Face metadata", "GET", &url);
+    let response = ureq::get(&url).timeout(MODEL_CONFIG_TIMEOUT).call();
+    let (status, error) = match &response {
+        Ok(response) => (Some(response.status()), None),
+        Err(ureq::Error::Status(status, _)) => (Some(*status), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    guard.finish(status, error);
+    match response {
+        Ok(response) => response
+            .into_string()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("Reading config.json of {model_id} failed: {e}")),
+        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!(
+            "Fetching config.json of {model_id} failed: {e}"
+        )),
+    }
+}
+
 /// Fetch total download size for `model_id` from the HuggingFace API.
 /// Sums all files in the repo — accurate for SBERT, an upper bound for Candle.
 pub fn fetch_model_size(model_id: &str) -> anyhow::Result<u64> {

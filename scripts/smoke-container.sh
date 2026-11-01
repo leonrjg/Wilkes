@@ -12,7 +12,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Exercise the bundled executable and its dynamic libraries; EOF shuts it down.
-docker run --rm --entrypoint /bin/sh "$image" -c '/app/wilkes-rust-worker </dev/null'
+docker run --rm --entrypoint /bin/sh "$image" -c '/app/wilkes-rust-worker </dev/null && /app/uv --version'
 container="$(docker run --detach --publish 127.0.0.1::2000 \
   --tmpfs /data:uid=1001,gid=1001 "$image")"
 address="$(docker port "$container" 2000/tcp)"

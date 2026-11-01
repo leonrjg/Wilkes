@@ -148,6 +148,7 @@ impl OcrEngine for WorkerOcr {
             recognize: Some(RecognitionRequest { image_paths }),
             layout: None,
             table: None,
+            python_env: None,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -302,10 +303,10 @@ mod tests {
     fn test_manager() -> WorkerManager {
         crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths {
-                python_path: PathBuf::new(),
+                python_override: None,
                 python_package_dir: PathBuf::new(),
                 requirements_path: PathBuf::new(),
-                venv_dir: PathBuf::new(),
+                uv_bin: PathBuf::new(),
                 worker_bin: PathBuf::new(),
                 data_dir: PathBuf::new(),
             },
@@ -348,10 +349,10 @@ mod tests {
 
         let (manager, _events, loop_fut) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths {
-                python_path: std::path::PathBuf::new(),
+                python_override: None,
                 python_package_dir: std::path::PathBuf::new(),
                 requirements_path: std::path::PathBuf::new(),
-                venv_dir: std::path::PathBuf::new(),
+                uv_bin: std::path::PathBuf::new(),
                 worker_bin,
                 data_dir: model_dir.clone(),
             },

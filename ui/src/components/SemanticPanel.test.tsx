@@ -12,7 +12,9 @@ describe("SemanticPanel", () => {
     getSettings: vi.fn(),
     getEmbedderCapabilities: vi.fn(),
     getIndexStatus: vi.fn(),
-    getPythonInfo: vi.fn(),
+    getPythonEnvs: vi.fn(),
+    removePythonEnvs: vi.fn(),
+    removeCustomModel: vi.fn(),
     onEmbedProgress: vi.fn().mockImplementation((h) => {
       progressHandler = h;
       return Promise.resolve(() => {});
@@ -115,7 +117,9 @@ describe("SemanticPanel", () => {
       ]),
     );
     mockApi.getIndexStatus.mockResolvedValue(null);
-    mockApi.getPythonInfo.mockResolvedValue("/usr/bin/python3");
+    mockApi.getPythonEnvs.mockResolvedValue({ envs: [], total_bytes: 0 });
+    mockApi.removePythonEnvs.mockResolvedValue(undefined);
+    mockApi.removeCustomModel.mockResolvedValue(undefined);
     mockApi.getLogs.mockResolvedValue([]);
     mockApi.getModelSize.mockResolvedValue(1024 * 1024 * 100);
     mockApi.updateSettings.mockImplementation(async (patch: any) => ({
@@ -237,6 +241,119 @@ describe("SemanticPanel", () => {
       fireEvent.click(actionBtn);
     });
     expect(mockApi.buildIndex).toHaveBeenCalledWith("/test", expect.objectContaining({ model: "new-id" }));
+  });
+
+  describe("Python environments", () => {
+    const sbertSettings = (selected: string, custom: string[]) => ({
+      ...defaultSettings,
+      semantic: {
+        ...defaultSettings.semantic,
+        selected: { engine: "SBERT", model: selected, dimension: 384 },
+        custom_models: custom.map((model_id) => ({ engine: "SBERT", model_id })),
+      },
+    });
+    const env = (models: string[]) => ({
+      id: "e",
+      is_base: false,
+      transformers: "4.47.1",
+      python: "3.13",
+      packages: [],
+      size_bytes: 600 * 1_048_576,
+      models,
+      last_used_at: null,
+    });
+
+    const renderOn = async (selected: string, custom: string[], models: any[]) => {
+      mockApi.getSettings.mockResolvedValue(sbertSettings(selected, custom));
+      mockApi.getEmbedderCapabilities.mockResolvedValue(manifest(models));
+      await act(async () => {
+        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      });
+    };
+
+    const models = [
+      { engine: "SBERT", model_id: "org/kept", display_name: "Kept", is_cached: true },
+      { engine: "SBERT", model_id: "org/old", display_name: "Old", is_cached: true },
+    ];
+
+    it("says which environment the selected model runs in", async () => {
+      mockApi.getPythonEnvs.mockResolvedValue({ envs: [env(["org/kept"])], total_bytes: 0 });
+
+      await renderOn("org/kept", ["org/kept"], models);
+
+      expect(screen.getByText("Transformers 4.47.1 on Python 3.13")).toBeInTheDocument();
+    });
+
+    it("says an environment is coming for a custom model not installed yet", async () => {
+      await renderOn("org/kept", ["org/kept"], models);
+
+      expect(screen.getByText("Set up to suit this model when it is installed")).toBeInTheDocument();
+    });
+
+    it("offers removal only for models the user added", async () => {
+      await renderOn("org/kept", ["org/old"], [
+        ...models,
+        { engine: "SBERT", model_id: "org/shipped", display_name: "Shipped", is_cached: true },
+      ]);
+
+      expect(screen.getByRole("button", { name: "Remove Old" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Remove Shipped" })).not.toBeInTheDocument();
+    });
+
+    it("does not offer to remove the selected model", async () => {
+      await renderOn("org/old", ["org/old"], models);
+
+      expect(screen.queryByRole("button", { name: "Remove Old" })).not.toBeInTheDocument();
+    });
+
+    it("removes a model and, when nothing else uses it, its environment", async () => {
+      mockApi.getPythonEnvs.mockResolvedValue({ envs: [env(["org/old"])], total_bytes: 0 });
+      await renderOn("org/kept", ["org/old"], models);
+
+      fireEvent.click(screen.getByRole("button", { name: "Remove Old" }));
+      expect(screen.getByText(/Also remove its Python environment \(600 MB\)/)).toBeInTheDocument();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+      });
+
+      expect(mockApi.removeCustomModel).toHaveBeenCalledWith("SBERT", "org/old");
+      expect(mockApi.removePythonEnvs).toHaveBeenCalledWith(["e"]);
+    });
+
+    it("keeps an environment the user chose to keep or another model shares", async () => {
+      mockApi.getPythonEnvs.mockResolvedValue({ envs: [env(["org/old", "org/other"])], total_bytes: 0 });
+      await renderOn("org/kept", ["org/old"], models);
+
+      fireEvent.click(screen.getByRole("button", { name: "Remove Old" }));
+      expect(screen.queryByText(/Also remove its Python environment/)).not.toBeInTheDocument();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+      });
+
+      expect(mockApi.removeCustomModel).toHaveBeenCalled();
+      expect(mockApi.removePythonEnvs).not.toHaveBeenCalled();
+    });
+
+    it("warns when the current index was built with the model", async () => {
+      mockApi.getIndexStatus.mockResolvedValue({ model_id: "org/old", engine: "SBERT" });
+      await renderOn("org/kept", ["org/old"], models);
+
+      fireEvent.click(screen.getByRole("button", { name: "Remove Old" }));
+
+      expect(screen.getByText(/will need rebuilding/)).toBeInTheDocument();
+    });
+
+    it("shows what the environment setup is doing while it does", async () => {
+      await renderOn("org/kept", ["org/kept"], [
+        { engine: "SBERT", model_id: "org/kept", display_name: "Kept", is_cached: false },
+      ]);
+
+      await act(async () => {
+        progressHandler({ Setup: "Installing Python 3.13" });
+      });
+
+      expect(screen.getByText("Installing Python 3.13")).toBeInTheDocument();
+    });
   });
 
   it("handles model download and triggering progress", async () => {

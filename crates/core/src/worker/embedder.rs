@@ -1,5 +1,6 @@
 use super::ipc::{WorkerEvent, WorkerRequest, WorkerRole};
 use super::manager::{ManagerCommand, WorkerManager};
+use super::EnvNeeds;
 use crate::embed::{Embedder, EmbeddingSpaceIdentity};
 use crate::types::EmbeddingEngine;
 
@@ -16,6 +17,9 @@ pub struct WorkerEmbedderConfig {
     /// Texts the worker may put through the model at once. The user's resource
     /// control for embedding; see `SemanticSettings::default_embed_batch_size`.
     pub batch_size: usize,
+    /// The Python environment the model needs, `None` being the base one or an
+    /// engine that has no such thing.
+    pub python_env: Option<EnvNeeds>,
 }
 
 /// Implements `Embedder` by dispatching to a worker subprocess via `WorkerManager`.
@@ -34,6 +38,7 @@ pub struct WorkerEmbedder {
     passage_prefix: String,
     embedding_space_identity: EmbeddingSpaceIdentity,
     batch_size: usize,
+    python_env: Option<EnvNeeds>,
 }
 
 impl WorkerEmbedder {
@@ -50,6 +55,7 @@ impl WorkerEmbedder {
             passage_prefix: config.passage_prefix,
             embedding_space_identity: config.embedding_space_identity,
             batch_size: config.batch_size,
+            python_env: config.python_env,
         }
     }
 
@@ -66,6 +72,7 @@ impl WorkerEmbedder {
             recognize: None,
             layout: None,
             table: None,
+            python_env: self.python_env.clone(),
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -161,10 +168,10 @@ mod tests {
     #[tokio::test]
     async fn test_worker_embedder_new() {
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
-            venv_dir: PathBuf::from("v"),
+            uv_bin: PathBuf::from("v"),
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
@@ -173,6 +180,7 @@ mod tests {
 
         let config = WorkerEmbedderConfig {
             batch_size: crate::worker::ipc::default_embed_batch_size(),
+            python_env: None,
             model_id: "test-model".to_string(),
             dimension: 384,
             device: "cpu".to_string(),
@@ -197,10 +205,10 @@ mod tests {
     #[tokio::test]
     async fn test_worker_embedder_prefixes() {
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
-            venv_dir: PathBuf::from("v"),
+            uv_bin: PathBuf::from("v"),
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
@@ -210,6 +218,7 @@ mod tests {
 
         let config = WorkerEmbedderConfig {
             batch_size: crate::worker::ipc::default_embed_batch_size(),
+            python_env: None,
             model_id: "test-model".to_string(),
             dimension: 384,
             device: "cpu".to_string(),
@@ -270,10 +279,10 @@ mod tests {
         }
 
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
-            venv_dir: PathBuf::from("v"),
+            uv_bin: PathBuf::from("v"),
             worker_bin: worker_bin.clone(),
             data_dir: dir.path().to_path_buf(),
         };
@@ -283,6 +292,7 @@ mod tests {
 
         let config = WorkerEmbedderConfig {
             batch_size: crate::worker::ipc::default_embed_batch_size(),
+            python_env: None,
             model_id: "m".to_string(),
             dimension: 384,
             device: "cpu".to_string(),

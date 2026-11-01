@@ -513,6 +513,7 @@ async fn embedder_capabilities_for_ctx(
     let settings = ctx.get_settings().await;
     Ok(wilkes_core::embed::dispatch::model_capabilities(
         &ctx.model_dir,
+        &ctx.sbert_cache(),
         &settings.semantic.custom_models,
     ))
 }
@@ -1254,10 +1255,29 @@ async fn switch_workspace(app: AppHandle, workspace_id: String) -> Result<Worksp
 }
 
 #[tauri::command]
-async fn get_python_info() -> Result<String, String> {
-    wilkes_core::path::resolve_python()
-        .map(|p| p.display().to_string())
-        .map_err(|e| e.to_string())
+async fn get_python_envs(
+    app: AppHandle,
+) -> Result<wilkes_core::worker::PythonEnvInventory, String> {
+    app_context(&app)
+        .python_environments()
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn remove_python_envs(app: AppHandle, ids: Vec<String>) -> Result<(), String> {
+    app_context(&app).remove_python_environments(ids).await
+}
+
+#[tauri::command]
+async fn remove_custom_model(
+    app: AppHandle,
+    engine: wilkes_core::types::EmbeddingEngine,
+    model_id: String,
+) -> Result<(), String> {
+    app_context(&app)
+        .remove_custom_model(engine, model_id)
+        .await
 }
 
 #[tauri::command]
@@ -2482,7 +2502,9 @@ pub fn run() {
             path_kinds,
             trash_file,
             get_file_metadata,
-            get_python_info,
+            get_python_envs,
+            remove_python_envs,
+            remove_custom_model,
             get_settings,
             update_settings,
             configure_external_mcp,
@@ -3000,10 +3022,10 @@ mod tests {
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -3080,10 +3102,10 @@ mod tests {
         let settings_path = dir.path().join("settings.json");
         let emitter = Arc::new(MockEmitter);
         let paths = WorkerPaths {
-            python_path: std::path::PathBuf::from("python"),
+            python_override: None,
             python_package_dir: std::path::PathBuf::from("pkg"),
             requirements_path: std::path::PathBuf::from("reqs.txt"),
-            venv_dir: std::path::PathBuf::from("venv"),
+            uv_bin: std::path::PathBuf::from("venv"),
             worker_bin: std::path::PathBuf::from("worker"),
             data_dir: dir.path().to_path_buf(),
         };
@@ -3544,8 +3566,6 @@ mod tests {
         // The workspace path is its own answer, not the installation's: the
         // Data page names both, and naming one twice is what it used to do.
         assert_eq!(paths.workspace, "test-data/workspaces/w1");
-
-        let _ = super::get_python_info().await;
 
         super::clear_logs().await.unwrap();
         let logs = super::get_logs().await.unwrap();

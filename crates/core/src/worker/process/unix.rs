@@ -42,8 +42,9 @@ impl WorkerProcess {
         paths: &WorkerPaths,
         req: &WorkerRequest,
         active_pid: &AtomicU32,
+        reply: &mpsc::Sender<WorkerEvent>,
     ) -> Result<Self, String> {
-        let plan = build_command_plan(paths, req).await?;
+        let plan = build_command_plan(paths, req, reply).await?;
         let mut command = apply_command_plan(&plan);
         let mut child = command
             .stdin(Stdio::piped())

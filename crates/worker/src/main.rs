@@ -984,6 +984,7 @@ mod tests {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
         }
     }
 

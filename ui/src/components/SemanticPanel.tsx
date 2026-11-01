@@ -10,6 +10,7 @@ import {
   type SemanticSettings,
   type SelectedEmbedder,
   type IndexStatus,
+  type PythonEnvInventory,
   type EmbeddingEngine,
 } from "../lib/types";
 import type { SearchApi } from "../services/api";
@@ -19,7 +20,7 @@ import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 import LogsPanel from "./LogsPanel";
 import {CornerLeftDown, CornerRightUp} from "react-feather";
 import { Tooltip } from "@leonrjg/wilkes-reader";
-import ModelCatalog from "./ModelCatalog";
+import ModelCatalog, { formatModelBytes } from "./ModelCatalog";
 
 // ---------------------------------------------------------------------------
 // State & reducer
@@ -48,8 +49,9 @@ interface PanelState {
   progress: ProgressState | null;
   isCancelling: boolean;
   supportedEngines: EmbeddingEngine[];
-  pythonPath: string | null;
-  pythonError: string | null;
+  /** What the setup of a Python environment is doing, while it does. */
+  setupMessage: string | null;
+  pythonEnvs: PythonEnvInventory | null;
   pendingBuild: PendingBuild | null;
   buildRequest: PendingBuild | null;
 }
@@ -62,8 +64,8 @@ const INITIAL_STATE: PanelState = {
   progress: null,
   isCancelling: false,
   supportedEngines: [],
-  pythonPath: null,
-  pythonError: null,
+  setupMessage: null,
+  pythonEnvs: null,
   pendingBuild: null,
   buildRequest: null,
 };
@@ -82,7 +84,8 @@ type Action =
   | { type: "cancel_completed" }
   | { type: "cancel_failed" }
   | { type: "index_deleted" }
-  | { type: "python_info"; pythonPath: string | null; pythonError: string | null }
+  | { type: "setup"; message: string }
+  | { type: "python_envs"; inventory: PythonEnvInventory | null }
   | { type: "model_size_fetched"; modelId: string; sizeBytes: number }
   | { type: "queue_build"; build: PendingBuild }
   | { type: "launch_pending_build" }
@@ -114,7 +117,7 @@ function reducer(state: PanelState, action: Action): PanelState {
         isCancelling: false,
       };
     case "progress":
-      return { ...state, activeOp: action.op, progress: action.progress };
+      return { ...state, activeOp: action.op, progress: action.progress, setupMessage: null };
     case "op_done":
       return {
         ...state,
@@ -152,8 +155,10 @@ function reducer(state: PanelState, action: Action): PanelState {
       return { ...state, isCancelling: false };
     case "index_deleted":
       return { ...state, indexStatus: null };
-    case "python_info":
-      return { ...state, pythonPath: action.pythonPath, pythonError: action.pythonError };
+    case "setup":
+      return { ...state, activeOp: "downloading", setupMessage: action.message };
+    case "python_envs":
+      return { ...state, pythonEnvs: action.inventory };
     case "model_size_fetched":
       return {
         ...state,
@@ -238,6 +243,8 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   const [sizeFetchingFor, setSizeFetchingFor] = useState<string | null>(null);
   const [customModelInput, setCustomModelInput] = useState("");
   const [isAddingCustom, setIsAddingCustom] = useState(false);
+  const [modelToRemove, setModelToRemove] = useState<{ model_id: string; display_name: string } | null>(null);
+  const [removeEnvToo, setRemoveEnvToo] = useState(true);
   const [showLogs, setShowLogs] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   // Bumped to re-trigger model + index fetches after async ops (download, build, etc.)
@@ -319,22 +326,22 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   }, [api, directory, effectiveSelected?.engine, effectiveSelected?.model, fetchEpoch]);
 
   // ---------------------------------------------------------------------------
-  // Effect: python info (only for SBERT)
+  // Effect: Python environments (only for SBERT)
   // ---------------------------------------------------------------------------
 
   useEffect(() => {
     if (currentEngine !== "SBERT") {
-      dispatch({ type: "python_info", pythonPath: null, pythonError: null });
+      dispatch({ type: "python_envs", inventory: null });
       return;
     }
     let cancelled = false;
-    api.getPythonInfo().then((p) => {
-      if (!cancelled) dispatch({ type: "python_info", pythonPath: p, pythonError: null });
+    api.getPythonEnvs().then((inventory) => {
+      if (!cancelled) dispatch({ type: "python_envs", inventory });
     }).catch((e) => {
-      if (!cancelled) dispatch({ type: "python_info", pythonPath: null, pythonError: e.toString() });
+      if (!cancelled) dispatch({ type: "error", error: e.toString() });
     });
     return () => { cancelled = true; };
-  }, [api, currentEngine]);
+  }, [api, currentEngine, fetchEpoch]);
 
   // ---------------------------------------------------------------------------
   // Effect: embed event subscriptions
@@ -350,6 +357,8 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
           dispatch({ type: "progress", op: "downloading", progress: { current: p.Download.bytes_received, total: p.Download.total_bytes } });
         } else if ("Build" in p) {
           dispatch({ type: "progress", op: "building", progress: { current: p.Build.files_processed, total: p.Build.total_files } });
+        } else if ("Setup" in p) {
+          dispatch({ type: "setup", message: p.Setup });
         }
       })
       .then((u) => { if (mounted) unlisteners.push(u); else u(); })
@@ -537,6 +546,36 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     }
   }, [phase, settings, effectiveSelected, api, directory, handleCurrentRootIndexRemoved, refreshSemanticReady]);
 
+  const customModelIds = new Set(
+    (settings?.custom_models ?? []).filter((m) => m.engine === currentEngine).map((m) => m.model_id),
+  );
+
+  const pythonEnvOf = (modelId: string | undefined) =>
+    state.pythonEnvs?.envs.find((env) => modelId !== undefined && env.models.includes(modelId)) ?? null;
+
+  const selectedPythonEnv = pythonEnvOf(effectiveSelected?.model);
+  const pythonEnvLabel = selectedPythonEnv
+    ? `Transformers ${selectedPythonEnv.transformers} on Python ${selectedPythonEnv.python}`
+    : effectiveSelected && customModelIds.has(effectiveSelected.model)
+      ? "Set up to suit this model when it is installed"
+      : "The shared base environment, set up on first use";
+
+  const removalEnv = pythonEnvOf(modelToRemove?.model_id);
+  const removalEnvGoes = removalEnv !== null && !removalEnv.is_base && removalEnv.models.length === 1;
+
+  const handleRemoveCustomModel = async () => {
+    if (!modelToRemove || !currentEngine) return;
+    dispatch({ type: "clear_error" });
+    try {
+      await api.removeCustomModel(currentEngine, modelToRemove.model_id);
+      if (removalEnvGoes && removeEnvToo) await api.removePythonEnvs([removalEnv.id]);
+      invalidate();
+    } catch (e: any) {
+      dispatch({ type: "error", error: e.toString() });
+    }
+    setModelToRemove(null);
+  };
+
   const handleAddCustomModel = async () => {
     if (!settings || !customModelInput.trim()) return;
 
@@ -580,7 +619,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     state.progress && state.progress.total > 0
       ? Math.round((state.progress.current / state.progress.total) * 100)
       : 0;
-  const progressLabel = phase === "downloading" ? "Downloading model" : "Indexing";
+  const progressLabel = state.setupMessage ?? (phase === "downloading" ? "Downloading model" : "Indexing");
 
   // ---------------------------------------------------------------------------
   // Render
@@ -648,14 +687,8 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
         </p>
         {currentEngine === "SBERT" && (
           <div className="mt-1.5 px-2 py-1.5 rounded bg-[var(--bg-active)] flex items-start gap-1.5">
-            <span className="text-[10px] text-[var(--text-dim)] shrink-0 mt-px uppercase font-bold tracking-tighter">python runtime</span>
-            {state.pythonPath ? (
-              <span className="text-[10px] text-[var(--text-main)] font-mono break-all selectable">{state.pythonPath}</span>
-            ) : (
-              <span className="text-[10px] text-[var(--accent-red,#f87171)] font-mono break-all selectable">
-                {state.pythonError ?? "Resolving…"}
-              </span>
-            )}
+            <span className="text-[10px] text-[var(--text-dim)] shrink-0 mt-px uppercase font-bold tracking-tighter">python</span>
+            <span className="text-[10px] text-[var(--text-main)] selectable">{pythonEnvLabel}</span>
           </div>
         )}
       </section>
@@ -674,6 +707,11 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
           emptyMessage="No models found for this engine"
           onFilterChange={setModelFilter}
           onSelect={(model) => void handleModelChange(model.model_id)}
+          canRemove={(model) => customModelIds.has(model.model_id)}
+          onRemove={(model) => {
+            setRemoveEnvToo(true);
+            setModelToRemove(model);
+          }}
           toolbarAction={
             currentEngine && supportsCustomModels(currentEngine) ? (
               <button
@@ -690,7 +728,44 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
             ) : undefined
           }
           toolbarContent={
-            isAddingCustom ? (
+            modelToRemove ? (
+              <div className="animate-in fade-in slide-in-from-top-1 flex flex-col gap-2 rounded-lg border border-[var(--border-main)]/30 bg-[var(--bg-active)] p-2">
+                <p className="text-[10px] text-[var(--text-main)]">
+                  Remove {modelToRemove.display_name} and its downloaded files?
+                </p>
+                {state.indexStatus?.model_id === modelToRemove.model_id && (
+                  <p className="text-[10px] text-amber-500">
+                    The current index was built with this model and will need rebuilding.
+                  </p>
+                )}
+                {removalEnvGoes && (
+                  <label className="flex items-center gap-1.5 text-[10px] text-[var(--text-muted)]">
+                    <input
+                      type="checkbox"
+                      checked={removeEnvToo}
+                      onChange={(event) => setRemoveEnvToo(event.target.checked)}
+                    />
+                    Also remove its Python environment ({formatModelBytes(removalEnv.size_bytes)}), which nothing else uses
+                  </label>
+                )}
+                <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setModelToRemove(null)}
+                    className="rounded border border-[var(--border-main)] px-3 py-1 text-[10px] text-[var(--text-muted)] hover:text-[var(--text-main)]"
+                  >
+                    Keep
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleRemoveCustomModel()}
+                    className="rounded bg-red-700 px-3 py-1 text-[10px] font-semibold text-white hover:bg-red-600"
+                  >
+                    Remove
+                  </button>
+                </div>
+              </div>
+            ) : isAddingCustom ? (
               <div className="animate-in fade-in slide-in-from-top-1 flex flex-col gap-2 rounded-lg border border-[var(--border-main)]/30 bg-[var(--bg-active)] p-2">
                 <p className="text-[10px] text-[var(--text-dim)]">
                   Enter HuggingFace Repository ID:

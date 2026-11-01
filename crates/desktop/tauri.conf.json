@@ -18,7 +18,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["sidecars/wilkes-rust-worker"],
+    "externalBin": ["sidecars/wilkes-rust-worker", "sidecars/uv"],
     "fileAssociations": [
       {
         "ext": ["pdf"],

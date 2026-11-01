@@ -565,10 +565,28 @@ export class HttpSearchApi implements SearchApi {
     if (!res.ok && res.status !== 204) throw new Error(`clearLogs failed: ${res.status}`);
   }
 
-  async getPythonInfo(): Promise<string> {
-    const res = await fetch("/api/worker/python-info");
-    if (!res.ok) throw new Error(`getPythonInfo failed: ${res.status}`);
-    return res.json() as Promise<string>;
+  async getPythonEnvs(): Promise<import("../lib/types").PythonEnvInventory> {
+    const res = await fetch("/api/worker/python-envs");
+    if (!res.ok) throw await responseError(res, "getPythonEnvs");
+    return res.json() as Promise<import("../lib/types").PythonEnvInventory>;
+  }
+
+  async removePythonEnvs(ids: string[]): Promise<void> {
+    const res = await fetch("/api/worker/python-envs/remove", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    });
+    if (!res.ok) throw await responseError(res, "removePythonEnvs");
+  }
+
+  async removeCustomModel(engine: import("../lib/types").EmbeddingEngine, modelId: string): Promise<void> {
+    const res = await fetch("/api/models/custom/remove", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ engine, model_id: modelId }),
+    });
+    if (!res.ok) throw await responseError(res, "removeCustomModel");
   }
 
   async getDataPaths(): Promise<any> {

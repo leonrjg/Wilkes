@@ -88,10 +88,10 @@ mod tests {
         std::fs::write(uploads_dir.join("settings.json"), "{}").unwrap();
         let settings_path = dir.path().join("settings.json");
         let paths = WorkerPaths {
-            python_path: dir.path().join("python"),
+            python_override: None,
             python_package_dir: dir.path().join("pkg"),
             requirements_path: dir.path().join("reqs.txt"),
-            venv_dir: dir.path().join("venv"),
+            uv_bin: dir.path().join("venv"),
             worker_bin: dir.path().join("worker"),
             data_dir: dir.path().to_path_buf(),
         };

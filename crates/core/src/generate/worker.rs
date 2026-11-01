@@ -56,6 +56,7 @@ impl WorkerGenerator {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
         }
     }
 }
@@ -176,10 +177,10 @@ mod tests {
 
     fn paths(dir: &std::path::Path) -> WorkerPaths {
         WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
-            venv_dir: PathBuf::from("v"),
+            uv_bin: PathBuf::from("v"),
             worker_bin: dir.join("worker.sh"),
             data_dir: dir.to_path_buf(),
         }
