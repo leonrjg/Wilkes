@@ -30,6 +30,13 @@ def event_embeddings(vectors: List[List[float]]) -> dict:
 def event_info(dimension: int, max_seq_length: int) -> dict:
     return {"Info": {"dimension": dimension, "max_seq_length": max_seq_length}}
 
+def event_download_progress(bytes_received: int, total_bytes: int) -> dict:
+    return {"Progress": {"Download": {
+        "bytes_received": bytes_received,
+        "total_bytes": total_bytes,
+        "done": False,
+    }}}
+
 def event_done() -> dict:
     return {"Done": None}
 

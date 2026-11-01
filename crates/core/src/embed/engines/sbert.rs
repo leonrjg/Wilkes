@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::super::Embedder;
 use super::aux_config;
 use crate::embed::installer::EmbedderInstaller;
-use crate::models::progress::ProgressTx;
+use crate::models::progress::{EmbedProgress, ProgressTx};
 use crate::types::{EmbedderModel, EmbeddingEngine, ModelDescriptor};
 use crate::worker::embedder::{WorkerEmbedder, WorkerEmbedderConfig};
 use crate::worker::ipc::{WorkerEvent, WorkerRequest, WorkerRole};
@@ -115,6 +115,48 @@ pub fn list_supported_models(data_dir: &Path) -> Vec<ModelDescriptor> {
         .collect()
 }
 
+/// Wait for the worker's answer to a probe, however long the answer takes.
+///
+/// There is no deadline here, on purpose. Probing a model that is not cached
+/// yet is its whole download and load, which depends on the size of the model
+/// and the speed of the connection and says nothing about whether anything is
+/// wrong. A deadline also never stopped that work: the worker carried on with
+/// nobody waiting for it. A probe ends in the worker's answer, its error or its
+/// death, and a user's cancel is one of those, because it kills the worker.
+async fn await_probe(
+    mut reply_rx: tokio::sync::mpsc::Receiver<WorkerEvent>,
+    progress_tx: &ProgressTx,
+    model_id: &str,
+) -> anyhow::Result<usize> {
+    while let Some(event) = reply_rx.recv().await {
+        match event {
+            WorkerEvent::Info { dimension, .. } => return Ok(dimension),
+            // Only the download: a probe is not an index build, and the
+            // worker's other progress would tell the interface one had begun.
+            // `try_send` because progress is a notification and the next one
+            // supersedes it; some callers probe with a channel nobody reads,
+            // and waiting on one of those would hang the probe.
+            WorkerEvent::Progress(progress @ EmbedProgress::Download(_)) => {
+                if let Err(e) = progress_tx.try_send(progress) {
+                    tracing::trace!("dropping download progress for '{model_id}': {e}");
+                }
+            }
+            WorkerEvent::Error(err) => {
+                return Err(anyhow::anyhow!("Worker error probing model: {}", err))
+            }
+            WorkerEvent::Gone(detail) => {
+                return Err(crate::worker::fault::WorkerFault::gone(detail))
+            }
+            WorkerEvent::Done => break,
+            _ => {}
+        }
+    }
+    Err(anyhow::anyhow!(
+        "Worker finished without returning model info for {}",
+        model_id
+    ))
+}
+
 // ── SBERTInstaller ───────────────────────────────────────────────────────────
 
 pub struct SBERTInstaller {
@@ -156,7 +198,7 @@ impl EmbedderInstaller for SBERTInstaller {
         self.dimension.lock().unwrap().is_some()
     }
 
-    async fn install(&self, _data_dir: &Path, _tx: ProgressTx) -> anyhow::Result<()> {
+    async fn install(&self, _data_dir: &Path, progress_tx: ProgressTx) -> anyhow::Result<()> {
         let model_id = self.model.model_id();
 
         // If it's a built-in model, we already know the dimension.
@@ -180,10 +222,10 @@ impl EmbedderInstaller for SBERTInstaller {
             table: None,
         };
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(32);
         let cmd = ManagerCommand::Submit {
             req: Box::new(request),
-            reply: tx,
+            reply: reply_tx,
         };
 
         self.manager
@@ -191,46 +233,9 @@ impl EmbedderInstaller for SBERTInstaller {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to send info command to manager: {e}"))?;
 
-        let timeout_duration = std::time::Duration::from_secs(30);
-        let result = tokio::time::timeout(timeout_duration, async {
-            while let Some(event) = rx.recv().await {
-                match event {
-                    WorkerEvent::Info { dimension, .. } => {
-                        return Ok(dimension);
-                    }
-                    WorkerEvent::Error(err) => {
-                        return Err(anyhow::anyhow!("Worker error probing model: {}", err))
-                    }
-                    // Named rather than swallowed by the catch-all below: a
-                    // probe whose worker died would otherwise sit here until
-                    // the thirty-second timeout and then report a timeout,
-                    // which says the model was slow rather than that the
-                    // process is gone.
-                    WorkerEvent::Gone(detail) => {
-                        return Err(crate::worker::fault::WorkerFault::gone(detail))
-                    }
-                    WorkerEvent::Done => break,
-                    _ => {}
-                }
-            }
-            Err(anyhow::anyhow!(
-                "Worker finished without returning model info for {}",
-                model_id
-            ))
-        })
-        .await;
-
-        match result {
-            Ok(Ok(dimension)) => {
-                *self.dimension.lock().unwrap() = Some(dimension);
-                Ok(())
-            }
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(anyhow::anyhow!(
-                "Timeout probing model '{}' after 30 seconds",
-                model_id
-            )),
-        }
+        let dimension = await_probe(reply_rx, &progress_tx, model_id).await?;
+        *self.dimension.lock().unwrap() = Some(dimension);
+        Ok(())
     }
 
     fn uninstall(&self, _data_dir: &Path) -> anyhow::Result<()> {
@@ -423,6 +428,122 @@ mod tests {
             Ok(_) => panic!("expected build to fail without a probed dimension"),
             Err(err) => assert!(err.to_string().contains("Dimension unknown")),
         }
+    }
+
+    /// The clock is paused, so the hours pass instantly: a probe still has to
+    /// be waiting for its answer on the far side of them.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_waits_for_as_long_as_the_download_and_load_take() {
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(32);
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+            reply_tx
+                .send(WorkerEvent::Info {
+                    dimension: 4096,
+                    max_seq_length: 131072,
+                })
+                .await
+                .unwrap();
+        });
+
+        let dimension = await_probe(reply_rx, &progress_tx, "org/large").await;
+
+        assert_eq!(dimension.unwrap(), 4096);
+    }
+
+    #[tokio::test]
+    async fn a_probe_passes_on_the_download_and_nothing_else() {
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(32);
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(8);
+        let build = crate::models::progress::IndexBuildProgress {
+            files_processed: 0,
+            total_files: 0,
+            job_id: None,
+            document: None,
+            stage: None,
+            outcome: None,
+            done: false,
+        };
+        let download = crate::models::progress::DownloadProgress {
+            bytes_received: 5,
+            total_bytes: 10,
+            done: false,
+        };
+        reply_tx
+            .send(WorkerEvent::Progress(EmbedProgress::Build(build)))
+            .await
+            .unwrap();
+        reply_tx
+            .send(WorkerEvent::Progress(EmbedProgress::Download(download)))
+            .await
+            .unwrap();
+        reply_tx
+            .send(WorkerEvent::Info {
+                dimension: 8,
+                max_seq_length: 512,
+            })
+            .await
+            .unwrap();
+
+        await_probe(reply_rx, &progress_tx, "org/model")
+            .await
+            .unwrap();
+
+        match progress_rx.try_recv() {
+            Ok(EmbedProgress::Download(progress)) => assert_eq!(progress.bytes_received, 5),
+            other => panic!("expected the download's progress, got {other:?}"),
+        }
+        assert!(progress_rx.try_recv().is_err());
+    }
+
+    /// `prepare_embedder` probes with a channel of one that nothing reads, so
+    /// a probe that waited for room to report progress would never finish.
+    #[tokio::test]
+    async fn a_probe_is_not_held_up_by_progress_nobody_reads() {
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(32);
+        let (progress_tx, _unread) = tokio::sync::mpsc::channel(1);
+        for bytes_received in 0..3 {
+            let progress = crate::models::progress::DownloadProgress {
+                bytes_received,
+                total_bytes: 3,
+                done: false,
+            };
+            reply_tx
+                .send(WorkerEvent::Progress(EmbedProgress::Download(progress)))
+                .await
+                .unwrap();
+        }
+        reply_tx
+            .send(WorkerEvent::Info {
+                dimension: 8,
+                max_seq_length: 512,
+            })
+            .await
+            .unwrap();
+
+        let dimension = await_probe(reply_rx, &progress_tx, "org/model").await;
+
+        assert_eq!(dimension.unwrap(), 8);
+    }
+
+    /// What a user's cancel looks like from here: the worker is killed and the
+    /// probe ends at once, which is what keeps a download cancellable now that
+    /// no deadline would have ended it.
+    #[tokio::test]
+    async fn a_probe_ends_when_its_worker_is_gone() {
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(32);
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(1);
+        reply_tx
+            .send(WorkerEvent::Gone("the user cancelled".to_string()))
+            .await
+            .unwrap();
+
+        let err = await_probe(reply_rx, &progress_tx, "org/model")
+            .await
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("the user cancelled"));
     }
 
     #[test]

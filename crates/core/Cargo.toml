@@ -153,6 +153,7 @@ tempfile = "3.10"
 mockall = "0.13"
 mockito = "1.4"
 base64 = "0.22.1"
+tokio = { version = "1", features = ["test-util"] }
 wilkes-core = { path = ".", features = ["test-utils"] }
 
 [[example]]
