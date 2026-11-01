@@ -23,6 +23,9 @@
 
 ### Fixed
 
+- SBERT models use the prefixes they ship. Each search query was embedded with the document prefix on Jina v5, because the model's default prompt applied to everything, and any other SBERT model's own prefixes were not read at all. Indexes built with Jina v5 stay valid. An index built with a custom SBERT model that ships prefixes should be rebuilt, because its passages were embedded without them.
+- OBLIQ-IR models use the `query: ` and `passage: ` prefixes their card requires.
+- SBERT models the worker has already downloaded show as cached in the model list.
 - Cancelling while a Python environment is being set up stops it within the cancellation deadline, instead of leaving it running to the end.
 - An open chat no longer uses more than a full CPU core while it sits idle.
 - CBZ comics open and scroll by loading individual page images, avoiding full-book

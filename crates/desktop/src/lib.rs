@@ -513,6 +513,7 @@ async fn embedder_capabilities_for_ctx(
     let settings = ctx.get_settings().await;
     Ok(wilkes_core::embed::dispatch::model_capabilities(
         &ctx.model_dir,
+        &ctx.sbert_cache(),
         &settings.semantic.custom_models,
     ))
 }

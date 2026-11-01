@@ -68,17 +68,26 @@ pub fn list_models(engine: EmbeddingEngine, data_dir: &Path) -> Vec<ModelDescrip
 /// `custom_models` are the ids the user added by hand. They are included so
 /// the answer covers everything this Wilkes would accept, and they carry no
 /// dimension: that is a property of weights nobody here has loaded yet.
+///
+/// `sbert_cache` is where the Python worker downloads to, which is not
+/// `data_dir`: asking `data_dir` about an SBERT model only ever answers that
+/// nothing is there.
 pub fn model_capabilities(
     data_dir: &Path,
+    sbert_cache: &Path,
     custom_models: &[CustomModel],
 ) -> EmbedderCapabilityManifest {
+    let cache_of = |engine: EmbeddingEngine| match engine {
+        EmbeddingEngine::SBERT => sbert_cache,
+        _ => data_dir,
+    };
     let engines = EmbeddingEngine::supported_engines();
     let mut models = Vec::new();
     for engine in &engines {
-        for descriptor in list_models(*engine, data_dir) {
+        for descriptor in list_models(*engine, cache_of(*engine)) {
             let repository_id = repository_id(*engine, &descriptor.model_id);
             let (prefixes, prefix_source) = match &repository_id {
-                Some(repo) => super::aux_config::describe(data_dir, repo),
+                Some(repo) => super::aux_config::describe(cache_of(*engine), repo),
                 None => (Default::default(), PrefixSource::Undetermined),
             };
             models.push(EmbedderCapability {
@@ -110,7 +119,8 @@ pub fn model_capabilities(
         {
             continue;
         }
-        let (prefixes, prefix_source) = super::aux_config::describe(data_dir, &custom.model_id);
+        let (prefixes, prefix_source) =
+            super::aux_config::describe(cache_of(custom.engine), &custom.model_id);
         models.push(EmbedderCapability {
             engine: custom.engine,
             model_id: custom.model_id.clone(),
@@ -123,7 +133,10 @@ pub fn model_capabilities(
             passage_prefix: Some(prefixes.passage_prefix).filter(|p| !p.is_empty()),
             prefix_source,
             max_input_tokens: prefixes.max_sequence_length,
-            locally_available: crate::models::hf_hub::is_model_cached(data_dir, &custom.model_id),
+            locally_available: crate::models::hf_hub::is_model_cached(
+                cache_of(custom.engine),
+                &custom.model_id,
+            ),
             size_bytes: None,
             preferred_batch_size: None,
             catalogued: false,
@@ -443,7 +456,7 @@ mod tests {
             engine: EmbeddingEngine::SBERT,
             model_id: "some-org/added-by-hand".to_string(),
         }];
-        let manifest = model_capabilities(dir.path(), &custom);
+        let manifest = model_capabilities(dir.path(), dir.path(), &custom);
 
         assert!(!manifest.models.is_empty());
         assert!(manifest.roles.iter().any(|role| role == "query"));
@@ -473,11 +486,56 @@ mod tests {
     /// fastembed addresses models by an enum name, so without the repository
     /// behind it the prefix reader looks in the wrong place — the defect that
     /// made a model's card unreachable in the first place.
+    /// Written the way the worker's downloads land, in a directory other than
+    /// the one the other engines keep their models in.
+    #[test]
+    fn an_sbert_model_is_described_from_where_the_worker_downloads_to() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sbert_cache = tempfile::tempdir().unwrap();
+        for model in [
+            "jinaai--jina-embeddings-v5-text-nano",
+            "some-org--added-by-hand",
+        ] {
+            let repo = sbert_cache.path().join(format!("models--{model}"));
+            let snapshot = repo.join("snapshots").join("abc");
+            std::fs::create_dir_all(&snapshot).unwrap();
+            std::fs::create_dir_all(repo.join("refs")).unwrap();
+            std::fs::write(repo.join("refs").join("main"), "abc").unwrap();
+            std::fs::write(snapshot.join("config.json"), "{}").unwrap();
+            std::fs::write(
+                snapshot.join("config_sentence_transformers.json"),
+                r#"{"prompts": {"query": "ask: ", "document": "text: "}}"#,
+            )
+            .unwrap();
+        }
+        let custom = vec![CustomModel {
+            engine: EmbeddingEngine::SBERT,
+            model_id: "some-org/added-by-hand".to_string(),
+        }];
+
+        let manifest = model_capabilities(data_dir.path(), sbert_cache.path(), &custom);
+
+        let of = |id: &str| {
+            manifest
+                .models
+                .iter()
+                .find(|model| model.engine == EmbeddingEngine::SBERT && model.model_id == id)
+                .unwrap()
+        };
+        let built_in = of("jinaai/jina-embeddings-v5-text-nano");
+        assert!(built_in.locally_available);
+        assert_eq!(built_in.query_prefix.as_deref(), Some("ask: "));
+        let added = of("some-org/added-by-hand");
+        assert!(added.locally_available);
+        assert_eq!(added.passage_prefix.as_deref(), Some("text: "));
+        assert!(!of("thenlper/gte-small").locally_available);
+    }
+
     #[cfg(feature = "fastembed")]
     #[test]
     fn a_fastembed_entry_carries_the_repository_its_config_lives_in() {
         let dir = tempfile::tempdir().unwrap();
-        let manifest = model_capabilities(dir.path(), &[]);
+        let manifest = model_capabilities(dir.path(), dir.path(), &[]);
         let mini = manifest
             .models
             .iter()

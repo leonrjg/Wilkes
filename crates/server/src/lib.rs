@@ -1135,6 +1135,7 @@ async fn embedder_capabilities_handler(
     let settings = context.get_settings().await;
     Json(wilkes_core::embed::dispatch::model_capabilities(
         &context.model_dir,
+        &context.sbert_cache(),
         &settings.semantic.custom_models,
     ))
 }

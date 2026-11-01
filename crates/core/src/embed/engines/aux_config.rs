@@ -4,7 +4,7 @@ use std::path::Path;
 use crate::types::PrefixSource;
 
 /// Accumulated per-model configuration derived from auxiliary HF config files.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct EmbedderConfig {
     pub query_prefix: String,
     pub passage_prefix: String,
@@ -73,6 +73,26 @@ const CURATED_PREFIXES: &[(&str, &str, &str)] = &[
         "search_query: ",
         "search_document: ",
     ),
+    // Jina v5 ships these, but a built-in SBERT model is embedded with before
+    // the worker has fetched anything, and the prefix must not depend on that.
+    (
+        "jinaai/jina-embeddings-v5-text-small",
+        "Query: ",
+        "Document: ",
+    ),
+    (
+        "jinaai/jina-embeddings-v5-text-nano",
+        "Query: ",
+        "Document: ",
+    ),
+    // OBLIQ-IR — the card requires both, and its config's `prompts` is empty.
+    ("DataScience-UIBK/OBLIQ-IR-3B", "query: ", "passage: "),
+    (
+        "DataScience-UIBK/OBLIQ-IR-3B-no-distill",
+        "query: ",
+        "passage: ",
+    ),
+    ("DataScience-UIBK/OBLIQ-IR-3B-LoRA", "query: ", "passage: "),
     // Arctic and mxbai ship their prompts, so these entries only cover the
     // mirrors that republish the weights without the config.
     ("Snowflake/snowflake-arctic-embed-xs", BGE_QUERY, ""),
@@ -95,6 +115,7 @@ fn parse_st_config(content: &str, config: &mut EmbedderConfig) {
     #[derive(serde::Deserialize)]
     struct StConfig {
         prompts: Option<HashMap<String, String>>,
+        default_prompt_name: Option<String>,
     }
 
     let Ok(st) = serde_json::from_str::<StConfig>(content) else {
@@ -112,6 +133,20 @@ fn parse_st_config(content: &str, config: &mut EmbedderConfig) {
             tracing::debug!(
                 "Unrecognized prompt key '{key}' in config_sentence_transformers.json — skipping"
             );
+        }
+    }
+
+    // The worker switches this off so that the host is the only thing adding a
+    // prefix. A prompt that names neither side is still what the model wants on
+    // every text, so it has to survive that.
+    let default_prompt = st
+        .default_prompt_name
+        .and_then(|name| prompts.get(&name).cloned());
+    if let Some(prompt) = default_prompt {
+        for side in [&mut config.query_prefix, &mut config.passage_prefix] {
+            if side.is_empty() {
+                side.clone_from(&prompt);
+            }
         }
     }
 }
@@ -321,6 +356,78 @@ mod tests {
     fn test_fetch_aux_configs_invalid_path() {
         // Should not panic, just log debug
         fetch_aux_configs(Path::new("/non/existent/path/12345"), "test/model");
+    }
+
+    #[test]
+    fn a_default_prompt_naming_a_side_does_not_leak_onto_the_other() {
+        let content = r#"{
+            "prompts": {"query": "Query: ", "document": "Document: "},
+            "default_prompt_name": "document"
+        }"#;
+        let mut config = EmbedderConfig::default();
+        parse_st_config(content, &mut config);
+        assert_eq!(config.query_prefix, "Query: ");
+        assert_eq!(config.passage_prefix, "Document: ");
+    }
+
+    #[test]
+    fn a_default_prompt_naming_neither_side_applies_to_both() {
+        let content = r#"{
+            "prompts": {"retrieval": "Represent: "},
+            "default_prompt_name": "retrieval"
+        }"#;
+        let mut config = EmbedderConfig::default();
+        parse_st_config(content, &mut config);
+        assert_eq!(config.query_prefix, "Represent: ");
+        assert_eq!(config.passage_prefix, "Represent: ");
+    }
+
+    #[test]
+    fn a_prompt_nothing_names_as_the_default_stays_unused() {
+        let content = r#"{"prompts": {"retrieval": "Represent: "}}"#;
+        let mut config = EmbedderConfig::default();
+        parse_st_config(content, &mut config);
+        assert!(config.query_prefix.is_empty());
+        assert!(config.passage_prefix.is_empty());
+    }
+
+    #[test]
+    fn prefixes_a_model_cannot_do_without_are_known_before_anything_is_cached() {
+        let dir = tempdir().unwrap();
+        for (model, query, passage) in [
+            (
+                "jinaai/jina-embeddings-v5-text-nano",
+                "Query: ",
+                "Document: ",
+            ),
+            ("DataScience-UIBK/OBLIQ-IR-3B", "query: ", "passage: "),
+            (
+                "DataScience-UIBK/OBLIQ-IR-3B-no-distill",
+                "query: ",
+                "passage: ",
+            ),
+            ("DataScience-UIBK/OBLIQ-IR-3B-LoRA", "query: ", "passage: "),
+        ] {
+            let config = load_prefixes(dir.path(), model);
+            assert_eq!(config.query_prefix, query, "{model}");
+            assert_eq!(config.passage_prefix, passage, "{model}");
+        }
+    }
+
+    /// OBLIQ-IR's own config says `"prompts": {}`, so an empty map must not read
+    /// as the model having answered.
+    #[test]
+    fn an_empty_prompts_map_does_not_outrank_the_table() {
+        let dir = tempdir().unwrap();
+        write_cached_aux(
+            dir.path(),
+            "DataScience-UIBK/OBLIQ-IR-3B",
+            "config_sentence_transformers.json",
+            r#"{"prompts": {}, "default_prompt_name": null}"#,
+        );
+        let (config, source) = describe(dir.path(), "DataScience-UIBK/OBLIQ-IR-3B");
+        assert_eq!(config.query_prefix, "query: ");
+        assert_eq!(source, PrefixSource::Curated);
     }
 
     #[test]

@@ -8699,6 +8699,11 @@ impl AppContext {
         self.worker_manager.request_shutdown();
     }
 
+    /// Where the Python worker downloads SBERT models to.
+    pub fn sbert_cache(&self) -> PathBuf {
+        self.worker_manager.paths().hub_cache()
+    }
+
     /// Every built Python environment, with what uses it and what it occupies.
     pub async fn python_environments(&self) -> anyhow::Result<PythonEnvInventory> {
         let paths = self.worker_manager.paths().clone();

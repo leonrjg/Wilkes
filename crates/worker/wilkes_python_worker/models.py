@@ -126,6 +126,10 @@ def get_model(model_id: str, device: str) -> Any:
         # terminal event would be read as part of the next request.
         stop_watching.set()
         watcher.join()
+    # The host adds every prefix, because only it knows which side of a search
+    # a text is on. Left set, this would go in front of the host's, and a model
+    # that defaults to its document prompt would embed queries as documents.
+    model.default_prompt_name = None
     return model
 
 def safe_encode(model: Any, texts: List[str], **kwargs: Any) -> Any:

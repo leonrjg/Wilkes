@@ -291,6 +291,12 @@ impl SBERTInstaller {
         }
     }
 
+    /// The model's prefixes, from the cache the worker downloads into, which
+    /// is not the `data_dir` every installer is handed.
+    fn prefixes(&self) -> aux_config::EmbedderConfig {
+        aux_config::load_prefixes(&self.manager.paths().hub_cache(), self.model.model_id())
+    }
+
     /// Ask a worker in `python_env` for the model's width.
     async fn probe(
         &self,
@@ -438,7 +444,7 @@ impl EmbedderInstaller for SBERTInstaller {
                 )
             })?;
 
-        let prefixes = aux_config::load_prefixes(_data_dir, model_id);
+        let prefixes = self.prefixes();
         let artifact_revision =
             crate::embed::identity::artifact_revision_for_cache(_data_dir, model_id)?;
         let embedding_space_identity = crate::embed::EmbeddingSpaceIdentity::with_artifact_revision(
@@ -883,6 +889,37 @@ mod tests {
         assert!(recorded_model_env(&paths, "org/old-code")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn prefixes_are_read_from_where_the_worker_downloads_to() {
+        let dir = tempdir().unwrap();
+        let paths = crate::worker::manager::WorkerPaths::resolve(dir.path());
+        let repo = paths.hub_cache().join("models--org--prompted");
+        let snapshot = repo.join("snapshots").join("abc");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(repo.join("refs")).unwrap();
+        fs::write(repo.join("refs").join("main"), "abc").unwrap();
+        fs::write(
+            snapshot.join("config_sentence_transformers.json"),
+            r#"{"prompts": {"query": "ask: ", "passage": "text: "}}"#,
+        )
+        .unwrap();
+        let (manager, _, _) = crate::worker::manager::WorkerManager::new(
+            paths,
+            crate::worker::ipc::WorkerKind::Embed,
+        );
+        let installer = SBERTInstaller::new(
+            EmbedderModel("org/prompted".to_string()),
+            manager,
+            "cpu".to_string(),
+            16,
+        );
+
+        let prefixes = installer.prefixes();
+
+        assert_eq!(prefixes.query_prefix, "ask: ");
+        assert_eq!(prefixes.passage_prefix, "text: ");
     }
 
     #[tokio::test]
