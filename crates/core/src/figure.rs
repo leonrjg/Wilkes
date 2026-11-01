@@ -123,6 +123,26 @@ impl std::fmt::Debug for FigurePixels {
     }
 }
 
+/// One document's cover, encoded.
+///
+/// `Debug` prints the bytes' length for the reason [`FigurePixels`] does.
+pub struct CoverPixels {
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl std::fmt::Debug for CoverPixels {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CoverPixels")
+            .field("png_bytes", &self.png.len())
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish()
+    }
+}
+
 /// The pixels of one retained figure, from the document it was extracted from.
 ///
 /// Re-derived rather than stored: the pixels are already in the PDF, and the
@@ -190,15 +210,7 @@ pub fn render_figure(
         _ => decoded.pixels,
     };
 
-    let mut png = Vec::new();
-    image::ImageEncoder::write_image(
-        image::codecs::png::PngEncoder::new(&mut png),
-        pixels.as_raw(),
-        pixels.width(),
-        pixels.height(),
-        image::ExtendedColorType::Rgb8,
-    )
-    .map_err(|e| anyhow::anyhow!("encoding {} as PNG failed: {e}", image.id))?;
+    let png = encode_png(&pixels).map_err(|e| anyhow::anyhow!("encoding {}: {e:#}", image.id))?;
 
     Ok(FigurePixels {
         width: pixels.width(),
@@ -207,6 +219,33 @@ pub fn render_figure(
         source_height,
         png,
     })
+}
+
+/// A picture of a whole document: its first page, fitted inside `max_edge`.
+///
+/// Nothing decides whether that page is a cover. It is what the document opens
+/// on, which is the same thing for a book that has one, and the first thing a
+/// reader would see for one that does not.
+pub fn render_cover(source: &Path, max_edge: u32) -> anyhow::Result<CoverPixels> {
+    let pixels = mupdf::render_cover(source, max_edge)?.pixels;
+    Ok(CoverPixels {
+        png: encode_png(&pixels)?,
+        width: pixels.width(),
+        height: pixels.height(),
+    })
+}
+
+fn encode_png(pixels: &image::RgbImage) -> anyhow::Result<Vec<u8>> {
+    let mut png = Vec::new();
+    image::ImageEncoder::write_image(
+        image::codecs::png::PngEncoder::new(&mut png),
+        pixels.as_raw(),
+        pixels.width(),
+        pixels.height(),
+        image::ExtendedColorType::Rgb8,
+    )
+    .map_err(|e| anyhow::anyhow!("encoding as PNG failed: {e}"))?;
+    Ok(png)
 }
 
 #[cfg(test)]

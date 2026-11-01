@@ -579,6 +579,46 @@ async fn document_snapshot_handler(
         .unwrap())
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentCoverBody {
+    /// The corpus and no embedding space, as [`DocumentSnapshotBody`] says why.
+    corpus_id: String,
+    snapshot_id: String,
+    /// The longest side of the picture, in pixels.
+    max_edge: u32,
+}
+
+/// The first page of one imported document, small: what a list of documents
+/// draws, for a caller that would otherwise be sent the whole book to draw it.
+///
+/// PNG bytes for the reason `/api/figure` gives. A snapshot id is a content
+/// hash, so what this returns for one id never changes and a caller can keep it.
+async fn document_cover_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DocumentCoverBody>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let manager = state
+        .workspaces
+        .as_ref()
+        .ok_or_else(workspace_manager_unavailable)?;
+    let corpus = manager
+        .context_for(&body.corpus_id)
+        .await
+        .map_err(consumer_anyhow_err)?;
+    let cover = corpus
+        .managed_document_cover(body.snapshot_id, body.max_edge)
+        .await
+        .map_err(consumer_err)?;
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, cover.media_type)
+        .header("x-wilkes-source-sha256", cover.source_sha256)
+        .header("x-wilkes-image-width", cover.width)
+        .header("x-wilkes-image-height", cover.height)
+        .body(Body::from(cover.bytes))
+        .unwrap())
+}
+
 /// A chunk request names an index with `scope` and its passages with refs, and
 /// that is the whole of its addressing.
 ///
@@ -2644,6 +2684,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             "/api/corpora/documents/snapshot",
             post(document_snapshot_handler),
         )
+        .route("/api/corpora/documents/cover", post(document_cover_handler))
         .route("/api/chunks/resolve", post(chunks_resolve_handler))
         .route("/api/chunks/accumulate", post(chunks_accumulate_handler))
         .route(

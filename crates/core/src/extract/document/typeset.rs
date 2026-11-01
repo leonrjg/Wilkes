@@ -497,17 +497,27 @@ fn union(a: &BoundingBox, b: &BoundingBox) -> BoundingBox {
 /// page than that and cut it up itself, and cutting it up here would be
 /// inference geometry in the host.
 pub fn render_page(page: &mupdf::Page, side: u32) -> anyhow::Result<::image::RgbImage> {
+    draw_page(page, side, side)
+}
+
+/// Draw a whole page onto a canvas of exactly this size, each axis scaled to
+/// fill it. Whether that keeps the page's aspect is the caller's to decide.
+pub(super) fn draw_page(
+    page: &mupdf::Page,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> anyhow::Result<::image::RgbImage> {
     let bounds = page.bounds()?;
     let (width, height) = (bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
     anyhow::ensure!(
         width > 0.0 && height > 0.0,
-        "a page with no extent cannot be detected on"
+        "a page with no extent cannot be drawn"
     );
     let canvas = IRect {
         x0: 0,
         y0: 0,
-        x1: side as i32,
-        y1: side as i32,
+        x1: canvas_width as i32,
+        y1: canvas_height as i32,
     };
     let mut pixmap = mupdf::Pixmap::new_with_rect(&Colorspace::device_rgb(), canvas, false)?;
     // Paper first: the page paints only what it draws.
@@ -515,7 +525,7 @@ pub fn render_page(page: &mupdf::Page, side: u32) -> anyhow::Result<::image::Rgb
     let device = Device::from_pixmap(&pixmap)?;
     page.run(
         &device,
-        &Matrix::new_scale(side as f32 / width, side as f32 / height),
+        &Matrix::new_scale(canvas_width as f32 / width, canvas_height as f32 / height),
     )?;
     drop(device);
 
@@ -526,7 +536,7 @@ pub fn render_page(page: &mupdf::Page, side: u32) -> anyhow::Result<::image::Rgb
         pixmap.stride() as usize,
         pixmap.samples(),
     )
-    .map_err(|reason| anyhow::anyhow!("the page did not render for detection: {reason}"))?;
+    .map_err(|reason| anyhow::anyhow!("the page did not render: {reason}"))?;
     Ok(decoded.pixels)
 }
 

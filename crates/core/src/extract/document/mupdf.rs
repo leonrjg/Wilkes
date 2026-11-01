@@ -1058,6 +1058,25 @@ pub fn render_page_area(path: &Path, page: u32, bbox: &BoundingBox) -> anyhow::R
     Ok(rendered)
 }
 
+/// Rasterize a document's first page to fit inside `max_edge`.
+///
+/// Drawn at the size asked for rather than at print size and resampled: a
+/// picture of a whole document is small, and the page's vectors and its scan
+/// only have to be scaled once to get there.
+pub fn render_cover(path: &Path, max_edge: u32) -> anyhow::Result<NativeImage> {
+    let doc = open_document(path)?;
+    let page = doc.load_page(0)?;
+    let bounds = page.bounds()?;
+    let (width, height) = (bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
+    let scale = max_edge as f32 / width.max(height);
+    let pixels = typeset::draw_page(
+        &page,
+        ((width * scale).round() as u32).max(1),
+        ((height * scale).round() as u32).max(1),
+    )?;
+    Ok(NativeImage { pixels })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,6 +1159,9 @@ mod tests {
     /// something a consumer can parse back into any — which is the whole
     /// reason for the feature these tests cover.
     const NATIVE_EQUATION: &str = "c i = a i + bi + di + e i + f i + gi + hi";
+
+    /// One 300×144 point page of text, with no outline.
+    const PLAIN_PDF_BASE64: &str = "JVBERi0xLjQKMSAwIG9iago8PAovVHlwZSAvQ2F0YWxvZwovUGFnZXMgMiAwIFIKPj4KZW5kb2JqCjIgMCBvYmoKPDwKL1R5cGUgL1BhZ2VzCi9LaWRzIFszIDAgUl0KL0NvdW50IDEKPj4KZW5kb2JqCjMgMCBvYmoKPDwKL1R5cGUgL1BhZ2UKL1BhcmVudCAyIDAgUgovTWVkaWFCb3ggWzAgMCAzMDAgMTQ0XQovQ29udGVudHMgNCAwIFIKL1Jlc291cmNlcyA8PAovRm9udCA8PAovRjEgPDwKL1R5cGUgL0ZvbnQKL1N1YnR5cGUgL1R5cGUxCi9CYXNlRm9udCAvSGVsdmV0aWNhCj4+Cj4+Cj4+Cj4+CjBlbmRvYmoKNCAwIG9iago8PAovTGVuZ3RoIDQxCj4+CnN0cmVhbQpCVAovRjEgMTggVGYKMCBldAo1MCA1MCBUZAooSGVsbG8gV29ybGQpIFRqCkVUCmVuZHN0cmVhbQplbmRvYmoKeHJlZgowIDUKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTYgMDAwMDAgbiAKMDAwMDAwMDExMSAwMDAwMCBuIAowMDAwMDAwMjgyIDAwMDAwIG4gCnRyYWlsZXIKPDwKL1NpemUgNQovUm9vdCAxIDAgUgo+PgpzdGFydHhyZWYKMzcyCiUlRU9GCg==";
 
     fn write_pdf(dir: &std::path::Path, name: &str, base64: &str) -> std::path::PathBuf {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -1288,11 +1310,27 @@ mod tests {
         assert_eq!(chapter_one.page, Some(1));
     }
 
+    /// The page's own shape, at the size asked for. A cover stretched to a
+    /// square would be a picture of no book.
+    #[test]
+    fn a_cover_keeps_the_page_s_shape_inside_the_edge_it_was_given() {
+        let dir = tempdir().unwrap();
+        let path = write_pdf(dir.path(), "plain.pdf", PLAIN_PDF_BASE64);
+
+        let cover = render_cover(&path, 100).unwrap().pixels;
+
+        assert_eq!(cover.dimensions(), (100, 48));
+        assert!(
+            cover.pixels().any(|pixel| pixel.0[0] < 128),
+            "the page's text was drawn, not just its paper"
+        );
+    }
+
     #[test]
     fn a_pdf_without_bookmarks_declares_no_outline() {
         let dir = tempdir().unwrap();
         // The plain single-page PDF the extraction test uses.
-        let path = write_pdf(dir.path(), "plain.pdf", "JVBERi0xLjQKMSAwIG9iago8PAovVHlwZSAvQ2F0YWxvZwovUGFnZXMgMiAwIFIKPj4KZW5kb2JqCjIgMCBvYmoKPDwKL1R5cGUgL1BhZ2VzCi9LaWRzIFszIDAgUl0KL0NvdW50IDEKPj4KZW5kb2JqCjMgMCBvYmoKPDwKL1R5cGUgL1BhZ2UKL1BhcmVudCAyIDAgUgovTWVkaWFCb3ggWzAgMCAzMDAgMTQ0XQovQ29udGVudHMgNCAwIFIKL1Jlc291cmNlcyA8PAovRm9udCA8PAovRjEgPDwKL1R5cGUgL0ZvbnQKL1N1YnR5cGUgL1R5cGUxCi9CYXNlRm9udCAvSGVsdmV0aWNhCj4+Cj4+Cj4+Cj4+CjBlbmRvYmoKNCAwIG9iago8PAovTGVuZ3RoIDQxCj4+CnN0cmVhbQpCVAovRjEgMTggVGYKMCBldAo1MCA1MCBUZAooSGVsbG8gV29ybGQpIFRqCkVUCmVuZHN0cmVhbQplbmRvYmoKeHJlZgowIDUKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTYgMDAwMDAgbiAKMDAwMDAwMDExMSAwMDAwMCBuIAowMDAwMDAwMjgyIDAwMDAwIG4gCnRyYWlsZXIKPDwKL1NpemUgNQovUm9vdCAxIDAgUgo+PgpzdGFydHhyZWYKMzcyCiUlRU9GCg==");
+        let path = write_pdf(dir.path(), "plain.pdf", PLAIN_PDF_BASE64);
 
         assert!(MuPdfBackend::default()
             .outline(&path)

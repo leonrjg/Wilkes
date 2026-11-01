@@ -1354,6 +1354,18 @@ pub struct DocumentSnapshotExport {
     pub source_byte_len: u64,
 }
 
+/// One imported document's cover, ready to be served.
+#[derive(Clone, Debug)]
+pub struct DocumentCoverExport {
+    pub bytes: Vec<u8>,
+    pub media_type: &'static str,
+    pub width: u32,
+    pub height: u32,
+    /// The retained document it was drawn from, as
+    /// [`DocumentSnapshotExport::source_sha256`] names it.
+    pub source_sha256: String,
+}
+
 /// Most chunk refs one `resolve` request may name.
 ///
 /// The two surfaces this replaces disagreed: the export route capped at 64 on
@@ -3610,22 +3622,8 @@ impl AppContext {
         let index_arc = self.index.lock().clone();
         let data_dir = self.data_dir.clone();
         tokio::task::spawn_blocking(move || {
-            let guard = index_arc
-                .lock()
-                .map_err(|_| ConsumerError::untyped("Semantic index lock was poisoned"))?;
-            let index = guard
-                .as_ref()
-                .ok_or_else(|| ConsumerError::untyped("Semantic index unavailable"))?;
-            let source = index
-                .managed_snapshot_source(&snapshot_id)
-                .map_err(|error| ConsumerError::from_anyhow(&error))?
-                .ok_or_else(|| {
-                    ConsumerError::new(
-                        ConsumerErrorCode::DocumentIndexIncomplete,
-                        format!("This corpus retains no snapshot {snapshot_id}."),
-                    )
-                })?;
-            let path = data_dir.join(&source.managed_snapshot_relative_path);
+            let (path, source_sha256) =
+                Self::retained_snapshot(&index_arc, &data_dir, &snapshot_id)?;
             let bytes = std::fs::read(&path).map_err(|error| {
                 ConsumerError::new(
                     ConsumerErrorCode::DocumentIndexIncomplete,
@@ -3635,7 +3633,7 @@ impl AppContext {
             Ok(DocumentSnapshotExport {
                 media_type: Self::snapshot_media_type(&path),
                 source_byte_len: bytes.len() as u64,
-                source_sha256: source.source_sha256,
+                source_sha256,
                 bytes,
             })
         })
@@ -3643,6 +3641,75 @@ impl AppContext {
         .map_err(|error| {
             ConsumerError::untyped(format!("Managed snapshot task panicked: {error}"))
         })?
+    }
+
+    /// The first page of one imported document, small.
+    ///
+    /// What a list of documents needs, and the reason not to send it
+    /// [`Self::managed_document_snapshot`]: a whole book to draw one page the
+    /// size of a thumbnail. Addressed the same way and subject to the same
+    /// rule, so call it on the canonical corpus context.
+    ///
+    /// The render happens after the index lock is released. The lock serves
+    /// every search in this corpus, and a list of documents asks for a dozen
+    /// of these at once.
+    pub async fn managed_document_cover(
+        &self,
+        snapshot_id: String,
+        max_edge: u32,
+    ) -> Result<DocumentCoverExport, ConsumerError> {
+        if max_edge == 0 || max_edge > MAX_FIGURE_EDGE {
+            return Err(ConsumerError::untyped(format!(
+                "max_edge must be between 1 and {MAX_FIGURE_EDGE}; got {max_edge}"
+            )));
+        }
+        let index_arc = self.index.lock().clone();
+        let data_dir = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let (path, source_sha256) =
+                Self::retained_snapshot(&index_arc, &data_dir, &snapshot_id)?;
+            let cover = wilkes_core::figure::render_cover(&path, max_edge)
+                .map_err(|error| ConsumerError::from_anyhow(&error))?;
+            Ok(DocumentCoverExport {
+                bytes: cover.png,
+                media_type: "image/png",
+                width: cover.width,
+                height: cover.height,
+                source_sha256,
+            })
+        })
+        .await
+        .map_err(|error| ConsumerError::untyped(format!("Cover render task panicked: {error}")))?
+    }
+
+    /// Where a retained snapshot is on disk, and what it hashed to.
+    ///
+    /// The index guard does not outlive this call, so a caller can read or
+    /// render the file without holding up the index.
+    fn retained_snapshot(
+        index: &Mutex<Option<SemanticIndex>>,
+        data_dir: &Path,
+        snapshot_id: &str,
+    ) -> Result<(PathBuf, String), ConsumerError> {
+        let guard = index
+            .lock()
+            .map_err(|_| ConsumerError::untyped("Semantic index lock was poisoned"))?;
+        let index = guard
+            .as_ref()
+            .ok_or_else(|| ConsumerError::untyped("Semantic index unavailable"))?;
+        let source = index
+            .managed_snapshot_source(snapshot_id)
+            .map_err(|error| ConsumerError::from_anyhow(&error))?
+            .ok_or_else(|| {
+                ConsumerError::new(
+                    ConsumerErrorCode::DocumentIndexIncomplete,
+                    format!("This corpus retains no snapshot {snapshot_id}."),
+                )
+            })?;
+        Ok((
+            data_dir.join(&source.managed_snapshot_relative_path),
+            source.source_sha256,
+        ))
     }
 
     /// Async because of the outline, which is a full read of the snapshot.
