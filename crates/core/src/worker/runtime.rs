@@ -14,7 +14,17 @@ use super::manager::{
 };
 use super::process::{Stop, WorkerProcess};
 use super::residency::{self, Residency};
-use super::DEFAULT_IDLE_TIMEOUT_SECS;
+use super::{EnvNeeds, DEFAULT_IDLE_TIMEOUT_SECS};
+
+/// How often a wait the seal has to interrupt looks at it. Far inside the three
+/// seconds a cancellation has.
+const SEAL_POLL: Duration = Duration::from_millis(100);
+
+pub(super) async fn until_sealed(sealed: &AtomicBool) {
+    while !sealed.load(Ordering::Acquire) {
+        tokio::time::sleep(SEAL_POLL).await;
+    }
+}
 
 #[async_trait]
 pub(crate) trait WorkerSession: Send + Sync {
@@ -40,6 +50,7 @@ trait WorkerProcessSpawner: Send + Sync {
         paths: &WorkerPaths,
         req: &WorkerRequest,
         active_pid: &AtomicU32,
+        reply: &mpsc::Sender<WorkerEvent>,
     ) -> Result<Arc<dyn WorkerSession>, String>;
 }
 
@@ -52,8 +63,9 @@ impl WorkerProcessSpawner for RealWorkerProcessSpawner {
         paths: &WorkerPaths,
         req: &WorkerRequest,
         active_pid: &AtomicU32,
+        reply: &mpsc::Sender<WorkerEvent>,
     ) -> Result<Arc<dyn WorkerSession>, String> {
-        let proc = WorkerProcess::spawn(paths, req, active_pid).await?;
+        let proc = WorkerProcess::spawn(paths, req, active_pid, reply).await?;
         Ok(Arc::new(proc))
     }
 }
@@ -162,6 +174,8 @@ struct WorkerRuntime {
     active_role: Option<WorkerRole>,
     active_model: Option<String>,
     active_device: Option<String>,
+    /// The Python environment the active worker runs in.
+    active_env: Option<EnvNeeds>,
     idle_timeout: Duration,
     /// Commands taken off the channel while a request was in flight, held back
     /// until it finished. Only the cancel signal is acted on mid-request.
@@ -215,12 +229,14 @@ fn serialize_request_for_worker(req: &WorkerRequest) -> Result<String, String> {
 /// document alternates page detection, page reading and formula reading
 /// continuously.
 ///
-/// Two things still force a restart, and both are properties of the process
+/// Two things force a restart here, and both are properties of the process
 /// rather than of the model. A kind change, because a kind is what a manager
 /// supervises for its whole life and two kinds never share a process. And a
 /// [`WorkerProcessKind`] change, because SBERT embedding runs in the Python
 /// sidecar and everything else in the Rust worker binary — a running sidecar
-/// cannot serve a candle request whatever is in its map.
+/// cannot serve a candle request whatever is in its map. The third, a sidecar
+/// in the wrong Python environment, is in `ensure_worker`: it is the one
+/// question that is not about the role.
 fn should_restart_worker(
     active_process: bool,
     active_role: Option<WorkerRole>,
@@ -278,6 +294,7 @@ impl WorkerRuntime {
             active_role: None,
             active_model: None,
             active_device: None,
+            active_env: None,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             deferred: VecDeque::new(),
             residency_semaphore,
@@ -444,7 +461,8 @@ impl WorkerRuntime {
         reply: &mpsc::Sender<WorkerEvent>,
     ) -> Result<(), ()> {
         let needs_restart =
-            should_restart_worker(self.active_process.is_some(), self.active_role, req.role);
+            should_restart_worker(self.active_process.is_some(), self.active_role, req.role)
+                || self.active_env != req.python_env;
 
         if !needs_restart {
             return Ok(());
@@ -506,7 +524,28 @@ impl WorkerRuntime {
             }
         }
 
-        match self.spawner.spawn(&self.paths, req, &self.active_pid).await {
+        // A start can be minutes of `pip` building an environment, with no
+        // worker yet for a cancel to kill. Dropping the spawn is what stops
+        // that: the install runs as a child that dies with it.
+        let spawned = tokio::select! {
+            biased;
+            spawned = self.spawner.spawn(&self.paths, req, &self.active_pid, reply) => spawned,
+            () = until_sealed(&self.sealed) => {
+                tracing::info!(
+                    "WorkerManager: abandoning a {:?} start: the user cancelled.",
+                    req.role
+                );
+                self.residency = None;
+                let _ = reply
+                    .send(WorkerEvent::Gone(
+                        "the user cancelled: this worker is sealed".to_string(),
+                    ))
+                    .await;
+                return Err(());
+            }
+        };
+
+        match spawned {
             Ok(proc) => {
                 self.last_stop_was_a_death = false;
                 self.active_process = Some(Arc::clone(&proc));
@@ -514,6 +553,7 @@ impl WorkerRuntime {
                 self.active_role = Some(req.role);
                 self.active_model = Some(req.model.clone());
                 self.active_device = Some(req.device.clone());
+                self.active_env = req.python_env.clone();
                 self.update_status_active(req.role, &req.model, &req.device, &req.mode);
                 Ok(())
             }
@@ -563,6 +603,7 @@ impl WorkerRuntime {
         self.active_role = None;
         self.active_model = None;
         self.active_device = None;
+        self.active_env = None;
         // After the shutdown, never before it: the permit says a process of
         // this kind holds models, and until the stop returns one still does.
         self.residency = None;
@@ -677,6 +718,7 @@ mod tests {
             _paths: &WorkerPaths,
             _req: &WorkerRequest,
             _active_pid: &AtomicU32,
+            _reply: &mpsc::Sender<WorkerEvent>,
         ) -> Result<Arc<dyn WorkerSession>, String> {
             self.spawn_calls.fetch_add(1, Ordering::Relaxed);
             if self.spawn_should_fail {
@@ -708,10 +750,10 @@ mod tests {
     /// two that contend the way two managers of one kind in two workspaces do.
     fn test_runtime_sharing(residency: Arc<Semaphore>) -> TestRuntime {
         let paths = WorkerPaths {
-            python_path: std::path::PathBuf::from("python"),
+            python_override: None,
             python_package_dir: std::path::PathBuf::from("pkg"),
             requirements_path: std::path::PathBuf::from("reqs.txt"),
-            venv_dir: std::path::PathBuf::from("venv"),
+            uv_bin: std::path::PathBuf::from("venv"),
             worker_bin: std::path::PathBuf::from("worker"),
             data_dir: std::path::PathBuf::from("data"),
         };
@@ -773,6 +815,7 @@ mod tests {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         }
@@ -912,6 +955,89 @@ mod tests {
     /// once more on its way out; if that submit started a process, the user
     /// would have killed a worker and got a fresh one loading the same model
     /// back.
+    /// A spawn that never returns, which is what a start looks like from here
+    /// while `pip` is building an environment.
+    struct StuckSpawner;
+
+    #[async_trait]
+    impl WorkerProcessSpawner for StuckSpawner {
+        async fn spawn(
+            &self,
+            _paths: &WorkerPaths,
+            _req: &WorkerRequest,
+            _active_pid: &AtomicU32,
+            _reply: &mpsc::Sender<WorkerEvent>,
+        ) -> Result<Arc<dyn WorkerSession>, String> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_abandons_a_start_still_building_its_environment() {
+        let (mut runtime, _spawn_calls, _send, _shutdown, _tx, _events) = test_runtime();
+        runtime.spawner = Arc::new(StuckSpawner);
+        let sealed = Arc::clone(&runtime.sealed);
+        let (reply_tx, mut reply_rx) = mpsc::channel(4);
+        let submit = tokio::spawn(async move {
+            runtime
+                .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+                .await;
+            runtime
+        });
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(!submit.is_finished(), "the start ended by itself");
+
+        sealed.store(true, Ordering::Release);
+
+        let runtime = timeout(Duration::from_secs(3), submit)
+            .await
+            .expect("a cancel has three seconds")
+            .unwrap();
+        assert!(matches!(reply_rx.recv().await, Some(WorkerEvent::Gone(_))));
+        assert!(
+            runtime.residency.is_none(),
+            "an abandoned start kept the permit of a process that never existed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_in_another_python_environment_is_replaced() {
+        let (mut runtime, spawn_calls, _send, shutdown_calls, _tx, _events) = test_runtime();
+        let (reply_tx, _reply_rx) = mpsc::channel(8);
+        let other_env = EnvNeeds {
+            packages: ["timm".to_string()].into_iter().collect(),
+            ..EnvNeeds::default()
+        };
+        let mut on_series = embed_request("model-b");
+        on_series.python_env = Some(other_env.clone());
+
+        runtime
+            .ensure_worker(&embed_request("model-a"), &reply_tx)
+            .await
+            .unwrap();
+        // A model that shares the environment shares the worker.
+        runtime
+            .ensure_worker(&embed_request("model-c"), &reply_tx)
+            .await
+            .unwrap();
+        assert_eq!(spawn_calls.load(Ordering::Relaxed), 1);
+
+        runtime.ensure_worker(&on_series, &reply_tx).await.unwrap();
+        assert_eq!(spawn_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(shutdown_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.active_env, Some(other_env));
+
+        runtime.ensure_worker(&on_series, &reply_tx).await.unwrap();
+        assert_eq!(spawn_calls.load(Ordering::Relaxed), 2);
+
+        runtime
+            .ensure_worker(&embed_request("model-a"), &reply_tx)
+            .await
+            .unwrap();
+        assert_eq!(spawn_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(runtime.active_env, None);
+    }
+
     #[tokio::test]
     async fn a_sealed_runtime_starts_nothing_and_answers_gone() {
         let (mut runtime, spawn_calls, _send, _shutdown, _tx, _events) = test_runtime();
@@ -1012,6 +1138,7 @@ mod tests {
             _paths: &WorkerPaths,
             _req: &WorkerRequest,
             _active_pid: &AtomicU32,
+            _reply: &mpsc::Sender<WorkerEvent>,
         ) -> Result<Arc<dyn WorkerSession>, String> {
             Ok(Arc::clone(&self.session) as Arc<dyn WorkerSession>)
         }
@@ -1047,6 +1174,7 @@ mod tests {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
             mode: "generate".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1185,6 +1313,7 @@ mod tests {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1231,6 +1360,7 @@ mod tests {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1279,6 +1409,7 @@ mod tests {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1322,10 +1453,10 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_worker_spawn_failure_sends_error() {
         let paths = WorkerPaths {
-            python_path: std::path::PathBuf::from("python"),
+            python_override: None,
             python_package_dir: std::path::PathBuf::from("pkg"),
             requirements_path: std::path::PathBuf::from("reqs.txt"),
-            venv_dir: std::path::PathBuf::from("venv"),
+            uv_bin: std::path::PathBuf::from("venv"),
             worker_bin: std::path::PathBuf::from("worker"),
             data_dir: std::path::PathBuf::from("data"),
         };
@@ -1374,6 +1505,7 @@ mod tests {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1401,6 +1533,7 @@ mod tests {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1429,6 +1562,7 @@ mod tests {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1463,6 +1597,7 @@ mod tests {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };
@@ -1475,10 +1610,10 @@ mod tests {
     #[tokio::test]
     async fn test_handle_submit_send_failure_clears_active_worker() {
         let paths = WorkerPaths {
-            python_path: std::path::PathBuf::from("python"),
+            python_override: None,
             python_package_dir: std::path::PathBuf::from("pkg"),
             requirements_path: std::path::PathBuf::from("reqs.txt"),
-            venv_dir: std::path::PathBuf::from("venv"),
+            uv_bin: std::path::PathBuf::from("venv"),
             worker_bin: std::path::PathBuf::from("worker"),
             data_dir: std::path::PathBuf::from("data"),
         };
@@ -1527,6 +1662,7 @@ mod tests {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
             mode: "embed".to_string(),
             model_dir: std::path::PathBuf::from("data"),
         };

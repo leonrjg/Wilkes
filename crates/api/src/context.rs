@@ -64,6 +64,7 @@ use wilkes_core::worker::ipc::WorkerKind;
 use wilkes_core::worker::manager::{
     ManagerCommand, ManagerEvent, WorkerManager, WorkerPaths, WorkerStatus,
 };
+use wilkes_core::worker::{python_env_inventory, remove_python_envs, PythonEnvInventory};
 
 use crate::commands::search::{start_search, SearchHandle};
 use wilkes_core::consumer::{ConsumerError, ConsumerErrorCode};
@@ -367,6 +368,10 @@ pub struct EmbedTaskHandle {
 /// for. Nothing in the cancel path waits for anything that is not bounded by
 /// it.
 pub const CANCEL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long a worker gets to stop before files are removed from under it. A
+/// stop between requests is answered within the roof knock's three seconds.
+const WORKER_REMOVAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long *exiting* waits for a stopped build to finish writing.
 ///
@@ -1668,6 +1673,7 @@ impl AppContext {
         // role: a build alternates recognition and embedding file by file, and
         // sharing a manager between them would restart and reload a model on
         // every alternation.
+        wilkes_core::worker::sweep_python_envs(&paths);
         let (recognize_manager, recognize_event_rx, recognize_loop_fut) =
             WorkerManager::new(paths, WorkerKind::Recognize);
         let bookmarks_path = data_dir.join("bookmarks.json");
@@ -8693,6 +8699,77 @@ impl AppContext {
         self.worker_manager.request_shutdown();
     }
 
+    /// Every built Python environment, with what uses it and what it occupies.
+    pub async fn python_environments(&self) -> anyhow::Result<PythonEnvInventory> {
+        let paths = self.worker_manager.paths().clone();
+        tokio::task::spawn_blocking(move || python_env_inventory(&paths))
+            .await?
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// Stop the embedding worker and wait for it to be gone, for an operation
+    /// that takes files out from under it.
+    async fn stop_worker_for_removal(&self) -> Result<(), String> {
+        self.worker_manager.request_shutdown();
+        let deadline = tokio::time::Instant::now() + WORKER_REMOVAL_DEADLINE;
+        while self.worker_manager.live_pid().is_some() {
+            if tokio::time::Instant::now() >= deadline {
+                return Err("The embedding worker did not stop in time.".to_string());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Ok(())
+    }
+
+    /// Remove Python environments. Any of them is rebuilt from its lock the
+    /// next time a model needs it, the base one included.
+    pub async fn remove_python_environments(&self, ids: Vec<String>) -> Result<(), String> {
+        self.ensure_no_active_embed_task(
+            "Python environments cannot be removed while an index is being built.",
+        )?;
+        self.stop_worker_for_removal().await?;
+        remove_python_envs(self.worker_manager.paths(), &ids).await
+    }
+
+    /// Delete a model the user added: its weights, what is recorded about it,
+    /// and its entry in the catalog. Its Python environment stays, because
+    /// other models may share it.
+    pub async fn remove_custom_model(
+        &self,
+        engine: wilkes_core::types::EmbeddingEngine,
+        model_id: String,
+    ) -> Result<(), String> {
+        self.ensure_no_active_embed_task(
+            "Models cannot be removed while an index is being built.",
+        )?;
+        let settings = self.settings().await;
+        let selected = &settings.semantic.selected;
+        if selected.engine == engine && selected.model.model_id() == model_id {
+            return Err("Choose another model before removing the selected one.".to_string());
+        }
+        self.stop_worker_for_removal().await?;
+        let installer = dispatch::get_installer(
+            engine,
+            wilkes_core::types::EmbedderModel(model_id.clone()),
+            self.worker_manager.clone(),
+            settings.semantic.device_for(engine).to_string(),
+            settings.semantic.embed_batch_size,
+        );
+        let model_dir = self.model_dir.clone();
+        tokio::task::spawn_blocking(move || installer.uninstall(&model_dir))
+            .await
+            .map_err(|e| format!("Model removal panicked: {e}"))?
+            .map_err(|e| format!("{e:#}"))?;
+        self.update_semantic_settings(|mut semantic| {
+            semantic
+                .custom_models
+                .retain(|m| !(m.engine == engine && m.model_id == model_id));
+            semantic
+        })
+        .await;
+        Ok(())
+    }
+
     pub fn kill_generation_worker(&self) {
         self.generate_manager.request_shutdown();
     }
@@ -10731,10 +10808,10 @@ mod tests {
             events: Arc::new(Mutex::new(Vec::new())),
         });
         let paths = WorkerPaths {
-            python_path: PathBuf::from("python"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: dir.path().to_path_buf(),
         };
@@ -11511,10 +11588,10 @@ title = "title[0]"
         )
         .unwrap();
         let paths = WorkerPaths {
-            python_path: PathBuf::from("python"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: dir.to_path_buf(),
         };
@@ -12028,10 +12105,10 @@ title = "title[0]"
         let options = AppContext::build_index_options(
             WorkerManager::new(
                 WorkerPaths {
-                    python_path: PathBuf::from("python"),
+                    python_override: None,
                     python_package_dir: PathBuf::from("pkg"),
                     requirements_path: PathBuf::from("reqs.txt"),
-                    venv_dir: PathBuf::from("venv"),
+                    uv_bin: PathBuf::from("venv"),
                     worker_bin: PathBuf::from("worker"),
                     data_dir: dir.path().to_path_buf(),
                 },
@@ -12978,10 +13055,10 @@ title = "title[0]"
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: dir.path().join("missing-worker"),
                 data_dir: dir.path().to_path_buf(),
             },
@@ -13053,10 +13130,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin,
                 data_dir: dir.path().to_path_buf(),
             },
@@ -13121,10 +13198,10 @@ exit 0
             events: Arc::new(Mutex::new(Vec::new())),
         });
         let paths = WorkerPaths {
-            python_path: PathBuf::from("python"),
+            python_override: None,
             python_package_dir: PathBuf::from("py_pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -13155,10 +13232,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -13190,10 +13267,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -13216,10 +13293,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -13253,10 +13330,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -13305,10 +13382,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: dir.path().to_path_buf(),
             },
@@ -13414,10 +13491,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -13456,10 +13533,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: dir.path().to_path_buf(),
             },
@@ -13516,10 +13593,10 @@ exit 0
             data_dir.clone(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -13541,10 +13618,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -13553,6 +13630,64 @@ exit 0
 
         let res = ctx.get_index_status(None).await;
         assert!(res.is_err()); // No index exists
+    }
+
+    fn pretend_a_build_is_running(ctx: &AppContext) {
+        *ctx.embed_task.lock() = Some(EmbedTaskHandle {
+            operation: EmbedOperation::Build,
+            cancel: CancellationToken::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            join: BuildHandle::new(tokio::spawn(async { Ok(()) })),
+            settlement: Arc::new(BuildSettlement::new()),
+        });
+    }
+
+    #[tokio::test]
+    async fn nothing_is_removed_from_under_a_running_build() {
+        let (_dir, ctx) = test_ctx();
+        pretend_a_build_is_running(&ctx);
+
+        let env = ctx.remove_python_environments(vec!["0".repeat(16)]).await;
+        assert!(env.unwrap_err().contains("being built"));
+
+        let model = ctx
+            .remove_custom_model(EmbeddingEngine::SBERT, "org/model".to_string())
+            .await;
+        assert!(model.unwrap_err().contains("being built"));
+    }
+
+    #[tokio::test]
+    async fn the_selected_model_cannot_be_removed() {
+        let (_dir, ctx) = test_ctx();
+        let selected = ctx.settings().await.semantic.selected;
+
+        let err = ctx
+            .remove_custom_model(selected.engine, selected.model.model_id().to_string())
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("Choose another model"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_removed_custom_model_leaves_the_catalog_and_the_disk() {
+        let (_dir, ctx) = test_ctx();
+        ctx.update_semantic_settings(|mut semantic| {
+            semantic
+                .custom_models
+                .push(wilkes_core::types::CustomModel {
+                    engine: EmbeddingEngine::Candle,
+                    model_id: "org/model".to_string(),
+                });
+            semantic
+        })
+        .await;
+
+        ctx.remove_custom_model(EmbeddingEngine::Candle, "org/model".to_string())
+            .await
+            .unwrap();
+
+        assert!(ctx.settings().await.semantic.custom_models.is_empty());
     }
 
     #[tokio::test]
@@ -13565,10 +13700,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -13588,10 +13723,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -13613,10 +13748,10 @@ exit 0
             dir.path().to_path_buf(),
             settings_path.clone(),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -13672,10 +13807,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -13705,10 +13840,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -13781,10 +13916,10 @@ exit 0
             root.clone(),
             root.join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -14083,10 +14218,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -14132,10 +14267,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -14156,10 +14291,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -14181,10 +14316,10 @@ exit 0
             dir.path().to_path_buf(),
             settings_path.clone(),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -14211,10 +14346,10 @@ exit 0
             data_dir.clone(),
             settings_path,
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir,
             },
@@ -14238,10 +14373,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -14715,10 +14850,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -14761,10 +14896,10 @@ exit 0
             data_dir.clone(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: data_dir.clone(),
             },
@@ -14830,10 +14965,10 @@ exit 0
             data_dir.clone(),
             settings_path,
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: data_dir.clone(),
             },
@@ -14916,10 +15051,10 @@ exit 0
             data_dir.clone(),
             settings_path,
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: data_dir.clone(),
             },
@@ -15007,10 +15142,10 @@ exit 0
             data_dir.clone(),
             settings_path.clone(),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: data_dir.clone(),
             },
@@ -15038,10 +15173,10 @@ exit 0
             dir.path().to_path_buf(),
             settings_path,
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: PathBuf::from("data"),
             },
@@ -15089,10 +15224,10 @@ exit 0
             data_dir.clone(),
             settings_path,
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: data_dir.clone(),
             },
@@ -15117,10 +15252,10 @@ exit 0
             data_dir.clone(),
             settings_path,
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: data_dir.clone(),
             },
@@ -15150,10 +15285,10 @@ exit 0
             data_dir.clone(),
             settings_path,
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: data_dir.clone(),
             },
@@ -15183,10 +15318,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("s.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: dir.path().to_path_buf(),
             },
@@ -15207,10 +15342,10 @@ exit 0
             dir.path().to_path_buf(),
             settings_path.clone(),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: dir.path().to_path_buf(),
             },
@@ -15260,10 +15395,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: dir.path().to_path_buf(),
             },
@@ -15302,10 +15437,10 @@ exit 0
             dir.path().to_path_buf(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: PathBuf::from("p"),
+                python_override: None,
                 python_package_dir: PathBuf::from("pkg"),
                 requirements_path: PathBuf::from("r"),
-                venv_dir: PathBuf::from("v"),
+                uv_bin: PathBuf::from("v"),
                 worker_bin: PathBuf::from("w"),
                 data_dir: dir.path().to_path_buf(),
             },
@@ -15602,10 +15737,10 @@ exit 0
             dir.path().into(),
             dir.path().join("settings.json"),
             WorkerPaths {
-                python_path: "p".into(),
+                python_override: None,
                 python_package_dir: "pkg".into(),
                 requirements_path: "r".into(),
-                venv_dir: "v".into(),
+                uv_bin: "v".into(),
                 worker_bin: "w".into(),
                 data_dir: dir.path().into(),
             },

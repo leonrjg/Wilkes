@@ -20,7 +20,7 @@ def verify_bundles(bundle_dir: Path, target: str) -> None:
     if target == "x86_64-pc-windows-msvc":
         with zipfile.ZipFile(next(bundle_dir.glob("portable/*.zip"))) as archive:
             names = set(archive.namelist())
-            required = {"Wilkes.exe", "wilkes-rust-worker.exe", "requirements.txt",
+            required = {"Wilkes.exe", "wilkes-rust-worker.exe", "uv.exe", "requirements.txt",
                         "wilkes_python_worker/__main__.py"}
             missing = required - names
             if missing:

@@ -832,6 +832,7 @@ impl EmbedderInstaller for CandleInstaller {
                 passage_prefix: prefixes.passage_prefix,
                 embedding_space_identity,
                 batch_size: self.batch_size,
+                python_env: None,
             },
         )))
     }

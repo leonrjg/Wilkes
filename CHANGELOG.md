@@ -11,8 +11,19 @@
 - MCP clients can write custom integrations. `read_custom_integrations` lists them and returns the manifest format's authoring guide, but never a stored manifest's text: to have the chat change one, use Edit with chat on its row in Settings › Integrations, which sends the manifest with the change you ask for. `probe_custom_integration` runs a draft's search once without saving it. `save_custom_integration` adds a manifest or replaces the one with the same id. A replaced integration keeps its name, and keeps its stored secrets only if the new manifest reaches no origin or program the old one did not. A new one is off unless asked for. Saving never sets a secret or allows a program; the answer names what the user still has to set. The probe likewise runs with stored secrets only under that same origin and program rule. Settings that are open pick up the saved manifest instead of overwriting it. A chat reads integration settings as they are at each call, not as they were when it started, so it can search a provider saved during it.
 - Literature and catalogue results can be saved for later with the bookmark button on a result, and listed from the bookmark button in the literature pane's header. A saved work keeps the result as it was found, takes a note, and once added to the library stays on the list, linked to the file. The same DOI from another provider counts as the same saved work. MCP clients can save a `literature_search` result with `save_literature_result`, and list, annotate or remove saved works with `read_library` and `edit_library`.
 
+- SBERT no longer needs Python installed. The app installs the Python and packages it needs under its data directory, using a bundled `uv`, and rebuilds the old environment once. `WILKES_PYTHON` still names an interpreter to use instead.
+- A custom SBERT model runs in an environment built for what it needs: the Transformers version its own code was written for, older or newer than the app's, on the newest Python that version installs on, plus any packages its code imports. Models that need the same thing share one environment, and packages are shared between environments, so a second one takes a fraction of the first. A model that cannot be set up on the machine is refused with the reason, before anything is installed.
+- Installing a custom SBERT model now embeds a short text, so a model that loads but cannot run fails at installation rather than during an index build. Setting up an environment shows what it is doing.
+- Settings › Workers lists Python environments with their size, last use and the models that use them. Any can be removed, and is rebuilt with the same versions the next time a model needs it. Environments are never removed automatically.
+- Custom models can be removed from the model list, which deletes their downloaded files.
+
+### Changed
+
+- The Python worker's dependencies are pinned and locked per environment, so every install gets the same versions. `semantic-text-splitter`, `sqlite-vec` and PyMuPDF, which it never used, are gone.
+
 ### Fixed
 
+- Cancelling while a Python environment is being set up stops it within the cancellation deadline, instead of leaving it running to the end.
 - An open chat no longer uses more than a full CPU core while it sits idle.
 - CBZ comics open and scroll by loading individual page images, avoiding full-book
   PDF conversion and keeping only nearby images in the reader. They show the same

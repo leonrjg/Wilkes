@@ -1,9 +1,16 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
+# The base environment, which the built-in models run in. `python_env.rs` picks
+# the newest Python these resolve on and locks the result, so there is one set
+# of pins for every machine. `transformers` must stay an exact, unconditional
+# pin: it is how the host learns what the base environment provides. A model
+# that needs anything else gets an environment of its own.
 torch==2.8.0+cpu ; sys_platform == "linux"
-sentence-transformers
-semantic-text-splitter
-sqlite-vec
-numpy
-PyMuPDF
-einops
-peft
+torch==2.11.0 ; sys_platform != "linux"
+transformers==5.22.1
+sentence-transformers==6.2.0
+tokenizers==0.23.3
+huggingface-hub==2.4.0
+accelerate==1.15.0
+peft==0.21.2
+einops==0.8.2
+numpy==2.5.4

@@ -10,6 +10,7 @@ use crate::generate::{
 };
 use crate::models::progress::EmbedProgress;
 use crate::types::EmbeddingEngine;
+use crate::worker::EnvNeeds;
 
 /// What a worker process is for. Replaces the bare `EmbeddingEngine` on the
 /// request: once a non-embedding role exists, keying restart decisions on an
@@ -225,6 +226,11 @@ pub struct WorkerRequest {
     /// Used by "table" mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table: Option<TableStructureRequest>,
+    /// The Python environment this request has to run in, `None` being the
+    /// base one. Which process serves the request, like `role`, so it is read
+    /// by the host and never sent: a running worker cannot change environment.
+    #[serde(skip)]
+    pub python_env: Option<EnvNeeds>,
 }
 
 impl WorkerRequest {
@@ -291,10 +297,36 @@ pub struct CancelSignal {
 }
 
 /// Lines emitted by the worker to stdout.
+/// What a model turned out to need that its environment does not have, found
+/// by trying to load it. A model's source can import anything, and whether
+/// Transformers knows an architecture is only decided by Transformers.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct UnmetNeeds {
+    /// Packages its code imports, as they are imported.
+    #[serde(default)]
+    pub packages: Vec<String>,
+    /// Transformers does not know its model type.
+    #[serde(default)]
+    pub architecture: bool,
+    /// The failure as Python reported it.
+    pub detail: String,
+}
+
+impl std::fmt::Display for UnmetNeeds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for UnmetNeeds {}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub enum WorkerEvent {
     /// Forwarded from the index build progress channel.
     Progress(EmbedProgress),
+    /// Terminal event for a probe that failed for want of something another
+    /// environment could give it, as opposed to one that simply failed.
+    Unmet(UnmetNeeds),
     /// Embedding vectors returned by the "embed" mode.
     Embeddings(Vec<Vec<f32>>),
     /// Model metadata returned by the "info" mode.
@@ -370,6 +402,7 @@ impl WorkerEvent {
             self,
             WorkerEvent::Done
                 | WorkerEvent::Error(_)
+                | WorkerEvent::Unmet(_)
                 | WorkerEvent::Gone(_)
                 | WorkerEvent::Completion { .. }
         )
@@ -395,6 +428,7 @@ mod tests {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
         }
     }
 

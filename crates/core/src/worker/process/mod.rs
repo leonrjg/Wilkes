@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use super::ipc::{WorkerEvent, WorkerProcessKind, WorkerRequest};
 use super::manager::WorkerPaths;
-use super::python_env::setup_python_env;
+use super::python_env::ensure_env;
 
 #[cfg(unix)]
 mod unix;
@@ -73,6 +73,7 @@ pub(super) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub(super) async fn build_command_plan(
     paths: &WorkerPaths,
     req: &WorkerRequest,
+    reply: &tokio::sync::mpsc::Sender<WorkerEvent>,
 ) -> Result<ProcessCommandPlan, String> {
     // Which process, asked once. `WorkerRole::process_kind` is the answer, and
     // it is the same answer the manager used to decide whether the worker it
@@ -81,7 +82,7 @@ pub(super) async fn build_command_plan(
     // for.
     Ok(match req.role.process_kind() {
         WorkerProcessKind::Sidecar => {
-            let python = setup_python_env(paths).await?;
+            let python = ensure_env(paths, req.python_env.as_ref(), reply).await?;
             let cache_root = paths.data_dir.join("huggingface");
             let xdg_cache_root = paths.data_dir.join(".cache");
             std::fs::create_dir_all(&cache_root).map_err(|e| {
@@ -203,38 +204,42 @@ exit 0
         write_executable(path, body);
     }
 
-    fn write_fake_python_suite(path: &Path, venv_dir: &Path) {
-        let script = format!(
-            r#"#!/bin/sh
-if [ "$1" = "-c" ]; then
-    printf '%s\n' "3.9.6"
-    exit 0
-fi
+    /// A reply channel nobody reads, for the setup progress a spawn reports.
+    fn unread_reply() -> tokio::sync::mpsc::Sender<WorkerEvent> {
+        tokio::sync::mpsc::channel(8).0
+    }
 
-case "$*" in
-*"-m venv"*)
-    mkdir -p "{venv}/bin"
-    cat > "{venv}/bin/python3" <<'EOF'
+    /// A `uv` whose environments hold a Python that answers as the worker does.
+    fn write_fake_uv(path: &Path) {
+        let script = r#"#!/bin/sh
+case "$1 $2" in
+    "pip compile")
+        while [ $# -gt 0 ]; do
+            if [ "$1" = "--output-file" ]; then
+                printf 'transformers==5.22.1\n' > "$2"
+            fi
+            shift
+        done
+        ;;
+    venv*)
+        mkdir -p "$2/bin"
+        cat > "$2/bin/python3" <<'EOF'
 #!/bin/sh
 if [ "$1" = "-m" ] && [ "$2" = "wilkes_python_worker" ]; then
   read req
   echo noise-line
-  echo '{{"Embeddings":[[1.0,2.0]]}}'
+  echo '{"Embeddings":[[1.0,2.0]]}'
   echo '"Done"'
   exit 0
 fi
 exit 0
 EOF
-    chmod +x "{venv}/bin/python3"
-    exit 0
-    ;;
+        chmod +x "$2/bin/python3"
+        ;;
 esac
-
 exit 0
-"#,
-            venv = venv_dir.display()
-        );
-        write_executable(path, &script);
+"#;
+        write_executable(path, script);
     }
 
     #[tokio::test]
@@ -244,10 +249,10 @@ exit 0
         write_candle_worker_script(&worker_bin, true);
 
         let paths = WorkerPaths {
-            python_path: dir.path().join("python"),
+            python_override: None,
             python_package_dir: dir.path().to_path_buf(),
             requirements_path: dir.path().join("requirements.txt"),
-            venv_dir: dir.path().join("venv"),
+            uv_bin: dir.path().join("uv"),
             worker_bin: worker_bin.clone(),
             data_dir: dir.path().to_path_buf(),
         };
@@ -265,10 +270,11 @@ exit 0
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
         };
 
         let active_pid = AtomicU32::new(0);
-        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid, &unread_reply())
             .await
             .unwrap();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(8);
@@ -312,10 +318,10 @@ echo '"Done"'
         );
 
         let paths = WorkerPaths {
-            python_path: std::path::PathBuf::from("python"),
+            python_override: None,
             python_package_dir: dir.path().to_path_buf(),
             requirements_path: dir.path().join("requirements.txt"),
-            venv_dir: dir.path().join("venv"),
+            uv_bin: dir.path().join("uv"),
             worker_bin,
             data_dir: dir.path().to_path_buf(),
         };
@@ -331,11 +337,12 @@ echo '"Done"'
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
         };
         let req_json = serde_json::to_string(&req).unwrap();
 
         let active_pid = AtomicU32::new(0);
-        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid, &unread_reply())
             .await
             .unwrap();
 
@@ -370,10 +377,10 @@ echo '"Done"'
         write_candle_worker_script(&worker_bin, false);
 
         let paths = WorkerPaths {
-            python_path: dir.path().join("python"),
+            python_override: None,
             python_package_dir: dir.path().to_path_buf(),
             requirements_path: dir.path().join("requirements.txt"),
-            venv_dir: dir.path().join("venv"),
+            uv_bin: dir.path().join("uv"),
             worker_bin: worker_bin.clone(),
             data_dir: dir.path().to_path_buf(),
         };
@@ -391,10 +398,11 @@ echo '"Done"'
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
         };
 
         let active_pid = AtomicU32::new(0);
-        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid, &unread_reply())
             .await
             .unwrap();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(8);
@@ -417,10 +425,10 @@ echo '"Done"'
         write_executable(&worker_bin, "#!/bin/sh\nexit 0\n");
 
         let paths = WorkerPaths {
-            python_path: dir.path().join("python"),
+            python_override: None,
             python_package_dir: dir.path().to_path_buf(),
             requirements_path: dir.path().join("requirements.txt"),
-            venv_dir: dir.path().join("venv"),
+            uv_bin: dir.path().join("uv"),
             worker_bin: worker_bin.clone(),
             data_dir: dir.path().to_path_buf(),
         };
@@ -438,10 +446,11 @@ echo '"Done"'
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
         };
 
         let active_pid = AtomicU32::new(0);
-        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid, &unread_reply())
             .await
             .unwrap();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(8);
@@ -470,10 +479,10 @@ exit 0
         );
 
         let paths = WorkerPaths {
-            python_path: dir.path().join("python"),
+            python_override: None,
             python_package_dir: dir.path().to_path_buf(),
             requirements_path: dir.path().join("requirements.txt"),
-            venv_dir: dir.path().join("venv"),
+            uv_bin: dir.path().join("uv"),
             worker_bin: worker_bin.clone(),
             data_dir: dir.path().to_path_buf(),
         };
@@ -491,10 +500,11 @@ exit 0
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
         };
 
         let active_pid = AtomicU32::new(0);
-        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid, &unread_reply())
             .await
             .unwrap();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(8);
@@ -514,10 +524,10 @@ exit 0
         write_executable(&worker_bin, "#!/bin/sh\nsleep 5\nexit 0\n");
 
         let paths = WorkerPaths {
-            python_path: dir.path().join("python"),
+            python_override: None,
             python_package_dir: dir.path().to_path_buf(),
             requirements_path: dir.path().join("requirements.txt"),
-            venv_dir: dir.path().join("venv"),
+            uv_bin: dir.path().join("uv"),
             worker_bin: worker_bin.clone(),
             data_dir: dir.path().to_path_buf(),
         };
@@ -535,10 +545,11 @@ exit 0
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
         };
 
         let active_pid = AtomicU32::new(0);
-        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid, &unread_reply())
             .await
             .unwrap();
         proc.shutdown(&active_pid, Stop::RoofKnock).await;
@@ -559,10 +570,10 @@ exit 0
         write_executable(&worker_bin, "#!/bin/sh\nsleep 300\nexit 0\n");
 
         let paths = WorkerPaths {
-            python_path: dir.path().join("python"),
+            python_override: None,
             python_package_dir: dir.path().to_path_buf(),
             requirements_path: dir.path().join("requirements.txt"),
-            venv_dir: dir.path().join("venv"),
+            uv_bin: dir.path().join("uv"),
             worker_bin: worker_bin.clone(),
             data_dir: dir.path().to_path_buf(),
         };
@@ -580,10 +591,11 @@ exit 0
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
         };
 
         let active_pid = AtomicU32::new(0);
-        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid, &unread_reply())
             .await
             .unwrap();
         let started = std::time::Instant::now();
@@ -601,18 +613,17 @@ exit 0
     #[tokio::test]
     async fn test_worker_process_spawn_sbert_build_command() {
         let dir = tempdir().unwrap();
-        let python_path = dir.path().join("python");
-        let venv_dir = dir.path().join("venv");
-        write_fake_python_suite(&python_path, &venv_dir);
+        let uv_bin = dir.path().join("uv");
+        write_fake_uv(&uv_bin);
 
         let requirements_path = dir.path().join("requirements.txt");
         std::fs::write(&requirements_path, "torch\n").unwrap();
 
         let paths = WorkerPaths {
-            python_path,
+            python_override: None,
             python_package_dir: dir.path().to_path_buf(),
             requirements_path,
-            venv_dir,
+            uv_bin,
             worker_bin: dir.path().join("unused-worker"),
             data_dir: dir.path().to_path_buf(),
         };
@@ -629,10 +640,11 @@ exit 0
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
         };
 
         let active_pid = AtomicU32::new(0);
-        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid, &unread_reply())
             .await
             .unwrap();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(8);
@@ -682,10 +694,10 @@ exit 0
         );
 
         let paths = WorkerPaths {
-            python_path: dir.path().join("python"),
+            python_override: None,
             python_package_dir: dir.path().to_path_buf(),
             requirements_path: dir.path().join("requirements.txt"),
-            venv_dir: dir.path().join("venv"),
+            uv_bin: dir.path().join("uv"),
             worker_bin: worker_bin.clone(),
             data_dir: dir.path().to_path_buf(),
         };
@@ -703,10 +715,11 @@ exit 0
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
         };
 
         let active_pid = AtomicU32::new(0);
-        let proc = WorkerProcess::spawn(&paths, &req, &active_pid)
+        let proc = WorkerProcess::spawn(&paths, &req, &active_pid, &unread_reply())
             .await
             .unwrap();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(8);

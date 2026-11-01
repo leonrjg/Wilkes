@@ -8,7 +8,7 @@ use crate::generate::{GenerationRuntime, GenerationTimings};
 
 use super::ipc::{WorkerEvent, WorkerKind, WorkerRequest};
 use super::process::Stop;
-use super::runtime::{supervised_manager_loop, ActiveProcessSlot};
+use super::runtime::{supervised_manager_loop, until_sealed, ActiveProcessSlot};
 use super::DEFAULT_IDLE_TIMEOUT_SECS;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -46,10 +46,11 @@ pub struct GenerationWorkerStatus {
 
 #[derive(Clone)]
 pub struct WorkerPaths {
-    pub python_path: PathBuf,
+    /// The interpreter to build environments on, instead of choosing one.
+    pub python_override: Option<PathBuf>,
     pub python_package_dir: PathBuf,
     pub requirements_path: PathBuf,
-    pub venv_dir: PathBuf,
+    pub uv_bin: PathBuf,
     pub worker_bin: PathBuf,
     pub data_dir: PathBuf,
 }
@@ -57,28 +58,38 @@ pub struct WorkerPaths {
 impl WorkerPaths {
     /// Attempt to resolve all paths automatically.
     pub fn resolve(data_dir: &Path) -> Self {
-        use crate::path::{resolve_python, resolve_python_package_dir};
+        use crate::path::{python_override, resolve_python_package_dir, resolve_uv};
 
-        let python_path = resolve_python().unwrap_or_default();
         let python_package_dir = resolve_python_package_dir().unwrap_or_default();
         let requirements_path = if python_package_dir.exists() {
             python_package_dir.join("requirements.txt")
         } else {
             PathBuf::new()
         };
-        let venv_dir = data_dir.join("sbert_venv");
+        let uv_bin = resolve_uv().unwrap_or_default();
         let worker_bin = std::env::current_exe()
             .unwrap_or_default()
             .with_file_name("wilkes-rust-worker");
 
         Self {
-            python_path,
+            python_override: python_override(),
             python_package_dir,
             requirements_path,
-            venv_dir,
+            uv_bin,
             worker_bin,
             data_dir: data_dir.to_path_buf(),
         }
+    }
+
+    /// Where everything `uv` builds lives: environments, interpreters and the
+    /// package cache they share.
+    pub fn python_root(&self) -> PathBuf {
+        self.data_dir.join("python")
+    }
+
+    /// Where the Python worker's model downloads land.
+    pub fn hub_cache(&self) -> PathBuf {
+        self.data_dir.join("huggingface").join("hub")
     }
 }
 
@@ -105,6 +116,7 @@ type SenderSlot = Arc<std::sync::Mutex<mpsc::Sender<ManagerCommand>>>;
 
 #[derive(Clone)]
 pub struct WorkerManager {
+    paths: WorkerPaths,
     sender: SenderSlot,
     active_pid: Arc<AtomicU32>,
     active_process: ActiveProcessSlot,
@@ -148,7 +160,7 @@ impl WorkerManager {
         let sender: SenderSlot = Arc::new(std::sync::Mutex::new(tx));
         let sealed = Arc::new(AtomicBool::new(false));
         let fut = supervised_manager_loop(
-            paths,
+            paths.clone(),
             kind,
             rx,
             event_tx,
@@ -160,6 +172,7 @@ impl WorkerManager {
         );
         (
             Self {
+                paths,
                 sender,
                 active_pid,
                 active_process,
@@ -173,6 +186,10 @@ impl WorkerManager {
 
     pub fn status(&self) -> WorkerStatus {
         self.status.read().unwrap().clone()
+    }
+
+    pub fn paths(&self) -> &WorkerPaths {
+        &self.paths
     }
 
     pub fn record_generation_runtime(&self, runtime: GenerationRuntime) {
@@ -267,6 +284,12 @@ impl WorkerManager {
         self.sealed.load(Ordering::Acquire)
     }
 
+    /// Resolves once starts are sealed. For a caller about to wait on something
+    /// a kill cannot reach, which the seal has to be able to abandon.
+    pub async fn until_sealed(&self) {
+        until_sealed(&self.sealed).await;
+    }
+
     /// The process this manager believes is alive, if any. Zeroed by the
     /// shutdown that reaps it, so a non-zero pid after a kill is a kill that
     /// has not landed.
@@ -300,10 +323,10 @@ mod tests {
     #[tokio::test]
     async fn test_worker_manager_status_inactive() {
         let paths = WorkerPaths {
-            python_path: PathBuf::from("python"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -322,10 +345,10 @@ mod tests {
     #[tokio::test]
     async fn an_idle_manager_reports_the_role_it_supervises() {
         let paths = WorkerPaths {
-            python_path: PathBuf::from("python"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -349,10 +372,10 @@ mod tests {
     #[tokio::test]
     async fn generation_runtime_records_realized_device_and_timings() {
         let paths = WorkerPaths {
-            python_path: PathBuf::from("python"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("reqs"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -386,7 +409,7 @@ mod tests {
         let paths = WorkerPaths::resolve(dir.path());
 
         assert_eq!(paths.data_dir, dir.path());
-        assert_eq!(paths.venv_dir, dir.path().join("sbert_venv"));
+        assert_eq!(paths.python_root(), dir.path().join("python"));
         assert_eq!(
             paths.worker_bin.file_name().and_then(|s| s.to_str()),
             Some("wilkes-rust-worker")
@@ -396,10 +419,10 @@ mod tests {
     #[tokio::test]
     async fn test_worker_manager_try_send_and_blocking_send() {
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
-            venv_dir: PathBuf::from("v"),
+            uv_bin: PathBuf::from("v"),
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
@@ -424,10 +447,10 @@ mod tests {
     #[tokio::test]
     async fn test_worker_manager_lifecycle_no_process() {
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
-            venv_dir: PathBuf::from("v"),
+            uv_bin: PathBuf::from("v"),
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
@@ -440,10 +463,10 @@ mod tests {
     #[tokio::test]
     async fn test_worker_manager_commands() {
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
-            venv_dir: PathBuf::from("v"),
+            uv_bin: PathBuf::from("v"),
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
@@ -466,10 +489,10 @@ mod tests {
         std::fs::write(&worker_bin, "").unwrap();
 
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
-            venv_dir: PathBuf::from("v"),
+            uv_bin: PathBuf::from("v"),
             worker_bin,
             data_dir: PathBuf::from("data"),
         };
@@ -489,6 +512,7 @@ mod tests {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
         });
 
         manager
@@ -505,10 +529,10 @@ mod tests {
     #[tokio::test]
     async fn test_worker_manager_idle_timeout() {
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
-            venv_dir: PathBuf::from("v"),
+            uv_bin: PathBuf::from("v"),
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
@@ -529,10 +553,10 @@ mod tests {
         let worker_bin = dir.path().join("this_does_not_exist");
 
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
-            venv_dir: PathBuf::from("v"),
+            uv_bin: PathBuf::from("v"),
             worker_bin,
             data_dir: PathBuf::from("data"),
         };
@@ -552,6 +576,7 @@ mod tests {
             recognize: None,
             layout: None,
             table: None,
+            python_env: None,
         });
 
         manager
@@ -571,10 +596,10 @@ mod tests {
     #[tokio::test]
     async fn test_request_shutdown_is_non_blocking() {
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
-            venv_dir: PathBuf::from("v"),
+            uv_bin: PathBuf::from("v"),
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };

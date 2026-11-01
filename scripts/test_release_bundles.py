@@ -45,7 +45,7 @@ class ReleaseBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing"):
             verify_bundles(self.root, "x86_64-pc-windows-msvc")
         with zipfile.ZipFile(archive_path, "a") as archive:
-            for name in ("wilkes-rust-worker.exe", "requirements.txt", "wilkes_python_worker/__main__.py"):
+            for name in ("wilkes-rust-worker.exe", "uv.exe", "requirements.txt", "wilkes_python_worker/__main__.py"):
                 archive.writestr(name, b"resource")
         verify_bundles(self.root, "x86_64-pc-windows-msvc")
 

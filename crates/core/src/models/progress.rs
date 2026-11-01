@@ -39,6 +39,9 @@ pub struct IndexBuildProgress {
 pub enum EmbedProgress {
     Download(DownloadProgress),
     Build(IndexBuildProgress),
+    /// What the setup of a Python environment is doing, which has no bytes to
+    /// count: most of it is deciding and testing.
+    Setup(String),
 }
 
 pub type ProgressTx = mpsc::Sender<EmbedProgress>;

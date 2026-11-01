@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { SearchApi } from "../services/api";
-import type { WorkerStatus, Settings } from "../lib/types";
+import type { PythonEnvInventory, WorkerStatus, Settings } from "../lib/types";
+import { formatModelBytes } from "./ModelCatalog";
 
 /** The worker roles the backend reports, in the order they are listed. */
 const ROLE_LABELS: Record<string, string> = {
@@ -18,6 +19,120 @@ interface WorkersPanelProps {
   api: SearchApi;
   settings: Settings;
   onUpdateSettings: (patch: Partial<Settings>) => Promise<void>;
+}
+
+function formatLastUsed(lastUsed: string | null): string {
+  return lastUsed ? `last used ${new Date(lastUsed).toLocaleDateString()}` : "never used";
+}
+
+/**
+ * The Python environments models run in. Nothing here is ever removed without
+ * being asked: a finished environment stays until the user takes it away, and
+ * one taken away while a model needs it is rebuilt from its lock on next use.
+ */
+function PythonEnvironments({ api }: { api: WorkersPanelProps["api"] }) {
+  const [inventory, setInventory] = useState<PythonEnvInventory | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [removing, setRemoving] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      setInventory(await api.getPythonEnvs());
+      setError(null);
+    } catch (e: any) {
+      setError(e.toString());
+    }
+  }, [api]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const remove = async (ids: string[]) => {
+    setRemoving(true);
+    try {
+      await api.removePythonEnvs(ids);
+      await refresh();
+    } catch (e: any) {
+      setError(e.toString());
+    } finally {
+      setRemoving(false);
+    }
+  };
+
+  const unused = (inventory?.envs ?? []).filter((env) => !env.is_base && env.models.length === 0);
+  const buttonClass =
+    "px-2 py-1 bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] text-[var(--text-main)] text-[10px] font-medium rounded transition-colors border border-[var(--border-main)] disabled:opacity-50";
+
+  return (
+    <section>
+      <div className="flex items-center justify-between mb-2.5">
+        <h3 className="text-[10px] font-medium text-[var(--text-dim)] uppercase tracking-wider">Python Environments</h3>
+        {inventory && inventory.envs.length > 0 && (
+          <span className="text-[10px] text-[var(--text-dim)]">
+            {formatModelBytes(inventory.total_bytes)} in total
+          </span>
+        )}
+      </div>
+      <div className="bg-[var(--bg-input)] border border-[var(--border-main)] rounded-lg p-4 space-y-3">
+        {error && (
+          <div className="p-2 bg-red-900/20 border border-red-900/50 rounded text-[10px] text-red-400 font-mono break-all whitespace-pre-wrap">
+            {error}
+          </div>
+        )}
+        {inventory?.envs.length === 0 && (
+          <p className="text-xs text-[var(--text-muted)]">
+            None yet. One is set up the first time a Python model is used.
+          </p>
+        )}
+        {inventory?.envs.map((env) => (
+          <div key={env.id} className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-xs text-[var(--text-main)]">
+                Transformers {env.transformers} on Python {env.python}
+                {env.is_base && <span className="ml-1.5 text-[10px] text-[var(--text-dim)]">base</span>}
+              </p>
+              <p className="text-[10px] text-[var(--text-dim)] break-words">
+                {formatModelBytes(env.size_bytes)} · {formatLastUsed(env.last_used_at)}
+                {env.packages.length > 0 && ` · with ${env.packages.join(", ")}`}
+              </p>
+              <p className="text-[10px] text-[var(--text-muted)] break-words">
+                {env.is_base
+                  ? ["Built-in models", ...env.models].join(", ")
+                  : env.models.length > 0
+                    ? env.models.join(", ")
+                    : "Not used by any model"}
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={removing}
+              aria-label={`${env.is_base ? "Rebuild" : "Remove"} Transformers ${env.transformers} on Python ${env.python}`}
+              title={
+                env.is_base || env.models.length > 0
+                  ? "Deleted now and built again the next time a model needs it."
+                  : undefined
+              }
+              onClick={() => void remove([env.id])}
+              className={buttonClass}
+            >
+              {env.is_base ? "Rebuild" : "Remove"}
+            </button>
+          </div>
+        ))}
+        {unused.length > 1 && (
+          <button
+            type="button"
+            disabled={removing}
+            onClick={() => void remove(unused.map((env) => env.id))}
+            className={buttonClass}
+          >
+            Remove all unused
+          </button>
+        )}
+      </div>
+    </section>
+  );
 }
 
 export default function WorkersPanel({ api, settings, onUpdateSettings }: WorkersPanelProps) {
@@ -207,6 +322,8 @@ export default function WorkersPanel({ api, settings, onUpdateSettings }: Worker
           )}
         </div>
       </section>
+
+      <PythonEnvironments api={api} />
 
       <section>
         <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2.5 uppercase tracking-wider">Configuration</h3>

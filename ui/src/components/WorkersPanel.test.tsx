@@ -7,6 +7,8 @@ describe("WorkersPanel", () => {
     getWorkerStatuses: vi.fn(),
     killWorker: vi.fn(),
     setWorkerTimeout: vi.fn(),
+    getPythonEnvs: vi.fn().mockResolvedValue({ envs: [], total_bytes: 0 }),
+    removePythonEnvs: vi.fn().mockResolvedValue(undefined),
   } as any;
 
   const mockSettings = {
@@ -244,5 +246,83 @@ describe("WorkersPanel", () => {
       fireEvent.click(applyButton);
     });
     // Coverage for catch block
+  });
+
+  describe("Python environments", () => {
+    const base = {
+      id: "b",
+      is_base: true,
+      transformers: "5.22.1",
+      python: "3.14",
+      packages: [],
+      size_bytes: 700 * 1_048_576,
+      models: [],
+      last_used_at: null,
+    };
+    const inUse = { ...base, id: "u", is_base: false, transformers: "4.47.1", python: "3.13", packages: ["timm"], models: ["org/old"] };
+    const idle = { ...base, id: "i", is_base: false, transformers: "4.39.3", python: "3.12" };
+    const idleToo = { ...idle, id: "j", transformers: "4.36.2" };
+
+    beforeEach(() => {
+      mockApi.getWorkerStatuses.mockResolvedValue([]);
+      mockApi.removePythonEnvs.mockClear();
+      mockApi.getPythonEnvs.mockResolvedValue({ envs: [base, inUse, idle, idleToo], total_bytes: 900 * 1_048_576 });
+    });
+
+    afterEach(() => {
+      mockApi.getPythonEnvs.mockResolvedValue({ envs: [], total_bytes: 0 });
+    });
+
+    const renderPanel = async () => {
+      await act(async () => {
+        render(<WorkersPanel api={mockApi} settings={mockSettings} onUpdateSettings={mockOnUpdateSettings} />);
+      });
+    };
+
+    it("says what each environment is and what uses it", async () => {
+      await renderPanel();
+
+      expect(screen.getByText("Transformers 4.47.1 on Python 3.13")).toBeInTheDocument();
+      expect(screen.getByText("org/old")).toBeInTheDocument();
+      expect(screen.getByText(/with timm/)).toBeInTheDocument();
+      expect(screen.getAllByText("Not used by any model")).toHaveLength(2);
+      expect(screen.getByText("Built-in models")).toBeInTheDocument();
+      expect(screen.getByText("900 MB in total")).toBeInTheDocument();
+    });
+
+    it("offers to rebuild the base environment and to remove the others", async () => {
+      await renderPanel();
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Rebuild Transformers 5.22.1 on Python 3.14" }));
+      });
+      expect(mockApi.removePythonEnvs).toHaveBeenCalledWith(["b"]);
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Remove Transformers 4.39.3 on Python 3.12" }));
+      });
+      expect(mockApi.removePythonEnvs).toHaveBeenCalledWith(["i"]);
+    });
+
+    it("removes only what nothing uses when asked to remove all unused", async () => {
+      await renderPanel();
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Remove all unused" }));
+      });
+
+      expect(mockApi.removePythonEnvs).toHaveBeenCalledWith(["i", "j"]);
+    });
+
+    it("shows why a removal failed", async () => {
+      mockApi.removePythonEnvs.mockRejectedValueOnce("an index is being built");
+      await renderPanel();
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Remove Transformers 4.39.3 on Python 3.12" }));
+      });
+
+      expect(screen.getByText("an index is being built")).toBeInTheDocument();
+    });
   });
 });

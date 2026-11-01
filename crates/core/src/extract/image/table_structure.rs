@@ -1054,6 +1054,7 @@ impl TableStructure for WorkerTableStructure {
             recognize: None,
             layout: None,
             table: Some(TableStructureRequest { image_paths }),
+            python_env: None,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -1649,10 +1650,10 @@ mod tests {
     async fn attaching_an_unknown_table_reader_is_an_error() {
         let (manager, _events, _loop_fut) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths {
-                python_path: PathBuf::new(),
+                python_override: None,
                 python_package_dir: PathBuf::new(),
                 requirements_path: PathBuf::new(),
-                venv_dir: PathBuf::new(),
+                uv_bin: PathBuf::new(),
                 worker_bin: PathBuf::new(),
                 data_dir: PathBuf::new(),
             },
@@ -1725,10 +1726,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (manager, _events, _loop_fut) = crate::worker::manager::WorkerManager::new(
             crate::worker::manager::WorkerPaths {
-                python_path: PathBuf::new(),
+                python_override: None,
                 python_package_dir: PathBuf::new(),
                 requirements_path: PathBuf::new(),
-                venv_dir: PathBuf::new(),
+                uv_bin: PathBuf::new(),
                 worker_bin: PathBuf::new(),
                 data_dir: PathBuf::new(),
             },

@@ -233,13 +233,6 @@ async fn get_data_paths_handler(State(state): State<Arc<AppState>>) -> impl Into
     })
 }
 
-async fn get_python_info_handler() -> impl IntoResponse {
-    match wilkes_core::path::resolve_python() {
-        Ok(p) => Json(p.display().to_string()),
-        Err(e) => Json(format!("Not found: {}", e)),
-    }
-}
-
 async fn get_settings_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
@@ -2573,6 +2566,52 @@ async fn get_worker_statuses_handler(
     Ok(Json(state.context().get_worker_statuses()))
 }
 
+async fn get_python_envs_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .python_environments()
+        .await
+        .map(Json)
+        .map_err(|e| server_err(format!("{e:#}")))
+}
+
+#[derive(Deserialize)]
+struct RemovePythonEnvsBody {
+    ids: Vec<String>,
+}
+
+async fn remove_python_envs_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RemovePythonEnvsBody>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .remove_python_environments(body.ids)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(server_err)
+}
+
+#[derive(Deserialize)]
+struct RemoveCustomModelBody {
+    engine: wilkes_core::types::EmbeddingEngine,
+    model_id: String,
+}
+
+async fn remove_custom_model_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RemoveCustomModelBody>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .remove_custom_model(body.engine, body.model_id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(server_err)
+}
+
 async fn kill_worker_handler(State(state): State<Arc<AppState>>) -> StatusCode {
     state.context().kill_worker();
     StatusCode::NO_CONTENT
@@ -2821,7 +2860,15 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/logs", get(get_logs_handler))
         .route("/api/logs", delete(clear_logs_handler))
         .route("/api/data/paths", get(get_data_paths_handler))
-        .route("/api/worker/python-info", get(get_python_info_handler))
+        .route("/api/worker/python-envs", get(get_python_envs_handler))
+        .route(
+            "/api/worker/python-envs/remove",
+            post(remove_python_envs_handler),
+        )
+        .route(
+            "/api/models/custom/remove",
+            post(remove_custom_model_handler),
+        )
         .route("/api/files", get(list_files_handler))
         .route("/api/file", post(open_file_handler))
         .route("/api/file/rename", post(rename_file_handler))
@@ -3014,10 +3061,10 @@ mod tests {
     async fn the_router_is_constructible() {
         let dir = tempfile::tempdir().unwrap();
         let paths = WorkerPaths {
-            python_path: PathBuf::from("python"),
+            python_override: None,
             python_package_dir: PathBuf::from("py_pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -3048,10 +3095,10 @@ mod tests {
         let settings_path = dir.path().join("settings.json");
         std::fs::create_dir_all(&uploads_dir).unwrap();
         let paths = WorkerPaths {
-            python_path: PathBuf::from("python"),
+            python_override: None,
             python_package_dir: PathBuf::from("py_pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -3287,10 +3334,10 @@ mod tests {
             .unwrap();
 
         let paths = WorkerPaths {
-            python_path: PathBuf::from("python"),
+            python_override: None,
             python_package_dir: PathBuf::from("py_pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -3381,10 +3428,10 @@ mod tests {
             .unwrap();
 
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -3419,10 +3466,10 @@ mod tests {
     async fn test_update_bookmark_note_handler() {
         let dir = tempfile::tempdir().unwrap();
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -3495,10 +3542,10 @@ mod tests {
             .unwrap();
 
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -3561,10 +3608,10 @@ mod tests {
     async fn test_settings_handlers() {
         let dir = tempfile::tempdir().unwrap();
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -3588,7 +3635,6 @@ mod tests {
         let _ = get_logs_handler().await;
         let _ = clear_logs_handler().await;
         let _ = get_data_paths_handler(State(state.clone())).await;
-        let _ = get_python_info_handler().await;
         let _ = is_semantic_ready_handler(State(state.clone())).await;
         let _ = embedder_capabilities_handler(State(state.clone())).await;
 
@@ -3606,10 +3652,10 @@ mod tests {
         tokio::fs::write(&file_path, "content").await.unwrap();
 
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -3696,10 +3742,10 @@ mod tests {
         tokio::fs::write(&file_path, "asset content").await.unwrap();
 
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -3736,10 +3782,10 @@ mod tests {
         tokio::fs::write(&file_path, "file content").await.unwrap();
 
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -3776,10 +3822,10 @@ mod tests {
         tokio::fs::write(&file_path, "file content").await.unwrap();
 
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("reqs.txt"),
-            venv_dir: PathBuf::from("venv"),
+            uv_bin: PathBuf::from("venv"),
             worker_bin: PathBuf::from("worker"),
             data_dir: PathBuf::from("data"),
         };
@@ -3854,10 +3900,10 @@ mod tests {
             tx: events_tx.clone(),
         });
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
-            venv_dir: PathBuf::from("v"),
+            uv_bin: PathBuf::from("v"),
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
@@ -3909,10 +3955,10 @@ mod tests {
             tx: events_tx.clone(),
         });
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
-            venv_dir: PathBuf::from("v"),
+            uv_bin: PathBuf::from("v"),
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
@@ -3949,10 +3995,10 @@ mod tests {
             tx: events_tx.clone(),
         });
         let paths = WorkerPaths {
-            python_path: PathBuf::from("p"),
+            python_override: None,
             python_package_dir: PathBuf::from("pkg"),
             requirements_path: PathBuf::from("r"),
-            venv_dir: PathBuf::from("v"),
+            uv_bin: PathBuf::from("v"),
             worker_bin: PathBuf::from("w"),
             data_dir: PathBuf::from("data"),
         };
@@ -3995,9 +4041,6 @@ mod tests {
 
         // test embedder_capabilities_handler
         let _ = embedder_capabilities_handler(State(state.clone())).await;
-
-        // test get_python_info_handler
-        let _ = get_python_info_handler().await;
     }
 
     #[tokio::test]

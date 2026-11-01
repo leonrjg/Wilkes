@@ -416,8 +416,16 @@ export class TauriSearchApi implements SearchApi {
     return invoke("clear_logs");
   }
 
-  async getPythonInfo(): Promise<string> {
-    return invoke<string>("get_python_info");
+  async getPythonEnvs(): Promise<import("../lib/types").PythonEnvInventory> {
+    return invoke<import("../lib/types").PythonEnvInventory>("get_python_envs");
+  }
+
+  async removePythonEnvs(ids: string[]): Promise<void> {
+    return invoke("remove_python_envs", { ids });
+  }
+
+  async removeCustomModel(engine: import("../lib/types").EmbeddingEngine, modelId: string): Promise<void> {
+    return invoke("remove_custom_model", { engine, modelId });
   }
 
   async getDataPaths(): Promise<DataPaths> {

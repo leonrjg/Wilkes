@@ -396,15 +396,35 @@ describe("HttpSearchApi", () => {
     expect(fetch).toHaveBeenCalledWith("/api/logs", { method: "DELETE" });
   });
 
-  it("getPythonInfo calls fetch and returns string", async () => {
-    (fetch as any).mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve("python info"),
-    });
+  it("getPythonEnvs calls fetch and returns the inventory", async () => {
+    const inventory = { envs: [], total_bytes: 0 };
+    (fetch as any).mockResolvedValue({ ok: true, json: () => Promise.resolve(inventory) });
 
-    const res = await api.getPythonInfo();
-    expect(fetch).toHaveBeenCalledWith("/api/worker/python-info");
-    expect(res).toBe("python info");
+    const res = await api.getPythonEnvs();
+    expect(fetch).toHaveBeenCalledWith("/api/worker/python-envs");
+    expect(res).toBe(inventory);
+  });
+
+  it("removePythonEnvs posts the ids", async () => {
+    (fetch as any).mockResolvedValue({ ok: true });
+
+    await api.removePythonEnvs(["abc"]);
+    expect(fetch).toHaveBeenCalledWith("/api/worker/python-envs/remove", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: ["abc"] }),
+    });
+  });
+
+  it("removeCustomModel posts the engine and model", async () => {
+    (fetch as any).mockResolvedValue({ ok: true });
+
+    await api.removeCustomModel("SBERT", "org/model");
+    expect(fetch).toHaveBeenCalledWith("/api/models/custom/remove", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ engine: "SBERT", model_id: "org/model" }),
+    });
   });
 
   it("getDataPaths calls fetch and returns data paths", async () => {
@@ -656,7 +676,9 @@ describe("HttpSearchApi", () => {
     await expect(api.isSemanticReady()).rejects.toThrow("isSemanticReady failed: 500");
     await expect(api.getLogs()).rejects.toThrow("getLogs failed: 500");
     await expect(api.clearLogs()).rejects.toThrow("clearLogs failed: 500");
-    await expect(api.getPythonInfo()).rejects.toThrow("getPythonInfo failed: 500");
+    await expect(api.getPythonEnvs()).rejects.toThrow("getPythonEnvs failed: 500");
+    await expect(api.removePythonEnvs([])).rejects.toThrow("removePythonEnvs failed: 500");
+    await expect(api.removeCustomModel("SBERT", "m")).rejects.toThrow("removeCustomModel failed: 500");
     await expect(api.getDataPaths()).rejects.toThrow("getDataPaths failed: 500");
     await expect(api.getWorkerStatus()).rejects.toThrow("getWorkerStatus failed: 500");
     await expect(api.killWorker()).rejects.toThrow("killWorker failed: 500");
