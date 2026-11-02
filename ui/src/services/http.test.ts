@@ -367,6 +367,26 @@ describe("HttpSearchApi", () => {
     expect(url).toBe("/asset?path=%2Fpath%2Fto%2Ftest.pdf");
   });
 
+  it("fileCover asks for the picture at its size and passes the signal on", async () => {
+    const bytes = new ArrayBuffer(4);
+    (fetch as any).mockResolvedValue({ ok: true, arrayBuffer: () => Promise.resolve(bytes) });
+    const { signal } = new AbortController();
+
+    await expect(api.fileCover("/path/to/test.pdf", 96, signal)).resolves.toBe(bytes);
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/file/cover?path=%2Fpath%2Fto%2Ftest.pdf&max_edge=96",
+      { signal },
+    );
+  });
+
+  it("fileCover reports a refused cover", async () => {
+    (fetch as any).mockResolvedValue({ ok: false, status: 403 });
+
+    await expect(api.fileCover("/outside.pdf", 96, new AbortController().signal))
+      .rejects.toThrow("fileCover failed: 403");
+  });
+
   it("isSemanticReady calls fetch and returns boolean", async () => {
     (fetch as any).mockResolvedValue({
       ok: true,

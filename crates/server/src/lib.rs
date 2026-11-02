@@ -164,6 +164,33 @@ async fn comic_page_handler(
     ))
 }
 
+#[derive(Deserialize)]
+struct FileCoverQuery {
+    path: String,
+    /// The longest side of the picture, in pixels.
+    max_edge: u32,
+}
+
+/// A file's first page, as PNG bytes.
+///
+/// Held to the same rule as `/asset`, because a picture of a page is the page.
+async fn file_cover_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<FileCoverQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    let plan = asset_access_plan(Path::new(&params.path), &uploads_dir, &TokioServerFs).await?;
+    let bytes = ctx
+        .file_cover(plan.canonical, params.max_edge)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "image/png")],
+        bytes,
+    ))
+}
+
 /// The pages of a book, as PDF bytes.
 ///
 /// `application/pdf` because that is what the body is: the reader hands it
@@ -2914,6 +2941,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/files", get(list_files_handler))
         .route("/api/file", post(open_file_handler))
         .route("/api/file/rename", post(rename_file_handler))
+        .route("/api/file/cover", get(file_cover_handler))
         .route("/api/file/metadata", post(get_file_metadata_handler))
         .route(
             "/api/file/metadata/resolve",
@@ -3770,6 +3798,52 @@ mod tests {
                 path: path.to_string_lossy().into_owned(),
                 page: 0,
             })
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn file_cover_endpoint_serves_a_png_and_only_from_uploads() {
+        let (dir, state) = handler_state();
+        let inside = state.uploads_dir.join("comic.cbz");
+        let outside = dir.path().join("private.cbz");
+        let comic = include_bytes!("../../core/examples/fixtures/comic-reader.cbz");
+        std::fs::write(&inside, comic).unwrap();
+        std::fs::write(&outside, comic).unwrap();
+
+        let response = file_cover_handler(
+            State(state.clone()),
+            Query(FileCoverQuery {
+                path: inside.to_string_lossy().into_owned(),
+                max_edge: 64,
+            }),
+        )
+        .await
+        .unwrap_or_else(|(status, _)| panic!("cover endpoint failed: {status}"))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[1..4], b"PNG");
+
+        assert!(file_cover_handler(
+            State(state.clone()),
+            Query(FileCoverQuery {
+                path: outside.to_string_lossy().into_owned(),
+                max_edge: 64,
+            }),
+        )
+        .await
+        .is_err());
+        assert!(file_cover_handler(
+            State(state),
+            Query(FileCoverQuery {
+                path: inside.to_string_lossy().into_owned(),
+                max_edge: 0,
+            }),
         )
         .await
         .is_err());

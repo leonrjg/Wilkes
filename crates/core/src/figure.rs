@@ -14,9 +14,15 @@
 //! would. The extraction module's rule that nothing decides what a figure is
 //! survives intact on both sides of this boundary.
 
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use sha2::{Digest, Sha256};
+use tracing::warn;
 
 use crate::extract::document::mupdf;
+use crate::extract::document::surrogate::FileIdentity;
 use crate::extract::image::{digest_pixels, NativeImage};
 use crate::types::{ByteRange, RegionOrigin, RetainedImage};
 
@@ -143,6 +149,94 @@ impl std::fmt::Debug for CoverPixels {
     }
 }
 
+/// How many bytes of covers one installation keeps.
+///
+/// A budget because a changed file leaves its old covers behind under a key
+/// nothing asks for again, so without one the directory only grows. Thousands
+/// of list pictures and a few dozen enlarged ones fit, and what falls out costs
+/// one render the next time it is asked for.
+const COVER_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Covers written between sweeps of the directory. The first write of a process
+/// sweeps too, which catches up with whatever an earlier run left.
+const COVER_SWEEP_INTERVAL: usize = 64;
+
+static COVERS_WRITTEN: AtomicUsize = AtomicUsize::new(0);
+
+/// A document's cover as PNG bytes, drawn once for each size it is asked for.
+///
+/// Keyed on the file's identity, as a surrogate is, so a document replaced in
+/// place is drawn again and nothing has to be told that it changed.
+pub fn cached_cover(cache_dir: &Path, source: &Path, max_edge: u32) -> anyhow::Result<Vec<u8>> {
+    let entry = cache_dir.join(cover_file_name(source, max_edge)?);
+    match std::fs::read(&entry) {
+        Ok(png) => return Ok(png),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "reading cached cover {} failed: {error}",
+                entry.display()
+            ))
+        }
+    }
+
+    let cover = render_cover(source, max_edge)?;
+
+    // Through a temporary file, because two lists can ask for one cover at once
+    // and a reader must never find half of one under the final name.
+    std::fs::create_dir_all(cache_dir)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(cache_dir)?;
+    temporary.write_all(&cover.png)?;
+    temporary.persist(&entry)?;
+
+    if COVERS_WRITTEN
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(COVER_SWEEP_INTERVAL)
+    {
+        if let Err(error) = sweep_covers(cache_dir, COVER_CACHE_BUDGET_BYTES) {
+            warn!(
+                "could not sweep the cover cache {}: {error}",
+                cache_dir.display()
+            );
+        }
+    }
+    Ok(cover.png)
+}
+
+fn cover_file_name(source: &Path, max_edge: u32) -> anyhow::Result<String> {
+    let identity = FileIdentity::of(source)?;
+    let mut hasher = Sha256::new();
+    hasher.update(identity.path.as_os_str().as_encoded_bytes());
+    hasher.update(identity.modified_ms.to_le_bytes());
+    hasher.update(identity.size_bytes.to_le_bytes());
+    hasher.update(max_edge.to_le_bytes());
+    Ok(format!("{:x}.png", hasher.finalize()))
+}
+
+/// Bring the cache under `budget`, oldest writes first.
+///
+/// Oldest written rather than least recently read: telling them apart would
+/// mean a write for every cover a list shows, to save the one render a wrongly
+/// evicted cover costs.
+fn sweep_covers(cache_dir: &Path, budget: u64) -> std::io::Result<()> {
+    let mut held = Vec::new();
+    for entry in std::fs::read_dir(cache_dir)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        held.push((metadata.modified()?, metadata.len(), entry.path()));
+    }
+    let mut total: u64 = held.iter().map(|(_, length, _)| *length).sum();
+    held.sort();
+    for (_, length, path) in held {
+        if total <= budget {
+            break;
+        }
+        std::fs::remove_file(path)?;
+        total -= length;
+    }
+    Ok(())
+}
+
 /// The pixels of one retained figure, from the document it was extracted from.
 ///
 /// Re-derived rather than stored: the pixels are already in the PDF, and the
@@ -252,6 +346,109 @@ fn encode_png(pixels: &image::RgbImage) -> anyhow::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::types::{BoundingBox, ImageAnalysisStatus, ImageTransform};
+
+    const COMIC: &[u8] = include_bytes!("../examples/fixtures/comic-reader.cbz");
+
+    fn write_comic(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("comic.cbz");
+        std::fs::write(&path, COMIC).unwrap();
+        path
+    }
+
+    fn entries(dir: &Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
+    #[test]
+    fn a_cover_is_drawn_once_and_then_read_back() {
+        let library = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let path = write_comic(library.path());
+
+        let drawn = cached_cover(cache.path(), &path, 64).unwrap();
+        assert_eq!(&drawn[1..4], b"PNG");
+        let stored = entries(cache.path());
+        assert_eq!(stored.len(), 1);
+
+        // Not a PNG, so only the cache can have answered with it.
+        std::fs::write(&stored[0], b"from the cache").unwrap();
+        assert_eq!(
+            cached_cover(cache.path(), &path, 64).unwrap(),
+            b"from the cache"
+        );
+    }
+
+    #[test]
+    fn each_size_of_a_cover_is_its_own_entry() {
+        let library = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let path = write_comic(library.path());
+
+        cached_cover(cache.path(), &path, 64).unwrap();
+        cached_cover(cache.path(), &path, 128).unwrap();
+
+        assert_eq!(entries(cache.path()).len(), 2);
+    }
+
+    #[test]
+    fn a_document_replaced_in_place_is_drawn_again() {
+        let library = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let path = write_comic(library.path());
+
+        cached_cover(cache.path(), &path, 64).unwrap();
+        let stored = entries(cache.path());
+        std::fs::write(&stored[0], b"the old cover").unwrap();
+
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+
+        assert_ne!(
+            cached_cover(cache.path(), &path, 64).unwrap(),
+            b"the old cover"
+        );
+    }
+
+    #[test]
+    fn a_document_that_cannot_be_drawn_leaves_nothing_in_the_cache() {
+        let library = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let path = library.path().join("broken.pdf");
+        std::fs::write(&path, "not a pdf").unwrap();
+
+        assert!(cached_cover(cache.path(), &path, 64).is_err());
+        assert!(entries(cache.path()).is_empty());
+    }
+
+    #[test]
+    fn a_sweep_removes_the_oldest_covers_until_the_cache_is_within_budget() {
+        let cache = tempfile::tempdir().unwrap();
+        for (name, age_seconds) in [("old", 300), ("middle", 200), ("new", 100)] {
+            let path = cache.path().join(name);
+            std::fs::write(&path, [0u8; 10]).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(age_seconds),
+                )
+                .unwrap();
+        }
+
+        sweep_covers(cache.path(), 20).unwrap();
+
+        assert!(!cache.path().join("old").exists());
+        assert!(cache.path().join("middle").exists());
+        assert!(cache.path().join("new").exists());
+    }
 
     fn figure(anchor: Option<usize>, range: Option<(usize, usize)>) -> RetainedImage {
         RetainedImage {

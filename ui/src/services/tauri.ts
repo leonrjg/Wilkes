@@ -393,6 +393,13 @@ export class TauriSearchApi implements SearchApi {
     return decodeComicPage(bytes instanceof ArrayBuffer ? bytes : new Uint8Array(bytes).buffer);
   }
 
+  async fileCover(path: string, maxEdge: number, signal: AbortSignal): Promise<ArrayBuffer> {
+    signal.throwIfAborted();
+    const bytes = await invoke<ArrayBuffer | number[]>("file_cover", { path, maxEdge });
+    signal.throwIfAborted();
+    return bytes instanceof ArrayBuffer ? bytes : new Uint8Array(bytes).buffer;
+  }
+
   async surrogateBytes(path: string): Promise<ArrayBuffer> {
     // The command answers with `tauri::ipc::Response`, which arrives as raw
     // bytes rather than base64 -- a 6 MB book stays 6 MB on the way over.

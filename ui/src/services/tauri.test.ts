@@ -286,6 +286,26 @@ describe("TauriSearchApi", () => {
     expect(url).toContain("/path/to/file.pdf");
   });
 
+  it("should call file_cover and take its bytes as they arrive", async () => {
+    const bytes = new ArrayBuffer(4);
+    (invoke as any).mockResolvedValue(bytes);
+
+    await expect(api.fileCover("/path/to/file.pdf", 96, new AbortController().signal))
+      .resolves.toBe(bytes);
+
+    expect(invoke).toHaveBeenCalledWith("file_cover", { path: "/path/to/file.pdf", maxEdge: 96 });
+  });
+
+  it("should not ask for a cover nobody is waiting for", async () => {
+    (invoke as any).mockClear();
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(api.fileCover("/path/to/file.pdf", 96, controller.signal)).rejects.toBeDefined();
+
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
   it("should call get_logs", async () => {
     (invoke as any).mockResolvedValue(["log1"]);
     const logs = await api.getLogs();

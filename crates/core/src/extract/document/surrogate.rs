@@ -76,14 +76,14 @@ pub struct Surrogate {
 /// alone: a book edited or replaced in place must not be served as the copy
 /// rendered before it changed.
 #[derive(Clone, PartialEq, Eq)]
-struct Key {
-    path: PathBuf,
-    modified_ms: i64,
-    size_bytes: u64,
+pub(crate) struct FileIdentity {
+    pub(crate) path: PathBuf,
+    pub(crate) modified_ms: i64,
+    pub(crate) size_bytes: u64,
 }
 
-impl Key {
-    fn of(path: &Path) -> anyhow::Result<Self> {
+impl FileIdentity {
+    pub(crate) fn of(path: &Path) -> anyhow::Result<Self> {
         let metadata = std::fs::metadata(path)?;
         let modified_ms = metadata
             .modified()
@@ -100,7 +100,7 @@ impl Key {
 }
 
 /// Most-recently-used last, as the reader's own document cache is ordered.
-static CACHE: Mutex<Vec<(Key, Surrogate)>> = Mutex::new(Vec::new());
+static CACHE: Mutex<Vec<(FileIdentity, Surrogate)>> = Mutex::new(Vec::new());
 
 /// The rendering of this book, from the cache when it is there.
 ///
@@ -120,7 +120,7 @@ pub fn surrogate(path: &Path) -> anyhow::Result<Surrogate> {
         "{} is a PDF; its pages are its own and the reader reads them from the file",
         path.display()
     );
-    let key = Key::of(path)?;
+    let key = FileIdentity::of(path)?;
     {
         let mut cache = lock();
         if let Some(position) = cache.iter().position(|(cached, _)| *cached == key) {
@@ -152,7 +152,7 @@ pub fn surrogate(path: &Path) -> anyhow::Result<Surrogate> {
     Ok(rendered)
 }
 
-fn lock() -> std::sync::MutexGuard<'static, Vec<(Key, Surrogate)>> {
+fn lock() -> std::sync::MutexGuard<'static, Vec<(FileIdentity, Surrogate)>> {
     CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -298,10 +298,10 @@ mod tests {
     /// user is reading on every request for its pages.
     #[test]
     fn the_cache_keeps_the_newest_rendering_even_when_it_alone_exceeds_the_budget() {
-        let mut cache: Vec<(Key, Surrogate)> = Vec::new();
+        let mut cache: Vec<(FileIdentity, Surrogate)> = Vec::new();
         let entry = |name: &str, size: usize| {
             (
-                Key {
+                FileIdentity {
                     path: PathBuf::from(name),
                     modified_ms: 0,
                     size_bytes: 0,

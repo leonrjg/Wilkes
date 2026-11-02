@@ -31,6 +31,7 @@ import { useSettingsStore } from "../stores/useSettingsStore";
 import { useResearchStore } from "../stores/useResearchStore";
 import { useCatalogueStore } from "../stores/useCatalogueStore";
 import { sourceLabel } from "../lib/integrations/names";
+import { isPagedPath } from "../lib/documentFormats";
 import { useGenerationStore } from "../stores/useGenerationStore";
 import { useTopicsStore } from "../stores/useTopicsStore";
 import { FileScopeControls } from "./FileScopeControls";
@@ -62,6 +63,7 @@ import {
   type DetailIcon,
   type DocumentDetail,
 } from "./DocumentEntryRow";
+import { CoverViewer, DocumentCover } from "./DocumentCover";
 import BulkActionsBar from "./BulkActionsBar";
 import CatalogueGapStrip, { CatalogueGapPrompt } from "./CatalogueGapStrip";
 import SearchResultsSummary from "./SearchResultsSummary";
@@ -469,6 +471,7 @@ export default function ResultList({
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [openSummaryKey, setOpenSummaryKey] = useState<string | null>(null);
+  const [viewedCover, setViewedCover] = useState<string | null>(null);
   const [hydeOpen, setHydeOpen] = useState(false);
   const activeFilterKeyRef = useRef(
     `${selectedCollectionId ?? ""}|${selectedTagId ?? ""}|${draftCollectionExpression ?? ""}`,
@@ -771,6 +774,7 @@ export default function ResultList({
                   selected={selectedMatch?.path === entry.path}
                   drag={drag}
                   checked={selectionMode ? selectedPathSet.has(entry.path) : undefined}
+                  onCoverOpen={() => setViewedCover(entry.path)}
                   onClick={rowClickHandler(entry.path)}
                   onContextMenu={(event) =>
                     openFileMenu(event, {
@@ -791,6 +795,7 @@ export default function ResultList({
                 additionalRoots={additionalRootsForPath(entry.path)}
                 selected={selectedMatch?.path === entry.path}
                 checked={selectionMode ? selectedPathSet.has(entry.path) : undefined}
+                onCoverOpen={() => setViewedCover(entry.path)}
                 onClick={rowClickHandler(entry.path)}
                 onContextMenu={(event) =>
                   openFileMenu(event, {
@@ -845,6 +850,7 @@ export default function ResultList({
           )}
         </div>
         {fileMenu}
+        {viewedCover && <CoverViewer path={viewedCover} onClose={() => setViewedCover(null)} />}
       </div>
     );
   }
@@ -1324,6 +1330,7 @@ function FileEntryRowAdapter({
   detail,
   muted = false,
   drag,
+  onCoverOpen,
   onClick,
   onContextMenu,
 }: {
@@ -1338,6 +1345,7 @@ function FileEntryRowAdapter({
   detail?: string;
   muted?: boolean;
   drag?: FileTreeDragProps;
+  onCoverOpen?: () => void;
   onClick: () => void;
   onContextMenu: (event: React.MouseEvent) => void;
 }) {
@@ -1381,6 +1389,14 @@ function FileEntryRowAdapter({
           <AdditionalRootsIndicator roots={additionalRoots} />
         </>
       }
+      leading={isPagedPath(entry.path) && !muted ? (
+        <DocumentCover
+          path={entry.path}
+          version={`${entry.modified_at_ms}:${entry.size_bytes}`}
+          // In selection mode a click anywhere on a row ticks it.
+          onOpen={checked === undefined ? onCoverOpen : undefined}
+        />
+      ) : undefined}
       accessory={accessory}
       selected={selected}
       muted={muted}

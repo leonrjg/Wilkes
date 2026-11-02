@@ -33,6 +33,7 @@ const {
   mockSummarizeSearchResults,
   mockOnGenerationStream,
   mockOpenChatPaneAndSend,
+  mockCoversVisible,
 } = vi.hoisted(() => ({
   mockOpenPath: vi.fn(),
   mockRevealPath: vi.fn(),
@@ -48,6 +49,16 @@ const {
   mockSummarizeSearchResults: vi.fn().mockResolvedValue(undefined),
   mockOnGenerationStream: vi.fn(),
   mockOpenChatPaneAndSend: vi.fn().mockResolvedValue(undefined),
+  mockCoversVisible: { value: false },
+}));
+
+vi.mock("../lib/covers", () => ({
+  watchVisibility: (_element: Element, listener: (visible: boolean) => void) => {
+    if (mockCoversVisible.value) listener(true);
+    return () => undefined;
+  },
+  loadThumbnail: () => Promise.resolve("blob:thumbnail"),
+  loadFullCover: () => Promise.resolve("blob:full"),
 }));
 
 vi.mock("../services", () => ({
@@ -249,6 +260,60 @@ describe("ResultList", () => {
 
     expect(screen.getByLabelText("Also in root: /library/nested")).toBeInTheDocument();
     expect(screen.getAllByLabelText(/^Also in root/)).toHaveLength(1);
+  });
+
+  describe("document covers", () => {
+    const coverFiles = {
+      directory: "/library",
+      favorites: [],
+      recentDirs: ["/library"],
+      fileList: [
+        { path: "/library/book.epub", size_bytes: 10, file_type: "Pdf", extension: "epub" },
+        { path: "/library/notes.txt", size_bytes: 10, file_type: "PlainText", extension: "txt" },
+      ],
+      omittedFileList: [],
+    } as const;
+
+    beforeEach(() => {
+      mockCoversVisible.value = true;
+      return () => {
+        mockCoversVisible.value = false;
+      };
+    });
+
+    it("draws one for a paged document and none for a text file", async () => {
+      useSettingsStore.setState({ ...coverFiles, fileList: [...coverFiles.fileList] });
+
+      renderWithToasts();
+
+      expect(await screen.findByRole("button", { name: "Show cover of book.epub" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Show cover of notes.txt" })).toBeNull();
+    });
+
+    it("opens the cover without opening the document, and closes it again", async () => {
+      useSettingsStore.setState({ ...coverFiles, fileList: [...coverFiles.fileList] });
+      renderWithToasts();
+
+      fireEvent.click(await screen.findByRole("button", { name: "Show cover of book.epub" }));
+
+      expect(await screen.findByRole("img", { name: "Cover of book.epub" })).toHaveAttribute("src", "blob:full");
+      expect(mockOnFileClick).not.toHaveBeenCalled();
+
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    it("leaves the cover to the row while files are being selected", async () => {
+      useSettingsStore.setState({ ...coverFiles, fileList: [...coverFiles.fileList] });
+      renderWithToasts();
+      await screen.findByRole("button", { name: "Show cover of book.epub" });
+
+      fireEvent.click(screen.getByRole("button", { name: "Select multiple files" }));
+
+      await waitFor(() =>
+        expect(screen.queryByRole("button", { name: "Show cover of book.epub" })).toBeNull());
+      expect(screen.getByRole("checkbox", { name: "Select book.epub" })).toBeInTheDocument();
+    });
   });
 
   it("marks files in the current nested root when an ancestor is also configured", () => {

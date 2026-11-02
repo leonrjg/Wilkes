@@ -1562,6 +1562,12 @@ pub struct AppContext {
     /// show for it, and a consumer that synced under one workspace found an
     /// empty mirror under the next.
     pub catalogue_dir: PathBuf,
+    /// The one store of document covers for the installation:
+    /// `shared_data_dir/covers`.
+    ///
+    /// Shared because a cover belongs to a file, not to a workspace, and two
+    /// workspaces listing one library should not each draw it.
+    pub cover_cache_dir: PathBuf,
     pub settings_path: PathBuf,
     pub workspace_path: PathBuf,
     pub bookmarks_path: PathBuf,
@@ -1691,11 +1697,13 @@ impl AppContext {
         let bookmarks_path = data_dir.join("bookmarks.json");
         let model_dir = shared_data_dir.join("models");
         let catalogue_dir = shared_data_dir.join("catalogue");
+        let cover_cache_dir = shared_data_dir.join("covers");
         let ctx = Arc::new(Self {
             data_dir,
             shared_data_dir,
             model_dir,
             catalogue_dir,
+            cover_cache_dir,
             bookmarks_path,
             settings_path,
             workspace_path,
@@ -3483,6 +3491,23 @@ impl AppContext {
     /// asks for the pages once it knows it needs them.
     pub async fn surrogate_bytes(&self, path: std::path::PathBuf) -> anyhow::Result<Vec<u8>> {
         crate::commands::preview::surrogate_bytes(path).await
+    }
+
+    /// The first page of a file on disk, as a PNG fitted inside `max_edge`.
+    ///
+    /// What a file list draws. It is [`Self::managed_document_cover`] for a
+    /// document addressed by path, which need not be in any index, and a list
+    /// asks for the same covers every time it is shown, so these are kept.
+    pub async fn file_cover(
+        &self,
+        path: std::path::PathBuf,
+        max_edge: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            (1..=MAX_FIGURE_EDGE).contains(&max_edge),
+            "max_edge must be between 1 and {MAX_FIGURE_EDGE}; got {max_edge}"
+        );
+        crate::commands::preview::file_cover(self.cover_cache_dir.clone(), path, max_edge).await
     }
 
     /// The retained snapshots this managed corpus has admitted, each with the

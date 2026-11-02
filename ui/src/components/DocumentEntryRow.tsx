@@ -31,6 +31,8 @@ interface Props {
   details?: DocumentDetail[];
   /** Compact status rendered immediately after the filename. */
   nameAccessory?: React.ReactNode;
+  /** Drawn beside everything else in the row, inside its button. */
+  leading?: React.ReactNode;
   /** Rendered directly below the row, outside its button so it can hold its
    *  own controls. Absent for every caller that has nothing to attach. */
   accessory?: React.ReactNode;
@@ -50,6 +52,7 @@ export function DocumentEntryRow({
   entry,
   details = [],
   nameAccessory,
+  leading,
   accessory,
   selected = false,
   muted = false,
@@ -102,136 +105,139 @@ export function DocumentEntryRow({
       onClick={onClick}
       onContextMenu={onContextMenu}
       {...drag}
-      className={`w-full flex select-none flex-col gap-1 px-3 py-1.5 text-left hover:bg-[var(--bg-hover)] transition-colors ${
+      className={`w-full flex select-none items-start gap-2 px-3 py-1.5 text-left hover:bg-[var(--bg-hover)] transition-colors ${
         drag?.onPointerDown ? "cursor-grab active:cursor-grabbing" : ""
       } ${
         selected ? "bg-[var(--bg-active)]" : ""
       }`}
     >
-      <span className="flex w-full min-w-0 items-center gap-1.5">
-        {nameAccessory}
-        <span
-          className={`min-w-0 truncate text-sm font-medium ${
-            muted ? "text-[var(--text-muted)]" : "text-[var(--text-main)]"
-          }`}
-        >
-          {fileName(entry.path)}
-        </span>
-        {pagedFormatLabel(entry.path) && (
-          <Tooltip content="Type">
-            <span
-              className="inline-flex flex-shrink-0 items-center gap-1 text-xs font-mono tabular-nums text-[var(--accent-blue)]"
-              aria-label="Type"
-            >
-              <TagIcon size={11} aria-hidden="true" />
-              {pagedFormatLabel(entry.path)}
-            </span>
-          </Tooltip>
-        )}
-        <Tooltip content={entry.path} className="font-mono break-all">
+      {leading}
+      <span className="flex min-w-0 flex-1 flex-col gap-1">
+        <span className="flex w-full min-w-0 items-center gap-1.5">
+          {nameAccessory}
           <span
-            className="ml-auto flex h-5 w-5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
-            aria-label={`Path: ${entry.path}`}
-          >
-            <Folder size={12} aria-hidden="true" />
-          </span>
-        </Tooltip>
-      </span>
-      {!!entry.tags?.length && (
-        <span className="flex flex-wrap gap-1">
-          {entry.tags.map((tag) => (
-            <span
-              key={tag.id}
-              role={onTagClick ? "button" : undefined}
-              tabIndex={onTagClick ? 0 : undefined}
-              onClick={onTagClick ? (event) => { event.stopPropagation(); onTagClick(tag); } : undefined}
-              onKeyDown={onTagClick ? (event) => {
-                if (event.key === "Enter" || event.key === " ") {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  onTagClick(tag);
-                }
-              } : undefined}
-              className={`rounded-full bg-[var(--accent-blue-muted)] px-1.5 py-0.5 text-[10px] text-[var(--accent-blue)] ${onTagClick ? "hover:ring-1 hover:ring-[var(--accent-blue)]" : ""}`}
-            >{tag.name}</span>
-          ))}
-        </span>
-      )}
-      {inlineDetails.length > 0 && (
-        <span className="flex w-full min-w-0 items-start gap-1.5 pl-0.5">
-          <span
-            ref={inlineDetailsRef}
-            className={`flex min-w-0 flex-1 items-center gap-x-2 gap-y-0.5 ${
-              inlineDetailsExpanded ? "flex-wrap" : "overflow-hidden whitespace-nowrap"
+            className={`min-w-0 truncate text-sm font-medium ${
+              muted ? "text-[var(--text-muted)]" : "text-[var(--text-main)]"
             }`}
           >
-            {inlineDetails.map((field) => (
-              <span key={field.key} className="inline-flex min-w-0 flex-shrink-0 items-center gap-1 text-xs">
-                <Tooltip content={field.label}>
-                  <span
-                    className="flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
-                    aria-label={field.label}
-                  >
-                    <field.icon size={11} aria-hidden="true" />
-                  </span>
-                </Tooltip>
-                <Tooltip content={field.conflictTooltip ?? field.valueTitle}>
-                  <span
-                    className={`min-w-0 truncate text-[var(--text-muted)] ${
-                      field.monospace ? "font-mono tabular-nums" : ""
-                    } ${field.key === "file-type" ? "text-[var(--accent-blue)]" : ""} ${
-                      field.conflictTooltip ? "underline decoration-wavy decoration-[var(--accent-blue)] underline-offset-2" : ""
-                    }`}
-                  >
-                    {field.value}
-                  </span>
-                </Tooltip>
+            {fileName(entry.path)}
+          </span>
+          {pagedFormatLabel(entry.path) && (
+            <Tooltip content="Type">
+              <span
+                className="inline-flex flex-shrink-0 items-center gap-1 text-xs font-mono tabular-nums text-[var(--accent-blue)]"
+                aria-label="Type"
+              >
+                <TagIcon size={11} aria-hidden="true" />
+                {pagedFormatLabel(entry.path)}
               </span>
+            </Tooltip>
+          )}
+          <Tooltip content={entry.path} className="font-mono break-all">
+            <span
+              className="ml-auto flex h-5 w-5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
+              aria-label={`Path: ${entry.path}`}
+            >
+              <Folder size={12} aria-hidden="true" />
+            </span>
+          </Tooltip>
+        </span>
+        {!!entry.tags?.length && (
+          <span className="flex flex-wrap gap-1">
+            {entry.tags.map((tag) => (
+              <span
+                key={tag.id}
+                role={onTagClick ? "button" : undefined}
+                tabIndex={onTagClick ? 0 : undefined}
+                onClick={onTagClick ? (event) => { event.stopPropagation(); onTagClick(tag); } : undefined}
+                onKeyDown={onTagClick ? (event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    onTagClick(tag);
+                  }
+                } : undefined}
+                className={`rounded-full bg-[var(--accent-blue-muted)] px-1.5 py-0.5 text-[10px] text-[var(--accent-blue)] ${onTagClick ? "hover:ring-1 hover:ring-[var(--accent-blue)]" : ""}`}
+              >{tag.name}</span>
             ))}
           </span>
-          {inlineDetailsOverflow && !inlineDetailsExpanded && (
+        )}
+        {inlineDetails.length > 0 && (
+          <span className="flex w-full min-w-0 items-start gap-1.5 pl-0.5">
             <span
-              role="button"
-              tabIndex={0}
-              aria-label="Show hidden file details"
-              onClick={(event) => {
-                event.stopPropagation();
-                setInlineDetailsExpanded(true);
-              }}
-              onKeyDown={(event) => {
-                if (event.key !== "Enter" && event.key !== " ") return;
-                event.preventDefault();
-                event.stopPropagation();
-                setInlineDetailsExpanded(true);
-              }}
-              className="flex h-4 flex-shrink-0 items-center rounded border border-[var(--border-main)] px-1 text-[10px] leading-none text-[var(--text-dim)] hover:border-[var(--border-strong)] hover:text-[var(--text-muted)]"
-            >
-              ...
-            </span>
-          )}
-        </span>
-      )}
-      {fullWidthDetails.map((field) => (
-        <span key={field.key} className="flex w-full min-w-0 items-center gap-1.5 pl-0.5 text-xs">
-          <Tooltip content={field.label}>
-            <span
-              className="flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
-              aria-label={field.label}
-            >
-              <field.icon size={11} aria-hidden="true" />
-            </span>
-          </Tooltip>
-          <Tooltip content={field.conflictTooltip ?? field.valueTitle ?? field.value}>
-            <span
-              className={`min-w-0 flex-1 truncate text-[var(--text-muted)] ${
-                field.conflictTooltip ? "underline decoration-wavy decoration-[var(--accent-blue)] underline-offset-2" : ""
+              ref={inlineDetailsRef}
+              className={`flex min-w-0 flex-1 items-center gap-x-2 gap-y-0.5 ${
+                inlineDetailsExpanded ? "flex-wrap" : "overflow-hidden whitespace-nowrap"
               }`}
             >
-              {field.value}
+              {inlineDetails.map((field) => (
+                <span key={field.key} className="inline-flex min-w-0 flex-shrink-0 items-center gap-1 text-xs">
+                  <Tooltip content={field.label}>
+                    <span
+                      className="flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
+                      aria-label={field.label}
+                    >
+                      <field.icon size={11} aria-hidden="true" />
+                    </span>
+                  </Tooltip>
+                  <Tooltip content={field.conflictTooltip ?? field.valueTitle}>
+                    <span
+                      className={`min-w-0 truncate text-[var(--text-muted)] ${
+                        field.monospace ? "font-mono tabular-nums" : ""
+                      } ${field.key === "file-type" ? "text-[var(--accent-blue)]" : ""} ${
+                        field.conflictTooltip ? "underline decoration-wavy decoration-[var(--accent-blue)] underline-offset-2" : ""
+                      }`}
+                    >
+                      {field.value}
+                    </span>
+                  </Tooltip>
+                </span>
+              ))}
             </span>
-          </Tooltip>
-        </span>
-      ))}
+            {inlineDetailsOverflow && !inlineDetailsExpanded && (
+              <span
+                role="button"
+                tabIndex={0}
+                aria-label="Show hidden file details"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setInlineDetailsExpanded(true);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter" && event.key !== " ") return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setInlineDetailsExpanded(true);
+                }}
+                className="flex h-4 flex-shrink-0 items-center rounded border border-[var(--border-main)] px-1 text-[10px] leading-none text-[var(--text-dim)] hover:border-[var(--border-strong)] hover:text-[var(--text-muted)]"
+              >
+                ...
+              </span>
+            )}
+          </span>
+        )}
+        {fullWidthDetails.map((field) => (
+          <span key={field.key} className="flex w-full min-w-0 items-center gap-1.5 pl-0.5 text-xs">
+            <Tooltip content={field.label}>
+              <span
+                className="flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center text-[var(--text-dim)]"
+                aria-label={field.label}
+              >
+                <field.icon size={11} aria-hidden="true" />
+              </span>
+            </Tooltip>
+            <Tooltip content={field.conflictTooltip ?? field.valueTitle ?? field.value}>
+              <span
+                className={`min-w-0 flex-1 truncate text-[var(--text-muted)] ${
+                  field.conflictTooltip ? "underline decoration-wavy decoration-[var(--accent-blue)] underline-offset-2" : ""
+                }`}
+              >
+                {field.value}
+              </span>
+            </Tooltip>
+          </span>
+        ))}
+      </span>
     </button>
   );
 

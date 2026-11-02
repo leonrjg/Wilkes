@@ -263,6 +263,9 @@ export interface SearchApi {
    *  across as bytes instead. */
   surrogateBytes(path: string): Promise<ArrayBuffer>;
   comicPage(path: string, page: number, signal: AbortSignal): Promise<ImagePage>;
+  /** A document's first page as PNG bytes, fitted inside `maxEdge` pixels. The
+   *  host keeps what it draws, so asking again costs a read. */
+  fileCover(path: string, maxEdge: number, signal: AbortSignal): Promise<ArrayBuffer>;
 
   resolveAssetUrl(path: string): string;
   getHttpCalls(): Promise<HttpCall[]>;

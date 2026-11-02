@@ -1383,6 +1383,24 @@ async fn comic_page(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// A file's first page, as PNG bytes.
+///
+/// `tauri::ipc::Response` for the reason `comic_page` uses it. The stored cover
+/// is not served over the asset protocol because that protocol's scope does not
+/// reach dot-directories, which is where Linux keeps application data.
+#[tauri::command]
+async fn file_cover(
+    app: AppHandle,
+    path: String,
+    max_edge: u32,
+) -> Result<tauri::ipc::Response, String> {
+    app_context(&app)
+        .file_cover(std::path::PathBuf::from(path), max_edge)
+        .await
+        .map(tauri::ipc::Response::new)
+        .map_err(|e| e.to_string())
+}
+
 /// The pages of a book, as PDF bytes.
 ///
 /// Returned as bytes rather than served over the asset protocol because there
@@ -2491,6 +2509,7 @@ pub fn run() {
             preview,
             surrogate_bytes,
             comic_page,
+            file_cover,
             list_files,
             open_file,
             rename_file,

@@ -531,6 +531,12 @@ export class HttpSearchApi implements SearchApi {
     return decodeComicPage(await res.arrayBuffer());
   }
 
+  async fileCover(path: string, maxEdge: number, signal: AbortSignal): Promise<ArrayBuffer> {
+    const res = await fetch(`/api/file/cover?path=${encodeURIComponent(path)}&max_edge=${maxEdge}`, { signal });
+    if (!res.ok) throw new Error(`fileCover failed: ${res.status}`);
+    return res.arrayBuffer();
+  }
+
   async surrogateBytes(path: string): Promise<ArrayBuffer> {
     const res = await fetch(`/api/surrogate?path=${encodeURIComponent(path)}`);
     if (!res.ok) throw new Error(`surrogateBytes failed: ${res.status}`);

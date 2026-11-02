@@ -148,6 +148,18 @@ pub async fn surrogate_bytes(path: std::path::PathBuf) -> anyhow::Result<Vec<u8>
     Ok(rendered.bytes.as_ref().clone())
 }
 
+/// A document's cover, from the store in `cache_dir` when it is there.
+pub async fn file_cover(
+    cache_dir: std::path::PathBuf,
+    path: std::path::PathBuf,
+    max_edge: u32,
+) -> anyhow::Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        wilkes_core::figure::cached_cover(&cache_dir, &path, max_edge)
+    })
+    .await?
+}
+
 pub async fn comic_page(path: std::path::PathBuf, page: u32) -> anyhow::Result<Vec<u8>> {
     tokio::task::spawn_blocking(move || wilkes_core::extract::document::comic::page(&path, page))
         .await?
