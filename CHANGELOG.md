@@ -29,6 +29,7 @@
 - OBLIQ-IR models use the `query: ` and `passage: ` prefixes their card requires.
 - SBERT models in their own environment load at the precision they ship in, instead of being expanded to 32-bit. This halves the memory of a `bfloat16` model, which is what lets ReasonIR-8B run on a 24 GB machine.
 - SBERT models the worker has already downloaded show as cached in the model list.
+- ModernBERT models load on Candle. They were read as plain BERT, because the check looked for a model type Hugging Face does not use, and failed when loading. This covers embedding models such as Granite Embedding r2 and `nomic-ai/modernbert-embed-base`.
 - Cancelling while a Python environment is being set up stops it within the cancellation deadline, instead of leaving it running to the end.
 - An open chat no longer uses more than a full CPU core while it sits idle.
 - CBZ comics open and scroll by loading individual page images, avoiding full-book

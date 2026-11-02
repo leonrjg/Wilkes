@@ -301,10 +301,18 @@ impl CandleRuntimeFactory for RealCandleRuntimeFactory {
                     JinaBertModel::new(vb, &config).context("Failed to build JinaBert model")?;
                 Ok((LoadedModel::JinaBert(m), dim))
             }
-            "modern_bert" => {
+            "modernbert" => {
                 let config: ModernBertConfig = serde_json::from_str(config_text)
                     .with_context(|| format!("Failed to parse ModernBertConfig: {config_text}"))?;
                 let dim = config.hidden_size;
+                // `ModernBert::load` reads a masked-LM checkpoint, whose backbone
+                // sits under `model.`. An embedding checkpoint is that backbone
+                // alone, saved without the prefix.
+                let vb = if vb.contains_tensor("model.embeddings.tok_embeddings.weight") {
+                    vb
+                } else {
+                    vb.rename_f(|name| name.strip_prefix("model.").unwrap_or(name).to_string())
+                };
                 let m =
                     ModernBert::load(vb, &config).context("Failed to build ModernBert model")?;
                 Ok((LoadedModel::ModernBert(m), dim))
@@ -964,7 +972,7 @@ mod tests {
             "initializer_range": 0.02,
             "norm_eps": 1e-12,
             "layer_norm_eps": 1e-12,
-            "model_type": "modern_bert",
+            "model_type": "modernbert",
             "pad_token_id": 0,
             "global_attn_every_n_layers": 1,
             "global_rope_theta": 1.0,
@@ -1805,10 +1813,59 @@ mod tests {
             .build_loaded_model("jina_bert_v2", minimal_jina_config_json(), jina_vb)
             .is_err());
 
+        // No tensors to build from, so this fails, but only ModernBERT's own
+        // path fails with this message: any other arm would have parsed the
+        // config as something else first.
         let modern_vb = VarBuilder::from_tensors(HashMap::new(), dtype, &device);
-        assert!(factory
-            .build_loaded_model("modern_bert", minimal_modern_config_json(), modern_vb)
-            .is_err());
+        let modern =
+            factory.build_loaded_model("modernbert", minimal_modern_config_json(), modern_vb);
+        assert_eq!(
+            modern.err().unwrap().to_string(),
+            "Failed to build ModernBert model"
+        );
+    }
+
+    fn minimal_modern_tensors(
+        prefix: &str,
+        dtype: DType,
+        device: &Device,
+    ) -> HashMap<String, Tensor> {
+        [
+            ("embeddings.tok_embeddings.weight", vec![1, 3]),
+            ("embeddings.norm.weight", vec![3]),
+            ("layers.0.attn.Wqkv.weight", vec![9, 3]),
+            ("layers.0.attn.Wo.weight", vec![3, 3]),
+            ("layers.0.mlp.Wi.weight", vec![6, 3]),
+            ("layers.0.mlp.Wo.weight", vec![3, 3]),
+            ("layers.0.mlp_norm.weight", vec![3]),
+            ("final_norm.weight", vec![3]),
+        ]
+        .into_iter()
+        .map(|(name, shape)| {
+            (
+                format!("{prefix}{name}"),
+                Tensor::ones(shape, dtype, device).unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn modernbert_loads_with_or_without_the_masked_lm_prefix() {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        for prefix in ["", "model."] {
+            let tensors = minimal_modern_tensors(prefix, dtype, &device);
+            let vb = VarBuilder::from_tensors(tensors, dtype, &device);
+
+            let (model, dimension) = RealCandleRuntimeFactory
+                .build_loaded_model("modernbert", minimal_modern_config_json(), vb)
+                .unwrap_or_else(|e| panic!("prefix {prefix:?}: {e:#}"));
+
+            assert!(matches!(model, LoadedModel::ModernBert(_)));
+            assert_eq!(dimension, 3);
+        }
     }
 
     #[tokio::test]
