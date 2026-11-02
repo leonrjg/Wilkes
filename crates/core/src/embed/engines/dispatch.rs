@@ -3,7 +3,7 @@ use crate::embed::installer::EmbedderInstaller;
 use crate::models::progress::{DownloadProgress, EmbedProgress};
 use crate::types::{
     CustomModel, EmbedderCapability, EmbedderCapabilityManifest, EmbedderModel, EmbeddingEngine,
-    ModelDescriptor, PrefixSource,
+    ModelDescriptor, ModelSearchHit, PrefixSource,
 };
 use crate::worker::ipc::{WorkerEvent, WorkerKind};
 use crate::worker::manager::WorkerManager;
@@ -366,6 +366,26 @@ pub fn fetch_model_size(engine: EmbeddingEngine, _model_id: &str) -> anyhow::Res
         EmbeddingEngine::Fastembed => super::fastembed::fetch_model_size(_model_id),
         #[cfg(not(feature = "fastembed"))]
         EmbeddingEngine::Fastembed => anyhow::bail!("Fastembed feature is disabled"),
+    }
+}
+
+/// Search Hugging Face for repositories `engine` could take as a custom model.
+/// Each engine names the files it cannot load a repository without.
+pub fn search_custom_models(
+    engine: EmbeddingEngine,
+    query: &str,
+) -> anyhow::Result<Vec<ModelSearchHit>> {
+    match engine {
+        EmbeddingEngine::SBERT => crate::models::hf_hub::search_embedding_models(query, &[]),
+
+        #[cfg(feature = "candle")]
+        EmbeddingEngine::Candle => {
+            crate::models::hf_hub::search_embedding_models(query, super::candle::MODEL_FILES)
+        }
+        #[cfg(not(feature = "candle"))]
+        EmbeddingEngine::Candle => anyhow::bail!("Candle feature is disabled"),
+
+        EmbeddingEngine::Fastembed => anyhow::bail!("Fastembed does not take custom models"),
     }
 }
 

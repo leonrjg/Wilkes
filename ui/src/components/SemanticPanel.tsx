@@ -12,6 +12,7 @@ import {
   type IndexStatus,
   type PythonEnvInventory,
   type EmbeddingEngine,
+  type ModelSearchHit,
 } from "../lib/types";
 import type { SearchApi } from "../services/api";
 import { useSettingsStore } from "../stores/useSettingsStore";
@@ -230,6 +231,24 @@ interface Props {
   refreshSemanticReady: () => Promise<boolean>;
 }
 
+interface CustomSearch {
+  hits: ModelSearchHit[];
+  searching: boolean;
+  failed: boolean;
+}
+
+const CUSTOM_SEARCH_DEBOUNCE_MS = 300;
+
+const compactCount = new Intl.NumberFormat(undefined, { notation: "compact" });
+
+/** The `org/model` a repository ID or Hugging Face URL names, if it names one. */
+function parseHuggingFaceRepoId(input: string): string | null {
+  const hfUrlRegex = /(?:https?:\/\/)?(?:www\.)?(?:huggingface\.co\/|hf\.co\/)([a-zA-Z0-9._-]+)\/([a-zA-Z0-9._-]+)/i;
+  const hfIdRegex = /([a-zA-Z0-9._-]+)\/([a-zA-Z0-9._-]+)/;
+  const match = input.match(hfUrlRegex) || input.match(hfIdRegex);
+  return match ? `${match[1]}/${match[2]}` : null;
+}
+
 export default function SemanticPanel({ api, directory, refreshSemanticReady }: Props) {
   const handleCurrentRootIndexRemoved = useSemanticStore((s) => s.handleCurrentRootIndexRemoved);
   const activeWorkspace = useWorkspaceStore((s) =>
@@ -243,6 +262,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   const [sizeFetchingFor, setSizeFetchingFor] = useState<string | null>(null);
   const [customModelInput, setCustomModelInput] = useState("");
   const [isAddingCustom, setIsAddingCustom] = useState(false);
+  const [customSearch, setCustomSearch] = useState<CustomSearch>({ hits: [], searching: false, failed: false });
   const [modelToRemove, setModelToRemove] = useState<{ model_id: string; display_name: string } | null>(null);
   const [removeEnvToo, setRemoveEnvToo] = useState(true);
   const [showLogs, setShowLogs] = useState(false);
@@ -445,11 +465,38 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     replaceSettings(await api.updateSettings({ semantic: next }));
   };
 
+  // ---------------------------------------------------------------------------
+  // Effect: search Hugging Face as the custom model input changes. A pasted
+  // URL is searched as the repository it names. An empty input is a search
+  // too, which opens the form on the most downloaded models.
+  // ---------------------------------------------------------------------------
+
+  useEffect(() => {
+    if (!isAddingCustom || !currentEngine) return;
+    const input = customModelInput.trim();
+    const query = parseHuggingFaceRepoId(input) ?? input;
+    let cancelled = false;
+    setCustomSearch((search) => ({ ...search, searching: true }));
+    const timer = setTimeout(() => {
+      api.searchCustomModels(currentEngine, query).then((hits) => {
+        if (!cancelled) setCustomSearch({ hits, searching: false, failed: false });
+      }).catch((e) => {
+        console.error("searchCustomModels failed:", e);
+        if (!cancelled) setCustomSearch({ hits: [], searching: false, failed: true });
+      });
+    }, CUSTOM_SEARCH_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [api, isAddingCustom, currentEngine, customModelInput]);
+
   const supportsCustomModels = (engine: EmbeddingEngine) => engine !== "Fastembed";
 
   const handleEngineChange = async (engine: EmbeddingEngine) => {
     if (!settings) return;
     setModelFilter("");
+    setIsAddingCustom(false);
     setDraftSelected({
       engine,
       model: ENGINE_DEFAULT_MODELS[engine],
@@ -576,17 +623,11 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     setModelToRemove(null);
   };
 
-  const handleAddCustomModel = async () => {
-    if (!settings || !customModelInput.trim()) return;
+  const addCustomModel = async (input: string) => {
+    if (!settings || !input.trim()) return;
 
-    let modelId = customModelInput.trim();
-    const hfUrlRegex = /(?:https?:\/\/)?(?:www\.)?(?:huggingface\.co\/|hf\.co\/)([a-zA-Z0-9._-]+)\/([a-zA-Z0-9._-]+)/i;
-    const hfIdRegex = /([a-zA-Z0-9._-]+)\/([a-zA-Z0-9._-]+)/;
-    const match = modelId.match(hfUrlRegex) || modelId.match(hfIdRegex);
-
-    if (match && match[1] && match[2]) {
-      modelId = `${match[1]}/${match[2]}`;
-    } else {
+    const modelId = parseHuggingFaceRepoId(input.trim());
+    if (!modelId) {
       dispatch({ type: "error", error: "Please enter a valid HuggingFace repository ID (e.g., org/model) or URL" });
       return;
     }
@@ -613,6 +654,16 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
 
     replaceSettings(await api.updateSettings({ semantic: next }));
     invalidate();
+  };
+
+  // A model already in the list needs choosing, not adding a second time.
+  const handleSearchHit = (modelId: string) => {
+    if (backendModels.some((model) => model.model_id === modelId)) {
+      setIsAddingCustom(false);
+      void handleModelChange(modelId);
+    } else {
+      void addCustomModel(modelId);
+    }
   };
 
   const progressPct =
@@ -768,25 +819,63 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
             ) : isAddingCustom ? (
               <div className="animate-in fade-in slide-in-from-top-1 flex flex-col gap-2 rounded-lg border border-[var(--border-main)]/30 bg-[var(--bg-active)] p-2">
                 <p className="text-[10px] text-[var(--text-dim)]">
-                  Enter HuggingFace Repository ID:
+                  Search Hugging Face, or enter a repository ID:
                 </p>
                 <div className="flex gap-2">
                   <input
                     type="text"
-                    placeholder="e.g. org/repo-name"
+                    placeholder="e.g. bge or org/repo-name"
                     value={customModelInput}
                     onChange={(event) => setCustomModelInput(event.target.value)}
-                    onKeyDown={(event) => event.key === "Enter" && handleAddCustomModel()}
-                    className="flex-1 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2 py-1 text-[11px] text-[var(--text-main)] placeholder-[var(--text-dim)] focus:border-[var(--accent-blue)] focus:outline-none"
+                    onKeyDown={(event) => event.key === "Enter" && addCustomModel(customModelInput)}
+                    className="min-w-0 flex-1 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2 py-1 text-[11px] text-[var(--text-main)] placeholder-[var(--text-dim)] focus:border-[var(--accent-blue)] focus:outline-none"
                     autoFocus
                   />
                   <button
                     type="button"
-                    onClick={handleAddCustomModel}
+                    onClick={() => void addCustomModel(customModelInput)}
                     className="rounded bg-[var(--accent-blue)] px-3 py-1 text-[10px] font-semibold text-white hover:bg-[var(--accent-blue-hover)]"
                   >
                     Add
                   </button>
+                </div>
+                <div className="custom-scrollbar flex max-h-40 flex-col gap-0.5 overflow-y-auto pr-1">
+                  {customSearch.failed ? (
+                    <p className="py-2 text-center text-[10px] text-[var(--text-muted)]">
+                      Could not search Hugging Face. A repository ID can still be added.
+                    </p>
+                  ) : customSearch.hits.length === 0 ? (
+                    <p className="py-2 text-center text-[10px] text-[var(--text-muted)]">
+                      {customSearch.searching ? "Searching…" : "No embedding models found"}
+                    </p>
+                  ) : (
+                    customSearch.hits.map((hit) => (
+                      <button
+                        key={hit.model_id}
+                        type="button"
+                        disabled={isActive}
+                        onClick={() => handleSearchHit(hit.model_id)}
+                        className="flex w-full flex-col rounded p-1.5 text-left transition-colors hover:bg-[var(--bg-app)] disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        <span className="flex items-center gap-2">
+                          <span className="min-w-0 truncate text-[11px] font-medium text-[var(--text-main)]">
+                            {hit.model_id}
+                          </span>
+                          {backendModels.some((model) => model.model_id === hit.model_id) && (
+                            <span className="shrink-0 rounded bg-green-500/10 px-1 text-[9px] text-green-500">
+                              In list
+                            </span>
+                          )}
+                          <span className="ml-auto shrink-0 text-[9px] text-[var(--text-dim)]">
+                            {compactCount.format(hit.downloads)} downloads
+                          </span>
+                        </span>
+                        {hit.model_type && (
+                          <span className="text-[9px] text-[var(--text-dim)]">{hit.model_type}</span>
+                        )}
+                      </button>
+                    ))
+                  )}
                 </div>
               </div>
             ) : undefined

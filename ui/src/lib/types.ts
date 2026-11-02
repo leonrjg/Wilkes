@@ -609,6 +609,15 @@ export interface CustomModel {
   model_id: string;
 }
 
+/** A Hugging Face repository a search found that could be added as a custom model. */
+export interface ModelSearchHit {
+  model_id: string;
+  /** The architecture its config.json names, when the hub reports one. */
+  model_type: string | null;
+  /** Downloads over the last 30 days, the hub's own figure. */
+  downloads: number;
+}
+
 export interface SelectedEmbedder {
   engine: EmbeddingEngine;
   model: EmbedderModel;

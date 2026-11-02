@@ -17,6 +17,7 @@
 - Installing a custom SBERT model now embeds a short text, so a model that loads but cannot run fails at installation rather than during an index build. Setting up an environment shows what it is doing.
 - Settings › Workers lists Python environments with their size, last use and the models that use them. Any can be removed, and is rebuilt with the same versions the next time a model needs it. Environments are never removed automatically.
 - Custom models can be removed from the model list, which deletes their downloaded files.
+- Add Custom in the embedding model list searches Hugging Face as you type, opening on the most downloaded models, and clicking a result adds it. Results are embedding models the engine could download: rerankers and gated repositories are left out, and for Candle so is any repository without the files it loads. A repository ID or URL can still be entered directly. On the server, `GET /api/embed/model-search?engine=&query=` runs the same search.
 
 ### Changed
 

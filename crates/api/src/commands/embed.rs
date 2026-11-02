@@ -209,6 +209,17 @@ pub async fn get_model_size(
     .await?
 }
 
+/// Search Hugging Face for repositories `engine` could take as a custom model.
+pub async fn search_custom_models(
+    engine: wilkes_core::types::EmbeddingEngine,
+    query: String,
+) -> anyhow::Result<Vec<wilkes_core::types::ModelSearchHit>> {
+    tokio::task::spawn_blocking(move || {
+        wilkes_core::embed::dispatch::search_custom_models(engine, &query)
+    })
+    .await?
+}
+
 /// Read index status from disk without opening the full index.
 pub async fn get_index_status(
     data_dir: &Path,
@@ -665,5 +676,17 @@ mod tests {
         )
         .await;
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn fastembed_takes_no_custom_models_to_search_for() {
+        let err = search_custom_models(
+            wilkes_core::types::EmbeddingEngine::Fastembed,
+            "bge".to_string(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("does not take custom models"));
     }
 }

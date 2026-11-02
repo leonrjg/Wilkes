@@ -528,6 +528,15 @@ describe("HttpSearchApi", () => {
     expect(res).toBe(1024);
   });
 
+  it("searchCustomModels encodes its query and returns the hits", async () => {
+    const hits = [{ model_id: "org/model", model_type: "bert", downloads: 5 }];
+    (fetch as any).mockResolvedValue({ ok: true, json: () => Promise.resolve(hits) });
+
+    const res = await api.searchCustomModels("SBERT", "org/a b");
+    expect(fetch).toHaveBeenCalledWith("/api/embed/model-search?engine=SBERT&query=org%2Fa%20b");
+    expect(res).toEqual(hits);
+  });
+
   it("downloadModel calls fetch with POST", async () => {
     (fetch as any).mockResolvedValue({ ok: true, status: 202 });
     const selected = { model: "m1", engine: "SBERT", dimension: 384 };

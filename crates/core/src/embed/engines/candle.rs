@@ -100,7 +100,7 @@ const PREEXISTING_MODELS: &[ModelInfo] = &[
 ];
 
 // Files required to load and run a model.
-const MODEL_FILES: &[&str] = &["config.json", "tokenizer.json", "model.safetensors"];
+pub(crate) const MODEL_FILES: &[&str] = &["config.json", "tokenizer.json", "model.safetensors"];
 
 // ── HF cache helpers ──────────────────────────────────────────────────────────
 

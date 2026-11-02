@@ -1974,6 +1974,16 @@ async fn get_model_size(engine: EmbeddingEngine, model_id: String) -> Result<u64
 }
 
 #[tauri::command]
+async fn search_custom_models(
+    engine: EmbeddingEngine,
+    query: String,
+) -> Result<Vec<wilkes_core::types::ModelSearchHit>, String> {
+    wilkes_api::commands::embed::search_custom_models(engine, query)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn cancel_embed(app: AppHandle) -> Result<(), String> {
     cancel_embed_for_ctx(app_context(&app)).await
 }
@@ -2574,6 +2584,7 @@ pub fn run() {
             retry_failed_documents,
             embedder_capabilities,
             get_model_size,
+            search_custom_models,
             cancel_embed,
             get_index_status,
             delete_index,

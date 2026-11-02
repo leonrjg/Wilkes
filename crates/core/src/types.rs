@@ -2208,6 +2208,17 @@ pub struct CustomModel {
     pub model_id: String,
 }
 
+/// A Hugging Face repository a search found that could be added as a
+/// [`CustomModel`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ModelSearchHit {
+    pub model_id: String,
+    /// The architecture its `config.json` names, when the hub reports one.
+    pub model_type: Option<String>,
+    /// Downloads over the last 30 days, the hub's own figure.
+    pub downloads: u64,
+}
+
 // ── Recognizer inventory ──────────────────────────────────────────────────────
 
 /// One file of a recognizer, as an inventory names it.

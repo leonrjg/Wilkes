@@ -448,6 +448,12 @@ describe("TauriSearchApi", () => {
     expect(invoke).toHaveBeenCalledWith("remove_python_envs", { ids: ["abc"] });
   });
 
+  it("should call search_custom_models", async () => {
+    (invoke as any).mockResolvedValue([]);
+    await api.searchCustomModels("SBERT", "bge");
+    expect(invoke).toHaveBeenCalledWith("search_custom_models", { engine: "SBERT", query: "bge" });
+  });
+
   it("should call remove_custom_model", async () => {
     (invoke as any).mockResolvedValue(undefined);
     await api.removeCustomModel("SBERT", "org/model");

@@ -664,6 +664,12 @@ export class HttpSearchApi implements SearchApi {
     return res.json() as Promise<number>;
   }
 
+  async searchCustomModels(engine: EmbeddingEngine, query: string): Promise<import("../lib/types").ModelSearchHit[]> {
+    const res = await fetch(`/api/embed/model-search?engine=${encodeURIComponent(engine)}&query=${encodeURIComponent(query)}`);
+    if (!res.ok) throw await responseError(res, "searchCustomModels");
+    return res.json() as Promise<import("../lib/types").ModelSearchHit[]>;
+  }
+
   async downloadModel(selected: SelectedEmbedder): Promise<void> {
     const res = await fetch("/api/embed/download", {
       method: "POST",

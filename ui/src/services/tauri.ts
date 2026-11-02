@@ -538,6 +538,10 @@ export class TauriSearchApi implements SearchApi {
     return invoke<number>("get_model_size", { engine, modelId });
   }
 
+  async searchCustomModels(engine: EmbeddingEngine, query: string): Promise<import("../lib/types").ModelSearchHit[]> {
+    return invoke<import("../lib/types").ModelSearchHit[]>("search_custom_models", { engine, query });
+  }
+
   async downloadModel(selected: SelectedEmbedder): Promise<void> {
     return invoke("download_model", { selected });
   }

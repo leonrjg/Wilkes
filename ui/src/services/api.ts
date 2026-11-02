@@ -5,6 +5,7 @@ import type {
   EmbedError,
   EmbedProgress,
   EmbeddingEngine,
+  ModelSearchHit,
   Bookmark,
   BookmarkClustersQuery,
   CatalogueDownload,
@@ -395,6 +396,9 @@ export interface SearchApi {
    *  disagree about which models exist. */
   getEmbedderCapabilities(): Promise<EmbedderCapabilityManifest>;
   getModelSize(engine: EmbeddingEngine, modelId: string): Promise<number>;
+  /** Hugging Face repositories `engine` could take as a custom model, most
+   *  downloaded first. An empty query lists the most downloaded of them. */
+  searchCustomModels(engine: EmbeddingEngine, query: string): Promise<ModelSearchHit[]>;
   downloadModel(selected: SelectedEmbedder): Promise<void>;
   buildIndex(root: string, selected: SelectedEmbedder): Promise<void>;
   /** What the most recent indexing job for `root` did, document by document. */

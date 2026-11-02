@@ -2464,6 +2464,12 @@ struct ModelSizeQuery {
 }
 
 #[derive(Deserialize)]
+struct ModelSearchQuery {
+    engine: EmbeddingEngine,
+    query: String,
+}
+
+#[derive(Deserialize)]
 struct RootQuery {
     root: Option<String>,
 }
@@ -2475,6 +2481,15 @@ async fn get_model_size_handler(
         .await
         .map_err(|e| server_err(e.to_string()))?;
     Ok(Json(size))
+}
+
+async fn search_custom_models_handler(
+    Query(params): Query<ModelSearchQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let hits = wilkes_api::commands::embed::search_custom_models(params.engine, params.query)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(hits))
 }
 
 async fn get_index_status_handler(
@@ -2966,6 +2981,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             get(embedder_capabilities_handler),
         )
         .route("/api/embed/model-size", get(get_model_size_handler))
+        .route("/api/embed/model-search", get(search_custom_models_handler))
         .route("/api/embed/status", get(get_index_status_handler))
         .route("/api/embed/download", post(download_model_handler))
         .route("/api/embed/build", post(build_index_handler))
@@ -4152,6 +4168,13 @@ mod tests {
         let _ = get_model_size_handler(Query(ModelSizeQuery {
             engine: EmbeddingEngine::Fastembed,
             model_id: "m".to_string(),
+        }))
+        .await;
+
+        // test search_custom_models_handler (will fail)
+        let _ = search_custom_models_handler(Query(ModelSearchQuery {
+            engine: EmbeddingEngine::Fastembed,
+            query: "m".to_string(),
         }))
         .await;
 

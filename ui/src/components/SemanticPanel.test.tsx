@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import SemanticPanel from "./SemanticPanel";
 import { useSettingsStore } from "../stores/useSettingsStore";
@@ -39,6 +39,7 @@ describe("SemanticPanel", () => {
     deleteIndex: vi.fn().mockResolvedValue(undefined),
     cancelEmbed: vi.fn().mockResolvedValue(undefined),
     getModelSize: vi.fn(),
+    searchCustomModels: vi.fn(),
     getLogs: vi.fn(),
   } as any;
 
@@ -122,6 +123,7 @@ describe("SemanticPanel", () => {
     mockApi.removeCustomModel.mockResolvedValue(undefined);
     mockApi.getLogs.mockResolvedValue([]);
     mockApi.getModelSize.mockResolvedValue(1024 * 1024 * 100);
+    mockApi.searchCustomModels.mockResolvedValue([]);
     mockApi.updateSettings.mockImplementation(async (patch: any) => ({
       ...defaultSettings,
       ...patch,
@@ -634,7 +636,7 @@ describe("SemanticPanel", () => {
       fireEvent.click(addCustomBtn);
     });
 
-    const input = screen.getByPlaceholderText(/e.g. org\/repo-name/i);
+    const input = screen.getByPlaceholderText(/org\/repo-name/i);
     await act(async () => {
       fireEvent.change(input, { target: { value: "org/custom-model" } });
       fireEvent.click(screen.getByText(/^Add$/));
@@ -645,6 +647,129 @@ describe("SemanticPanel", () => {
         custom_models: expect.arrayContaining([{ engine: "Candle", model_id: "org/custom-model" }])
       })
     }));
+  });
+
+  describe("searching Hugging Face for a custom model", () => {
+    const openForm = async () => {
+      await act(async () => {
+        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByText(/Add Custom/i));
+      });
+    };
+
+    it("opens on the most downloaded models for the engine", async () => {
+      mockApi.searchCustomModels.mockResolvedValue([
+        { model_id: "org/popular", model_type: "bert", downloads: 1_500_000 },
+      ]);
+
+      await openForm();
+
+      expect(await screen.findByText("org/popular")).toBeInTheDocument();
+      expect(screen.getByText("bert")).toBeInTheDocument();
+      expect(screen.getByText(/1\.5M downloads/)).toBeInTheDocument();
+      expect(mockApi.searchCustomModels).toHaveBeenCalledWith("Candle", "");
+    });
+
+    it("waits for typing to pause and searches once", async () => {
+      await openForm();
+      await waitFor(() => expect(mockApi.searchCustomModels).toHaveBeenCalledTimes(1));
+      mockApi.searchCustomModels.mockClear();
+
+      const input = screen.getByPlaceholderText(/org\/repo-name/i);
+      fireEvent.change(input, { target: { value: "b" } });
+      fireEvent.change(input, { target: { value: "bg" } });
+      fireEvent.change(input, { target: { value: "bge" } });
+
+      await waitFor(() => expect(mockApi.searchCustomModels).toHaveBeenCalled());
+      expect(mockApi.searchCustomModels).toHaveBeenCalledTimes(1);
+      expect(mockApi.searchCustomModels).toHaveBeenCalledWith("Candle", "bge");
+    });
+
+    it("searches a pasted URL as the repository it names", async () => {
+      await openForm();
+      await waitFor(() => expect(mockApi.searchCustomModels).toHaveBeenCalledTimes(1));
+
+      fireEvent.change(screen.getByPlaceholderText(/org\/repo-name/i), {
+        target: { value: "https://huggingface.co/org/model/tree/main" },
+      });
+
+      await waitFor(() => expect(mockApi.searchCustomModels).toHaveBeenCalledWith("Candle", "org/model"));
+    });
+
+    it("ignores an answer to a search that has been replaced", async () => {
+      let answerFirst: (hits: any[]) => void = () => {};
+      mockApi.searchCustomModels.mockReturnValueOnce(new Promise((resolve) => { answerFirst = resolve; }));
+      await openForm();
+      await waitFor(() => expect(mockApi.searchCustomModels).toHaveBeenCalledTimes(1));
+
+      mockApi.searchCustomModels.mockResolvedValue([
+        { model_id: "org/current", model_type: null, downloads: 1 },
+      ]);
+      fireEvent.change(screen.getByPlaceholderText(/org\/repo-name/i), { target: { value: "cur" } });
+      expect(await screen.findByText("org/current")).toBeInTheDocument();
+
+      await act(async () => {
+        answerFirst([{ model_id: "org/stale", model_type: null, downloads: 1 }]);
+      });
+
+      expect(screen.queryByText("org/stale")).not.toBeInTheDocument();
+      expect(screen.getByText("org/current")).toBeInTheDocument();
+    });
+
+    it("adds and selects a result when it is clicked", async () => {
+      mockApi.searchCustomModels.mockResolvedValue([
+        { model_id: "org/found", model_type: "bert", downloads: 10 },
+      ]);
+      await openForm();
+
+      const hit = await screen.findByText("org/found");
+      await act(async () => {
+        fireEvent.click(hit);
+      });
+
+      expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({
+        semantic: expect.objectContaining({
+          custom_models: expect.arrayContaining([{ engine: "Candle", model_id: "org/found" }]),
+        }),
+      }));
+      expect(screen.queryByPlaceholderText(/org\/repo-name/i)).not.toBeInTheDocument();
+    });
+
+    it("chooses a result already in the list instead of adding it again", async () => {
+      mockApi.searchCustomModels.mockResolvedValue([
+        { model_id: "initial-id", model_type: "bert", downloads: 10 },
+      ]);
+      await openForm();
+
+      const row = (await screen.findByText("In list")).closest("button")!;
+      await act(async () => {
+        fireEvent.click(row);
+      });
+
+      expect(mockApi.updateSettings).not.toHaveBeenCalledWith(expect.objectContaining({
+        semantic: expect.objectContaining({
+          custom_models: expect.arrayContaining([expect.objectContaining({ model_id: "initial-id" })]),
+        }),
+      }));
+      expect(screen.queryByPlaceholderText(/org\/repo-name/i)).not.toBeInTheDocument();
+    });
+
+    it("keeps the repository ID route open when the search fails", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      mockApi.searchCustomModels.mockRejectedValue(new Error("offline"));
+      await openForm();
+
+      expect(await screen.findByText(/Could not search Hugging Face/)).toBeInTheDocument();
+      expect(screen.getByText(/^Add$/)).toBeEnabled();
+    });
+
+    it("says when nothing matched", async () => {
+      await openForm();
+
+      expect(await screen.findByText("No embedding models found")).toBeInTheDocument();
+    });
   });
 
   it("filters models by search text", async () => {

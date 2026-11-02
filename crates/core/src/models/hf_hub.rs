@@ -1,9 +1,25 @@
 use std::path::Path;
 
+use crate::types::ModelSearchHit;
+
 #[derive(Debug, serde::Deserialize)]
 pub struct HfSibling {
     pub rfilename: String,
     pub size: Option<u64>,
+}
+
+/// Make a request of the hub's metadata API, recorded in the HTTP history.
+fn metadata_call(request: ureq::Request) -> Result<ureq::Response, Box<ureq::Error>> {
+    let guard =
+        crate::http_history::CallGuard::start("Hugging Face metadata", "GET", request.url());
+    let response = request.call();
+    let (status, error) = match &response {
+        Ok(response) => (Some(response.status()), None),
+        Err(ureq::Error::Status(status, _)) => (Some(*status), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    guard.finish(status, error);
+    response.map_err(Box::new)
 }
 
 /// Fetch the sibling file list for `model_id` from the HuggingFace API, at the
@@ -20,15 +36,7 @@ pub fn fetch_hf_siblings_at(
     revision: Option<&str>,
 ) -> anyhow::Result<Vec<HfSibling>> {
     fetch_hf_siblings_from_response(model_id, revision, |url| {
-        let guard = crate::http_history::CallGuard::start("Hugging Face metadata", "GET", url);
-        let response = ureq::get(url).call();
-        let (status, error) = match &response {
-            Ok(response) => (Some(response.status()), None),
-            Err(ureq::Error::Status(status, _)) => (Some(*status), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-        guard.finish(status, error);
-        let body = response
+        let body = metadata_call(ureq::get(url))
             .map_err(|e| anyhow::anyhow!("HF API request failed: {e}"))?
             .into_string()
             .map_err(|e| anyhow::anyhow!("HF API response read failed: {e}"))?;
@@ -71,15 +79,7 @@ const MODEL_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// repository that is not a Transformers model.
 pub fn fetch_model_config(model_id: &str) -> anyhow::Result<Option<String>> {
     let url = format!("https://huggingface.co/{model_id}/resolve/main/config.json");
-    let guard = crate::http_history::CallGuard::start("Hugging Face metadata", "GET", &url);
-    let response = ureq::get(&url).timeout(MODEL_CONFIG_TIMEOUT).call();
-    let (status, error) = match &response {
-        Ok(response) => (Some(response.status()), None),
-        Err(ureq::Error::Status(status, _)) => (Some(*status), None),
-        Err(error) => (None, Some(error.to_string())),
-    };
-    guard.finish(status, error);
-    match response {
+    match metadata_call(ureq::get(&url).timeout(MODEL_CONFIG_TIMEOUT)).map_err(|e| *e) {
         Ok(response) => response
             .into_string()
             .map(Some)
@@ -108,6 +108,101 @@ where
         "No model files found in HF repo for '{model_id}'"
     );
     Ok(total)
+}
+
+/// How long a search of the hub gets. Someone is watching a list fill in, and
+/// the repository id can still be typed by hand.
+const MODEL_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Repositories asked of the hub. More than are shown, because the hub cannot
+/// be asked for everything [`usable_hits`] requires and some of a page is dropped.
+const MODEL_SEARCH_PAGE: usize = 50;
+
+/// Repositories a search answers with.
+const MODEL_SEARCH_RESULTS: usize = 20;
+
+/// Pipelines that turn text into a vector. The `sentence-transformers` tag alone
+/// also covers cross-encoders, which score pairs and cannot embed anything.
+const EMBEDDING_PIPELINES: &[&str] = &["sentence-similarity", "feature-extraction"];
+
+/// Search the hub for embedding models, most downloaded first. An empty `query`
+/// lists the most downloaded of them. A repository lacking any of
+/// `required_files` is left out.
+pub fn search_embedding_models(
+    query: &str,
+    required_files: &[&str],
+) -> anyhow::Result<Vec<ModelSearchHit>> {
+    let request = model_search_request(query);
+    let body = metadata_call(request.timeout(MODEL_SEARCH_TIMEOUT))
+        .map_err(|e| anyhow::anyhow!("HF model search failed: {e}"))?
+        .into_string()
+        .map_err(|e| anyhow::anyhow!("HF model search response read failed: {e}"))?;
+    usable_hits(&body, required_files)
+}
+
+fn model_search_request(query: &str) -> ureq::Request {
+    let mut request = ureq::get("https://huggingface.co/api/models")
+        .query("search", query)
+        .query("filter", "sentence-transformers")
+        .query("sort", "downloads")
+        .query("direction", "-1")
+        .query("limit", &MODEL_SEARCH_PAGE.to_string());
+    for field in ["downloads", "pipeline_tag", "gated", "config", "siblings"] {
+        request = request.query("expand[]", field);
+    }
+    request
+}
+
+/// The repositories in a search response that could actually be added: open,
+/// embedding models, holding `required_files`. Gated repositories are dropped
+/// because Wilkes holds no Hugging Face token to download them with.
+fn usable_hits(body: &str, required_files: &[&str]) -> anyhow::Result<Vec<ModelSearchHit>> {
+    #[derive(serde::Deserialize)]
+    struct Config {
+        model_type: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Repository {
+        id: String,
+        #[serde(default)]
+        downloads: u64,
+        pipeline_tag: Option<String>,
+        /// `false`, or the kind of approval it takes as a string.
+        #[serde(default)]
+        gated: serde_json::Value,
+        config: Option<Config>,
+        #[serde(default)]
+        siblings: Vec<HfSibling>,
+    }
+
+    let repositories: Vec<Repository> = serde_json::from_str(body)
+        .map_err(|e| anyhow::anyhow!("HF model search response parse failed: {e}"))?;
+
+    Ok(repositories
+        .into_iter()
+        .filter(|repository| repository.gated == serde_json::Value::Bool(false))
+        .filter(|repository| {
+            repository
+                .pipeline_tag
+                .as_deref()
+                .is_some_and(|pipeline| EMBEDDING_PIPELINES.contains(&pipeline))
+        })
+        .filter(|repository| {
+            required_files.iter().all(|file| {
+                repository
+                    .siblings
+                    .iter()
+                    .any(|sibling| sibling.rfilename == *file)
+            })
+        })
+        .take(MODEL_SEARCH_RESULTS)
+        .map(|repository| ModelSearchHit {
+            model_id: repository.id,
+            model_type: repository.config.and_then(|config| config.model_type),
+            downloads: repository.downloads,
+        })
+        .collect())
 }
 
 /// Check if a model is cached in the given data directory using hf-hub's structure.
@@ -228,6 +323,115 @@ mod tests {
                 .unwrap_err();
 
         assert!(err.to_string().contains("HF API response parse failed"));
+    }
+
+    fn repository(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "downloads": 7,
+            "pipeline_tag": "feature-extraction",
+            "gated": false,
+            "config": { "model_type": "bert" },
+            "siblings": [{ "rfilename": "config.json" }, { "rfilename": "model.safetensors" }],
+        })
+    }
+
+    fn hit_ids(repositories: Vec<serde_json::Value>, required_files: &[&str]) -> Vec<String> {
+        let body = serde_json::Value::Array(repositories).to_string();
+        usable_hits(&body, required_files)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.model_id)
+            .collect()
+    }
+
+    #[test]
+    fn a_search_hit_carries_what_the_picker_shows() {
+        let body = serde_json::json!([repository("org/model")]).to_string();
+
+        assert_eq!(
+            usable_hits(&body, &[]).unwrap(),
+            vec![ModelSearchHit {
+                model_id: "org/model".to_string(),
+                model_type: Some("bert".to_string()),
+                downloads: 7,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_search_leaves_out_what_cannot_embed() {
+        let mut reranker = repository("org/reranker");
+        reranker["pipeline_tag"] = "text-ranking".into();
+        let mut classifier = repository("org/classifier");
+        classifier["pipeline_tag"] = "text-classification".into();
+        let mut untagged = repository("org/untagged");
+        untagged["pipeline_tag"] = serde_json::Value::Null;
+
+        let hits = hit_ids(
+            vec![repository("org/embedder"), reranker, classifier, untagged],
+            &[],
+        );
+
+        assert_eq!(hits, vec!["org/embedder"]);
+    }
+
+    #[test]
+    fn a_search_leaves_out_gated_repositories() {
+        let mut manual = repository("org/manual");
+        manual["gated"] = "manual".into();
+        let mut auto = repository("org/auto");
+        auto["gated"] = "auto".into();
+
+        let hits = hit_ids(vec![manual, auto, repository("org/open")], &[]);
+
+        assert_eq!(hits, vec!["org/open"]);
+    }
+
+    #[test]
+    fn a_search_leaves_out_repositories_missing_a_required_file() {
+        let mut no_tokenizer = repository("org/no-tokenizer");
+        no_tokenizer["siblings"] = serde_json::json!([{ "rfilename": "config.json" }]);
+
+        let hits = hit_ids(
+            vec![no_tokenizer, repository("org/complete")],
+            &["config.json", "model.safetensors"],
+        );
+
+        assert_eq!(hits, vec!["org/complete"]);
+    }
+
+    #[test]
+    fn a_search_stops_at_the_results_it_shows_after_dropping_the_rest() {
+        let mut gated = repository("org/gated");
+        gated["gated"] = "manual".into();
+        let mut repositories = vec![gated];
+        repositories.extend((0..MODEL_SEARCH_PAGE).map(|n| repository(&format!("org/m{n}"))));
+
+        let hits = hit_ids(repositories, &[]);
+
+        assert_eq!(hits.len(), MODEL_SEARCH_RESULTS);
+        assert_eq!(hits[0], "org/m0");
+    }
+
+    #[test]
+    fn a_search_reports_a_response_it_cannot_read() {
+        let err = usable_hits("not json", &[]).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("HF model search response parse failed"));
+    }
+
+    #[test]
+    fn a_search_encodes_its_query_and_asks_for_the_most_downloaded() {
+        let request = model_search_request("org/bge & friends");
+        let url = request.url();
+
+        assert!(url.contains("search=org%2Fbge+%26+friends"), "{url}");
+        assert!(url.contains("filter=sentence-transformers"), "{url}");
+        assert!(url.contains("sort=downloads"), "{url}");
+        assert!(url.contains("direction=-1"), "{url}");
     }
 
     #[test]
