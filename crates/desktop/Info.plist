@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged by Tauri into the bundle's Info.plist. macOS asks for Local Network
+     access the first time sharing with other Wilkes is turned on; these say why,
+     and which service the app looks for. -->
+<plist version="1.0">
+<dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Wilkes finds other Wilkes on your network so you can send them files.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_wilkes._tcp</string>
+	</array>
+</dict>
+</plist>
