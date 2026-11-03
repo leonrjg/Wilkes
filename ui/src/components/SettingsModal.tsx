@@ -3,6 +3,7 @@ import type { SearchApi } from "../services/api";
 import type {
   ExternalMcpStatus,
   HttpApiStatus,
+  LanSharingStatus,
   LiteratureProviderInfo,
   Settings,
 } from "../lib/types";
@@ -231,6 +232,9 @@ export default function SettingsModal({
   const [httpApiPort, setHttpApiPort] = useState(2020);
   const [httpApiBusy, setHttpApiBusy] = useState(false);
   const [httpApiError, setHttpApiError] = useState<string | null>(null);
+  const [lanSharingStatus, setLanSharingStatus] = useState<LanSharingStatus | null>(null);
+  const [lanSharingBusy, setLanSharingBusy] = useState(false);
+  const [lanSharingError, setLanSharingError] = useState<string | null>(null);
   const customInstructionsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settingsSaveQueue = useRef<Promise<void> | null>(null);
   const inversionRevision = useRef(0);
@@ -274,6 +278,14 @@ export default function SettingsModal({
             setHttpApiError(status.error);
           })
           .catch((error) => setHttpApiError(error.toString()));
+      }
+      if (api.getLanSharingStatus) {
+        api.getLanSharingStatus()
+          .then((status) => {
+            setLanSharingStatus(status);
+            setLanSharingError(status.error);
+          })
+          .catch((error) => setLanSharingError(error.toString()));
       }
     }
   }, [isOpen, api]);
@@ -506,6 +518,24 @@ export default function SettingsModal({
       setHttpApiError(error.toString());
     } finally {
       setHttpApiBusy(false);
+    }
+  };
+
+  const configureLanSharing = async (enabled: boolean) => {
+    if (!api.configureLanSharing) return;
+    setLanSharingBusy(true);
+    setLanSharingError(null);
+    try {
+      const status = await api.configureLanSharing(enabled);
+      setLanSharingStatus(status);
+      const lan_sharing = { enabled: status.enabled };
+      setSettings((current) => current ? { ...current, lan_sharing } : current);
+      onSettingsUpdate?.({ lan_sharing });
+      setLanSharingError(status.error);
+    } catch (error: any) {
+      setLanSharingError(error.toString());
+    } finally {
+      setLanSharingBusy(false);
     }
   };
 
@@ -1384,6 +1414,62 @@ export default function SettingsModal({
                       {httpApiError && (
                         <div role="alert" className="p-2 bg-red-900/20 border border-red-900/50 rounded text-[10px] text-red-400 break-all">
                           {httpApiError}
+                        </div>
+                      )}
+                    </div>
+                  </section>
+
+                  <section className="border-t border-[var(--border-main)] pt-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <div>
+                        <h3 className="text-[10px] font-medium text-[var(--text-dim)] uppercase tracking-wider">
+                          Local network
+                        </h3>
+                        <p className="text-[10px] text-[var(--text-dim)] mt-1">
+                          Send files to other Wilkes on this network, and receive theirs into the
+                          current folder.
+                        </p>
+                      </div>
+                      <span className={`text-[10px] font-medium ${
+                        lanSharingStatus?.running ? "text-emerald-500" : "text-[var(--text-dim)]"
+                      }`}>
+                        {lanSharingStatus?.running ? "Visible" : "Off"}
+                      </span>
+                    </div>
+
+                    <div className="space-y-3">
+                      <label className="flex items-center gap-2.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          aria-label="Share with Wilkes on the local network"
+                          checked={lanSharingStatus?.enabled ?? settings.lan_sharing?.enabled ?? false}
+                          disabled={lanSharingBusy}
+                          onChange={(event) => void configureLanSharing(event.target.checked)}
+                          className="w-3.5 h-3.5 accent-[var(--accent-blue)]"
+                        />
+                        <span className="text-xs text-[var(--text-muted)]">
+                          Share with Wilkes on the local network
+                        </span>
+                      </label>
+
+                      {lanSharingStatus?.running && (
+                        <p className="text-[10px] text-[var(--text-dim)]">
+                          Others see this computer as{" "}
+                          <span className="font-mono text-[var(--text-main)]">{lanSharingStatus.device_name}</span>.
+                          Files they send land in the current folder without asking.
+                        </p>
+                      )}
+
+                      {(lanSharingStatus?.enabled ?? settings.lan_sharing?.enabled ?? false) && (
+                        <div role="status" className="p-2 bg-[var(--accent-amber-muted)] border border-[var(--accent-amber-border)] rounded text-[10px] text-[var(--accent-amber)]">
+                          Anyone on this network running Wilkes can put files into your current
+                          folder while this is on. Turn it off on networks you do not trust.
+                        </div>
+                      )}
+
+                      {lanSharingError && (
+                        <div role="alert" className="p-2 bg-red-900/20 border border-red-900/50 rounded text-[10px] text-red-400 break-all">
+                          {lanSharingError}
                         </div>
                       )}
                     </div>

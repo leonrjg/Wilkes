@@ -10,6 +10,7 @@ import { useGenerationStore } from "../stores/useGenerationStore";
 import { useTopicsStore } from "../stores/useTopicsStore";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useCatalogueStore } from "../stores/useCatalogueStore";
+import { useLanPeersStore } from "../stores/useLanPeersStore";
 
 export function useGlobalEvents() {
   const { addToast, removeToast } = useToasts();
@@ -25,6 +26,8 @@ export function useGlobalEvents() {
     let topicLabelUnlisten: (() => void) | undefined;
     let catalogueDownloadUnlisten: (() => void) | undefined;
     let catalogueCourseUnlisten: (() => void) | undefined;
+    let lanPeersUnlisten: (() => void) | undefined;
+    let lanReceivedUnlisten: (() => void) | undefined;
     let mounted = true;
 
     const closeReindexToast = () => {
@@ -164,6 +167,26 @@ export function useGlobalEvents() {
       }
     });
 
+    // Subscribed before the initial listing is read, so a peer that appears in
+    // between is not lost; the listing then only ever repeats what an event
+    // already said.
+    api.onLanPeersChanged?.((peers) => {
+      if (!mounted) return;
+      useLanPeersStore.getState().setPeers(peers);
+    }).then((u) => {
+      if (mounted) lanPeersUnlisten = u; else u();
+      return api.listLanPeers?.();
+    }).then((peers) => {
+      if (mounted && peers) useLanPeersStore.getState().setPeers(peers);
+    }).catch((error) => console.error("Failed to list Wilkes on the local network:", error));
+
+    // The file is already in the current root, whose watcher refreshes the
+    // list; this only says where it came from.
+    api.onLanFileReceived?.((event) => {
+      if (!mounted) return;
+      addToast(`Received "${event.name}" from ${event.from}`, { type: "success" });
+    }).then((u) => { if (mounted) lanReceivedUnlisten = u; else u(); });
+
     void useGenerationStore.getState().refreshReady();
 
     return () => {
@@ -177,6 +200,8 @@ export function useGlobalEvents() {
       if (topicLabelUnlisten) topicLabelUnlisten();
       if (catalogueDownloadUnlisten) catalogueDownloadUnlisten();
       if (catalogueCourseUnlisten) catalogueCourseUnlisten();
+      if (lanPeersUnlisten) lanPeersUnlisten();
+      if (lanReceivedUnlisten) lanReceivedUnlisten();
     };
   }, [addToast, removeToast]);
 }

@@ -71,6 +71,9 @@ import type {
   SearchLogEntry,
   ExternalMcpStatus,
   HttpApiStatus,
+  LanFileReceived,
+  LanPeer,
+  LanSharingStatus,
   BookmarkClusterLabelled,
   ChunkTopicLabelled,
   GeneratorDescriptor,
@@ -253,6 +256,32 @@ export class TauriSearchApi implements SearchApi {
       bindAddress,
       port,
     });
+  }
+
+  async getLanSharingStatus(): Promise<LanSharingStatus> {
+    return invoke<LanSharingStatus>("get_lan_sharing_status");
+  }
+
+  async configureLanSharing(enabled: boolean): Promise<LanSharingStatus> {
+    return invoke<LanSharingStatus>("configure_lan_sharing", { enabled });
+  }
+
+  async listLanPeers(): Promise<LanPeer[]> {
+    return invoke<LanPeer[]>("list_lan_peers");
+  }
+
+  async sendFilesToLanPeer(peerId: string, paths: string[]): Promise<void> {
+    return invoke<void>("send_files_to_lan_peer", { peerId, paths });
+  }
+
+  async onLanPeersChanged(handler: (peers: LanPeer[]) => void): Promise<() => void> {
+    return listen<LanPeer[]>("lan-peers-changed", (e) => handler(e.payload));
+  }
+
+  async onLanFileReceived(
+    handler: (event: LanFileReceived) => void,
+  ): Promise<() => void> {
+    return listen<LanFileReceived>("lan-file-received", (e) => handler(e.payload));
   }
 
   async listBookmarks(): Promise<Bookmark[]> {

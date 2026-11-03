@@ -408,7 +408,7 @@ fn import_folder_path(root: &Path, folder: &str) -> anyhow::Result<PathBuf> {
     Ok(target)
 }
 
-fn validate_new_file_name(name: &str) -> anyhow::Result<()> {
+pub fn validate_new_file_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() {
         anyhow::bail!("File name cannot be empty");
     }

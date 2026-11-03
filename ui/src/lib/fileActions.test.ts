@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { buildFileContextMenuItems, type ContextMenuTarget } from "./fileActions";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
+import { useLanPeersStore } from "../stores/useLanPeersStore";
 
 vi.mock("../services", () => ({ isTauri: true }));
 
@@ -53,5 +54,35 @@ describe("buildFileContextMenuItems", () => {
     expect(ids).toContain("open");
     expect(ids).toContain("copy-path");
     expect(ids).toContain("open-in-file-manager");
+  });
+
+  it("offers each Wilkes on the local network as a destination, even read-only", async () => {
+    useWorkspaceStore.setState({
+      workspaces: [{ id: "corpus", name: "Corpus", read_only: true, managed_by: "underdog" }],
+      activeWorkspaceId: "corpus",
+    });
+    useLanPeersStore.setState({ peers: [{ id: "peer-1", name: "Studio iMac" }] });
+    const sendFilesToLanPeer = vi.fn().mockResolvedValue(undefined);
+    const onToast = vi.fn();
+
+    const items = buildFileContextMenuItems({
+      target,
+      api: { writeClipboard: vi.fn(), sendFilesToLanPeer } as never,
+      capabilities: { canOpenInFileManager: false },
+      onToast,
+    });
+    const send = items.find((item) => item.id === "send-to-peer-1");
+    expect(send?.label).toBe("Send to Studio iMac");
+
+    await send!.run!();
+    expect(sendFilesToLanPeer).toHaveBeenCalledWith("peer-1", ["/library/paper.md"]);
+    expect(onToast).toHaveBeenCalledWith("Sent to Studio iMac", "success");
+    useLanPeersStore.setState({ peers: [] });
+  });
+
+  it("offers no destination where the build cannot send", () => {
+    useLanPeersStore.setState({ peers: [{ id: "peer-1", name: "Studio iMac" }] });
+    expect(menuIds().some((id) => id.startsWith("send-to-"))).toBe(false);
+    useLanPeersStore.setState({ peers: [] });
   });
 });

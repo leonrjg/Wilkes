@@ -22,6 +22,7 @@
   - You can choose from a set of predefined models or any HuggingFace model
 - Fully configurable: adjust embedding chunk size and overlap, or just use the default settings
 - Cross-platform: works on Windows, Linux, and macOS
+- Send files to other Wilkes on your local network
 - Web version
 
 ## Installation

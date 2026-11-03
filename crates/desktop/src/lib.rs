@@ -21,9 +21,10 @@ use wilkes_core::types::{
     AddOutcome, Bookmark, BookmarkClustersQuery, BookmarkClustersResult, ChunkTopicsQuery,
     ChunkTopicsResult, CitationResult, CollectionValidation, DataPaths, DocumentMetadata,
     DocumentTagUpdate, EmbedderCapabilityManifest, EmbeddingEngine, ExternalMcpSettings,
-    FileListResponse, HttpApiSettings, IndexStatus, IntegrationStatus, LiteratureSearchResult,
-    NewBookmark, NewSavedWork, NewSmartCollection, NewTag, RootCoverage, SavedWork, SearchLogEntry,
-    SelectedEmbedder, Settings, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
+    FileListResponse, HttpApiSettings, IndexStatus, IntegrationStatus, LanSharingSettings,
+    LiteratureSearchResult, NewBookmark, NewSavedWork, NewSmartCollection, NewTag, RootCoverage,
+    SavedWork, SearchLogEntry, SelectedEmbedder, Settings, SmartCollection, Tag,
+    UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::worker::manager::WorkerStatus;
 
@@ -34,6 +35,7 @@ mod browser_hover;
 mod browser_pane;
 mod chat;
 mod cookie_import;
+mod lan_share;
 mod platform;
 #[cfg(target_os = "macos")]
 mod shell_path;
@@ -907,6 +909,12 @@ fn http_api_manager_state(app: &AppHandle) -> Arc<HttpApiManager> {
     app.state::<Arc<HttpApiManager>>().inner().clone()
 }
 
+fn lan_share_manager_state(app: &AppHandle) -> Arc<lan_share::LanShareManager> {
+    app.state::<Arc<lan_share::LanShareManager>>()
+        .inner()
+        .clone()
+}
+
 fn generate_external_mcp_token() -> String {
     format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
 }
@@ -967,6 +975,7 @@ async fn update_settings_with_listeners(
     workspaces: Arc<WorkspaceManager>,
     external_mcp: Arc<ExternalMcpManager>,
     http_api: Arc<HttpApiManager>,
+    lan_share: Arc<lan_share::LanShareManager>,
     patch: serde_json::Value,
 ) -> Result<Settings, String> {
     let before = ctx.get_settings().await;
@@ -982,8 +991,14 @@ async fn update_settings_with_listeners(
         .map(serde_json::from_value::<HttpApiSettings>)
         .transpose()
         .map_err(|error| format!("Invalid HTTP API settings: {error}"))?;
+    let requested_lan = patch
+        .get("lan_sharing")
+        .cloned()
+        .map(serde_json::from_value::<LanSharingSettings>)
+        .transpose()
+        .map_err(|error| format!("Invalid local network sharing settings: {error}"))?;
 
-    if requested_external.is_none() && requested_http.is_none() {
+    if requested_external.is_none() && requested_http.is_none() && requested_lan.is_none() {
         return update_settings_for_ctx(ctx, patch).await;
     }
 
@@ -994,6 +1009,9 @@ async fn update_settings_with_listeners(
     }
     if let Some(requested) = &requested_http {
         http_api.apply(requested).await?;
+    }
+    if let Some(requested) = &requested_lan {
+        lan_share.apply(requested).await?;
     }
 
     match ctx.update_settings(patch).await {
@@ -1006,6 +1024,9 @@ async fn update_settings_with_listeners(
             }
             if requested_http.is_some() {
                 let _ = http_api.apply(&before.http_api).await;
+            }
+            if requested_lan.is_some() {
+                let _ = lan_share.apply(&before.lan_sharing).await;
             }
             Err(error.to_string())
         }
@@ -1043,12 +1064,20 @@ fn handle_exit_event(app_handle: &AppHandle, event: tauri::RunEvent) {
         let http_api = app_handle
             .try_state::<Arc<HttpApiManager>>()
             .map(|manager| manager.inner().clone());
+        // Stopped before the workspace for the same reason: it writes what it
+        // receives into the active workspace's root.
+        let lan_share = app_handle
+            .try_state::<Arc<lan_share::LanShareManager>>()
+            .map(|manager| manager.inner().clone());
         tauri::async_runtime::spawn(async move {
             if let Some(external_mcp) = external_mcp {
                 external_mcp.stop().await;
             }
             if let Some(http_api) = http_api {
                 http_api.stop().await;
+            }
+            if let Some(lan_share) = lan_share {
+                lan_share.stop().await;
             }
             // Every workspace this manager opened, not only the active one:
             // the HTTP API can have opened contexts for others.
@@ -1565,6 +1594,7 @@ async fn update_settings(patch: serde_json::Value, app: AppHandle) -> Result<Set
         workspace_manager(&app),
         external_mcp_manager_state(&app),
         http_api_manager_state(&app),
+        lan_share_manager_state(&app),
         patch,
     )
     .await
@@ -1588,6 +1618,7 @@ async fn configure_external_mcp(
         workspace_manager(&app),
         Arc::clone(&manager),
         http_api_manager_state(&app),
+        lan_share_manager_state(&app),
         serde_json::json!({
             "external_mcp": {
                 "enabled": enabled,
@@ -1618,6 +1649,7 @@ async fn configure_http_api(
         workspace_manager(&app),
         external_mcp_manager_state(&app),
         Arc::clone(&manager),
+        lan_share_manager_state(&app),
         serde_json::json!({
             "http_api": {
                 "enabled": enabled,
@@ -1636,6 +1668,49 @@ async fn get_http_api_status(app: AppHandle) -> Result<HttpApiStatus, String> {
     Ok(http_api_manager_state(&app)
         .status(&settings.http_api)
         .await)
+}
+
+/// Turns sharing with other Wilkes instances on the local network on or off.
+#[tauri::command]
+async fn configure_lan_sharing(
+    enabled: bool,
+    app: AppHandle,
+) -> Result<lan_share::LanSharingStatus, String> {
+    let manager = lan_share_manager_state(&app);
+    let settings = update_settings_with_listeners(
+        app_context(&app),
+        workspace_manager(&app),
+        external_mcp_manager_state(&app),
+        http_api_manager_state(&app),
+        Arc::clone(&manager),
+        serde_json::json!({ "lan_sharing": { "enabled": enabled } }),
+    )
+    .await?;
+    Ok(manager.status(&settings.lan_sharing).await)
+}
+
+#[tauri::command]
+async fn get_lan_sharing_status(app: AppHandle) -> Result<lan_share::LanSharingStatus, String> {
+    let settings = app_context(&app).get_settings().await;
+    Ok(lan_share_manager_state(&app)
+        .status(&settings.lan_sharing)
+        .await)
+}
+
+#[tauri::command]
+fn list_lan_peers(app: AppHandle) -> Vec<lan_share::LanPeer> {
+    lan_share_manager_state(&app).peers()
+}
+
+#[tauri::command]
+async fn send_files_to_lan_peer(
+    peer_id: String,
+    paths: Vec<String>,
+    app: AppHandle,
+) -> Result<(), String> {
+    lan_share_manager_state(&app)
+        .send(&peer_id, paths.into_iter().map(PathBuf::from).collect())
+        .await
 }
 
 #[tauri::command]
@@ -2438,8 +2513,9 @@ pub fn run() {
                 http: events_tx.clone(),
             });
             let external_mcp = Arc::new(ExternalMcpManager::new(data_dir.clone()));
+            let lan_share_data_dir = data_dir.clone();
             let (workspaces, event_rx, loop_fut) =
-                match WorkspaceManager::new(data_dir, settings_path, emitter) {
+                match WorkspaceManager::new(data_dir, settings_path, Arc::clone(&emitter)) {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         error!("desktop startup initialization failed: {error:#}");
@@ -2474,8 +2550,14 @@ pub fn run() {
             ) {
                 error!("chat: could not migrate saved conversations: {e:#}");
             }
+            let lan_share = Arc::new(lan_share::LanShareManager::new(
+                &lan_share_data_dir,
+                Arc::clone(&workspaces),
+                emitter,
+            ));
             app.manage(Arc::clone(&external_mcp));
             app.manage(Arc::clone(&http_api));
+            app.manage(Arc::clone(&lan_share));
 
             let ctx_c = Arc::clone(&ctx);
             tauri::async_runtime::spawn(async move {
@@ -2493,6 +2575,9 @@ pub fn run() {
                 }
                 if let Err(error) = http_api.apply(&settings.http_api).await {
                     error!("HTTP API startup failed: {error}");
+                }
+                if let Err(error) = lan_share.apply(&settings.lan_sharing).await {
+                    error!("local network sharing startup failed: {error}");
                 }
             });
 
@@ -2542,6 +2627,10 @@ pub fn run() {
             rotate_external_mcp_token,
             configure_http_api,
             get_http_api_status,
+            configure_lan_sharing,
+            get_lan_sharing_status,
+            list_lan_peers,
+            send_files_to_lan_peer,
             list_bookmarks,
             add_bookmark,
             remove_bookmark,

@@ -6,10 +6,11 @@ import type { Settings } from "./types";
 import { isTauri } from "../services";
 import { useChatStore } from "../stores/useChatStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
-import { Copy, Edit2, ExternalLink, Folder, FolderPlus, MessageSquare, Paperclip, RefreshCw, Tag, Trash2 } from "react-feather";
+import { Copy, Edit2, ExternalLink, Folder, FolderPlus, MessageSquare, Paperclip, RefreshCw, Send, Tag, Trash2 } from "react-feather";
 import { useResearchStore } from "../stores/useResearchStore";
 import { useEditorStore } from "../stores/useEditorStore";
 import { activeWorkspaceIsReadOnly } from "../stores/useWorkspaceStore";
+import { useLanPeersStore } from "../stores/useLanPeersStore";
 
 export type ContextMenuTarget =
   | { kind: "file" | "match"; path: string; open: () => void }
@@ -192,6 +193,27 @@ export function buildFileContextMenuItems({
         icon: FolderPlus,
         run: () => onMoveRequest?.(target.path),
     });
+  }
+
+  // One entry per instance, as tags are: the menu has no submenus. Sending
+  // reads the file and changes nothing here, so a read-only workspace keeps it.
+  if (api.sendFilesToLanPeer) {
+    for (const peer of useLanPeersStore.getState().peers) {
+      managementItems.push({
+        id: `send-to-${peer.id}`,
+        label: `Send to ${peer.name}`,
+        icon: Send,
+        run: async () => {
+          try {
+            await api.sendFilesToLanPeer!(peer.id, [target.path]);
+            onToast(`Sent to ${peer.name}`, "success");
+          } catch (error) {
+            console.error("Failed to send file:", error);
+            onToast(String(error), "error");
+          }
+        },
+      });
+    }
   }
 
   if (settings) {

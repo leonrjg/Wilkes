@@ -43,7 +43,7 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 tracing = "0.1"
@@ -53,6 +53,14 @@ clipboard-files = "0.1.2"
 trash = "5.2"
 # Reads one site's cookies from the user's browser into the browser pane.
 rookie = "0.5.6"
+# Sending files to other Wilkes instances on the local network: mDNS to find
+# them, a small HTTP route to receive from them and a client to send to them.
+mdns-sd = "0.21.7"
+gethostname = "1"
+tempfile = "3"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+reqwest = { version = "0.12", features = ["stream"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -74,6 +82,3 @@ windows-core = "0.61"
 # way to.
 webkit2gtk = "2.0"
 gtk = "0.18"
-
-[dev-dependencies]
-tempfile = "3.10"

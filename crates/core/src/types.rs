@@ -2685,6 +2685,16 @@ impl Default for HttpApiSettings {
     }
 }
 
+/// Sending files to, and receiving them from, other Wilkes instances on the
+/// local network. Off by default: while on, this instance announces itself
+/// over mDNS and accepts files from any instance that finds it, writing them
+/// into the current root.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LanSharingSettings {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default, alias = "bookmarked_dirs")]
@@ -2784,6 +2794,9 @@ pub struct Settings {
     /// `wilkes-server` itself, which is why it binds loopback by default.
     #[serde(default)]
     pub http_api: HttpApiSettings,
+    /// Sending files to other Wilkes instances on the local network.
+    #[serde(default)]
+    pub lan_sharing: LanSharingSettings,
     /// Local text generation. Off by default; every affordance that depends on
     /// it is invisible until it is both enabled and ready.
     #[serde(default)]
@@ -2924,6 +2937,7 @@ impl Default for Settings {
             chat_custom_instructions: String::new(),
             external_mcp: ExternalMcpSettings::default(),
             http_api: HttpApiSettings::default(),
+            lan_sharing: LanSharingSettings::default(),
             generation: GenerationSettings::default(),
             retrieval: RetrievalSettings::default(),
             image_analysis: ImageAnalysisSettings::default(),

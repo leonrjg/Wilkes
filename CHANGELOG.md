@@ -18,6 +18,7 @@
 - Settings › Workers lists Python environments with their size, last use and the models that use them. Any can be removed, and is rebuilt with the same versions the next time a model needs it. Environments are never removed automatically.
 - Custom models can be removed from the model list, which deletes their downloaded files.
 - Add Custom in the embedding model list searches Hugging Face as you type, opening on the most downloaded models, and clicking a result adds it. Results are embedding models the engine could download: rerankers and gated repositories are left out, and for Candle so is any repository without the files it loads. A repository ID or URL can still be entered directly. On the server, `GET /api/embed/model-search?engine=&query=` runs the same search.
+- The desktop app can send files to other Wilkes on the local network. Turn on Settings › Servers › Local network, and every other instance with it on appears in a file's menu as Send to <computer>. Instances find each other over mDNS. A received file lands in the receiver's current folder without a prompt, under the same name, type and duplicate rules as a drop onto the file list, and up to the library download limit. Sharing is off by default.
 
 ### Changed
 

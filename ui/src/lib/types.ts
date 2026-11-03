@@ -1399,6 +1399,8 @@ export interface Settings {
   external_mcp?: ExternalMcpSettings;
   /** Optional HTTP API, served over the workspace this app already has open. */
   http_api?: HttpApiSettings;
+  /** Sending files to other Wilkes instances on the local network. */
+  lan_sharing?: LanSharingSettings;
   /** Transcription and description of the pictures inside documents. */
   image_analysis?: ImageAnalysisSettings;
 }
@@ -1427,6 +1429,30 @@ export interface HttpApiStatus extends HttpApiSettings {
   running: boolean;
   url: string | null;
   error: string | null;
+}
+
+export interface LanSharingSettings {
+  enabled: boolean;
+}
+
+export interface LanSharingStatus extends LanSharingSettings {
+  running: boolean;
+  /** What other instances list this one as. */
+  device_name: string;
+  error: string | null;
+}
+
+/** Another Wilkes instance found on the local network. */
+export interface LanPeer {
+  id: string;
+  name: string;
+}
+
+/** A file another instance sent, already in the current root. */
+export interface LanFileReceived {
+  name: string;
+  from: string;
+  path: string;
 }
 
 

@@ -60,6 +60,9 @@ import type {
   SearchResultsSummaryInput,
   ExternalMcpStatus,
   HttpApiStatus,
+  LanFileReceived,
+  LanPeer,
+  LanSharingStatus,
   BookmarkClusterLabelled,
   ChunkTopicLabelled,
   GeneratorDescriptor,
@@ -197,6 +200,14 @@ export interface SearchApi {
     bindAddress: string,
     port: number,
   ): Promise<HttpApiStatus>;
+  /** Desktop-only: sending files to other Wilkes instances on the local
+   *  network. Off by default; the peer list is empty while it is off. */
+  getLanSharingStatus?(): Promise<LanSharingStatus>;
+  configureLanSharing?(enabled: boolean): Promise<LanSharingStatus>;
+  listLanPeers?(): Promise<LanPeer[]>;
+  sendFilesToLanPeer?(peerId: string, paths: string[]): Promise<void>;
+  onLanPeersChanged?(handler: (peers: LanPeer[]) => void): Promise<() => void>;
+  onLanFileReceived?(handler: (event: LanFileReceived) => void): Promise<() => void>;
   listBookmarks(): Promise<Bookmark[]>;
   addBookmark(bookmark: NewBookmark): Promise<Bookmark>;
   removeBookmark(id: string): Promise<void>;
