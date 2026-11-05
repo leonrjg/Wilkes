@@ -230,6 +230,37 @@ pub struct ManagedEmbeddingSpaceStatus {
     pub primary: bool,
 }
 
+/// How a refusal names the spaces a corpus holds: `none`, or their ids.
+///
+/// A refusal used to name the corpus's own `embedding_space_id`, which is
+/// absent by design — the canonical corpus holds passages and no vectors — so
+/// a corpus with three projections was reported as `corpus=none`.
+pub fn describe_corpus_spaces(spaces: &[ManagedEmbeddingSpaceStatus]) -> String {
+    if spaces.is_empty() {
+        return "none".to_string();
+    }
+    spaces
+        .iter()
+        .map(|space| space.embedding_space_id.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// What a caller refused for naming a space the corpus does not hold can do
+/// about it. The step a first-time consumer misses is the one that matters:
+/// `PUT /api/corpora` takes an embedding and creates no vectors, and nothing
+/// in its reply says that searching needs a projection.
+pub fn corpus_spaces_remedy(spaces: &[ManagedEmbeddingSpaceStatus]) -> &'static str {
+    if spaces.is_empty() {
+        "the corpus holds passages and no vectors until a projection embeds them: \
+         PUT /api/corpora/spaces with its corpus_id and an embedding creates one, and its \
+         embedding_space_id is the pin"
+    } else {
+        "pin one of the corpus's spaces; GET /api/corpora/status lists them, and \
+         PUT /api/corpora/spaces creates another"
+    }
+}
+
 /// What routing a request to a corpus needs to know: its membership
 /// generation and the projections that hold an index. See
 /// [`WorkspaceManager::managed_spaces`].
@@ -1695,7 +1726,11 @@ impl WorkspaceManager {
             .ok_or_else(|| {
                 consumer_error(
                     ConsumerErrorCode::EmbeddingSpaceMismatch,
-                    format!("the corpus holds no embedding space {embedding_space_id}"),
+                    format!(
+                        "corpus={}, request={embedding_space_id}; {}",
+                        describe_corpus_spaces(&status.spaces),
+                        corpus_spaces_remedy(&status.spaces),
+                    ),
                 )
             })?;
         consumer_ensure!(
@@ -3003,6 +3038,47 @@ mod tests {
         );
     }
 
+    /// A first-time consumer creates a corpus, imports into it and searches,
+    /// and is refused because searching needs a projection it was never told
+    /// about. The refusal is where it learns that, so it says so.
+    #[tokio::test]
+    async fn a_pin_the_corpus_lacks_is_refused_with_the_step_that_creates_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) = WorkspaceManager::new(
+            dir.path().to_path_buf(),
+            dir.path().join("global-settings.json"),
+            Arc::clone(&events),
+        )
+        .unwrap();
+        let corpus = manager
+            .ensure_managed_workspace(EnsureManagedWorkspace {
+                owner: "underdog".to_string(),
+                corpus_key: "store-no-space".to_string(),
+                embedding: SelectedEmbedder {
+                    engine: EmbeddingEngine::Candle,
+                    model: EmbedderModel("primary-model".to_string()),
+                    dimension: 2,
+                },
+                chunk_size: 600,
+                chunk_overlap: 128,
+            })
+            .await
+            .unwrap();
+        let error = manager
+            .managed_space_context(&corpus.corpus_id, "space-the-caller-imagined")
+            .await
+            .err()
+            .expect("a space the corpus does not hold must not serve");
+        let message = format!("{error:#}");
+        assert!(message.contains("EMBEDDING_SPACE_MISMATCH"), "{message}");
+        assert!(
+            message.contains("corpus=none, request=space-the-caller-imagined"),
+            "{message}"
+        );
+        assert!(message.contains("PUT /api/corpora/spaces"), "{message}");
+    }
+
     /// A projection build belongs to the manager, not to the request that
     /// asked for it. A client that gave up used to take the build with it —
     /// half a corpus embedded, nothing to resume it, and a status that showed
@@ -3046,7 +3122,10 @@ mod tests {
                 let mut released = released.clone();
                 async move {
                     started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    released.wait_for(|go| *go).await.map_err(|e| e.to_string())?;
+                    released
+                        .wait_for(|go| *go)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Ok(())
                 }

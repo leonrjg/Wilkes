@@ -2714,7 +2714,9 @@ mod tests {
         )
         .unwrap();
 
-        let all = idx.managed_chunk_search(&[vec![1.0, 0.0]], 8, -1.0).unwrap();
+        let all = idx
+            .managed_chunk_search(&[vec![1.0, 0.0]], 8, -1.0)
+            .unwrap();
         assert_eq!(all[0].len(), 8, "every passage is in reach");
         let mut tied: Vec<String> = all[0][..7]
             .iter()
@@ -2738,7 +2740,10 @@ mod tests {
                 .collect();
             tied.truncate(7);
             let want: Vec<&str> = tied[..top_k].iter().map(String::as_str).collect();
-            assert_eq!(got, want, "top_k={top_k} keeps the first renditions of the tie");
+            assert_eq!(
+                got, want,
+                "top_k={top_k} keeps the first renditions of the tie"
+            );
         }
     }
 

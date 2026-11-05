@@ -38,8 +38,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 use wilkes_api::context::AppContext;
 use wilkes_api::workspace::{
-    ConsumerScope, EnsureManagedEmbeddingSpace, EnsureManagedWorkspace,
-    ManagedEmbeddingSpaceStatus, ManagedWorkspaceStatus, WorkspaceState, WorkspaceSummary,
+    corpus_spaces_remedy, describe_corpus_spaces, ConsumerScope, EnsureManagedEmbeddingSpace,
+    EnsureManagedWorkspace, ManagedEmbeddingSpaceStatus, ManagedWorkspaceStatus, WorkspaceState,
+    WorkspaceSummary,
 };
 use wilkes_core::completion::{CompletionFeedback, CompletionRequest};
 use wilkes_core::consumer::{ConsumerError, ConsumerErrorCode};
@@ -471,7 +472,7 @@ async fn import_managed_document_handler(
         .as_ref()
         .ok_or_else(workspace_manager_unavailable)?;
     let status = manager
-        .managed_workspace_status(&body.corpus_id)
+        .managed_spaces(&body.corpus_id)
         .await
         .map_err(consumer_anyhow_err)?;
     let expected_exists = match body.expected_embedding_space_id.as_deref() {
@@ -484,11 +485,19 @@ async fn import_managed_document_handler(
     if !expected_exists {
         return Err(consumer_err(ConsumerError::new(
             ConsumerErrorCode::EmbeddingSpaceMismatch,
-            format!(
-                "corpus={}, request={}",
-                describe_space(status.embedding_space_id.as_deref()),
-                describe_space(body.expected_embedding_space_id.as_deref())
-            ),
+            match body.expected_embedding_space_id.as_deref() {
+                Some(pin) => format!(
+                    "corpus={}, request={pin}; {}",
+                    describe_corpus_spaces(&status.spaces),
+                    corpus_spaces_remedy(&status.spaces),
+                ),
+                // Unpinned, which only a corpus with no spaces may be.
+                None => format!(
+                    "corpus={}, request=none; a corpus with spaces is imported into with one \
+                     of them as expected_embedding_space_id",
+                    describe_corpus_spaces(&status.spaces),
+                ),
+            },
         )));
     }
     let managed = manager
@@ -1222,10 +1231,6 @@ fn workspace_manager_unavailable() -> (StatusCode, Json<ErrorBody>) {
 /// Render a corpus or request embedding space for an error message. A corpus
 /// with no index has no space, which is a distinct state from disagreeing
 /// about which space is in use.
-fn describe_space(space: Option<&str>) -> &str {
-    space.unwrap_or("none")
-}
-
 /// The index behind a scope, for a route that is about to name passages.
 ///
 /// Every `/api/chunks` route needs the same two things: the resolver's
