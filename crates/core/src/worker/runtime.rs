@@ -397,6 +397,23 @@ impl WorkerRuntime {
             return;
         }
 
+        // Nobody is waiting for the answer. A request sits in this channel for
+        // as long as the requests ahead of it take, and a worker for it can
+        // wait far longer than that for residency; its caller — an HTTP
+        // request whose client gave up, say — may be long gone by its turn.
+        // Starting a worker for it anyway loads a model nobody will use and
+        // holds the kind's one permit while it idles out, barring every other
+        // workspace's requests for those minutes. A ReasonIR-8B probe did
+        // exactly that an hour after the request that sent it was dropped.
+        if reply.is_closed() {
+            tracing::info!(
+                "WorkerManager: dropping a {:?} request for {:?}: its caller is gone.",
+                req.role,
+                req.model
+            );
+            return;
+        }
+
         let req_json = match serialize_request_for_worker(&req) {
             Ok(json) => json,
             Err(e) => {
@@ -509,7 +526,23 @@ impl WorkerRuntime {
         // `clear_active_worker` above: asking for one before that ran would be
         // this manager queueing behind itself.
         if self.residency.is_none() {
-            match Arc::clone(&self.residency_semaphore).acquire_owned().await {
+            let admitted = tokio::select! {
+                biased;
+                admitted = Arc::clone(&self.residency_semaphore).acquire_owned() => admitted,
+                // The wait for another workspace's worker to go has no bound
+                // of its own, so it ends when the caller stops waiting too —
+                // see the same check in `handle_submit`.
+                () = reply.closed() => {
+                    tracing::info!(
+                        "WorkerManager: abandoning a {:?} start for {:?} while it waited for \
+                         residency: its caller is gone.",
+                        req.role,
+                        req.model
+                    );
+                    return Err(());
+                }
+            };
+            match admitted {
                 Ok(permit) => self.residency = Some(permit),
                 Err(e) => {
                     // The semaphore lives for the process and is never closed,
@@ -919,6 +952,63 @@ mod tests {
             "the permit the first worker held was not released when it died"
         );
         assert_eq!(second_spawns.load(Ordering::Relaxed), 1);
+    }
+
+    /// A request whose caller has gone is not worth a worker. Its caller is
+    /// the one that would read the answer; starting a process for it loads a
+    /// model for nobody and holds the kind's permit until the idle timeout.
+    #[tokio::test]
+    async fn a_request_whose_caller_is_gone_starts_no_worker() {
+        let (mut runtime, spawn_calls, _s, _sd, _tx, _ev) = test_runtime();
+        let (reply_tx, reply_rx) = mpsc::channel(4);
+        drop(reply_rx);
+        runtime
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+        assert_eq!(spawn_calls.load(Ordering::Relaxed), 0);
+        assert!(runtime.residency.is_none());
+    }
+
+    /// The same, for a caller that leaves while the start waits for another
+    /// workspace's worker to let go: the wait ends with it, and when the other
+    /// worker does go, nothing starts in its place for a request nobody holds.
+    #[tokio::test]
+    async fn a_caller_leaving_ends_the_wait_for_residency() {
+        let shared = Arc::new(Semaphore::new(1));
+        let (mut first, _first_spawns, _s, _sd, _tx, _ev) =
+            test_runtime_sharing(Arc::clone(&shared));
+        let (mut second, second_spawns, _s2, _sd2, _tx2, _ev2) =
+            test_runtime_sharing(Arc::clone(&shared));
+
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        first
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+
+        let (reply_tx, reply_rx) = mpsc::channel(4);
+        let waiting = tokio::spawn(async move {
+            second
+                .handle_submit(Box::new(embed_request("model-b")), reply_tx)
+                .await;
+            second
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "the second start did not wait");
+
+        drop(reply_rx);
+        let second = timeout(Duration::from_secs(3), waiting)
+            .await
+            .expect("the wait outlived its caller")
+            .unwrap();
+        assert_eq!(second_spawns.load(Ordering::Relaxed), 0);
+        assert!(second.residency.is_none());
+
+        first.handle_idle_timeout().await;
+        assert_eq!(
+            shared.available_permits(),
+            1,
+            "the abandoned start took the permit when the first worker let go"
+        );
     }
 
     /// A spawn that fails started nothing, so it must hold nothing. Otherwise
