@@ -66,3 +66,85 @@ for the duration of a traversal.**
 
 Re-run the concurrency measurement above afterwards: catalog time should stay
 approximately flat as concurrency rises instead of reaching 2.6x at 8-way.
+
+## Findings from an embedding experiment against the managed-corpus API (2026-11-05)
+
+**Status:** open — met while eos compared ReasonIR-8B and OBLIQ-IR-3B against
+Jina v5 for prerequisite retrieval, on the Mac mini instance (`192.168.1.8:2020`,
+`~/Desktop/Wilkes` at `5477032d`). The corpus was 6,032 one-passage text
+documents (owner `eos-retriever-experiment`, corpus `c1d478b6-…`). Each item
+below cost time in the run; the causes of the first two are not established,
+only the symptoms.
+
+### 1. A ReasonIR-8B projection build started nothing and reported nothing
+
+`PUT /api/corpora/spaces` with `{"engine":"SBERT","model":"reasonir/ReasonIR-8B","dimension":4096}`
+created the projection workspace (`4d554b4f-…`, `workspace.json` and an empty
+`managed_sources/` at 18:45) and then did nothing visible for 12 minutes: no
+`semantic_index.db`, no Python worker for the model's environment (`2519f877…`,
+which the download had already created), the base worker idle. The request
+was still open when the client gave up (`http-requests`: cancelled after
+705 s); the workspace is still empty an hour later. Status reported the space
+neither as building nor as failed.
+
+The weights were fully cached by then, and the same environment loads the
+model in 16–18 s and embeds these documents at ~3.5/s when driven directly
+(`SentenceTransformer(..., trust_remote_code=True, torch_dtype="auto")` on MPS),
+so the model itself is not the obstacle. Jina searches against the same corpus
+were in flight throughout (item 3) — whether they held something the catch-up
+waits on is a hypothesis to check, not a finding.
+
+**Direction:** a projection catch-up needs observable progress (documents
+embedded / required, the worker it is waiting for) and a terminal state when it
+stops, and should not depend on the HTTP request staying open.
+
+### 2. A projection build during a model download stopped half way, silently
+
+The first `PUT /api/corpora/spaces` (Jina v5, cached) ran while the ReasonIR
+download held the embed task. It returned after the client's 300 s timeout
+with the space `ready: false`; the index stopped growing at 18:35 (5.4 MB of
+an eventual ~40 MB) and nothing resumed it. A second identical PUT, after the
+download finished, caught up in 379 s and reported `ready: true`.
+
+**Direction:** either queue the catch-up behind the download or report that it
+is blocked; a space that is not ready and not progressing should say why.
+
+### 3. Managed search takes ~8 s per query on a 6,032-passage projection
+
+`POST /api/chunks/search`, one text probe, `top_k` 51, two requests in flight:
+median 8,445 ms over 301 searches. A `sample` of `wilkes-desktop` during the
+run had the busy thread in `SemanticIndex::managed_chunk_search`; the Python
+worker (which embeds the probe) was idle. 6,032 × 1,024 floats is a few
+milliseconds of dot products, so the time is going somewhere else in that
+function.
+
+### 4. The managed-corpus contract misleads a consumer building its first corpus
+
+Three things a first-time caller cannot learn from the replies:
+
+- `PUT /api/corpora` takes an `embedding`, but the canonical corpus holds no
+  vectors by design; status says `ready: true` with `spaces: []`, and search
+  fails with `EMBEDDING_SPACE_MISMATCH … holds no embedding space` until a
+  `PUT /api/corpora/spaces` is made. Nothing in the replies points there.
+- `POST /api/corpora/documents/import` returns an `embedding_space_id`, and
+  sending that id back as `expected_embedding_space_id` on the next import is
+  refused (`corpus=none, request=space-…`, 409). Omitting it works only while
+  the corpus has no projection.
+- Imports took ~1 s each when the first 200 were sent with the returned id
+  (every one a 409 after three retries); without it they ran at ~16/s.
+
+**Direction:** stop returning a space id from import on the canonical corpus,
+or accept it; and have the corpus reply say that search needs a projection.
+
+### 5. Query-role vectors are reachable only through a projection search
+
+`/api/embed/text` answers in the passage role only (by design, since its
+vectors are stored), and the query role is reached only as a side effect of
+`/api/chunks/search`. So scoring queries against anything that is not already a
+Wilkes projection — or embedding with a model no index uses — means building a
+whole projection first. For an 8B model on this machine that is ~30 minutes
+for 6,000 short texts, which is what pushed the experiment to drive the
+model's Python environment directly instead.
+
+**Direction:** an endpoint that embeds text in a named role with a named
+model, without a corpus, returning vectors that are explicitly not for storage.
