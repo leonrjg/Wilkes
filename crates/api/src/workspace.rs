@@ -784,6 +784,40 @@ pub struct WorkspaceManager {
     scoped: PLMutex<std::collections::HashMap<String, Arc<AppContext>>>,
     registry_lock: PLMutex<()>,
     switch_lock: Mutex<()>,
+    /// Projection builds in flight, keyed by projection workspace id. See
+    /// [`WorkspaceManager::build_projection`].
+    projection_builds: PLMutex<std::collections::HashMap<String, ProjectionBuild>>,
+    /// Tells one build from the next under the same projection id, so a
+    /// finished build removes its own entry and never its successor's.
+    projection_build_serial: std::sync::atomic::AtomicU64,
+}
+
+/// One projection build, as a request waiting on it sees it.
+#[derive(Clone)]
+struct ProjectionBuild {
+    serial: u64,
+    corpus_id: String,
+    outcome: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
+}
+
+/// Removes a build's entry when its task ends, however it ends. A build that
+/// panicked would otherwise leave an entry every later caller waits on.
+struct ProjectionBuildSlot {
+    manager: Arc<WorkspaceManager>,
+    projection_id: String,
+    serial: u64,
+}
+
+impl Drop for ProjectionBuildSlot {
+    fn drop(&mut self) {
+        let mut builds = self.manager.projection_builds.lock();
+        if builds
+            .get(&self.projection_id)
+            .is_some_and(|build| build.serial == self.serial)
+        {
+            builds.remove(&self.projection_id);
+        }
+    }
 }
 
 struct WorkspaceEventEmitter {
@@ -885,6 +919,8 @@ impl WorkspaceManager {
                 scoped: PLMutex::new(std::collections::HashMap::new()),
                 registry_lock: PLMutex::new(()),
                 switch_lock: Mutex::new(()),
+                projection_builds: PLMutex::new(std::collections::HashMap::new()),
+                projection_build_serial: std::sync::atomic::AtomicU64::new(0),
             }),
             event_rx,
             loop_fut,
@@ -1358,7 +1394,7 @@ impl WorkspaceManager {
     /// The child workspace is an implementation detail: callers continue to
     /// address the canonical `corpus_id` plus the returned opaque space id.
     pub async fn ensure_managed_space(
-        &self,
+        self: &Arc<Self>,
         request: EnsureManagedEmbeddingSpace,
     ) -> anyhow::Result<ManagedEmbeddingSpaceStatus> {
         let parent_path = workspace_manifest_path(&self.app_data_dir, &request.corpus_id);
@@ -1407,8 +1443,7 @@ impl WorkspaceManager {
             return Ok(level.clone());
         }
 
-        self.catch_up_projection(&request.corpus_id, &id, None)
-            .await?;
+        self.build_projection(&request.corpus_id, &id, None).await?;
 
         let canonical = self.managed_spaces(&request.corpus_id).await?;
         canonical
@@ -1477,6 +1512,134 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// Brings one projection level with its corpus in a task the manager
+    /// owns, and waits for it.
+    ///
+    /// The build used to run inside the request that asked for it, so it
+    /// lived exactly as long as that request. A client that gave up — a
+    /// 300-second timeout while a download held the machine — dropped the
+    /// build half way through its documents, and nothing resumed it: the
+    /// projection sat part-embedded and unready until someone happened to put
+    /// to the endpoint again. A caller that stops waiting now stops only its
+    /// own waiting.
+    ///
+    /// One build per projection at a time. A caller that finds one in flight
+    /// waits for it and then checks the projection again rather than taking
+    /// its result as its own: the build in flight listed the corpus's sources
+    /// when it began, which may be before the document this caller imported.
+    pub async fn build_projection(
+        self: &Arc<Self>,
+        corpus_id: &str,
+        projection_id: &str,
+        source_workspace: Option<Arc<AppContext>>,
+    ) -> anyhow::Result<()> {
+        let manager = Arc::clone(self);
+        let corpus = corpus_id.to_string();
+        let projection = projection_id.to_string();
+        self.run_projection_build(corpus_id, projection_id, move || {
+            let manager = Arc::clone(&manager);
+            let corpus = corpus.clone();
+            let projection = projection.clone();
+            let source_workspace = source_workspace.clone();
+            async move {
+                manager
+                    .catch_up_projection(&corpus, &projection, source_workspace)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            }
+        })
+        .await
+    }
+
+    /// The task and the bookkeeping of [`Self::build_projection`], apart from
+    /// what a build does, so the lifetime rules can be tested without a model.
+    async fn run_projection_build<Work, Build>(
+        self: &Arc<Self>,
+        corpus_id: &str,
+        projection_id: &str,
+        mut work: Work,
+    ) -> anyhow::Result<()>
+    where
+        Work: FnMut() -> Build,
+        Build: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        loop {
+            let (build, ours) = {
+                let mut builds = self.projection_builds.lock();
+                match builds.get(projection_id) {
+                    Some(build) => (build.clone(), false),
+                    None => {
+                        let serial = self
+                            .projection_build_serial
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let (report, outcome) = tokio::sync::watch::channel(None);
+                        let build = ProjectionBuild {
+                            serial,
+                            corpus_id: corpus_id.to_string(),
+                            outcome,
+                        };
+                        builds.insert(projection_id.to_string(), build.clone());
+                        let slot = ProjectionBuildSlot {
+                            manager: Arc::clone(self),
+                            projection_id: projection_id.to_string(),
+                            serial,
+                        };
+                        let corpus_id = corpus_id.to_string();
+                        let projection_id = projection_id.to_string();
+                        let job = work();
+                        tokio::spawn(async move {
+                            let result = job.await;
+                            match &result {
+                                Ok(()) => tracing::info!(
+                                    "embedding projection {projection_id} of corpus {corpus_id} \
+                                     is level with its corpus"
+                                ),
+                                Err(error) => tracing::error!(
+                                    "embedding projection {projection_id} of corpus {corpus_id} \
+                                     did not finish building: {error}"
+                                ),
+                            }
+                            // Out of the map before the outcome is published,
+                            // so a waiter that loops finds no finished build
+                            // to wait on again.
+                            drop(slot);
+                            let _ = report.send(Some(result));
+                        });
+                        (build, true)
+                    }
+                }
+            };
+            let mut outcome = build.outcome;
+            let result = match outcome.wait_for(Option::is_some).await {
+                Ok(finished) => finished.clone().expect("waited for an outcome"),
+                Err(_) => Err("the projection build ended without an outcome".to_string()),
+            };
+            if ours {
+                return result.map_err(anyhow::Error::msg);
+            }
+            let status = self.managed_spaces(corpus_id).await?;
+            if status.spaces.iter().any(|space| {
+                space.workspace_id == projection_id
+                    && space.ready
+                    && space.indexed_generation == status.corpus_generation
+            }) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Projection builds of one corpus in flight, which the corpus status
+    /// reports among its pending builds: a build waiting for a worker shows
+    /// nothing else, since a projection has no index until its first document
+    /// is embedded.
+    pub fn projection_builds_in_flight(&self, corpus_id: &str) -> u64 {
+        self.projection_builds
+            .lock()
+            .values()
+            .filter(|build| build.corpus_id == corpus_id)
+            .count() as u64
+    }
+
     /// Brings every projection of one corpus level with it, reporting per
     /// space rather than stopping at the first failure.
     ///
@@ -1490,7 +1653,7 @@ impl WorkspaceManager {
     /// drop it one line later, so a corpus re-embedded documents its own
     /// Wilkes had already embedded under the same model.
     pub async fn catch_up_corpus(
-        &self,
+        self: &Arc<Self>,
         corpus_id: &str,
         source_workspace: Option<Arc<AppContext>>,
     ) -> anyhow::Result<Vec<(String, String)>> {
@@ -1501,7 +1664,7 @@ impl WorkspaceManager {
                 continue;
             }
             if let Err(error) = self
-                .catch_up_projection(corpus_id, &space.workspace_id, source_workspace.clone())
+                .build_projection(corpus_id, &space.workspace_id, source_workspace.clone())
                 .await
             {
                 failures.push((space.embedding_space_id.clone(), format!("{error:#}")));
@@ -2838,6 +3001,112 @@ mod tests {
                 .is_err(),
             "a projection behind its corpus is work owed, not work skipped"
         );
+    }
+
+    /// A projection build belongs to the manager, not to the request that
+    /// asked for it. A client that gave up used to take the build with it —
+    /// half a corpus embedded, nothing to resume it, and a status that showed
+    /// neither a build nor a failure. The build now runs to its end whoever
+    /// is still waiting, is counted among the corpus's pending builds while it
+    /// does, and a second caller waits for it rather than starting another.
+    #[tokio::test]
+    async fn a_projection_build_outlives_the_request_that_started_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) = WorkspaceManager::new(
+            dir.path().to_path_buf(),
+            dir.path().join("global-settings.json"),
+            Arc::clone(&events),
+        )
+        .unwrap();
+        let corpus = manager
+            .ensure_managed_workspace(EnsureManagedWorkspace {
+                owner: "underdog".to_string(),
+                corpus_key: "store-detached-build".to_string(),
+                embedding: SelectedEmbedder {
+                    engine: EmbeddingEngine::Candle,
+                    model: EmbedderModel("primary-model".to_string()),
+                    dimension: 2,
+                },
+                chunk_size: 600,
+                chunk_overlap: 128,
+            })
+            .await
+            .unwrap();
+        let corpus_id = corpus.corpus_id.clone();
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release, released) = tokio::sync::watch::channel(false);
+        let job = {
+            let started = Arc::clone(&started);
+            let finished = Arc::clone(&finished);
+            move || {
+                let started = Arc::clone(&started);
+                let finished = Arc::clone(&finished);
+                let mut released = released.clone();
+                async move {
+                    started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    released.wait_for(|go| *go).await.map_err(|e| e.to_string())?;
+                    finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        };
+
+        let request = {
+            let manager = Arc::clone(&manager);
+            let corpus_id = corpus_id.clone();
+            let job = job.clone();
+            tokio::spawn(async move {
+                manager
+                    .run_projection_build(&corpus_id, "projection-a", job)
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while started.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the build started");
+        assert_eq!(manager.projection_builds_in_flight(&corpus_id), 1);
+        assert_eq!(manager.projection_builds_in_flight("another-corpus"), 0);
+
+        // The client gives up.
+        request.abort();
+        let _ = request.await;
+        assert_eq!(
+            manager.projection_builds_in_flight(&corpus_id),
+            1,
+            "the build went with the request that started it"
+        );
+
+        // A second caller joins the build in flight instead of starting one.
+        let second = {
+            let manager = Arc::clone(&manager);
+            let corpus_id = corpus_id.clone();
+            let job = job.clone();
+            tokio::spawn(async move {
+                manager
+                    .run_projection_build(&corpus_id, "projection-a", job)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        release.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), second)
+            .await
+            .expect("the second caller was answered")
+            .unwrap()
+            .unwrap();
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the abandoned build ran to its end"
+        );
+        assert_eq!(manager.projection_builds_in_flight(&corpus_id), 0);
     }
 
     /// The cheap path has to stay cheap, because it is the one that runs after

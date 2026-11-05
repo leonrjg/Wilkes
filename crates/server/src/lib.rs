@@ -380,16 +380,19 @@ async fn ensure_managed_workspace_handler(
         .managed_workspace_status(&initial.corpus_id)
         .await
         .map_err(consumer_anyhow_err)?;
-    Ok(Json(managed_status_with_pending(status, &context)))
+    Ok(Json(managed_status_with_pending(status, &context, manager)))
 }
 
 fn managed_status_with_pending(
     mut status: ManagedWorkspaceStatus,
     context: &AppContext,
+    manager: &wilkes_api::workspace::WorkspaceManager,
 ) -> ManagedWorkspaceStatus {
     let (imports, builds) = context.managed_pending_operations();
     status.pending_imports = imports;
-    status.pending_builds = builds;
+    // The corpus's own pending work, and every projection build of it in
+    // flight — which is the only sign of a build still waiting for a worker.
+    status.pending_builds = builds + manager.projection_builds_in_flight(&status.corpus_id);
     status
 }
 
@@ -415,7 +418,7 @@ async fn managed_workspace_status_handler(
         .context_for(&query.corpus_id)
         .await
         .map_err(consumer_anyhow_err)?;
-    Ok(Json(managed_status_with_pending(status, &context)))
+    Ok(Json(managed_status_with_pending(status, &context, manager)))
 }
 
 async fn ensure_managed_space_handler(
