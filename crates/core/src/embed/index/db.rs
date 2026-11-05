@@ -2664,6 +2664,84 @@ mod tests {
         assert!(idx.managed_chunk_search(&[vec![1.0, 0.0]], 0, 0.0).is_err());
     }
 
+    /// Search runs on the vector table's nearest-neighbour scan, which returns
+    /// equal distances in its own order. Which of several equal passages
+    /// falls inside `top_k` must still be the documented rule — rendition,
+    /// then ordinal — or two corpora holding the same passages could answer
+    /// the same query differently.
+    #[test]
+    fn test_managed_chunk_search_breaks_ties_at_top_k_by_rendition() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut idx =
+            SemanticIndex::create(root, "m", 2, EmbeddingEngine::Candle, Some(root)).unwrap();
+        for at in 0..7 {
+            let name = format!("same-{at}.txt");
+            let text = format!("same direction {at}");
+            let path = root.join(&name);
+            fs::write(&path, &text).unwrap();
+            idx.write_file_with_recipe(
+                PreparedFile {
+                    retained: Default::default(),
+                    full_text: text.clone(),
+                    path: path.clone(),
+                    chunks: vec![(test_chunk(&path, &text), vec![1.0, 0.0])],
+                },
+                &ExtractionRecipe::new(100, 0),
+                Some(Path::new(&name)),
+                None,
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+        }
+        let path = root.join("other.txt");
+        fs::write(&path, "other").unwrap();
+        idx.write_file_with_recipe(
+            PreparedFile {
+                retained: Default::default(),
+                full_text: "other".to_string(),
+                path: path.clone(),
+                chunks: vec![(test_chunk(&path, "other"), vec![0.6, 0.8])],
+            },
+            &ExtractionRecipe::new(100, 0),
+            Some(Path::new("other.txt")),
+            None,
+            true,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let all = idx.managed_chunk_search(&[vec![1.0, 0.0]], 8, -1.0).unwrap();
+        assert_eq!(all[0].len(), 8, "every passage is in reach");
+        let mut tied: Vec<String> = all[0][..7]
+            .iter()
+            .map(|hit| hit.rendition_id.as_str().to_string())
+            .collect();
+        let sorted = {
+            let mut sorted = tied.clone();
+            sorted.sort();
+            sorted
+        };
+        assert_eq!(tied, sorted, "equal scores are ordered by rendition");
+        assert!((all[0][7].similarity - 0.6).abs() < 1e-5);
+
+        for top_k in 1..=7 {
+            let some = idx
+                .managed_chunk_search(&[vec![1.0, 0.0]], top_k, -1.0)
+                .unwrap();
+            let got: Vec<&str> = some[0]
+                .iter()
+                .map(|hit| hit.rendition_id.as_str())
+                .collect();
+            tied.truncate(7);
+            let want: Vec<&str> = tied[..top_k].iter().map(String::as_str).collect();
+            assert_eq!(got, want, "top_k={top_k} keeps the first renditions of the tie");
+        }
+    }
+
     #[test]
     fn test_related_documents_missing_source_errors() {
         let dir = tempdir().unwrap();
@@ -4228,6 +4306,10 @@ pub struct TopicCoverageResult {
 }
 
 const TOPIC_COVERAGE_CHUNKS_PER_DOCUMENT: usize = 15;
+
+/// The most neighbours sqlite-vec's nearest-neighbour scan returns at once.
+/// `managed_chunk_search` widens up to this while closing a tie at `top_k`.
+const MANAGED_SEARCH_MAX_NEIGHBOURS: usize = 4096;
 
 #[derive(Clone, Debug)]
 struct RankedCoverageChunk {
@@ -9377,9 +9459,23 @@ impl SemanticIndex {
     }
 
     /// Nearest managed chunks across the entire corpus for each caller-owned
-    /// probe. Probes are dotted exactly as provided against L2-normalized
-    /// stored chunks; they are deliberately not normalized here because an
-    /// unnormalized probe is a meaningful caller choice in the managed API.
+    /// probe, scored as cosines: the probe is normalized here and the space
+    /// is cosine by construction (`distance_metric=cosine`), so similarity is
+    /// `1 - distance` and probe magnitude never moves a score.
+    ///
+    /// Answered by the vector table's own nearest-neighbour scan, once per
+    /// probe. It used to read every stored vector out through a join on
+    /// `vec_chunks.rowid`, and sqlite-vec serves a column read by reopening
+    /// the vector chunk's blob and walking its overflow-page chain from the
+    /// start — quadratic in the chunk, and on a 6,032-passage, 1,024-wide
+    /// projection about seven seconds of `pread` per search where the scan
+    /// itself costs thirty milliseconds.
+    ///
+    /// Ties keep the documented order (similarity, then rendition, then
+    /// ordinal) exactly: when the last neighbour fetched ties the last one
+    /// returned, more are fetched until the tie is closed, so which of several
+    /// equal passages falls inside `top_k` never depends on the table's scan
+    /// order.
     pub fn managed_chunk_search(
         &self,
         probes: &[Vec<f32>],
@@ -9388,6 +9484,10 @@ impl SemanticIndex {
     ) -> anyhow::Result<Vec<Vec<ManagedChunkSearchHit>>> {
         anyhow::ensure!(!probes.is_empty(), "Search request names no probes");
         anyhow::ensure!(top_k > 0, "Search top_k must be greater than zero");
+        anyhow::ensure!(
+            top_k <= MANAGED_SEARCH_MAX_NEIGHBOURS,
+            "Search top_k {top_k} exceeds {MANAGED_SEARCH_MAX_NEIGHBOURS}"
+        );
         anyhow::ensure!(
             min_similarity.is_finite(),
             "Search minimum similarity is not finite"
@@ -9410,81 +9510,108 @@ impl SemanticIndex {
             );
         }
 
-        // The stored side is normalized below, so the dot product is a cosine
-        // only if the probe is a unit vector too. Both engines normalize on
-        // output, which made that an invariant nobody stated and nothing
-        // enforced — while `min_similarity` reads as a cosine floor and two of
-        // Underdog's thresholds ride on it. Normalizing here costs one pass
-        // over a handful of probes and makes the name true by construction.
-        let probes: Vec<Vec<f32>> = probes
-            .iter()
-            .map(|probe| normalized_vector(probe))
-            .collect();
-
-        let mut stmt = self.conn.prepare(
-            "SELECT c.chunk_ref, f.snapshot_id, f.rendition_id, c.chunk_idx, v.embedding
+        let mut neighbours = self.conn.prepare(
+            "SELECT v.rowid, v.distance
+               FROM vec_chunks v
+              WHERE v.embedding MATCH ?1
+                AND v.k = ?2
+              ORDER BY v.distance",
+        )?;
+        let mut describe = self.conn.prepare(
+            "SELECT c.chunk_ref, f.snapshot_id, f.rendition_id, c.chunk_idx
                FROM chunks c
                JOIN files f ON f.id = c.file_id
-               JOIN vec_chunks v ON v.rowid = c.id
-              ORDER BY f.id, c.chunk_idx, c.id",
+              WHERE c.id = ?1",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, Vec<u8>>(4)?,
-            ))
-        })?;
-        let mut answers = vec![Vec::new(); probes.len()];
-        for row in rows {
-            let (chunk_ref, snapshot_id, rendition_id, ordinal, blob) = row?;
-            let chunk_ref = chunk_ref.ok_or_else(|| {
-                consumer_error(
+        let mut answers = Vec::with_capacity(probes.len());
+        for probe in probes {
+            let blob = f32_slice_to_bytes(&normalized_vector(probe));
+            // One past the edge, so the first fetch can already show whether
+            // the neighbour after the last one returned ties it.
+            let mut fetch = (top_k + 1).min(MANAGED_SEARCH_MAX_NEIGHBOURS);
+            let scored = loop {
+                let scored = neighbours
+                    .query_map(params![blob, fetch as i64], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                // Fewer back than asked for: the table holds nothing further.
+                let exhausted = scored.len() < fetch;
+                // The last neighbour fetched is strictly farther than the
+                // last one that can be returned, so nothing past it ties.
+                let closed =
+                    scored.len() > top_k && scored[scored.len() - 1].1 > scored[top_k - 1].1;
+                if exhausted || closed {
+                    break scored;
+                }
+                if fetch >= MANAGED_SEARCH_MAX_NEIGHBOURS {
+                    tracing::warn!(
+                        "managed_chunk_search: {MANAGED_SEARCH_MAX_NEIGHBOURS} or more passages \
+                         tie at the top_k boundary; which of them are returned is the vector \
+                         table's scan order"
+                    );
+                    break scored;
+                }
+                fetch = (fetch * 2).min(MANAGED_SEARCH_MAX_NEIGHBOURS);
+            };
+            let mut hits = Vec::with_capacity(scored.len());
+            for (rowid, distance) in scored {
+                consumer_ensure!(
+                    distance.is_finite(),
                     ConsumerErrorCode::DocumentIndexIncomplete,
-                    "chunk ref is absent",
-                )
-            })?;
-            let snapshot_id = snapshot_id.ok_or_else(|| {
-                consumer_error(
-                    ConsumerErrorCode::DocumentIndexIncomplete,
-                    "snapshot id is absent",
-                )
-            })?;
-            let rendition_id = rendition_id.ok_or_else(|| {
-                consumer_error(
-                    ConsumerErrorCode::DocumentIndexIncomplete,
-                    "rendition id is absent",
-                )
-            })?;
-            consumer_ensure!(
-                ordinal >= 0,
-                ConsumerErrorCode::DocumentIndexIncomplete,
-                "negative chunk ordinal",
-            );
-            let vector = f32_slice_from_bytes(&blob)?;
-            consumer_ensure!(
-                vector.len() == self.dimension && vector.iter().all(|value| value.is_finite()),
-                ConsumerErrorCode::DocumentIndexIncomplete,
-                "invalid stored vector",
-            );
-            let vector = normalized_vector(&vector);
-            for (probe_index, probe) in probes.iter().enumerate() {
-                let similarity = dot(probe, &vector);
+                    "invalid stored vector",
+                );
+                let similarity = (1.0 - distance) as f32;
                 if similarity < min_similarity {
                     continue;
                 }
-                answers[probe_index].push(ManagedChunkSearchHit {
-                    chunk_ref: ChunkRef(chunk_ref.clone()),
-                    snapshot_id: DocumentSnapshotId(snapshot_id.clone()),
-                    rendition_id: RenditionId(rendition_id.clone()),
+                let described = describe
+                    .query_row(params![rowid], |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    })
+                    .optional()?;
+                let Some((chunk_ref, snapshot_id, rendition_id, ordinal)) = described else {
+                    consumer_bail!(
+                        ConsumerErrorCode::DocumentIndexIncomplete,
+                        "stored vector {rowid} belongs to no chunk",
+                    );
+                };
+                let chunk_ref = chunk_ref.ok_or_else(|| {
+                    consumer_error(
+                        ConsumerErrorCode::DocumentIndexIncomplete,
+                        "chunk ref is absent",
+                    )
+                })?;
+                let snapshot_id = snapshot_id.ok_or_else(|| {
+                    consumer_error(
+                        ConsumerErrorCode::DocumentIndexIncomplete,
+                        "snapshot id is absent",
+                    )
+                })?;
+                let rendition_id = rendition_id.ok_or_else(|| {
+                    consumer_error(
+                        ConsumerErrorCode::DocumentIndexIncomplete,
+                        "rendition id is absent",
+                    )
+                })?;
+                consumer_ensure!(
+                    ordinal >= 0,
+                    ConsumerErrorCode::DocumentIndexIncomplete,
+                    "negative chunk ordinal",
+                );
+                hits.push(ManagedChunkSearchHit {
+                    chunk_ref: ChunkRef(chunk_ref),
+                    snapshot_id: DocumentSnapshotId(snapshot_id),
+                    rendition_id: RenditionId(rendition_id),
                     ordinal: ordinal as usize,
                     similarity,
                 });
             }
-        }
-        for hits in &mut answers {
             hits.sort_by(|left, right| {
                 right
                     .similarity
@@ -9493,6 +9620,7 @@ impl SemanticIndex {
                     .then(left.ordinal.cmp(&right.ordinal))
             });
             hits.truncate(top_k);
+            answers.push(hits);
         }
         Ok(answers)
     }

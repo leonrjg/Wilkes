@@ -230,6 +230,15 @@ pub struct ManagedEmbeddingSpaceStatus {
     pub primary: bool,
 }
 
+/// What routing a request to a corpus needs to know: its membership
+/// generation and the projections that hold an index. See
+/// [`WorkspaceManager::managed_spaces`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedSpaces {
+    pub corpus_generation: String,
+    pub spaces: Vec<ManagedEmbeddingSpaceStatus>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnsureManagedEmbeddingSpace {
     pub corpus_id: String,
@@ -1388,7 +1397,7 @@ impl WorkspaceManager {
         // this check per space; ensuring a space did not, so a caller that put
         // to this endpoint on a timer paid the sweep every time. The check is
         // the same one, and it must stay the same one.
-        let status = self.managed_workspace_status(&request.corpus_id).await?;
+        let status = self.managed_spaces(&request.corpus_id).await?;
         if let Some(level) = status
             .spaces
             .iter()
@@ -1401,7 +1410,7 @@ impl WorkspaceManager {
         self.catch_up_projection(&request.corpus_id, &id, None)
             .await?;
 
-        let canonical = self.managed_workspace_status(&request.corpus_id).await?;
+        let canonical = self.managed_spaces(&request.corpus_id).await?;
         canonical
             .spaces
             .into_iter()
@@ -1485,7 +1494,7 @@ impl WorkspaceManager {
         corpus_id: &str,
         source_workspace: Option<Arc<AppContext>>,
     ) -> anyhow::Result<Vec<(String, String)>> {
-        let status = self.managed_workspace_status(corpus_id).await?;
+        let status = self.managed_spaces(corpus_id).await?;
         let mut failures = Vec::new();
         for space in status.spaces.iter().filter(|space| !space.primary) {
             if space.ready && space.indexed_generation == status.corpus_generation {
@@ -1515,7 +1524,7 @@ impl WorkspaceManager {
         corpus_id: &str,
         embedding_space_id: &str,
     ) -> anyhow::Result<Arc<AppContext>> {
-        let status = self.managed_workspace_status(corpus_id).await?;
+        let status = self.managed_spaces(corpus_id).await?;
         let space = status
             .spaces
             .iter()
@@ -1666,6 +1675,90 @@ impl WorkspaceManager {
             )
             .await
             .map_err(anyhow::Error::msg)
+    }
+
+    /// What a corpus can route to, and nothing else: its membership generation
+    /// and its projections.
+    ///
+    /// Every routed request — each search, each chunk lookup — used to answer
+    /// this with [`Self::managed_workspace_status`], which also walks every
+    /// retained source directory to report byte totals nobody routing reads.
+    /// On a 6,032-document corpus that walk was most of a second per request.
+    /// The spaces here are the same ones the status reports, built by the same
+    /// [`Self::projection_spaces`], so the two cannot disagree about which
+    /// space is ready.
+    pub async fn managed_spaces(&self, corpus_id: &str) -> anyhow::Result<ManagedSpaces> {
+        let manifest = read_manifest(&workspace_manifest_path(&self.app_data_dir, corpus_id))?;
+        match &manifest.kind {
+            WorkspaceKind::ApplicationManaged {
+                purpose,
+                parent_corpus_id: None,
+                ..
+            } if purpose == "semantic-corpus" => {}
+            _ => consumer_bail!(
+                ConsumerErrorCode::ManagedWorkspaceNotFound,
+                "this id names no managed semantic corpus",
+            ),
+        }
+        let index_root = workspace_root(&self.app_data_dir, corpus_id);
+        let corpus_generation = if index_root.join("semantic_index.db").exists() {
+            SemanticIndex::open_for_maintenance(&index_root)?.managed_snapshot_sha256()?
+        } else {
+            wilkes_core::embed::identity::sha256_bytes(&[])
+        };
+        let spaces = self.projection_spaces(corpus_id, &corpus_generation)?;
+        Ok(ManagedSpaces {
+            corpus_generation,
+            spaces,
+        })
+    }
+
+    /// The projections of one canonical corpus that hold an index, ordered by
+    /// space id. A projection is ready when every chunk it holds is embedded
+    /// and its membership is the corpus's.
+    fn projection_spaces(
+        &self,
+        corpus_id: &str,
+        corpus_generation: &str,
+    ) -> anyhow::Result<Vec<ManagedEmbeddingSpaceStatus>> {
+        let registry = {
+            let _guard = self.registry_lock.lock();
+            load_registry(&self.app_data_dir)?
+        };
+        let mut spaces = Vec::new();
+        for workspace_id in registry.workspace_ids {
+            if workspace_id == corpus_id {
+                continue;
+            }
+            let child = read_manifest(&workspace_manifest_path(&self.app_data_dir, &workspace_id))?;
+            let belongs = matches!(
+                child.kind,
+                WorkspaceKind::ApplicationManaged {
+                    parent_corpus_id: Some(ref parent),
+                    ..
+                } if parent == corpus_id
+            );
+            if !belongs {
+                continue;
+            }
+            let child_root = workspace_root(&self.app_data_dir, &workspace_id);
+            let Ok(index) = SemanticIndex::open_for_maintenance(&child_root) else {
+                continue;
+            };
+            let child_identity = index.embedding_space_identity()?;
+            let indexed_generation = index.managed_snapshot_sha256()?;
+            let counts = index.managed_completeness()?;
+            spaces.push(ManagedEmbeddingSpaceStatus {
+                embedding_space_id: child_identity.id().0,
+                embedding_space_identity: child_identity,
+                ready: counts.1 == counts.2 && indexed_generation == corpus_generation,
+                indexed_generation,
+                workspace_id,
+                primary: false,
+            });
+        }
+        spaces.sort_by(|left, right| left.embedding_space_id.cmp(&right.embedding_space_id));
+        Ok(spaces)
     }
 
     pub async fn managed_workspace_status(
@@ -1837,48 +1930,9 @@ impl WorkspaceManager {
         };
 
         if parent_corpus_id.is_none() {
-            let registry = {
-                let _guard = self.registry_lock.lock();
-                load_registry(&self.app_data_dir)?
-            };
-            for workspace_id in registry.workspace_ids {
-                if workspace_id == corpus_id {
-                    continue;
-                }
-                let child =
-                    read_manifest(&workspace_manifest_path(&self.app_data_dir, &workspace_id))?;
-                let belongs = matches!(
-                    child.kind,
-                    WorkspaceKind::ApplicationManaged {
-                        parent_corpus_id: Some(ref parent),
-                        ..
-                    } if parent == corpus_id
-                );
-                if !belongs {
-                    continue;
-                }
-                let child_root = workspace_root(&self.app_data_dir, &workspace_id);
-                let Ok(index) = SemanticIndex::open_for_maintenance(&child_root) else {
-                    continue;
-                };
-                let child_identity = index.embedding_space_identity()?;
-                let indexed_generation = index.managed_snapshot_sha256()?;
-                let counts = index.managed_completeness()?;
-                status.spaces.push(ManagedEmbeddingSpaceStatus {
-                    embedding_space_id: child_identity.id().0,
-                    embedding_space_identity: child_identity,
-                    ready: counts.1 == counts.2 && indexed_generation == status.corpus_generation,
-                    indexed_generation,
-                    workspace_id,
-                    primary: false,
-                });
-            }
-            status.spaces.sort_by(|left, right| {
-                right
-                    .primary
-                    .cmp(&left.primary)
-                    .then_with(|| left.embedding_space_id.cmp(&right.embedding_space_id))
-            });
+            status
+                .spaces
+                .extend(self.projection_spaces(corpus_id, &status.corpus_generation)?);
         }
         Ok(status)
     }
