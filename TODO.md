@@ -130,8 +130,6 @@ Three things a first-time caller cannot learn from the replies:
   sending that id back as `expected_embedding_space_id` on the next import is
   refused (`corpus=none, request=space-…`, 409). Omitting it works only while
   the corpus has no projection.
-- Imports took ~1 s each when the first 200 were sent with the returned id
-  (every one a 409 after three retries); without it they ran at ~16/s.
 
 **Direction:** stop returning a space id from import on the canonical corpus,
 or accept it; and have the corpus reply say that search needs a projection.
