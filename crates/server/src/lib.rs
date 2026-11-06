@@ -736,9 +736,10 @@ struct TextProbe {
 /// A probe is a vector the caller already holds or the text it wants searched
 /// for, and the two are not interchangeable in what they can express.
 ///
-/// A caller sending text gets its query embedded in the **query** role, which
-/// is the only way that role can be reached: `embed/text` answers in the
-/// passage role and has to, because the vectors it returns are stored. So
+/// A caller sending text gets its query embedded in the **query** role, as
+/// `embed/query` does for a caller ranking vectors it holds itself;
+/// `embed/text` answers in the passage role and has to, because the vectors it
+/// returns are stored. So
 /// "search the corpus for this text" used to be two calls of which the first
 /// could not know what the text was for. Sending text is also one round trip
 /// instead of two, and it lets a later model with query prefixes work without
@@ -1606,6 +1607,48 @@ async fn embed_text_handler(
         .embed_texts(body.texts, space)
         .await
         .map(Json)
+        .map_err(server_err)
+}
+
+/// What `/api/embed/query` answers: the passage route's reply, plus the role
+/// the vectors are in, so a caller can refuse a vector it did not ask for.
+#[derive(Serialize)]
+struct EmbeddedQueries {
+    #[serde(flatten)]
+    embedded: wilkes_api::context::EmbeddedTexts,
+    role: &'static str,
+}
+
+/// Embed strings in the **query** role, with the model the addressed index
+/// uses. The vectors are for ranking against passage vectors the caller
+/// holds and are never for storage: an asymmetric model places a query away
+/// from the passage of the same words on purpose.
+///
+/// A route of its own rather than a role field on `/api/embed/text`: the role
+/// is decided by the endpoint a caller reaches, never by a field it sets.
+/// Addressed exactly as `/api/embed/text` is, and refused the same way — a
+/// managed corpus routes on the pinned space, which must be one it holds and
+/// level with it; a model that cannot be loaded is an error, never a vector
+/// from some other space.
+async fn embed_query_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<EmbedTextBody>,
+) -> Result<Json<EmbeddedQueries>, (StatusCode, Json<ErrorBody>)> {
+    if body.texts.is_empty() {
+        return Err(err("texts must not be empty"));
+    }
+    let index = state.consumer_index(&body.scope).await?;
+    let space = index.embedding_space_id().map(str::to_string);
+    index
+        .into_context()
+        .embed_query_texts(body.texts, space)
+        .await
+        .map(|embedded| {
+            Json(EmbeddedQueries {
+                embedded,
+                role: "query",
+            })
+        })
         .map_err(server_err)
 }
 
@@ -2888,6 +2931,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/embed/ready", get(is_semantic_ready_handler))
         .route("/api/embed/text", post(embed_text_handler))
+        .route("/api/embed/query", post(embed_query_handler))
         .route("/api/export/chunks", post(export_chunks_handler))
         .route("/api/export/figures", post(export_figures_handler))
         .route("/api/chunks/figures", post(chunk_figures_handler))
@@ -3209,6 +3253,66 @@ mod tests {
             events_tx,
         });
         (dir, state)
+    }
+
+    /// The query route is reached, refuses what it cannot answer with an
+    /// error rather than a vector, and names its role. The role itself is
+    /// covered where the embedder is, in `embed_query_texts`.
+    #[tokio::test]
+    async fn the_query_embedding_route_refuses_rather_than_falls_back() {
+        let (_dir, state) = handler_state();
+        let empty = embed_query_handler(
+            State(Arc::clone(&state)),
+            Json(EmbedTextBody {
+                texts: Vec::new(),
+                scope: ConsumerScope::default(),
+            }),
+        )
+        .await
+        .err()
+        .expect("no texts is no request");
+        assert_eq!(empty.0, StatusCode::BAD_REQUEST);
+
+        let (status, body) = embed_query_handler(
+            State(Arc::clone(&state)),
+            Json(EmbedTextBody {
+                texts: vec!["what binds".to_string()],
+                scope: ConsumerScope::default(),
+            }),
+        )
+        .await
+        .err()
+        .expect("no model is not ready, not a vector");
+        assert!(status.is_server_error(), "{status}");
+        assert!(
+            body.error.contains("Semantic model unavailable"),
+            "{}",
+            body.error
+        );
+
+        let reply = serde_json::to_value(EmbeddedQueries {
+            embedded: wilkes_api::context::EmbeddedTexts {
+                embedding_space_id: Some("space-a".to_string()),
+                engine: "SBERT".to_string(),
+                model_id: "m".to_string(),
+                dimension: 2,
+                vectors: vec![vec![1.0, 0.0]],
+            },
+            role: "query",
+        })
+        .unwrap();
+        assert_eq!(
+            reply,
+            serde_json::json!({
+                "embedding_space_id": "space-a",
+                "engine": "SBERT",
+                "model_id": "m",
+                "dimension": 2,
+                "vectors": [[1.0, 0.0]],
+                "role": "query",
+            }),
+            "the passage route's reply, flat, plus the role"
+        );
     }
 
     #[tokio::test]

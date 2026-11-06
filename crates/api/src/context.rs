@@ -2505,6 +2505,30 @@ impl AppContext {
         Ok(embedded)
     }
 
+    /// Embed strings in the **query** role, with the model the addressed
+    /// index uses, for a caller that ranks its own stored passage vectors.
+    ///
+    /// The vectors are not for storage. An asymmetric model puts a query and
+    /// a passage of the same words in different places on purpose, so a
+    /// query vector stored beside passage vectors is a passage that ranks
+    /// wrongly against everything. The role is this method's, never a field
+    /// the caller sets: see [`Self::embed_texts_in_role`].
+    ///
+    /// A blank text is refused rather than embedded, as it is for a search
+    /// probe: it names nothing to look for.
+    pub async fn embed_query_texts(
+        &self,
+        texts: Vec<String>,
+        embedding_space_id: Option<String>,
+    ) -> Result<EmbeddedTexts, String> {
+        if texts.iter().any(|text| text.trim().is_empty()) {
+            return Err("A query text is empty and names nothing to embed".to_string());
+        }
+        let mut embedded = self.embed_texts_in_role(texts, EmbedRole::Query).await?;
+        embedded.embedding_space_id = embedding_space_id;
+        Ok(embedded)
+    }
+
     /// The two roles an asymmetric model distinguishes. Which one applies is
     /// decided by the endpoint a caller reached, never by a field it sets: a
     /// flag that can be set correctly can be set wrongly, and the caller is the
@@ -9946,6 +9970,80 @@ mod tests {
         assert_eq!(result.vectors.len(), 2);
         assert_eq!(result.vectors[0], vec![1.0, 0.0]);
         assert_eq!(result.vectors[1], vec![0.0, 1.0]);
+    }
+
+    /// An embedder whose two roles land in different places, which is the
+    /// whole reason the query role is worth an endpoint.
+    struct RoleEmbedder;
+
+    impl Embedder for RoleEmbedder {
+        fn embedding_space_identity(&self) -> wilkes_core::embed::EmbeddingSpaceIdentity {
+            wilkes_core::embed::EmbeddingSpaceIdentity::for_test(
+                self.engine(),
+                self.model_id(),
+                self.dimension(),
+            )
+        }
+
+        fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.0, 1.0]).collect())
+        }
+
+        fn embed_query(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+
+        fn model_id(&self) -> &str {
+            "role-test"
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+
+        fn engine(&self) -> EmbeddingEngine {
+            EmbeddingEngine::Fastembed
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_query_texts_answers_in_the_query_role() {
+        let (_dir, ctx) = test_ctx();
+
+        let err = ctx
+            .embed_query_texts(vec!["a".to_string()], None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Semantic model unavailable"), "{err}");
+
+        *ctx.embedder.lock() = Some(Arc::new(RoleEmbedder));
+
+        let err = ctx.embed_query_texts(Vec::new(), None).await.unwrap_err();
+        assert!(err.contains("No texts provided"), "{err}");
+        let err = ctx
+            .embed_query_texts(vec!["what".to_string(), "  ".to_string()], None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+
+        let texts = vec!["what binds".to_string(), "why it holds".to_string()];
+        let query = ctx
+            .embed_query_texts(texts.clone(), Some("space-under-test".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            query.embedding_space_id.as_deref(),
+            Some("space-under-test")
+        );
+        assert_eq!(query.model_id, "role-test");
+        assert_eq!(query.dimension, 2);
+        assert_eq!(query.vectors, vec![vec![1.0, 0.0], vec![1.0, 0.0]]);
+
+        let passage = ctx.embed_texts(texts, None).await.unwrap();
+        assert_ne!(
+            passage.vectors, query.vectors,
+            "the same words in the passage role are a different vector"
+        );
     }
 
     #[tokio::test]
