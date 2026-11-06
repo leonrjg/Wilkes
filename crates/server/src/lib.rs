@@ -463,10 +463,24 @@ struct ManagedImportBody {
     source: ManagedImportSource,
 }
 
+/// What `documents/import` answers: the admitted document, and the embedding
+/// spaces that hold it.
+#[derive(Serialize)]
+struct ManagedImportReply {
+    #[serde(flatten)]
+    document: wilkes_api::context::ManagedDocumentExport,
+    /// Every space of the corpus that is level with it once this import's
+    /// catch-up has run, so holds this document. Any of them is a valid
+    /// `expected_embedding_space_id` for the next import. A space that could
+    /// not follow is absent here, and logged; empty when the corpus has no
+    /// projection yet, which is also when the next import takes no pin.
+    spaces: Vec<String>,
+}
+
 async fn import_managed_document_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedImportBody>,
-) -> Result<Json<wilkes_api::context::ManagedDocumentExport>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Json<ManagedImportReply>, (StatusCode, Json<ErrorBody>)> {
     let manager = state
         .workspaces
         .as_ref()
@@ -554,7 +568,15 @@ async fn import_managed_document_handler(
         // caller's own maintenance pass — is what clears it.
         tracing::warn!("embedding projection {space} did not follow the import: {error}");
     }
-    Ok(Json(exported))
+    let spaces = manager
+        .managed_spaces(&body.corpus_id)
+        .await
+        .map_err(consumer_anyhow_err)?
+        .level_space_ids();
+    Ok(Json(ManagedImportReply {
+        document: exported,
+        spaces,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -3253,6 +3275,47 @@ mod tests {
             events_tx,
         });
         (dir, state)
+    }
+
+    /// The import reply names the spaces that hold the document, and no
+    /// space of the canonical corpus's own: that one embedded nothing, and a
+    /// caller that echoed it back as its next pin was refused.
+    #[test]
+    fn the_import_reply_names_the_spaces_holding_the_document() {
+        let reply = serde_json::to_value(ManagedImportReply {
+            document: wilkes_api::context::ManagedDocumentExport {
+                corpus_id: "corpus".to_string(),
+                source_sha256: "sha".to_string(),
+                source_byte_len: 1,
+                media_type: "text/plain".to_string(),
+                snapshot_id: "snapshot".to_string(),
+                rendition_id: "rendition".to_string(),
+                extraction_recipe_id: "recipe".to_string(),
+                extracted_content_sha256: "content".to_string(),
+                chunk_count: 0,
+                outline: Vec::new(),
+                extraction: Default::default(),
+                chunks: Vec::new(),
+                embedding_work: wilkes_api::context::ManagedEmbeddingWork {
+                    chunks: 0,
+                    reused: 0,
+                    computed: 0,
+                },
+            },
+            spaces: vec!["space-a".to_string()],
+        })
+        .unwrap();
+        assert_eq!(reply["spaces"], serde_json::json!(["space-a"]));
+        assert_eq!(reply["snapshot_id"], "snapshot", "the document stays flat");
+        for gone in [
+            "embedding_space_id",
+            "engine",
+            "model_id",
+            "dimension",
+            "passage_input_recipe",
+        ] {
+            assert!(reply.get(gone).is_none(), "{gone} is still reported");
+        }
     }
 
     /// The query route is reached, refuses what it cannot answer with an

@@ -837,11 +837,13 @@ pub struct ManagedDocumentExport {
     pub extraction_recipe_id: String,
     pub extracted_content_sha256: String,
     pub chunk_count: usize,
-    pub embedding_space_id: String,
-    pub engine: String,
-    pub model_id: String,
-    pub dimension: usize,
-    pub passage_input_recipe: String,
+    // No embedding space, engine, model or dimension. These used to be
+    // reported from the canonical corpus's index, whose identity is the model
+    // the corpus was *created* with: it embeds nothing, so its id is no space
+    // the corpus holds, and a caller that echoed it back as the next import's
+    // `expected_embedding_space_id` was refused. The spaces that hold the
+    // document are the import route's to report, after it has brought them
+    // level.
     pub outline: Vec<ExportedOutlineEntry>,
     /// What the read that anchored `outline` had to decide for itself — which
     /// pages clustered into a body column and which were too ambiguous to
@@ -2957,14 +2959,7 @@ impl AppContext {
                 .map_err(|error| error.to_string())?
         };
         if let Some(existing) = existing {
-            return Self::managed_export(
-                corpus_id,
-                existing,
-                &expected_identity,
-                snapshot_path,
-                true,
-            )
-            .await;
+            return Self::managed_export(corpus_id, existing, snapshot_path, true).await;
         }
 
         // Bound to a `let` before the `if let`, not inlined into it. A block
@@ -3007,14 +3002,7 @@ impl AppContext {
             existing
         };
         if let Some(existing) = existing {
-            return Self::managed_export(
-                corpus_id,
-                existing,
-                &expected_identity,
-                snapshot_path,
-                true,
-            )
-            .await;
+            return Self::managed_export(corpus_id, existing, snapshot_path, true).await;
         }
 
         let adopted = if let Some(source_context) = source_workspace {
@@ -3109,14 +3097,7 @@ impl AppContext {
                 "publication verification failed",
             ));
         }
-        Self::managed_export(
-            corpus_id,
-            managed,
-            &expected_identity,
-            snapshot_path,
-            reused,
-        )
-        .await
+        Self::managed_export(corpus_id, managed, snapshot_path, reused).await
     }
 
     /// Materialize one embedding projection from the canonical admitted
@@ -3782,7 +3763,6 @@ impl AppContext {
     async fn managed_export(
         corpus_id: String,
         document: ManagedDocumentData,
-        embedding_identity: &wilkes_core::embed::EmbeddingSpaceIdentity,
         snapshot_path: PathBuf,
         reused: bool,
     ) -> Result<ManagedDocumentExport, ConsumerError> {
@@ -3810,11 +3790,6 @@ impl AppContext {
             extraction_recipe_id: document.extraction_recipe_id,
             extracted_content_sha256: document.extracted_content_sha256,
             chunk_count,
-            embedding_space_id: embedding_identity.id().0,
-            engine: embedding_identity.engine.as_str().to_string(),
-            model_id: embedding_identity.model_id.clone(),
-            dimension: embedding_identity.dimension,
-            passage_input_recipe: embedding_identity.passage_input_recipe.clone(),
             outline,
             extraction: declared_outline.diagnostics,
             chunks: document

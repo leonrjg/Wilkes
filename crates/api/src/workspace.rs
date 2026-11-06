@@ -270,6 +270,19 @@ pub struct ManagedSpaces {
     pub spaces: Vec<ManagedEmbeddingSpaceStatus>,
 }
 
+impl ManagedSpaces {
+    /// The spaces level with the corpus: ready, and holding exactly the
+    /// membership it admitted. Each one holds every document the corpus does,
+    /// so each is a pin a caller may send with its next import or search.
+    pub fn level_space_ids(&self) -> Vec<String> {
+        self.spaces
+            .iter()
+            .filter(|space| space.ready && space.indexed_generation == self.corpus_generation)
+            .map(|space| space.embedding_space_id.clone())
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnsureManagedEmbeddingSpace {
     pub corpus_id: String,
@@ -3036,6 +3049,31 @@ mod tests {
                 .is_err(),
             "a projection behind its corpus is work owed, not work skipped"
         );
+    }
+
+    #[test]
+    fn only_spaces_level_with_the_corpus_are_named_as_holding_it() {
+        let space = |id: &str, ready: bool, generation: &str| ManagedEmbeddingSpaceStatus {
+            embedding_space_id: id.to_string(),
+            embedding_space_identity: EmbeddingSpaceIdentity::for_test(
+                wilkes_core::types::EmbeddingEngine::Candle,
+                id,
+                2,
+            ),
+            ready,
+            indexed_generation: generation.to_string(),
+            workspace_id: format!("workspace-{id}"),
+            primary: false,
+        };
+        let spaces = ManagedSpaces {
+            corpus_generation: "now".to_string(),
+            spaces: vec![
+                space("space-level", true, "now"),
+                space("space-behind", true, "before"),
+                space("space-embedding", false, "now"),
+            ],
+        };
+        assert_eq!(spaces.level_space_ids(), vec!["space-level".to_string()]);
     }
 
     /// A first-time consumer creates a corpus, imports into it and searches,
