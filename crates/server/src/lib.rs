@@ -3280,9 +3280,8 @@ mod tests {
     /// The import reply names the spaces that hold the document, and no
     /// space of the canonical corpus's own: that one embedded nothing, and a
     /// caller that echoed it back as its next pin was refused.
-    #[test]
-    fn the_import_reply_names_the_spaces_holding_the_document() {
-        let reply = serde_json::to_value(ManagedImportReply {
+    fn example_import_reply() -> ManagedImportReply {
+        ManagedImportReply {
             document: wilkes_api::context::ManagedDocumentExport {
                 corpus_id: "corpus".to_string(),
                 source_sha256: "sha".to_string(),
@@ -3303,8 +3302,12 @@ mod tests {
                 },
             },
             spaces: vec!["space-a".to_string()],
-        })
-        .unwrap();
+        }
+    }
+
+    #[test]
+    fn the_import_reply_names_the_spaces_holding_the_document() {
+        let reply = serde_json::to_value(example_import_reply()).unwrap();
         assert_eq!(reply["spaces"], serde_json::json!(["space-a"]));
         assert_eq!(reply["snapshot_id"], "snapshot", "the document stays flat");
         for gone in [
@@ -4715,23 +4718,18 @@ mod tests {
             wilkes_core::types::PrefixSource::Undetermined
         );
 
+        // Field for field what the import route serializes. A list of
+        // required names let the fixture keep five fields the reply had
+        // dropped, and the consumer that carries a copy of this file would
+        // have kept requiring them.
         let response = &fixture["import_response"];
-        for required in [
-            "corpus_id",
-            "snapshot_id",
-            "rendition_id",
-            "extracted_content_sha256",
-            "embedding_space_id",
-            "outline",
-            "extraction",
-            "chunks",
-            "embedding_work",
-        ] {
-            assert!(
-                response.get(required).is_some(),
-                "missing fixture field {required}"
-            );
-        }
+        let fixture_fields: std::collections::BTreeSet<&String> =
+            response.as_object().unwrap().keys().collect();
+        let served = serde_json::to_value(example_import_reply()).unwrap();
+        let served_fields: std::collections::BTreeSet<&String> =
+            served.as_object().unwrap().keys().collect();
+        assert_eq!(fixture_fields, served_fields);
+        assert_eq!(response["spaces"], serde_json::json!(["space-example"]));
 
         // The outline carries a position and says what established it, and the
         // extraction says what it had to decide to produce that position.
