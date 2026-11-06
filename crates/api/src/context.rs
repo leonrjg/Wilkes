@@ -722,16 +722,19 @@ struct CompletionOperation {
     cancel: Arc<AtomicBool>,
 }
 
-struct PendingManagedOperation<'a>(&'a AtomicU64);
+/// One managed import waiting for, or holding, its corpus's import lock —
+/// counted for the corpus status. Builds are not counted here: a projection's
+/// catch-up runs in the build slot, and the status reads it off that.
+struct PendingManagedImport<'a>(&'a AtomicU64);
 
-impl<'a> PendingManagedOperation<'a> {
+impl<'a> PendingManagedImport<'a> {
     fn new(counter: &'a AtomicU64) -> Self {
         counter.fetch_add(1, Ordering::AcqRel);
         Self(counter)
     }
 }
 
-impl Drop for PendingManagedOperation<'_> {
+impl Drop for PendingManagedImport<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
@@ -1645,7 +1648,6 @@ pub struct AppContext {
     settings_lock: tokio::sync::Mutex<()>,
     managed_runtime_lock: tokio::sync::Mutex<()>,
     managed_import_lock: tokio::sync::Mutex<()>,
-    managed_pending_builds: AtomicU64,
     managed_pending_imports: AtomicU64,
     bookmarks_lock: tokio::sync::Mutex<()>,
 }
@@ -1736,7 +1738,6 @@ impl AppContext {
             settings_lock: tokio::sync::Mutex::new(()),
             managed_runtime_lock: tokio::sync::Mutex::new(()),
             managed_import_lock: tokio::sync::Mutex::new(()),
-            managed_pending_builds: AtomicU64::new(0),
             managed_pending_imports: AtomicU64::new(0),
             bookmarks_lock: tokio::sync::Mutex::new(()),
         });
@@ -2601,47 +2602,33 @@ impl AppContext {
             .await
     }
 
+    /// The model comes from [`Self::load_embedder`] and the loaded state is
+    /// installed by `restore_store_*`, exactly as a user workspace's is. What
+    /// is the managed corpus's own is only the index: it is created on first
+    /// use rather than by a build, because nothing ever builds one, and its one
+    /// root is its retained sources.
     async fn ensure_managed_runtime_with(
         self: &Arc<Self>,
         runtime: ManagedRuntime,
     ) -> Result<String, ConsumerError> {
-        let _pending = PendingManagedOperation::new(&self.managed_pending_builds);
         let _runtime_guard = self.managed_runtime_lock.lock().await;
+        let settings = self.settings().await;
+        let selected = settings.semantic.selected.clone();
         if matches!(runtime, ManagedRuntime::IndexOnly) {
-            let settings = self.settings().await;
-            let selected = settings.semantic.selected.clone();
             let identity = wilkes_core::embed::identity::EmbeddingSpaceIdentity::for_runtime(
                 selected.engine,
                 selected.model.model_id(),
                 selected.dimension,
             );
-            {
-                let index_arc = self.index.lock().clone();
-                let guard = index_arc
-                    .lock()
-                    .map_err(|_| "Semantic index lock was poisoned".to_string())?;
-                if guard.is_some() {
-                    return Ok(identity.id().0);
-                }
+            if self.is_index_loaded() {
+                return Ok(identity.id().0);
             }
-            let data_dir = self.data_dir.clone();
-            let root = data_dir.join("managed_sources");
-            let for_creation = identity.clone();
-            let index = tokio::task::spawn_blocking(move || {
-                std::fs::create_dir_all(&root)?;
-                let mut index = if data_dir.join("semantic_index.db").exists() {
-                    SemanticIndex::open_for_maintenance(&data_dir)?
-                } else {
-                    SemanticIndex::create_exact(&data_dir, &for_creation, Some(&root))?
-                };
-                index.activate_root(&root)?;
-                Ok::<_, anyhow::Error>(index)
-            })
-            .await
-            .map_err(|error| format!("Managed index task panicked: {error}"))?
-            .map_err(|error| format!("Could not open managed index: {error:#}"))?;
-            self.invalidate_topic_tree_cache();
-            *self.index.lock() = Arc::new(Mutex::new(Some(index)));
+            let index = self
+                .open_or_create_managed_index(identity.clone(), |data_dir| {
+                    SemanticIndex::open_for_maintenance(data_dir)
+                })
+                .await?;
+            self.restore_store_index_only(index);
             return Ok(identity.id().0);
         }
         if let Some(embedder) = self.embedder.lock().clone() {
@@ -2657,27 +2644,21 @@ impl AppContext {
                 return Ok(identity.id().0);
             }
         }
-        let settings = self.settings().await;
-        let selected = settings.semantic.selected.clone();
-        let device = settings.semantic.device_for(selected.engine).to_string();
         let installer = dispatch::get_installer(
             selected.engine,
             selected.model.clone(),
             self.worker_manager.clone(),
-            device,
+            settings.semantic.device_for(selected.engine).to_string(),
             settings.semantic.embed_batch_size,
         );
-        let (progress_tx, _progress_rx) = mpsc::channel(8);
-        installer
-            .install(&self.model_dir, progress_tx)
+        let embedder = self
+            .load_embedder(installer)
             .await
-            .map_err(|error| format!("Could not install managed embedding model: {error:#}"))?;
-        let model_dir = self.model_dir.clone();
-        let installer_for_build = Arc::clone(&installer);
-        let embedder = tokio::task::spawn_blocking(move || installer_for_build.build(&model_dir))
-            .await
-            .map_err(|error| format!("Managed embedder task panicked: {error}"))?
-            .map_err(|error| format!("Could not load managed embedder: {error:#}"))?;
+            .map_err(|error| format!("Could not load managed embedder: {error:#}"))?
+            .ok_or_else(|| {
+                "Could not load managed embedder: its model files are absent after install"
+                    .to_string()
+            })?;
         if embedder.dimension() != selected.dimension {
             return Err(ConsumerError::new(
                 ConsumerErrorCode::ManagedWorkspaceConfigurationMismatch,
@@ -2689,30 +2670,51 @@ impl AppContext {
             ));
         }
         let expected_identity = embedder.embedding_space_identity();
-        let data_dir = self.data_dir.clone();
-        let root = data_dir.join("managed_sources");
         let model_id = embedder.model_id().to_string();
         let dimension = embedder.dimension();
-        let expected_for_index = expected_identity.clone();
-        let index = tokio::task::spawn_blocking(move || {
+        let index = self
+            .open_or_create_managed_index(expected_identity.clone(), {
+                let expected = expected_identity.clone();
+                move |data_dir| {
+                    let index = SemanticIndex::open(data_dir, &model_id, dimension)?;
+                    index.validate_embedding_space(&expected)?;
+                    Ok(index)
+                }
+            })
+            .await?;
+        self.restore_store_loaded_state(embedder, index);
+        Ok(expected_identity.id().0)
+    }
+
+    /// This managed workspace's index, opened with `open` when it exists and
+    /// created under `identity` when it does not, with its retained sources
+    /// as its active root. `open` is where an existing index's space is
+    /// checked, for the workspaces whose space means something.
+    ///
+    /// The canonical corpus opens its index for maintenance and checks no
+    /// space, because the space it was created under is vestigial: it holds no
+    /// vectors for that space or any other, and refusing a good pile of
+    /// passages because a setting elsewhere changed would help nobody.
+    async fn open_or_create_managed_index(
+        &self,
+        identity: wilkes_core::embed::identity::EmbeddingSpaceIdentity,
+        open: impl FnOnce(&Path) -> anyhow::Result<SemanticIndex> + Send + 'static,
+    ) -> Result<SemanticIndex, ConsumerError> {
+        let data_dir = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let root = data_dir.join("managed_sources");
             std::fs::create_dir_all(&root)?;
             let mut index = if data_dir.join("semantic_index.db").exists() {
-                SemanticIndex::open(&data_dir, &model_id, dimension)?
+                open(&data_dir)?
             } else {
-                SemanticIndex::create_exact(&data_dir, &expected_for_index, Some(&root))?
+                SemanticIndex::create_exact(&data_dir, &identity, Some(&root))?
             };
-            index.validate_embedding_space(&expected_for_index)?;
             index.activate_root(&root)?;
             Ok::<_, anyhow::Error>(index)
         })
         .await
         .map_err(|error| format!("Managed index task panicked: {error}"))?
-        .map_err(|error| format!("Could not open managed index: {error:#}"))?;
-
-        self.invalidate_topic_tree_cache();
-        *self.embedder.lock() = Some(embedder);
-        *self.index.lock() = Arc::new(Mutex::new(Some(index)));
-        Ok(expected_identity.id().0)
+        .map_err(|error| ConsumerError::untyped(format!("Could not open managed index: {error:#}")))
     }
 
     fn sanitize_managed_source_name(path: &Path) -> String {
@@ -2822,28 +2824,6 @@ impl AppContext {
         Ok((snapshot, relative, source_sha256))
     }
 
-    /// Resolve a `wilkes_file` import through the same library confinement as
-    /// ordinary exports. The returned canonical path is the only path the
-    /// managed importer is allowed to open for this source variant.
-    pub async fn authorize_managed_workspace_file(
-        &self,
-        root: PathBuf,
-        path: PathBuf,
-    ) -> Result<PathBuf, ConsumerError> {
-        let settings = self.settings().await;
-        let (library_roots, _) = library_roots(&settings);
-        let root = Self::canonicalize_search_root(&root)?;
-        Self::ensure_path_in_library(&root, &library_roots, "Managed import root")?;
-        let (path, _) = Self::canonicalize_supported_file(
-            &root,
-            &path,
-            &settings.supported_extensions,
-            "Managed import",
-        )?;
-        Self::ensure_path_in_library(&path, &library_roots, "Managed import file")?;
-        Ok(path)
-    }
-
     pub async fn import_managed_document(
         self: &Arc<Self>,
         corpus_id: String,
@@ -2852,7 +2832,7 @@ impl AppContext {
         source_workspace: Option<Arc<AppContext>>,
         original_source_provenance: serde_json::Value,
     ) -> Result<ManagedDocumentExport, ConsumerError> {
-        let _pending = PendingManagedOperation::new(&self.managed_pending_imports);
+        let _pending = PendingManagedImport::new(&self.managed_pending_imports);
         let _import_guard = self.managed_import_lock.lock().await;
         if idempotency_key.trim().is_empty() || idempotency_key.len() > 256 {
             return Err(ConsumerError::new(
@@ -3223,7 +3203,6 @@ impl AppContext {
         original_source_provenance: serde_json::Value,
         source_workspace: Option<&Arc<Self>>,
     ) -> Result<(), ConsumerError> {
-        let _pending = PendingManagedOperation::new(&self.managed_pending_imports);
         let _import_guard = self.managed_import_lock.lock().await;
         if idempotency_key.trim().is_empty() || idempotency_key.len() > 256 {
             return Err(ConsumerError::new(
@@ -3495,9 +3474,9 @@ impl AppContext {
 
     /// The first page of a file on disk, as a PNG fitted inside `max_edge`.
     ///
-    /// What a file list draws. It is [`Self::managed_document_cover`] for a
-    /// document addressed by path, which need not be in any index, and a list
-    /// asks for the same covers every time it is shown, so these are kept.
+    /// What a file list draws, and what [`Self::managed_document_cover`] draws
+    /// once it has found the retained snapshot. A list asks for the same
+    /// covers every time it is shown, so these are kept.
     pub async fn file_cover(
         &self,
         path: std::path::PathBuf,
@@ -3525,11 +3504,10 @@ impl AppContext {
             .map_err(|error| ConsumerError::from_anyhow(&error))
     }
 
-    pub fn managed_pending_operations(&self) -> (u64, u64) {
-        (
-            self.managed_pending_imports.load(Ordering::Acquire),
-            self.managed_pending_builds.load(Ordering::Acquire),
-        )
+    /// Imports into this corpus that are waiting for, or holding, its import
+    /// lock.
+    pub fn managed_pending_imports(&self) -> u64 {
+        self.managed_pending_imports.load(Ordering::Acquire)
     }
 
     /// Writes one point-in-time, self-verifying managed-corpus directory.
@@ -3681,36 +3659,36 @@ impl AppContext {
     /// size of a thumbnail. Addressed the same way and subject to the same
     /// rule, so call it on the canonical corpus context.
     ///
-    /// The render happens after the index lock is released. The lock serves
-    /// every search in this corpus, and a list of documents asks for a dozen
-    /// of these at once.
+    /// Drawn by [`Self::file_cover`], the one cover path: a retained snapshot
+    /// is a file on disk like any other, and an immutable one, so the cover
+    /// cache keyed on its identity never goes stale. The index lock is held
+    /// only to find the file — it serves every search in this corpus, and a
+    /// list of documents asks for a dozen of these at once.
     pub async fn managed_document_cover(
         &self,
         snapshot_id: String,
         max_edge: u32,
     ) -> Result<DocumentCoverExport, ConsumerError> {
-        if max_edge == 0 || max_edge > MAX_FIGURE_EDGE {
-            return Err(ConsumerError::untyped(format!(
-                "max_edge must be between 1 and {MAX_FIGURE_EDGE}; got {max_edge}"
-            )));
-        }
         let index_arc = self.index.lock().clone();
         let data_dir = self.data_dir.clone();
-        tokio::task::spawn_blocking(move || {
-            let (path, source_sha256) =
-                Self::retained_snapshot(&index_arc, &data_dir, &snapshot_id)?;
-            let cover = wilkes_core::figure::render_cover(&path, max_edge)
-                .map_err(|error| ConsumerError::from_anyhow(&error))?;
-            Ok(DocumentCoverExport {
-                bytes: cover.png,
-                media_type: "image/png",
-                width: cover.width,
-                height: cover.height,
-                source_sha256,
-            })
+        let (path, source_sha256) = tokio::task::spawn_blocking(move || {
+            Self::retained_snapshot(&index_arc, &data_dir, &snapshot_id)
         })
         .await
-        .map_err(|error| ConsumerError::untyped(format!("Cover render task panicked: {error}")))?
+        .map_err(|error| ConsumerError::untyped(format!("Snapshot lookup panicked: {error}")))??;
+        let png = self
+            .file_cover(path, max_edge)
+            .await
+            .map_err(|error| ConsumerError::from_anyhow(&error))?;
+        let (width, height) = wilkes_core::figure::png_dimensions(&png)
+            .map_err(|error| ConsumerError::from_anyhow(&error))?;
+        Ok(DocumentCoverExport {
+            bytes: png,
+            media_type: "image/png",
+            width,
+            height,
+            source_sha256,
+        })
     }
 
     /// Where a retained snapshot is on disk, and what it hashed to.
@@ -4147,8 +4125,9 @@ impl AppContext {
 
     /// Canonicalize one library document for an export route. All file export
     /// endpoints share this boundary so a new read surface cannot accidentally
-    /// weaken the library-root or supported-file restrictions.
-    async fn export_file_path(
+    /// weaken the library-root or supported-file restrictions — and so does a
+    /// managed import that names a library file, which is one more reader.
+    pub async fn export_file_path(
         &self,
         root: PathBuf,
         path: PathBuf,
@@ -5928,7 +5907,7 @@ impl AppContext {
         }
     }
 
-    fn embed_task_is_running(&self) -> bool {
+    pub(crate) fn embed_task_is_running(&self) -> bool {
         if self.embed_cancel_in_progress.load(Ordering::Acquire) {
             return true;
         }
@@ -7858,6 +7837,120 @@ impl AppContext {
         Ok(())
     }
 
+    /// Run `work` as this workspace's build: registered in `embed_task`, so
+    /// that [`Self::cancel_embed`] stops it — flag first, then every worker
+    /// sealed and killed, within [`CANCEL_DEADLINE`] — and a second build
+    /// cannot start beside it.
+    ///
+    /// For a managed projection catching up with its corpus, which is a build
+    /// in every sense the user's is: it loads a model and embeds documents
+    /// with it. It used to run inline in whichever request asked for it, in no
+    /// slot, so nothing could stop it and nothing reported it running.
+    ///
+    /// Two things differ from a build the user starts, each because the caller
+    /// differs. A busy slot is waited for rather than refused, since the
+    /// callers are imports arriving concurrently and every one of them is owed
+    /// its catch-up. And the caller awaits the outcome, since it answers an
+    /// HTTP request with it; a caller that goes away — the client gave up —
+    /// cancels the build rather than leaving it running for nobody.
+    ///
+    /// `work` is handed the cancel flag and must check it between documents.
+    pub(crate) async fn run_as_embed_task<Fut>(
+        self: &Arc<Self>,
+        work: impl FnOnce(Arc<AtomicBool>) -> Fut,
+    ) -> anyhow::Result<()>
+    where
+        Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let mut work = Some(work);
+        let (settlement, done_rx) = loop {
+            let notified = self.winddown.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut guard = self.embed_task.lock();
+                let free = !self.embed_cancel_in_progress.load(Ordering::Acquire)
+                    && guard.as_ref().is_none_or(|task| task.join.is_finished());
+                if free {
+                    let cancel = CancellationToken::new();
+                    let cancel_flag = Arc::new(AtomicBool::new(false));
+                    let settlement = Arc::new(BuildSettlement::new());
+                    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                    let work = work
+                        .take()
+                        .expect("work is taken once, when the slot is won")(
+                        Arc::clone(&cancel_flag),
+                    );
+                    let ctx = Arc::clone(self);
+                    let task_settlement = Arc::clone(&settlement);
+                    let join = tokio::spawn(async move {
+                        let result = work.await;
+                        // A cancelled build was settled by its canceller.
+                        task_settlement.claim();
+                        ctx.clear_embed_task();
+                        // The caller may have gone, which is how a cancel
+                        // starts; nobody is left to tell.
+                        let _ = done_tx.send(result);
+                        Ok(())
+                    });
+                    *guard = Some(EmbedTaskHandle {
+                        operation: EmbedOperation::Build,
+                        cancel,
+                        cancel_flag,
+                        join: BuildHandle::new(join),
+                        settlement: Arc::clone(&settlement),
+                    });
+                    break (settlement, done_rx);
+                }
+            }
+            notified.await;
+        };
+
+        struct CancelIfAbandoned {
+            ctx: Arc<AppContext>,
+            settlement: Option<Arc<BuildSettlement>>,
+        }
+        impl Drop for CancelIfAbandoned {
+            fn drop(&mut self) {
+                let Some(settlement) = self.settlement.take() else {
+                    return;
+                };
+                let ours = self
+                    .ctx
+                    .embed_task
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|task| Arc::ptr_eq(&task.settlement, &settlement));
+                if !ours {
+                    return;
+                }
+                info!("AppContext::run_as_embed_task: caller went away; cancelling its build");
+                match tokio::runtime::Handle::try_current() {
+                    Ok(runtime) => {
+                        let ctx = Arc::clone(&self.ctx);
+                        runtime.spawn(async move { ctx.cancel_embed().await });
+                    }
+                    // Only at exit, where `shutdown` cancels every build itself.
+                    Err(error) => warn!(
+                        "AppContext::run_as_embed_task: no runtime to cancel an abandoned build \
+                         on: {error}"
+                    ),
+                }
+            }
+        }
+        let mut abandoned = CancelIfAbandoned {
+            ctx: Arc::clone(self),
+            settlement: Some(settlement),
+        };
+        let outcome = done_rx.await;
+        abandoned.settlement = None;
+        match outcome {
+            Ok(result) => result,
+            // The task was cancelled before it could answer.
+            Err(_) => Err(anyhow::anyhow!("the build was cancelled")),
+        }
+    }
+
     // ── Download model ────────────────────────────────────────────────────────
 
     /// Download a model in the background and load it into state on success.
@@ -8535,18 +8628,13 @@ impl AppContext {
         self: &Arc<Self>,
         installer: Arc<dyn EmbedderInstaller>,
     ) -> Result<(), String> {
-        // Probe model dimensions by running install again (no-op if cached).
-        let (probe_tx, _) = mpsc::channel(1);
-        if let Err(e) = installer.install(&self.model_dir, probe_tx).await {
-            return Err(format!("Failed to probe model dimensions: {e:#}"));
-        }
-
-        match installer.build(&self.model_dir) {
-            Ok(embedder) => {
+        match self.load_embedder(installer).await {
+            Ok(Some(embedder)) => {
                 *self.embedder.lock() = Some(embedder);
                 Ok(())
             }
-            Err(e) => Err(e.to_string()),
+            Ok(None) => Err("The download left no model files to load".to_string()),
+            Err(e) => Err(format!("{e:#}")),
         }
     }
 
@@ -9108,28 +9196,47 @@ impl AppContext {
         &self,
         installer: Arc<dyn EmbedderInstaller>,
     ) -> Option<Arc<dyn Embedder>> {
-        let (probe_tx, _) = tokio::sync::mpsc::channel(1);
-        if let Err(err) = installer.install(&self.model_dir, probe_tx).await {
-            error!("restore_state: install probe failed: {err:#}");
-            return None;
-        }
-        if !installer.is_available(&self.model_dir) {
-            info!("restore_state: model files absent, skipping");
-            return None;
-        }
-
-        let model_dir = self.model_dir.clone();
-        match tokio::task::spawn_blocking(move || installer.build(&model_dir)).await {
-            Ok(Ok(embedder)) => Some(embedder),
-            Ok(Err(err)) => {
-                error!("restore_state: build embedder: {err:#}");
+        match self.load_embedder(installer).await {
+            Ok(Some(embedder)) => Some(embedder),
+            Ok(None) => {
+                info!("restore_state: model files absent, skipping");
                 None
             }
             Err(err) => {
-                error!("restore_state: build embedder panicked: {err}");
+                error!("restore_state: {err:#}");
                 None
             }
         }
+    }
+
+    /// Load an embedder: install (a no-op once the model is cached, and the
+    /// probe that settles a model's dimension), confirm its files are there,
+    /// and build it on the blocking pool. `None` when the files are absent.
+    ///
+    /// The one way a model becomes resident, whatever asked for it — a
+    /// workspace restoring its runtime, a finished download, or a managed
+    /// projection about to embed. Each of those used to carry its own copy of
+    /// these three steps, and they had drifted: one built the embedder on the
+    /// async runtime's own thread, and one never checked that the install had
+    /// left anything to build from.
+    async fn load_embedder(
+        &self,
+        installer: Arc<dyn EmbedderInstaller>,
+    ) -> anyhow::Result<Option<Arc<dyn Embedder>>> {
+        let (probe_tx, _) = tokio::sync::mpsc::channel(1);
+        installer
+            .install(&self.model_dir, probe_tx)
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to probe model dimensions: {err:#}"))?;
+        if !installer.is_available(&self.model_dir) {
+            return Ok(None);
+        }
+        let model_dir = self.model_dir.clone();
+        let embedder = tokio::task::spawn_blocking(move || installer.build(&model_dir))
+            .await
+            .map_err(|err| anyhow::anyhow!("building the embedder panicked: {err}"))?
+            .map_err(|err| anyhow::anyhow!("building the embedder failed: {err:#}"))?;
+        Ok(Some(embedder))
     }
 
     async fn restore_index(
@@ -12144,6 +12251,120 @@ title = "title[0]"
             })),
             settlement: Arc::new(BuildSettlement::new()),
         }
+    }
+
+    /// Spin until `ctx` holds a running build, which a spawned runner reaches
+    /// asynchronously.
+    async fn until_build_running(ctx: &Arc<AppContext>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !ctx.embed_task_is_running() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the build never took the slot");
+    }
+
+    /// Work that runs until its cancel flag is raised, as a projection's
+    /// catch-up does between documents.
+    async fn until_cancelled(cancel_flag: Arc<AtomicBool>) -> anyhow::Result<()> {
+        while !cancel_flag.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        anyhow::bail!("stopped by the flag")
+    }
+
+    #[tokio::test]
+    async fn work_in_the_build_slot_is_stopped_by_cancel_within_the_deadline() {
+        let (_dir, ctx) = test_ctx();
+        let runner = Arc::clone(&ctx);
+        let run = tokio::spawn(async move { runner.run_as_embed_task(until_cancelled).await });
+        until_build_running(&ctx).await;
+
+        let asked = std::time::Instant::now();
+        ctx.cancel_embed().await;
+        let result = tokio::time::timeout(CANCEL_DEADLINE, run)
+            .await
+            .expect("the cancelled work outlived the cancel deadline")
+            .unwrap();
+        assert!(result.is_err(), "cancelled work must not report success");
+        assert!(asked.elapsed() < CANCEL_DEADLINE);
+        tokio::time::timeout(CANCEL_DEADLINE, async {
+            while ctx.embed_task_is_running() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the build slot was not released after the cancel");
+    }
+
+    #[tokio::test]
+    async fn work_waits_for_the_build_slot_rather_than_being_refused() {
+        let (_dir, ctx) = test_ctx();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let first_runner = Arc::clone(&ctx);
+        let first = tokio::spawn(async move {
+            first_runner
+                .run_as_embed_task(|_| async move {
+                    let _ = released.await;
+                    Ok(())
+                })
+                .await
+        });
+        until_build_running(&ctx).await;
+
+        let second_started = Arc::new(AtomicBool::new(false));
+        let second_runner = Arc::clone(&ctx);
+        let started = Arc::clone(&second_started);
+        let second = tokio::spawn(async move {
+            second_runner
+                .run_as_embed_task(move |_| {
+                    started.store(true, Ordering::SeqCst);
+                    async { Ok(()) }
+                })
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !second_started.load(Ordering::SeqCst),
+            "the second build started while the first held the slot"
+        );
+
+        release.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("the second build never got the slot")
+            .unwrap()
+            .unwrap();
+        assert!(second_started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_goes_away_cancels_its_build() {
+        let (_dir, ctx) = test_ctx();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let runner = Arc::clone(&ctx);
+        let saw_flag = Arc::clone(&stopped);
+        let run = tokio::spawn(async move {
+            runner
+                .run_as_embed_task(move |cancel_flag| async move {
+                    let result = until_cancelled(cancel_flag).await;
+                    saw_flag.store(true, Ordering::SeqCst);
+                    result
+                })
+                .await
+        });
+        until_build_running(&ctx).await;
+
+        run.abort();
+        tokio::time::timeout(CANCEL_DEADLINE, async {
+            while !stopped.load(Ordering::SeqCst) || ctx.embed_task_is_running() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a build whose caller went away kept running");
     }
 
     #[tokio::test]

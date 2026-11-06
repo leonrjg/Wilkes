@@ -203,6 +203,17 @@ pub fn cached_cover(cache_dir: &Path, source: &Path, max_edge: u32) -> anyhow::R
     Ok(cover.png)
 }
 
+/// The width and height a PNG declares, read from its header alone.
+///
+/// For a caller that holds a cover from [`cached_cover`] and has to say how
+/// big it is: the cache keeps the encoded bytes and nothing beside them, and
+/// the header is the one place the size is written down.
+pub fn png_dimensions(png: &[u8]) -> anyhow::Result<(u32, u32)> {
+    image::ImageReader::with_format(std::io::Cursor::new(png), image::ImageFormat::Png)
+        .into_dimensions()
+        .map_err(|error| anyhow::anyhow!("reading the PNG header failed: {error}"))
+}
+
 fn cover_file_name(source: &Path, max_edge: u32) -> anyhow::Result<String> {
     let identity = FileIdentity::of(source)?;
     let mut hasher = Sha256::new();

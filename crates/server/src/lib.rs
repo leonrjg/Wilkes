@@ -387,9 +387,9 @@ fn managed_status_with_pending(
     mut status: ManagedWorkspaceStatus,
     context: &AppContext,
 ) -> ManagedWorkspaceStatus {
-    let (imports, builds) = context.managed_pending_operations();
-    status.pending_imports = imports;
-    status.pending_builds = builds;
+    // Builds are already in `status`: a projection's catch-up runs in its
+    // build slot, which the manager reads.
+    status.pending_imports = context.managed_pending_imports();
     status
 }
 
@@ -504,10 +504,10 @@ async fn import_managed_document_handler(
                 .context_for(workspace_id)
                 .await
                 .map_err(consumer_anyhow_err)?;
-            let path = source
-                .authorize_managed_workspace_file(root.clone(), path.clone())
+            let (_, path) = source
+                .export_file_path(root.clone(), path.clone(), "Managed import")
                 .await
-                .map_err(consumer_err)?;
+                .map_err(|error| consumer_err(ConsumerError::untyped(error)))?;
             (path, Some(source))
         }
     };

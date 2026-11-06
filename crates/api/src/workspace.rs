@@ -1,6 +1,7 @@
 use parking_lot::{Mutex as PLMutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::{mpsc, Mutex};
@@ -270,6 +271,40 @@ impl WorkspaceManifest {
             active_root: None,
             semantic: None,
         }
+    }
+
+    /// A new application-managed workspace: a canonical corpus when
+    /// `parent_corpus_id` is `None`, otherwise one embedding projection of
+    /// that corpus. Its `managed_sources` directory is created here, because
+    /// the manifest names it as the workspace's one root.
+    fn application_managed(
+        app_data_dir: &Path,
+        name: String,
+        owner: &str,
+        corpus_key: &str,
+        parent_corpus_id: Option<&str>,
+        mut semantic: SemanticSettings,
+    ) -> anyhow::Result<Self> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let root = workspace_root(app_data_dir, &id);
+        let managed_sources = root.join("managed_sources");
+        std::fs::create_dir_all(&managed_sources)?;
+        semantic.index_path = Some(root.join("semantic_index.db"));
+        Ok(Self {
+            version: MANIFEST_VERSION,
+            id,
+            name,
+            kind: WorkspaceKind::ApplicationManaged {
+                owner: owner.to_string(),
+                purpose: "semantic-corpus".to_string(),
+                corpus_key: corpus_key.to_string(),
+                parent_corpus_id: parent_corpus_id.map(str::to_string),
+            },
+            favorites: vec![managed_sources.clone()],
+            recent_roots: Vec::new(),
+            active_root: Some(managed_sources),
+            semantic: Some(semantic),
+        })
     }
 
     pub(crate) fn is_application_managed(&self) -> bool {
@@ -628,6 +663,24 @@ fn read_manifest_unlocked(path: &Path) -> anyhow::Result<WorkspaceManifest> {
     Ok(manifest)
 }
 
+/// Adds a new workspace to the registry: its manifest first, then its id.
+///
+/// The one way a workspace comes to exist after the first, whoever asks for
+/// it — the user, an application's corpus, or that corpus's projection. The
+/// caller holds `registry_lock` and hands in the registry it loaded under it.
+fn register_workspace(
+    app_data_dir: &Path,
+    registry: &mut WorkspaceRegistryFile,
+    manifest: &WorkspaceManifest,
+) -> anyhow::Result<()> {
+    write_manifest(
+        &workspace_manifest_path(app_data_dir, &manifest.id),
+        manifest,
+    )?;
+    registry.workspace_ids.push(manifest.id.clone());
+    atomic_write_json(&registry_path(app_data_dir), registry)
+}
+
 pub(crate) fn write_manifest(path: &Path, manifest: &WorkspaceManifest) -> anyhow::Result<()> {
     let _guard = manifest_lock().lock();
     atomic_write_json(path, manifest)
@@ -973,9 +1026,7 @@ impl WorkspaceManager {
             let id = uuid::Uuid::new_v4().to_string();
             let manifest = WorkspaceManifest::new(id.clone(), name.to_string());
             let manifest_path = workspace_manifest_path(&self.app_data_dir, &id);
-            write_manifest(&manifest_path, &manifest)?;
-            registry.workspace_ids.push(id);
-            atomic_write_json(&registry_path(&self.app_data_dir), &registry)?;
+            register_workspace(&self.app_data_dir, &mut registry, &manifest)?;
             (manifest, manifest_path)
         };
         // A fresh workspace declares no semantic block, so what it embeds with
@@ -1255,31 +1306,16 @@ impl WorkspaceManager {
                 );
                 manifest.id
             } else {
-                let id = uuid::Uuid::new_v4().to_string();
-                let managed_sources =
-                    workspace_root(&self.app_data_dir, &id).join("managed_sources");
-                std::fs::create_dir_all(&managed_sources)?;
-                semantic.index_path =
-                    Some(workspace_root(&self.app_data_dir, &id).join("semantic_index.db"));
-                let manifest = WorkspaceManifest {
-                    version: MANIFEST_VERSION,
-                    id: id.clone(),
-                    name: format!("{owner} semantic corpus"),
-                    kind: WorkspaceKind::ApplicationManaged {
-                        owner: owner.to_string(),
-                        purpose: "semantic-corpus".to_string(),
-                        corpus_key: corpus_key.to_string(),
-                        parent_corpus_id: None,
-                    },
-                    favorites: vec![managed_sources.clone()],
-                    recent_roots: Vec::new(),
-                    active_root: Some(managed_sources),
-                    semantic: Some(semantic),
-                };
-                write_manifest(&workspace_manifest_path(&self.app_data_dir, &id), &manifest)?;
-                registry.workspace_ids.push(id.clone());
-                atomic_write_json(&registry_path(&self.app_data_dir), &registry)?;
-                id
+                let manifest = WorkspaceManifest::application_managed(
+                    &self.app_data_dir,
+                    format!("{owner} semantic corpus"),
+                    owner,
+                    corpus_key,
+                    None,
+                    semantic,
+                )?;
+                register_workspace(&self.app_data_dir, &mut registry, &manifest)?;
+                manifest.id
             }
         };
         self.managed_workspace_status(&id).await
@@ -1317,32 +1353,18 @@ impl WorkspaceManager {
                 return Ok(id.clone());
             }
         }
-        let id = uuid::Uuid::new_v4().to_string();
-        let root = workspace_root(&self.app_data_dir, &id);
-        let managed_sources = root.join("managed_sources");
-        std::fs::create_dir_all(&managed_sources)?;
         let mut semantic = parent_semantic.clone();
         semantic.selected = embedding.clone();
-        semantic.index_path = Some(root.join("semantic_index.db"));
-        let manifest = WorkspaceManifest {
-            version: MANIFEST_VERSION,
-            id: id.clone(),
-            name: format!("{owner} embedding projection"),
-            kind: WorkspaceKind::ApplicationManaged {
-                owner: owner.to_string(),
-                purpose: "semantic-corpus".to_string(),
-                corpus_key: corpus_key.to_string(),
-                parent_corpus_id: Some(corpus_id.to_string()),
-            },
-            favorites: vec![managed_sources.clone()],
-            recent_roots: Vec::new(),
-            active_root: Some(managed_sources),
-            semantic: Some(semantic),
-        };
-        write_manifest(&workspace_manifest_path(&self.app_data_dir, &id), &manifest)?;
-        registry.workspace_ids.push(id.clone());
-        atomic_write_json(&registry_path(&self.app_data_dir), &registry)?;
-        Ok(id)
+        let manifest = WorkspaceManifest::application_managed(
+            &self.app_data_dir,
+            format!("{owner} embedding projection"),
+            owner,
+            corpus_key,
+            Some(corpus_id),
+            semantic,
+        )?;
+        register_workspace(&self.app_data_dir, &mut registry, &manifest)?;
+        Ok(manifest.id)
     }
 
     /// Adds one derived embedding projection to an existing managed corpus.
@@ -1426,46 +1448,62 @@ impl WorkspaceManager {
         source_workspace: Option<Arc<AppContext>>,
     ) -> anyhow::Result<()> {
         let child = self.context_for(projection_workspace_id).await?;
-        child
-            .ensure_managed_runtime()
-            .await
-            .map_err(anyhow::Error::msg)?;
         let canonical_context = self.context_for(corpus_id).await?;
-        canonical_context
-            .ensure_managed_index()
-            .await
-            .map_err(anyhow::Error::msg)?;
+        let corpus_id = corpus_id.to_string();
+        // A build of the projection's index, run as one: it loads the model
+        // and embeds with it, so it is what the projection's cancel stops.
+        let projection = Arc::clone(&child);
+        child
+            .run_as_embed_task(move |cancel_flag| async move {
+                projection
+                    .ensure_managed_runtime()
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                canonical_context
+                    .ensure_managed_index()
+                    .await
+                    .map_err(anyhow::Error::msg)?;
 
-        // The projection computes vectors only: it neither copies sources nor
-        // repeats extraction or chunking. Its passages are the canonical
-        // admitted rendition's passages, which is what keeps every space's
-        // chunk refs identical.
-        let sources = canonical_context
-            .managed_admitted_sources()
-            .map_err(anyhow::Error::msg)?;
-        for (source, rendition) in sources {
-            // Keyed by the rendition, not by the source bytes. The key is
-            // bound to a rendition for the life of the index and nothing can
-            // rebind it, so a key that names less than what it is bound to
-            // becomes a tombstone the moment the unnamed part moves: the
-            // source digest survives a re-extraction, the rendition does not,
-            // and a corpus whose recipe had changed could never bring a
-            // projection level again.
-            child
-                .import_managed_projection(
-                    format!("space-backfill-{rendition}"),
-                    &canonical_context,
-                    source.clone(),
-                    serde_json::json!({
-                        "kind": "managed_corpus_projection",
-                        "canonical_corpus_id": corpus_id,
-                    }),
-                    source_workspace.as_ref(),
-                )
-                .await
-                .map_err(anyhow::Error::msg)?;
-        }
-        Ok(())
+                // The projection computes vectors only: it neither copies
+                // sources nor repeats extraction or chunking. Its passages are
+                // the canonical admitted rendition's passages, which is what
+                // keeps every space's chunk refs identical.
+                let sources = canonical_context
+                    .managed_admitted_sources()
+                    .map_err(anyhow::Error::msg)?;
+                for (source, rendition) in sources {
+                    // Between documents, as a build checks: a cancel raises
+                    // the flag before it kills, so the next document is never
+                    // started into a killed worker.
+                    anyhow::ensure!(
+                        !cancel_flag.load(Ordering::Relaxed),
+                        "catching up was cancelled"
+                    );
+                    // Keyed by the rendition, not by the source bytes. The key
+                    // is bound to a rendition for the life of the index and
+                    // nothing can rebind it, so a key that names less than
+                    // what it is bound to becomes a tombstone the moment the
+                    // unnamed part moves: the source digest survives a
+                    // re-extraction, the rendition does not, and a corpus
+                    // whose recipe had changed could never bring a projection
+                    // level again.
+                    projection
+                        .import_managed_projection(
+                            format!("space-backfill-{rendition}"),
+                            &canonical_context,
+                            source.clone(),
+                            serde_json::json!({
+                                "kind": "managed_corpus_projection",
+                                "canonical_corpus_id": corpus_id,
+                            }),
+                            source_workspace.as_ref(),
+                        )
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                }
+                Ok(())
+            })
+            .await
     }
 
     /// Brings every projection of one corpus level with it, reporting per
@@ -1861,6 +1899,16 @@ impl WorkspaceManager {
                 let Ok(index) = SemanticIndex::open_for_maintenance(&child_root) else {
                     continue;
                 };
+                // Read off the build slot, which is where a projection's
+                // catch-up runs; only an open context can be running one.
+                if self
+                    .scoped
+                    .lock()
+                    .get(&workspace_id)
+                    .is_some_and(|context| context.embed_task_is_running())
+                {
+                    status.pending_builds += 1;
+                }
                 let child_identity = index.embedding_space_identity()?;
                 let indexed_generation = index.managed_snapshot_sha256()?;
                 let counts = index.managed_completeness()?;

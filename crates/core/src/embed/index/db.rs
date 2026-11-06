@@ -4071,6 +4071,9 @@ struct PendingFile {
 
 // ── Prepared file (ready to write) ───────────────────────────────────────────
 
+/// A document's chunks, each with its vector, in chunk order.
+type EmbeddedChunks = Vec<(Chunk, Vec<f32>)>;
+
 pub struct PreparedFile {
     pub path: PathBuf,
     /// Pairs of (chunk metadata, embedding vector), ready to write.
@@ -6013,34 +6016,30 @@ impl SemanticIndex {
         chunk_size: usize,
         chunk_overlap: usize,
     ) -> anyhow::Result<PreparedFile> {
-        let (full_text, raw_chunks, retained) =
-            Self::extract_chunks(path, extractors, chunk_size, chunk_overlap)?;
-        if raw_chunks.is_empty() {
-            return Ok(PreparedFile {
-                path: path.to_path_buf(),
-                chunks: Vec::new(),
-                full_text,
-                retained,
-            });
+        let mut prepared =
+            Self::prepare_file_without_vectors(path, extractors, chunk_size, chunk_overlap)?;
+        if prepared.chunks.is_empty() {
+            return Ok(prepared);
         }
 
-        let texts: Vec<&str> = raw_chunks.iter().map(|c| c.text.as_str()).collect();
+        let texts: Vec<&str> = prepared
+            .chunks
+            .iter()
+            .map(|(chunk, _)| chunk.text.as_str())
+            .collect();
         let embeddings = embedder.embed_passages(&texts)?;
 
         anyhow::ensure!(
-            embeddings.len() == raw_chunks.len(),
+            embeddings.len() == prepared.chunks.len(),
             "Embedder returned {} embeddings for {} chunks",
             embeddings.len(),
-            raw_chunks.len()
+            prepared.chunks.len()
         );
 
-        let chunks = raw_chunks.into_iter().zip(embeddings).collect();
-        Ok(PreparedFile {
-            path: path.to_path_buf(),
-            chunks,
-            full_text,
-            retained,
-        })
+        for ((_, vector), embedding) in prepared.chunks.iter_mut().zip(embeddings) {
+            *vector = embedding;
+        }
+        Ok(prepared)
     }
 
     /// Extract and chunk a file without embedding it.
@@ -6132,88 +6131,24 @@ impl SemanticIndex {
             || modified_at_ms != identity.modified_at_ms
             || stored_source_sha256.as_deref() != Some(source_sha256.as_str())
             || stored_recipe_id.as_deref() != Some(recipe.id().as_str())
-            || stored_rendition_id.is_none()
         {
             return Ok(false);
         }
 
-        let mut stmt = source.conn.prepare(
-            "SELECT c.byte_start, c.byte_end,
-                    c.origin_type, c.page, c.line, c.col,
-                    c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h, c.chunk_text,
-                    v.embedding
-             FROM chunks c
-             JOIN vec_chunks v ON v.rowid = c.id
-             WHERE c.file_id = ?1
-             ORDER BY c.chunk_idx",
-        )?;
-        let rows = stmt
-            .query_map(params![source_file_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, Option<f64>>(6)?,
-                    row.get::<_, Option<f64>>(7)?,
-                    row.get::<_, Option<f64>>(8)?,
-                    row.get::<_, Option<f64>>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, Vec<u8>>(11)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        if rows.is_empty() {
+        let Some(stored_rendition_id) = stored_rendition_id else {
             return Ok(false);
-        }
-
-        let mut chunks = Vec::with_capacity(rows.len());
-        for (
-            byte_start,
-            byte_end,
-            origin_type,
-            page,
-            line,
-            col,
-            bbox_x,
-            bbox_y,
-            bbox_w,
-            bbox_h,
-            text,
-            embedding_blob,
-        ) in rows
-        {
-            let Some(origin) = source_origin_from_parts(
-                &origin_type,
-                page,
-                line,
-                col,
-                bbox_x,
-                bbox_y,
-                bbox_w,
-                bbox_h,
-            ) else {
-                return Ok(false);
-            };
-            let embedding = f32_slice_from_bytes(&embedding_blob)?;
-            if embedding.len() != self.dimension {
-                return Ok(false);
-            }
-            chunks.push((
-                Chunk {
-                    file_path: path.to_path_buf(),
-                    text,
-                    byte_range: ByteRange {
-                        start: byte_start as usize,
-                        end: byte_end as usize,
-                    },
-                    origin,
-                },
-                embedding,
-            ));
-        }
+        };
+        let recipe_id = recipe.id();
+        let Some(chunks) = source.verified_rendition_chunks(
+            source_file_id,
+            &source_sha256,
+            &recipe_id,
+            &stored_rendition_id,
+            path,
+        )?
+        else {
+            return Ok(false);
+        };
 
         // Pre-v4 rows have no stored full text. Some builds made those rows look
         // populated by coercing NULL to an empty string even though they still
@@ -6226,22 +6161,6 @@ impl SemanticIndex {
         if stored_extracted_content_sha256.as_deref()
             != Some(sha256_bytes(full_text.as_bytes()).as_str())
         {
-            return Ok(false);
-        }
-
-        let descriptors: Vec<ChunkDescriptor> = chunks
-            .iter()
-            .enumerate()
-            .map(|(ordinal, (chunk, _))| ChunkDescriptor {
-                ordinal,
-                text_sha256: sha256_bytes(chunk.text.as_bytes()),
-                byte_range: chunk.byte_range.clone(),
-                origin: chunk.origin.clone(),
-            })
-            .collect();
-        let expected_rendition =
-            rendition_id(&snapshot_id(&source_sha256), &recipe.id(), &descriptors);
-        if stored_rendition_id.as_deref() != Some(expected_rendition.as_str()) {
             return Ok(false);
         }
 
@@ -6263,6 +6182,122 @@ impl SemanticIndex {
             None,
         )?;
         Ok(true)
+    }
+
+    /// One file's chunks and vectors as this index holds them, re-checked
+    /// against what was recorded when they were written: each chunk's text
+    /// against its stored hash, each vector for this index's width and for
+    /// finite components, and the whole against the rendition id those chunks
+    /// recompute to under `recipe_id`. `None` when any of it disagrees.
+    ///
+    /// The one reader both kinds of whole-file reuse go through — a build
+    /// copying an unchanged file from the index it replaces, and a managed
+    /// import adopting a rendition another workspace already read. The chunks
+    /// come back addressed to `target_path`, which is where they are about to
+    /// be written.
+    fn verified_rendition_chunks(
+        &self,
+        file_id: i64,
+        source_sha256: &str,
+        recipe_id: &str,
+        stored_rendition_id: &str,
+        target_path: &Path,
+    ) -> anyhow::Result<Option<EmbeddedChunks>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.chunk_idx, c.byte_start, c.byte_end, c.origin_type,
+                    c.page, c.line, c.col, c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h,
+                    c.chunk_text, c.text_sha256, v.embedding
+             FROM chunks c JOIN vec_chunks v ON v.rowid = c.id
+             WHERE c.file_id = ?1 ORDER BY c.chunk_idx",
+        )?;
+        let rows = stmt
+            .query_map(params![file_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<f64>>(7)?,
+                    row.get::<_, Option<f64>>(8)?,
+                    row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, Option<f64>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Vec<u8>>(13)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let mut chunks = Vec::with_capacity(rows.len());
+        let mut descriptors = Vec::with_capacity(rows.len());
+        for (
+            ordinal,
+            byte_start,
+            byte_end,
+            origin_type,
+            page,
+            line,
+            col,
+            bbox_x,
+            bbox_y,
+            bbox_w,
+            bbox_h,
+            text,
+            stored_text_sha256,
+            embedding_blob,
+        ) in rows
+        {
+            let Some(origin) = source_origin_from_parts(
+                &origin_type,
+                page,
+                line,
+                col,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+            ) else {
+                return Ok(None);
+            };
+            let text_sha256 = sha256_bytes(text.as_bytes());
+            if stored_text_sha256.as_deref() != Some(text_sha256.as_str()) {
+                return Ok(None);
+            }
+            let embedding = f32_slice_from_bytes(&embedding_blob)?;
+            if embedding.len() != self.dimension || embedding.iter().any(|value| !value.is_finite())
+            {
+                return Ok(None);
+            }
+            let byte_range = ByteRange {
+                start: byte_start as usize,
+                end: byte_end as usize,
+            };
+            descriptors.push(ChunkDescriptor {
+                ordinal: ordinal as usize,
+                text_sha256,
+                byte_range: byte_range.clone(),
+                origin: origin.clone(),
+            });
+            chunks.push((
+                Chunk {
+                    file_path: target_path.to_path_buf(),
+                    text,
+                    byte_range,
+                    origin,
+                },
+                embedding,
+            ));
+        }
+        let recomputed = rendition_id(&snapshot_id(source_sha256), recipe_id, &descriptors);
+        if recomputed.as_str() != stored_rendition_id {
+            return Ok(None);
+        }
+        Ok(Some(chunks))
     }
 
     /// Fill `full_text` for rows that carry chunks but no stored text — legacy
@@ -8733,103 +8768,19 @@ impl SemanticIndex {
         if sha256_bytes(full_text.as_bytes()) != stored_extracted_content_sha256 {
             return Ok(None);
         }
-        let mut stmt = self.conn.prepare(
-            "SELECT c.chunk_idx, c.byte_start, c.byte_end, c.origin_type,
-                    c.page, c.line, c.col, c.bbox_x, c.bbox_y, c.bbox_w, c.bbox_h,
-                    c.chunk_text, c.text_sha256, v.embedding
-             FROM chunks c JOIN vec_chunks v ON v.rowid = c.id
-             WHERE c.file_id = ?1 ORDER BY c.chunk_idx",
-        )?;
-        let rows = stmt
-            .query_map(params![file_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, Option<f64>>(7)?,
-                    row.get::<_, Option<f64>>(8)?,
-                    row.get::<_, Option<f64>>(9)?,
-                    row.get::<_, Option<f64>>(10)?,
-                    row.get::<_, String>(11)?,
-                    row.get::<_, Option<String>>(12)?,
-                    row.get::<_, Vec<u8>>(13)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        if rows.is_empty() {
+        let Some(chunks) = self.verified_rendition_chunks(
+            file_id,
+            source_sha256,
+            &recipe_id,
+            &stored_rendition,
+            target_path,
+        )?
+        else {
             return Ok(None);
-        }
-        let mut prepared_chunks = Vec::with_capacity(rows.len());
-        let mut descriptors = Vec::with_capacity(rows.len());
-        for (
-            ordinal,
-            byte_start,
-            byte_end,
-            origin_type,
-            page,
-            line,
-            col,
-            bbox_x,
-            bbox_y,
-            bbox_w,
-            bbox_h,
-            text,
-            stored_text_sha256,
-            embedding_blob,
-        ) in rows
-        {
-            let Some(origin) = source_origin_from_parts(
-                &origin_type,
-                page,
-                line,
-                col,
-                bbox_x,
-                bbox_y,
-                bbox_w,
-                bbox_h,
-            ) else {
-                return Ok(None);
-            };
-            let text_sha256 = sha256_bytes(text.as_bytes());
-            if stored_text_sha256.as_deref() != Some(text_sha256.as_str()) {
-                return Ok(None);
-            }
-            let embedding = f32_slice_from_bytes(&embedding_blob)?;
-            if embedding.len() != self.dimension || embedding.iter().any(|value| !value.is_finite())
-            {
-                return Ok(None);
-            }
-            let byte_range = ByteRange {
-                start: byte_start as usize,
-                end: byte_end as usize,
-            };
-            descriptors.push(ChunkDescriptor {
-                ordinal: ordinal as usize,
-                text_sha256,
-                byte_range: byte_range.clone(),
-                origin: origin.clone(),
-            });
-            prepared_chunks.push((
-                Chunk {
-                    file_path: target_path.to_path_buf(),
-                    text,
-                    byte_range,
-                    origin,
-                },
-                embedding,
-            ));
-        }
-        let recomputed = rendition_id(&snapshot_id(source_sha256), &recipe.id(), &descriptors);
-        if recomputed.as_str() != stored_rendition {
-            return Ok(None);
-        }
+        };
         Ok(Some(PreparedFile {
             path: target_path.to_path_buf(),
-            chunks: prepared_chunks,
+            chunks,
             full_text,
             retained: self.retained_extraction_for_file(file_id)?,
         }))
