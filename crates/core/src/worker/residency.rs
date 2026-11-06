@@ -36,16 +36,23 @@
 //! # What waiting means
 //!
 //! A permit is held from the spawn of a worker to its death, so a second
-//! context's first request blocks until the first context's worker goes. That
-//! is not indefinite: a worker that stops being asked for anything dies at its
-//! idle timeout and releases the permit. Two builds over two workspaces
-//! therefore run one after the other rather than both at once — which is the
-//! intended trade, and the alternative to it is the swap thrash that made
-//! neither of them finish.
+//! context's first request blocks until the first context's worker goes. A
+//! worker that stops being asked for anything dies at its idle timeout and
+//! releases the permit — but one that keeps being asked never idles, and
+//! waiting for that alone let one workspace's searches hold the kind for an
+//! hour while another's build waited. So a holder that another manager is
+//! waiting behind also gives the permit up at its next gap between requests,
+//! once it has held it for [`MIN_TENURE_WHILE_OTHERS_WAIT`], and the waiters
+//! are admitted in arrival order. Two workspaces sharing a kind therefore take
+//! turns rather than both running at once — the intended trade, since the
+//! alternative is the swap thrash that made neither of them finish — and the
+//! tenure bounds how often a turn costs a model load.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::ipc::WorkerKind;
 
@@ -58,25 +65,104 @@ const RESIDENT_WORKERS_PER_KIND: usize = 1;
 /// The permit a live worker holds. Dropping it admits the next one.
 pub(super) type Residency = OwnedSemaphorePermit;
 
-fn semaphores() -> &'static [Arc<Semaphore>; 3] {
-    static SEMAPHORES: OnceLock<[Arc<Semaphore>; 3]> = OnceLock::new();
-    SEMAPHORES.get_or_init(|| {
+/// How long a worker keeps residency once it has it, before another
+/// workspace's waiting manager may take it at the worker's next gap.
+///
+/// Waiting for the holder's *idle timeout* was not a bound at all: a holder
+/// that kept being asked for something never idled. On 2026-11-05 a stream of
+/// searches against one projection kept its worker alive for an hour while a
+/// second projection's build waited for a worker the whole time, and the
+/// build's caller gave up after twelve minutes. So a holder that someone is
+/// waiting behind gives the permit up at its next gap between requests.
+///
+/// Not at once, because every hand-off is a model load on the other side and
+/// another when it comes back — eighteen seconds for an 8B model. Thirty
+/// seconds of tenure bounds how often two workspaces sharing one kind can
+/// trade the worker, so each gets real work done between loads.
+pub(super) const MIN_TENURE_WHILE_OTHERS_WAIT: Duration = Duration::from_secs(30);
+
+/// Who may hold a worker of one kind, and who is waiting to.
+pub(super) struct KindResidency {
+    permits: Arc<Semaphore>,
+    /// Managers blocked in [`Self::admit`]. Read by holders deciding whether
+    /// to give the permit up at their next gap.
+    waiting: AtomicUsize,
+    /// Raised each time a manager starts waiting, so an idle holder learns
+    /// of it without polling.
+    waiter_arrived: Notify,
+}
+
+impl KindResidency {
+    pub(super) fn new(permits: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(permits)),
+            waiting: AtomicUsize::new(0),
+            waiter_arrived: Notify::new(),
+        }
+    }
+
+    /// A permit, waiting in arrival order for one if none is free. Counted
+    /// among the waiters for exactly as long as it waits, including when the
+    /// caller abandons the wait by dropping this future.
+    pub(super) async fn admit(&self) -> Result<Residency, AcquireError> {
+        if let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() {
+            return Ok(permit);
+        }
+        struct Waiting<'a>(&'a AtomicUsize);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        let _waiting = Waiting(&self.waiting);
+        self.waiter_arrived.notify_waiters();
+        Arc::clone(&self.permits).acquire_owned().await
+    }
+
+    /// Whether another manager is waiting for a permit of this kind.
+    pub(super) fn others_waiting(&self) -> bool {
+        self.waiting.load(Ordering::Acquire) > 0
+    }
+
+    /// Resolves once another manager is waiting. Immediately if one already is.
+    pub(super) async fn until_others_wait(&self) {
+        loop {
+            let arrived = self.waiter_arrived.notified();
+            tokio::pin!(arrived);
+            arrived.as_mut().enable();
+            if self.others_waiting() {
+                return;
+            }
+            arrived.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn available_permits(&self) -> usize {
+        self.permits.available_permits()
+    }
+}
+
+fn kinds() -> &'static [Arc<KindResidency>; 3] {
+    static KINDS: OnceLock<[Arc<KindResidency>; 3]> = OnceLock::new();
+    KINDS.get_or_init(|| {
         [
-            Arc::new(Semaphore::new(RESIDENT_WORKERS_PER_KIND)),
-            Arc::new(Semaphore::new(RESIDENT_WORKERS_PER_KIND)),
-            Arc::new(Semaphore::new(RESIDENT_WORKERS_PER_KIND)),
+            Arc::new(KindResidency::new(RESIDENT_WORKERS_PER_KIND)),
+            Arc::new(KindResidency::new(RESIDENT_WORKERS_PER_KIND)),
+            Arc::new(KindResidency::new(RESIDENT_WORKERS_PER_KIND)),
         ]
     })
 }
 
-/// The one semaphore that admits workers of `kind`, for this process.
-pub(super) fn for_kind(kind: WorkerKind) -> Arc<Semaphore> {
+/// The one residency that admits workers of `kind`, for this process.
+pub(super) fn for_kind(kind: WorkerKind) -> Arc<KindResidency> {
     let index = match kind {
         WorkerKind::Embed => 0,
         WorkerKind::Generate => 1,
         WorkerKind::Recognize => 2,
     };
-    Arc::clone(&semaphores()[index])
+    Arc::clone(&kinds()[index])
 }
 
 #[cfg(test)]
