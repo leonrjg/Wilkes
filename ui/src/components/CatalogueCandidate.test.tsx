@@ -1,4 +1,4 @@
-import { act, fireEvent, render as renderAlone, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render as renderAlone, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement, ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LiteratureSearchResult } from "../lib/types";
@@ -168,6 +168,18 @@ describe("CatalogueCandidate", () => {
     fireEvent.error(image);
     expect(screen.queryByRole("img")).toBeNull();
     expect(screen.getByText(HIT.title as string)).toBeTruthy();
+  });
+
+  it("opens a result image as large as the window allows and closes it on Escape", () => {
+    const url = "https://media.example.invalid/cover.jpg";
+    render(<CatalogueCandidate provider="custom:kitsu" work={{ ...HIT, image_url: url }} />);
+    fireEvent.click(screen.getByRole("button", { name: `Show image for ${HIT.title}` }));
+    const dialog = screen.getByRole("dialog", { name: `Image for ${HIT.title}` });
+    const large = within(dialog).getByRole("img", { name: `Image for ${HIT.title}` });
+    expect(large.getAttribute("src")).toBe(url);
+    expect(large.getAttribute("referrerpolicy")).toBe("no-referrer");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("keeps results without optional media and compact results free of image placeholders", () => {

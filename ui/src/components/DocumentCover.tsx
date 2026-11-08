@@ -1,3 +1,4 @@
+import type React from "react";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { FileText } from "react-feather";
@@ -96,7 +97,31 @@ interface CoverViewerProps {
 /** One document's cover, as large as the window allows. */
 export function CoverViewer({ path, onClose }: CoverViewerProps) {
   const { url, failed } = useCover(path, "", loadFullCover);
+  return (
+    <ImageViewer
+      src={url}
+      failed={failed}
+      label={`Cover of ${fileName(path)}`}
+      onClose={onClose}
+    />
+  );
+}
 
+interface ImageViewerProps {
+  /** Null while the picture is still being drawn. */
+  src: string | null;
+  failed: boolean;
+  /** What the picture is of, for the dialog and the image alike. */
+  label: string;
+  onClose: () => void;
+  /** For a picture fetched from another site, which need not learn where it is
+   *  shown. */
+  referrerPolicy?: React.ImgHTMLAttributes<HTMLImageElement>["referrerPolicy"];
+}
+
+/** One picture, as large as the window allows, over everything else. Closed
+ *  by a click anywhere or by Escape. */
+export function ImageViewer({ src, failed, label, onClose, referrerPolicy }: ImageViewerProps) {
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
@@ -109,22 +134,23 @@ export function CoverViewer({ path, onClose }: CoverViewerProps) {
     <div
       role="dialog"
       aria-modal="true"
-      aria-label={`Cover of ${fileName(path)}`}
+      aria-label={label}
       onClick={onClose}
       className="fixed inset-0 z-[1100] flex cursor-zoom-out items-center justify-center bg-black/70"
     >
-      {url ? (
+      {failed ? (
+        <span className="text-sm text-white">This picture could not be drawn.</span>
+      ) : src ? (
         <img
-          src={url}
-          alt={`Cover of ${fileName(path)}`}
+          src={src}
+          alt={label}
+          referrerPolicy={referrerPolicy}
           className="max-h-[92vh] max-w-[92vw] object-contain shadow-2xl"
         />
-      ) : failed ? (
-        <span className="text-sm text-white">This cover could not be drawn.</span>
       ) : (
         <div
           role="status"
-          aria-label="Loading cover"
+          aria-label="Loading picture"
           className="h-6 w-6 animate-spin rounded-full border-2 border-white border-t-transparent"
         />
       )}

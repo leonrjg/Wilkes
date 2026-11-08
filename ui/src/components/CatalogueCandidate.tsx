@@ -17,6 +17,7 @@ import {
   useCatalogueStore,
 } from "../stores/useCatalogueStore";
 import { Tooltip } from "@leonrjg/wilkes-reader";
+import { ImageViewer } from "./DocumentCover";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -69,18 +70,40 @@ function RowTitle({ title }: { title: string }) {
   );
 }
 
+/** A result's picture, which opens as large as the window allows on a click,
+ *  as a document's cover in the sidebar does. It is the picture this row has
+ *  already drawn, so the viewer cannot be left waiting on it. */
 function ResultImage({ url, title }: { url: string; title: string }) {
   const [failed, setFailed] = useState(false);
+  const [viewing, setViewing] = useState(false);
   if (failed) return null;
   return (
-    <img
-      src={url}
-      alt={`Image for ${title}`}
-      loading="lazy"
-      referrerPolicy="no-referrer"
-      onError={() => setFailed(true)}
-      className="h-20 w-14 shrink-0 rounded object-contain"
-    />
+    <>
+      <button
+        type="button"
+        onClick={() => setViewing(true)}
+        aria-label={`Show image for ${title}`}
+        className="shrink-0 cursor-zoom-in rounded border border-transparent hover:border-[var(--border-strong)]"
+      >
+        <img
+          src={url}
+          alt={`Image for ${title}`}
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          onError={() => setFailed(true)}
+          className="h-20 w-14 rounded object-contain"
+        />
+      </button>
+      {viewing && (
+        <ImageViewer
+          src={url}
+          failed={false}
+          label={`Image for ${title}`}
+          referrerPolicy="no-referrer"
+          onClose={() => setViewing(false)}
+        />
+      )}
+    </>
   );
 }
 
