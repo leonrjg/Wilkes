@@ -3354,8 +3354,12 @@ impl AppContext {
             .iter()
             .map(|(chunk, _)| wilkes_core::embed::identity::sha256_bytes(chunk.text.as_bytes()))
             .collect();
-        let mut adopted: std::collections::HashMap<String, Vec<f32>> =
-            std::collections::HashMap::new();
+        // One vector per distinct text hash, whatever its origin: adopted from
+        // the source workspace or this space below, or embedded fresh further
+        // down. Every chunk is then filled by looking its hash up here, so two
+        // chunks with the same text share one vector instead of competing for
+        // it.
+        let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
         if source_workspace.is_none() {
             // The import named no library to adopt from — a plain path import,
             // or a caller that resolved one and did not pass it on. Worth
@@ -3377,29 +3381,34 @@ impl AppContext {
                 &canonical_recipe_id,
                 label,
             ) {
-                adopted.entry(hash).or_insert(embedding);
+                vectors.entry(hash).or_insert(embedding);
             }
         }
 
+        let adopted_chunks = text_hashes
+            .iter()
+            .filter(|hash| vectors.contains_key(*hash))
+            .count();
         // Owned, because the embedding runs on the blocking pool and cannot
         // borrow `prepared`. `Embedder` is a blocking trait — the worker-backed
         // implementation waits on its subprocess by blocking the calling
         // thread — so an async caller has to leave the runtime thread first.
-        let missing: Vec<String> = prepared
-            .chunks
-            .iter()
-            .zip(&text_hashes)
-            .filter(|(_, hash)| !adopted.contains_key(*hash))
-            .map(|((chunk, _), _)| chunk.text.clone())
-            .collect();
+        let (missing_hashes, missing): (Vec<String>, Vec<String>) = texts_to_embed(
+            prepared.chunks.iter().map(|(chunk, _)| chunk.text.as_str()),
+            &text_hashes,
+            &vectors,
+        )
+        .into_iter()
+        .unzip();
         let missing_count = missing.len();
         tracing::info!(
-            "projection import: {} of {} chunks adopted, {} to embed",
-            prepared.chunks.len() - missing_count,
+            "projection import: {} of {} chunks adopted, {} distinct texts to embed for the other {}",
+            adopted_chunks,
             prepared.chunks.len(),
-            missing_count
+            missing_count,
+            prepared.chunks.len() - adopted_chunks
         );
-        let mut computed = if missing.is_empty() {
+        let computed = if missing.is_empty() {
             Vec::new()
         } else {
             let embedder = self.embedder.lock().clone().ok_or_else(|| {
@@ -3420,27 +3429,14 @@ impl AppContext {
             return Err(ConsumerError::new(
                 ConsumerErrorCode::DocumentIndexIncomplete,
                 format!(
-                    "embedder returned {} vectors for {} chunks it was asked to embed",
+                    "embedder returned {} vectors for {} texts it was asked to embed",
                     computed.len(),
                     missing_count
                 ),
             ));
         }
-        // Adopted where we had it, freshly computed where we did not, in the
-        // canonical chunk order either way. `computed` is consumed front to
-        // back in the same order `missing` was collected.
-        let mut fresh = computed.drain(..);
-        for ((_, vector), hash) in prepared.chunks.iter_mut().zip(&text_hashes) {
-            *vector = match adopted.remove(hash) {
-                Some(embedding) => embedding,
-                None => fresh.next().ok_or_else(|| {
-                    ConsumerError::new(
-                        ConsumerErrorCode::DocumentIndexIncomplete,
-                        "ran out of computed vectors while filling canonical chunks",
-                    )
-                })?,
-            };
-        }
+        vectors.extend(missing_hashes.into_iter().zip(computed));
+        fill_chunk_vectors(&mut prepared.chunks, &text_hashes, &vectors)?;
         let expected_chunks = prepared.chunks.len();
         let managed = {
             let index_arc = self.index.lock().clone();
@@ -9629,6 +9625,42 @@ async fn enrichment_for(
     }
 }
 
+/// The texts a projection import still has to embed: one `(hash, text)` per
+/// distinct text hash that `vectors` holds nothing for, in the order each hash
+/// first appears among the chunks. A text repeated across chunks is embedded
+/// once, and every chunk carrying it is filled from that one vector.
+fn texts_to_embed<'a>(
+    texts: impl Iterator<Item = &'a str>,
+    text_hashes: &[String],
+    vectors: &HashMap<String, Vec<f32>>,
+) -> Vec<(String, String)> {
+    let mut queued: HashSet<&str> = HashSet::new();
+    texts
+        .zip(text_hashes)
+        .filter(|(_, hash)| !vectors.contains_key(*hash) && queued.insert(hash.as_str()))
+        .map(|(text, hash)| (hash.clone(), text.to_string()))
+        .collect()
+}
+
+/// Gives every chunk the vector held for its text hash. `vectors` must hold
+/// one for every hash by now — adopted or freshly embedded — so a hash with
+/// none is a broken import, refused rather than written short.
+fn fill_chunk_vectors<T>(
+    chunks: &mut [(T, Vec<f32>)],
+    text_hashes: &[String],
+    vectors: &HashMap<String, Vec<f32>>,
+) -> Result<(), ConsumerError> {
+    for ((_, vector), hash) in chunks.iter_mut().zip(text_hashes) {
+        *vector = vectors.get(hash).cloned().ok_or_else(|| {
+            ConsumerError::new(
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "no vector was adopted or computed for a canonical chunk's text",
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9636,6 +9668,66 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
     use tempfile::tempdir;
+
+    fn hashes_of(texts: &[&str]) -> Vec<String> {
+        texts
+            .iter()
+            .map(|text| wilkes_core::embed::identity::sha256_bytes(text.as_bytes()))
+            .collect()
+    }
+
+    /// The forallx failure: a text appears in two chunks and its vector was
+    /// adopted. Both chunks must get it, and nothing is queued for embedding.
+    #[test]
+    fn a_repeated_adopted_text_fills_every_chunk_that_carries_it() {
+        let texts = ["boilerplate", "unique", "boilerplate"];
+        let hashes = hashes_of(&texts);
+        let mut vectors = HashMap::new();
+        vectors.insert(hashes[0].clone(), vec![1.0, 0.0]);
+        vectors.insert(hashes[1].clone(), vec![0.0, 1.0]);
+
+        assert!(texts_to_embed(texts.iter().copied(), &hashes, &vectors).is_empty());
+
+        let mut chunks: Vec<((), Vec<f32>)> = texts.iter().map(|_| ((), Vec::new())).collect();
+        fill_chunk_vectors(&mut chunks, &hashes, &vectors).unwrap();
+        let filled: Vec<Vec<f32>> = chunks.into_iter().map(|(_, v)| v).collect();
+        assert_eq!(filled, vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 0.0]]);
+    }
+
+    /// A text repeated among the chunks nothing was adopted for is embedded
+    /// once, and the one result fills each chunk carrying it.
+    #[test]
+    fn a_repeated_missing_text_is_embedded_once_and_fills_every_copy() {
+        let texts = ["adopted", "repeated", "fresh", "repeated"];
+        let hashes = hashes_of(&texts);
+        let mut vectors = HashMap::new();
+        vectors.insert(hashes[0].clone(), vec![9.0]);
+
+        let queued = texts_to_embed(texts.iter().copied(), &hashes, &vectors);
+        assert_eq!(
+            queued,
+            vec![
+                (hashes[1].clone(), "repeated".to_string()),
+                (hashes[2].clone(), "fresh".to_string()),
+            ]
+        );
+
+        vectors.extend(queued.into_iter().map(|(hash, _)| hash).zip([vec![1.0], vec![2.0]]));
+        let mut chunks: Vec<((), Vec<f32>)> = texts.iter().map(|_| ((), Vec::new())).collect();
+        fill_chunk_vectors(&mut chunks, &hashes, &vectors).unwrap();
+        let filled: Vec<Vec<f32>> = chunks.into_iter().map(|(_, v)| v).collect();
+        assert_eq!(filled, vec![vec![9.0], vec![1.0], vec![2.0], vec![1.0]]);
+    }
+
+    #[test]
+    fn a_chunk_with_no_vector_for_its_text_is_refused() {
+        let hashes = hashes_of(&["held", "absent"]);
+        let mut vectors = HashMap::new();
+        vectors.insert(hashes[0].clone(), vec![1.0]);
+        let mut chunks: Vec<((), Vec<f32>)> = vec![((), Vec::new()), ((), Vec::new())];
+        let error = fill_chunk_vectors(&mut chunks, &hashes, &vectors).unwrap_err();
+        assert_eq!(error.code(), Some(ConsumerErrorCode::DocumentIndexIncomplete));
+    }
 
     #[test]
     fn managed_backup_is_a_self_verifying_sqlite_snapshot() {
