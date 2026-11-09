@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import { api } from "../services";
+import { darkPageFilter } from "../lib/darkPages";
 import { useResearchStore } from "./useResearchStore";
 import { useCatalogueStore } from "./useCatalogueStore";
 import type {
@@ -48,8 +49,8 @@ function projectWindowTheme(theme: Theme) {
 }
 
 /** Project the saved preference without keeping a second copy of it. */
-function projectDarkModeInversion(percent = 90) {
-  window.document.documentElement.style.setProperty("--pdf-dark-inversion", String(percent / 100));
+function projectDarkPageFilter(settings: Partial<Settings>) {
+  window.document.documentElement.style.setProperty("--pdf-dark-filter", darkPageFilter(settings));
 }
 
 // The one registration that follows the OS while the theme is "System". Held
@@ -180,7 +181,7 @@ export const useSettingsStore = create<SettingsStore>()(
     load: async () => {
       const s = await api.getSettings();
       applyTheme(s.theme);
-      projectDarkModeInversion(s.dark_mode_inversion);
+      projectDarkPageFilter(s);
 
       set({
         settings: s,
@@ -379,8 +380,12 @@ export const useSettingsStore = create<SettingsStore>()(
           },
         });
       }
-      if (patch.dark_mode_inversion !== undefined) {
-        projectDarkModeInversion(patch.dark_mode_inversion);
+      if (
+        patch.dark_mode_reading !== undefined ||
+        patch.dark_mode_inversion !== undefined ||
+        patch.dark_mode_dimming !== undefined
+      ) {
+        projectDarkPageFilter({ ...settings, ...patch });
       }
       if (patch.theme) {
         applyTheme(patch.theme);
@@ -464,7 +469,7 @@ export const useSettingsStore = create<SettingsStore>()(
 
     replaceSettings: (settings) => {
       applyTheme(settings.theme);
-      projectDarkModeInversion(settings.dark_mode_inversion);
+      projectDarkPageFilter(settings);
       set({
         settings,
         favorites: settings.favorites,

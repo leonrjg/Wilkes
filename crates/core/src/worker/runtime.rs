@@ -5,15 +5,14 @@ use std::time::Duration;
 use std::{future::Future, pin::Pin};
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, Semaphore};
-use tokio::time::timeout;
+use tokio::sync::mpsc;
 
 use super::ipc::{CancelSignal, WorkerEvent, WorkerKind, WorkerRequest, WorkerRole};
 use super::manager::{
     GenerationWorkerStatus, ManagerCommand, ManagerEvent, WorkerPaths, WorkerStatus,
 };
 use super::process::{Stop, WorkerProcess};
-use super::residency::{self, Residency};
+use super::residency::{self, KindResidency, Residency, MIN_TENURE_WHILE_OTHERS_WAIT};
 use super::{EnvNeeds, DEFAULT_IDLE_TIMEOUT_SECS};
 
 /// How often a wait the seal has to interrupt looks at it. Far inside the three
@@ -180,9 +179,12 @@ struct WorkerRuntime {
     /// Commands taken off the channel while a request was in flight, held back
     /// until it finished. Only the cancel signal is acted on mid-request.
     deferred: VecDeque<ManagerCommand>,
-    /// The semaphore that admits a worker of this manager's kind, shared with
-    /// every other manager of that kind in the process.
-    residency_semaphore: Arc<Semaphore>,
+    /// What admits a worker of this manager's kind, shared with every other
+    /// manager of that kind in the process.
+    residency_kind: Arc<KindResidency>,
+    /// When this manager took the permit it holds, for the tenure it keeps
+    /// before giving way to a manager waiting behind it.
+    resident_since: Option<tokio::time::Instant>,
     /// Held for exactly as long as this manager has a live worker. Taken before
     /// the spawn and dropped in `clear_active_worker`, which is where every
     /// stop funnels — an idle timeout, a restart for a new kind, a closed
@@ -212,6 +214,25 @@ enum NextCommand {
     Received(ManagerCommand),
     ChannelClosed,
     IdleTimeout,
+    /// Another manager of this kind is waiting and this one has held the
+    /// permit for its tenure: give it up now, between requests.
+    GiveWay,
+}
+
+/// Resolves when a holder that took its permit at `since` owes it to a
+/// manager waiting behind it: someone is waiting, and the tenure is up.
+/// Never, for a manager holding nothing.
+async fn give_way_due(kind: Arc<KindResidency>, since: Option<tokio::time::Instant>) {
+    let Some(since) = since else {
+        return std::future::pending().await;
+    };
+    loop {
+        kind.until_others_wait().await;
+        tokio::time::sleep_until(since + MIN_TENURE_WHILE_OTHERS_WAIT).await;
+        if kind.others_waiting() {
+            return;
+        }
+    }
 }
 
 fn serialize_request_for_worker(req: &WorkerRequest) -> Result<String, String> {
@@ -279,7 +300,7 @@ impl WorkerRuntime {
         active_process_slot: ActiveProcessSlot,
         status: Arc<RwLock<WorkerStatus>>,
         spawner: Arc<dyn WorkerProcessSpawner>,
-        residency_semaphore: Arc<Semaphore>,
+        residency_kind: Arc<KindResidency>,
         sealed: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -297,7 +318,8 @@ impl WorkerRuntime {
             active_env: None,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             deferred: VecDeque::new(),
-            residency_semaphore,
+            residency_kind,
+            resident_since: None,
             residency: None,
             sealed,
             last_stop_was_a_death: false,
@@ -314,6 +336,7 @@ impl WorkerRuntime {
                     break;
                 }
                 NextCommand::IdleTimeout => self.handle_idle_timeout().await,
+                NextCommand::GiveWay => self.give_way().await,
             }
         }
     }
@@ -324,11 +347,40 @@ impl WorkerRuntime {
         if let Some(cmd) = self.deferred.pop_front() {
             return NextCommand::Received(cmd);
         }
-        match timeout(self.idle_timeout, self.rx.recv()).await {
-            Ok(Some(cmd)) => NextCommand::Received(cmd),
-            Ok(None) => NextCommand::ChannelClosed,
-            Err(_) => NextCommand::IdleTimeout,
+        let give_way = give_way_due(Arc::clone(&self.residency_kind), self.resident_since);
+        tokio::select! {
+            biased;
+            cmd = self.rx.recv() => match cmd {
+                Some(cmd) => NextCommand::Received(cmd),
+                None => NextCommand::ChannelClosed,
+            },
+            () = tokio::time::sleep(self.idle_timeout) => NextCommand::IdleTimeout,
+            () = give_way => NextCommand::GiveWay,
         }
+    }
+
+    /// Whether the permit this manager holds is owed to one waiting behind it.
+    fn owes_residency(&self) -> bool {
+        self.residency.is_some()
+            && self.residency_kind.others_waiting()
+            && self
+                .resident_since
+                .is_some_and(|since| since.elapsed() >= MIN_TENURE_WHILE_OTHERS_WAIT)
+    }
+
+    /// Stop the worker so a manager of the same kind in another workspace can
+    /// start one. Deliberate, between requests: this manager's next request
+    /// queues for the permit behind the one it gave way to.
+    async fn give_way(&mut self) {
+        if self.active_process.is_some() {
+            tracing::info!(
+                "WorkerManager: another workspace is waiting for a worker of this kind; \
+                 stopping this one after {:?} so it can start.",
+                self.resident_since.map(|since| since.elapsed())
+            );
+            self.clear_active_worker().await;
+        }
+        self.note_deliberate_stop();
     }
 
     async fn handle_channel_closed(&mut self) {
@@ -397,6 +449,23 @@ impl WorkerRuntime {
             return;
         }
 
+        // Nobody is waiting for the answer. A request sits in this channel for
+        // as long as the requests ahead of it take, and a worker for it can
+        // wait far longer than that for residency; its caller — an HTTP
+        // request whose client gave up, say — may be long gone by its turn.
+        // Starting a worker for it anyway loads a model nobody will use and
+        // holds the kind's one permit while it idles out, barring every other
+        // workspace's requests for those minutes. A ReasonIR-8B probe did
+        // exactly that an hour after the request that sent it was dropped.
+        if reply.is_closed() {
+            tracing::info!(
+                "WorkerManager: dropping a {:?} request for {:?}: its caller is gone.",
+                req.role,
+                req.model
+            );
+            return;
+        }
+
         let req_json = match serialize_request_for_worker(&req) {
             Ok(json) => json,
             Err(e) => {
@@ -406,6 +475,14 @@ impl WorkerRuntime {
                 return;
             }
         };
+
+        // A request queued behind others never gives this manager a gap of
+        // its own, so the turn is also offered here, before the next request
+        // is served: otherwise a steady stream of them would hold the permit
+        // for as long as the stream lasts.
+        if self.owes_residency() {
+            self.give_way().await;
+        }
 
         let log_req = req.redacted_for_log();
         tracing::info!(
@@ -509,8 +586,41 @@ impl WorkerRuntime {
         // `clear_active_worker` above: asking for one before that ran would be
         // this manager queueing behind itself.
         if self.residency.is_none() {
-            match Arc::clone(&self.residency_semaphore).acquire_owned().await {
-                Ok(permit) => self.residency = Some(permit),
+            let admitted = tokio::select! {
+                biased;
+                admitted = self.residency_kind.admit() => admitted,
+                // A cancel cannot wait for another workspace's worker to go.
+                () = until_sealed(&self.sealed) => {
+                    tracing::info!(
+                        "WorkerManager: abandoning a {:?} start while it waited for residency: \
+                         the user cancelled.",
+                        req.role
+                    );
+                    let _ = reply
+                        .send(WorkerEvent::Gone(
+                            "the user cancelled: this worker is sealed".to_string(),
+                        ))
+                        .await;
+                    return Err(());
+                }
+                // The wait for another workspace's worker to go has no bound
+                // of its own, so it ends when the caller stops waiting too —
+                // see the same check in `handle_submit`.
+                () = reply.closed() => {
+                    tracing::info!(
+                        "WorkerManager: abandoning a {:?} start for {:?} while it waited for \
+                         residency: its caller is gone.",
+                        req.role,
+                        req.model
+                    );
+                    return Err(());
+                }
+            };
+            match admitted {
+                Ok(permit) => {
+                    self.residency = Some(permit);
+                    self.resident_since = Some(tokio::time::Instant::now());
+                }
                 Err(e) => {
                     // The semaphore lives for the process and is never closed,
                     // so this cannot happen — but a worker started without a
@@ -536,6 +646,7 @@ impl WorkerRuntime {
                     req.role
                 );
                 self.residency = None;
+                self.resident_since = None;
                 let _ = reply
                     .send(WorkerEvent::Gone(
                         "the user cancelled: this worker is sealed".to_string(),
@@ -562,6 +673,7 @@ impl WorkerRuntime {
                 // the permit would bar every other manager of this kind on
                 // behalf of a process that does not exist.
                 self.residency = None;
+                self.resident_since = None;
                 let _ = reply.send(WorkerEvent::Error(e)).await;
                 Err(())
             }
@@ -607,6 +719,7 @@ impl WorkerRuntime {
         // After the shutdown, never before it: the permit says a process of
         // this kind holds models, and until the stop returns one still does.
         self.residency = None;
+        self.resident_since = None;
         self.update_status_idle();
     }
 
@@ -667,6 +780,7 @@ mod tests {
     use crate::generate::GenerationEngine;
     use crate::types::EmbeddingEngine;
     use std::sync::atomic::AtomicUsize;
+    use tokio::time::timeout;
 
     struct FakeSession {
         cancel_calls: Arc<AtomicUsize>,
@@ -743,12 +857,12 @@ mod tests {
     );
 
     fn test_runtime() -> TestRuntime {
-        test_runtime_sharing(Arc::new(Semaphore::new(1)))
+        test_runtime_sharing(Arc::new(KindResidency::new(1)))
     }
 
     /// A runtime admitted by a caller-supplied semaphore, so a test can build
     /// two that contend the way two managers of one kind in two workspaces do.
-    fn test_runtime_sharing(residency: Arc<Semaphore>) -> TestRuntime {
+    fn test_runtime_sharing(residency: Arc<KindResidency>) -> TestRuntime {
         let paths = WorkerPaths {
             python_override: None,
             python_package_dir: std::path::PathBuf::from("pkg"),
@@ -877,7 +991,7 @@ mod tests {
     /// held two copies of weights that are gigabytes apiece.
     #[tokio::test]
     async fn a_second_manager_of_one_kind_waits_for_the_first_to_let_go() {
-        let shared = Arc::new(Semaphore::new(1));
+        let shared = Arc::new(KindResidency::new(1));
         let (mut first, first_spawns, _s, _sd, _tx, _ev) =
             test_runtime_sharing(Arc::clone(&shared));
         let (mut second, second_spawns, _s2, _sd2, _tx2, _ev2) =
@@ -921,12 +1035,212 @@ mod tests {
         assert_eq!(second_spawns.load(Ordering::Relaxed), 1);
     }
 
+    /// A request whose caller has gone is not worth a worker. Its caller is
+    /// the one that would read the answer; starting a process for it loads a
+    /// model for nobody and holds the kind's permit until the idle timeout.
+    #[tokio::test]
+    async fn a_request_whose_caller_is_gone_starts_no_worker() {
+        let (mut runtime, spawn_calls, _s, _sd, _tx, _ev) = test_runtime();
+        let (reply_tx, reply_rx) = mpsc::channel(4);
+        drop(reply_rx);
+        runtime
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+        assert_eq!(spawn_calls.load(Ordering::Relaxed), 0);
+        assert!(runtime.residency.is_none());
+    }
+
+    /// The same, for a caller that leaves while the start waits for another
+    /// workspace's worker to let go: the wait ends with it, and when the other
+    /// worker does go, nothing starts in its place for a request nobody holds.
+    #[tokio::test]
+    async fn a_caller_leaving_ends_the_wait_for_residency() {
+        let shared = Arc::new(KindResidency::new(1));
+        let (mut first, _first_spawns, _s, _sd, _tx, _ev) =
+            test_runtime_sharing(Arc::clone(&shared));
+        let (mut second, second_spawns, _s2, _sd2, _tx2, _ev2) =
+            test_runtime_sharing(Arc::clone(&shared));
+
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        first
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+
+        let (reply_tx, reply_rx) = mpsc::channel(4);
+        let waiting = tokio::spawn(async move {
+            second
+                .handle_submit(Box::new(embed_request("model-b")), reply_tx)
+                .await;
+            second
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "the second start did not wait");
+
+        drop(reply_rx);
+        let second = timeout(Duration::from_secs(3), waiting)
+            .await
+            .expect("the wait outlived its caller")
+            .unwrap();
+        assert_eq!(second_spawns.load(Ordering::Relaxed), 0);
+        assert!(second.residency.is_none());
+
+        first.handle_idle_timeout().await;
+        assert_eq!(
+            shared.available_permits(),
+            1,
+            "the abandoned start took the permit when the first worker let go"
+        );
+    }
+
+    /// A worker that keeps being asked for something never reaches its idle
+    /// timeout, so the idle timeout alone let one workspace hold the kind for
+    /// as long as its requests kept coming. Once another manager waits and
+    /// the holder has had its tenure, the holder gives the permit up at its
+    /// next gap — and not before the tenure, which is what keeps two
+    /// workspaces from trading a model load on every request.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_holder_gives_way_once_its_tenure_is_up() {
+        let shared = Arc::new(KindResidency::new(1));
+        let (mut first, _first_spawns, _s, first_shutdowns, _tx, _ev) =
+            test_runtime_sharing(Arc::clone(&shared));
+        let (mut second, second_spawns, _s2, _sd2, _tx2, _ev2) =
+            test_runtime_sharing(Arc::clone(&shared));
+
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        first
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+        let held_from = tokio::time::Instant::now();
+
+        // Nobody waits: the holder idles on, with no reason to stop early.
+        assert!(
+            timeout(Duration::from_secs(60), first.next_command())
+                .await
+                .is_err(),
+            "a holder nobody is waiting behind gave way"
+        );
+
+        let (reply_tx, _reply_rx2) = mpsc::channel(4);
+        let waiting = tokio::spawn(async move {
+            second
+                .handle_submit(Box::new(embed_request("model-b")), reply_tx)
+                .await;
+            second
+        });
+        tokio::task::yield_now().await;
+
+        let next = timeout(Duration::from_secs(120), first.next_command())
+            .await
+            .expect("a holder someone waits behind gives way well before its idle timeout");
+        assert!(matches!(next, NextCommand::GiveWay));
+        assert!(held_from.elapsed() >= MIN_TENURE_WHILE_OTHERS_WAIT);
+        first.give_way().await;
+        assert_eq!(first_shutdowns.load(Ordering::Relaxed), 1);
+        assert!(first.residency.is_none());
+
+        let _second = timeout(Duration::from_secs(3), waiting)
+            .await
+            .expect("the waiting manager was admitted")
+            .unwrap();
+        assert_eq!(second_spawns.load(Ordering::Relaxed), 1);
+    }
+
+    /// The same turn, for a holder whose requests are back to back and so
+    /// never has an idle gap: it gives way before serving its next request,
+    /// and that request queues for the permit behind the manager it gave way
+    /// to.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_holder_gives_way_between_requests() {
+        let shared = Arc::new(KindResidency::new(1));
+        let (mut first, first_spawns, _s, first_shutdowns, _tx, _ev) =
+            test_runtime_sharing(Arc::clone(&shared));
+        let (mut second, second_spawns, _s2, _sd2, _tx2, _ev2) =
+            test_runtime_sharing(Arc::clone(&shared));
+
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        first
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+
+        let (reply_tx, _reply_rx2) = mpsc::channel(4);
+        let waiting = tokio::spawn(async move {
+            second
+                .handle_submit(Box::new(embed_request("model-b")), reply_tx)
+                .await;
+            second
+        });
+        tokio::task::yield_now().await;
+
+        // Within the tenure, the holder's next request is served as usual.
+        let (reply_tx, _reply_rx3) = mpsc::channel(4);
+        first
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+        assert_eq!(first_shutdowns.load(Ordering::Relaxed), 0);
+        assert!(!waiting.is_finished());
+
+        tokio::time::sleep(MIN_TENURE_WHILE_OTHERS_WAIT).await;
+        let (reply_tx, _reply_rx4) = mpsc::channel(4);
+        let first_next = tokio::spawn(async move {
+            first
+                .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+                .await;
+            first
+        });
+        let mut second = timeout(Duration::from_secs(3), waiting)
+            .await
+            .expect("the holder gave way before its next request")
+            .unwrap();
+        assert_eq!(first_shutdowns.load(Ordering::Relaxed), 1);
+        assert_eq!(second_spawns.load(Ordering::Relaxed), 1);
+        assert!(
+            !first_next.is_finished(),
+            "the holder's next request waits its turn behind the one it gave way to"
+        );
+
+        second.handle_idle_timeout().await;
+        let _first = timeout(Duration::from_secs(3), first_next)
+            .await
+            .expect("the holder's request was served once its turn came")
+            .unwrap();
+        assert_eq!(first_spawns.load(Ordering::Relaxed), 2);
+    }
+
+    /// A user's cancel cannot wait behind another workspace's worker.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_ends_the_wait_for_residency() {
+        let shared = Arc::new(KindResidency::new(1));
+        let (mut first, _f, _s, _sd, _tx, _ev) = test_runtime_sharing(Arc::clone(&shared));
+        let (mut second, second_spawns, _s2, _sd2, _tx2, _ev2) =
+            test_runtime_sharing(Arc::clone(&shared));
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        first
+            .handle_submit(Box::new(embed_request("model-a")), reply_tx)
+            .await;
+
+        let sealed = Arc::clone(&second.sealed);
+        let (reply_tx, mut reply_rx) = mpsc::channel(4);
+        let waiting = tokio::spawn(async move {
+            second
+                .handle_submit(Box::new(embed_request("model-b")), reply_tx)
+                .await;
+        });
+        tokio::task::yield_now().await;
+        sealed.store(true, Ordering::Release);
+        timeout(Duration::from_secs(3), waiting)
+            .await
+            .expect("a cancel has three seconds")
+            .unwrap();
+        assert!(matches!(reply_rx.recv().await, Some(WorkerEvent::Gone(_))));
+        assert_eq!(second_spawns.load(Ordering::Relaxed), 0);
+    }
+
     /// A spawn that fails started nothing, so it must hold nothing. Otherwise
     /// one manager that cannot start its worker bars every other manager of
     /// that kind for the life of the process.
     #[tokio::test]
     async fn a_worker_that_failed_to_start_holds_no_residency() {
-        let shared = Arc::new(Semaphore::new(1));
+        let shared = Arc::new(KindResidency::new(1));
         let (mut runtime, spawn_calls, _s, _sd, _tx, _ev) =
             test_runtime_sharing(Arc::clone(&shared));
         runtime.spawner = Arc::new(FakeSpawner {
@@ -1491,7 +1805,7 @@ mod tests {
                 spawn_should_fail: true,
                 send_should_fail: false,
             }),
-            Arc::new(Semaphore::new(1)),
+            Arc::new(KindResidency::new(1)),
             Arc::new(AtomicBool::new(false)),
         );
 
@@ -1648,7 +1962,7 @@ mod tests {
                 spawn_should_fail: false,
                 send_should_fail: true,
             }),
-            Arc::new(Semaphore::new(1)),
+            Arc::new(KindResidency::new(1)),
             Arc::new(AtomicBool::new(false)),
         );
 

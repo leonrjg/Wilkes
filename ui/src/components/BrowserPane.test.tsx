@@ -7,7 +7,7 @@ vi.mock("../services", () => ({
     browserPaneShow: vi.fn(() => Promise.resolve()),
     browserPaneSetBounds: vi.fn(() => Promise.resolve()),
     browserPaneSetVisible: vi.fn(() => Promise.resolve()),
-    browserPaneSetInversion: vi.fn(() => Promise.resolve()),
+    browserPaneSetDarkFilter: vi.fn(() => Promise.resolve()),
     browserPaneStep: vi.fn(() => Promise.resolve()),
     browserPaneClearData: vi.fn(() => Promise.resolve()),
     browserPaneSavePage: vi.fn(() => Promise.resolve()),
@@ -43,7 +43,7 @@ describe("BrowserPane", () => {
       title: null,
       loading: false,
       held: false,
-      invertLightPages: true,
+      darkenLightPages: true,
       finding: false,
       findRequests: 0,
       hoveredLink: null,
@@ -56,19 +56,32 @@ describe("BrowserPane", () => {
     await act(async () => {
       render(<BrowserPane />);
     });
-    expect(api.browserPaneSetInversion).toHaveBeenLastCalledWith(0.8);
+    expect(api.browserPaneSetDarkFilter).toHaveBeenLastCalledWith(
+      "invert(0.8) hue-rotate(180deg) brightness(1.1)",
+    );
     await act(async () => {
-      fireEvent.click(screen.getByLabelText("Invert light pages"));
+      fireEvent.click(screen.getByLabelText("Darken light pages"));
     });
-    expect(api.browserPaneSetInversion).toHaveBeenLastCalledWith(null);
+    expect(api.browserPaneSetDarkFilter).toHaveBeenLastCalledWith(null);
   });
 
-  it("does not invert in light mode", async () => {
+  it("dims light pages instead when the reader dims its own", async () => {
+    useSettingsStore.setState({
+      colorScheme: "dark",
+      settings: { dark_mode_reading: "Dim", dark_mode_dimming: 40 } as Settings,
+    });
     await act(async () => {
       render(<BrowserPane />);
     });
-    expect(api.browserPaneSetInversion).toHaveBeenLastCalledWith(null);
-    expect(screen.queryByLabelText("Invert light pages")).toBeNull();
+    expect(api.browserPaneSetDarkFilter).toHaveBeenLastCalledWith("brightness(0.6)");
+  });
+
+  it("does not darken in light mode", async () => {
+    await act(async () => {
+      render(<BrowserPane />);
+    });
+    expect(api.browserPaneSetDarkFilter).toHaveBeenLastCalledWith(null);
+    expect(screen.queryByLabelText("Darken light pages")).toBeNull();
   });
 
   it("opens the requested address over its stage, in the colour behind it", async () => {

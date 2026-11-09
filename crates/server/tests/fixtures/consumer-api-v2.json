@@ -99,11 +99,7 @@
     "extraction_recipe_id": "extract-example",
     "extracted_content_sha256": "content-sha256-example",
     "chunk_count": 1,
-    "embedding_space_id": "space-example",
-    "engine": "candle",
-    "model_id": "sentence-transformers/all-MiniLM-L6-v2",
-    "dimension": 384,
-    "passage_input_recipe": "wilkes-passage-input-v1",
+    "spaces": ["space-example"],
     "outline": [
       {
         "title": "Introduction",

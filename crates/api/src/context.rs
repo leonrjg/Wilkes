@@ -840,11 +840,13 @@ pub struct ManagedDocumentExport {
     pub extraction_recipe_id: String,
     pub extracted_content_sha256: String,
     pub chunk_count: usize,
-    pub embedding_space_id: String,
-    pub engine: String,
-    pub model_id: String,
-    pub dimension: usize,
-    pub passage_input_recipe: String,
+    // No embedding space, engine, model or dimension. These used to be
+    // reported from the canonical corpus's index, whose identity is the model
+    // the corpus was *created* with: it embeds nothing, so its id is no space
+    // the corpus holds, and a caller that echoed it back as the next import's
+    // `expected_embedding_space_id` was refused. The spaces that hold the
+    // document are the import route's to report, after it has brought them
+    // level.
     pub outline: Vec<ExportedOutlineEntry>,
     /// What the read that anchored `outline` had to decide for itself — which
     /// pages clustered into a body column and which were too ambiguous to
@@ -2506,6 +2508,30 @@ impl AppContext {
         Ok(embedded)
     }
 
+    /// Embed strings in the **query** role, with the model the addressed
+    /// index uses, for a caller that ranks its own stored passage vectors.
+    ///
+    /// The vectors are not for storage. An asymmetric model puts a query and
+    /// a passage of the same words in different places on purpose, so a
+    /// query vector stored beside passage vectors is a passage that ranks
+    /// wrongly against everything. The role is this method's, never a field
+    /// the caller sets: see [`Self::embed_texts_in_role`].
+    ///
+    /// A blank text is refused rather than embedded, as it is for a search
+    /// probe: it names nothing to look for.
+    pub async fn embed_query_texts(
+        &self,
+        texts: Vec<String>,
+        embedding_space_id: Option<String>,
+    ) -> Result<EmbeddedTexts, String> {
+        if texts.iter().any(|text| text.trim().is_empty()) {
+            return Err("A query text is empty and names nothing to embed".to_string());
+        }
+        let mut embedded = self.embed_texts_in_role(texts, EmbedRole::Query).await?;
+        embedded.embedding_space_id = embedding_space_id;
+        Ok(embedded)
+    }
+
     /// The two roles an asymmetric model distinguishes. Which one applies is
     /// decided by the endpoint a caller reached, never by a field it sets: a
     /// flag that can be set correctly can be set wrongly, and the caller is the
@@ -2913,14 +2939,7 @@ impl AppContext {
                 .map_err(|error| error.to_string())?
         };
         if let Some(existing) = existing {
-            return Self::managed_export(
-                corpus_id,
-                existing,
-                &expected_identity,
-                snapshot_path,
-                true,
-            )
-            .await;
+            return Self::managed_export(corpus_id, existing, snapshot_path, true).await;
         }
 
         // Bound to a `let` before the `if let`, not inlined into it. A block
@@ -2963,14 +2982,7 @@ impl AppContext {
             existing
         };
         if let Some(existing) = existing {
-            return Self::managed_export(
-                corpus_id,
-                existing,
-                &expected_identity,
-                snapshot_path,
-                true,
-            )
-            .await;
+            return Self::managed_export(corpus_id, existing, snapshot_path, true).await;
         }
 
         let adopted = if let Some(source_context) = source_workspace {
@@ -3065,14 +3077,7 @@ impl AppContext {
                 "publication verification failed",
             ));
         }
-        Self::managed_export(
-            corpus_id,
-            managed,
-            &expected_identity,
-            snapshot_path,
-            reused,
-        )
-        .await
+        Self::managed_export(corpus_id, managed, snapshot_path, reused).await
     }
 
     /// Materialize one embedding projection from the canonical admitted
@@ -3328,8 +3333,12 @@ impl AppContext {
             .iter()
             .map(|(chunk, _)| wilkes_core::embed::identity::sha256_bytes(chunk.text.as_bytes()))
             .collect();
-        let mut adopted: std::collections::HashMap<String, Vec<f32>> =
-            std::collections::HashMap::new();
+        // One vector per distinct text hash, whatever its origin: adopted from
+        // the source workspace or this space below, or embedded fresh further
+        // down. Every chunk is then filled by looking its hash up here, so two
+        // chunks with the same text share one vector instead of competing for
+        // it.
+        let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
         if source_workspace.is_none() {
             // The import named no library to adopt from — a plain path import,
             // or a caller that resolved one and did not pass it on. Worth
@@ -3351,29 +3360,34 @@ impl AppContext {
                 &canonical_recipe_id,
                 label,
             ) {
-                adopted.entry(hash).or_insert(embedding);
+                vectors.entry(hash).or_insert(embedding);
             }
         }
 
+        let adopted_chunks = text_hashes
+            .iter()
+            .filter(|hash| vectors.contains_key(*hash))
+            .count();
         // Owned, because the embedding runs on the blocking pool and cannot
         // borrow `prepared`. `Embedder` is a blocking trait — the worker-backed
         // implementation waits on its subprocess by blocking the calling
         // thread — so an async caller has to leave the runtime thread first.
-        let missing: Vec<String> = prepared
-            .chunks
-            .iter()
-            .zip(&text_hashes)
-            .filter(|(_, hash)| !adopted.contains_key(*hash))
-            .map(|((chunk, _), _)| chunk.text.clone())
-            .collect();
+        let (missing_hashes, missing): (Vec<String>, Vec<String>) = texts_to_embed(
+            prepared.chunks.iter().map(|(chunk, _)| chunk.text.as_str()),
+            &text_hashes,
+            &vectors,
+        )
+        .into_iter()
+        .unzip();
         let missing_count = missing.len();
         tracing::info!(
-            "projection import: {} of {} chunks adopted, {} to embed",
-            prepared.chunks.len() - missing_count,
+            "projection import: {} of {} chunks adopted, {} distinct texts to embed for the other {}",
+            adopted_chunks,
             prepared.chunks.len(),
-            missing_count
+            missing_count,
+            prepared.chunks.len() - adopted_chunks
         );
-        let mut computed = if missing.is_empty() {
+        let computed = if missing.is_empty() {
             Vec::new()
         } else {
             let embedder = self.embedder.lock().clone().ok_or_else(|| {
@@ -3394,27 +3408,14 @@ impl AppContext {
             return Err(ConsumerError::new(
                 ConsumerErrorCode::DocumentIndexIncomplete,
                 format!(
-                    "embedder returned {} vectors for {} chunks it was asked to embed",
+                    "embedder returned {} vectors for {} texts it was asked to embed",
                     computed.len(),
                     missing_count
                 ),
             ));
         }
-        // Adopted where we had it, freshly computed where we did not, in the
-        // canonical chunk order either way. `computed` is consumed front to
-        // back in the same order `missing` was collected.
-        let mut fresh = computed.drain(..);
-        for ((_, vector), hash) in prepared.chunks.iter_mut().zip(&text_hashes) {
-            *vector = match adopted.remove(hash) {
-                Some(embedding) => embedding,
-                None => fresh.next().ok_or_else(|| {
-                    ConsumerError::new(
-                        ConsumerErrorCode::DocumentIndexIncomplete,
-                        "ran out of computed vectors while filling canonical chunks",
-                    )
-                })?,
-            };
-        }
+        vectors.extend(missing_hashes.into_iter().zip(computed));
+        fill_chunk_vectors(&mut prepared.chunks, &text_hashes, &vectors)?;
         let expected_chunks = prepared.chunks.len();
         let managed = {
             let index_arc = self.index.lock().clone();
@@ -3736,7 +3737,6 @@ impl AppContext {
     async fn managed_export(
         corpus_id: String,
         document: ManagedDocumentData,
-        embedding_identity: &wilkes_core::embed::EmbeddingSpaceIdentity,
         snapshot_path: PathBuf,
         reused: bool,
     ) -> Result<ManagedDocumentExport, ConsumerError> {
@@ -3764,11 +3764,6 @@ impl AppContext {
             extraction_recipe_id: document.extraction_recipe_id,
             extracted_content_sha256: document.extracted_content_sha256,
             chunk_count,
-            embedding_space_id: embedding_identity.id().0,
-            engine: embedding_identity.engine.as_str().to_string(),
-            model_id: embedding_identity.model_id.clone(),
-            dimension: embedding_identity.dimension,
-            passage_input_recipe: embedding_identity.passage_input_recipe.clone(),
             outline,
             extraction: declared_outline.diagnostics,
             chunks: document
@@ -9737,6 +9732,42 @@ async fn enrichment_for(
     }
 }
 
+/// The texts a projection import still has to embed: one `(hash, text)` per
+/// distinct text hash that `vectors` holds nothing for, in the order each hash
+/// first appears among the chunks. A text repeated across chunks is embedded
+/// once, and every chunk carrying it is filled from that one vector.
+fn texts_to_embed<'a>(
+    texts: impl Iterator<Item = &'a str>,
+    text_hashes: &[String],
+    vectors: &HashMap<String, Vec<f32>>,
+) -> Vec<(String, String)> {
+    let mut queued: HashSet<&str> = HashSet::new();
+    texts
+        .zip(text_hashes)
+        .filter(|(_, hash)| !vectors.contains_key(*hash) && queued.insert(hash.as_str()))
+        .map(|(text, hash)| (hash.clone(), text.to_string()))
+        .collect()
+}
+
+/// Gives every chunk the vector held for its text hash. `vectors` must hold
+/// one for every hash by now — adopted or freshly embedded — so a hash with
+/// none is a broken import, refused rather than written short.
+fn fill_chunk_vectors<T>(
+    chunks: &mut [(T, Vec<f32>)],
+    text_hashes: &[String],
+    vectors: &HashMap<String, Vec<f32>>,
+) -> Result<(), ConsumerError> {
+    for ((_, vector), hash) in chunks.iter_mut().zip(text_hashes) {
+        *vector = vectors.get(hash).cloned().ok_or_else(|| {
+            ConsumerError::new(
+                ConsumerErrorCode::DocumentIndexIncomplete,
+                "no vector was adopted or computed for a canonical chunk's text",
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9744,6 +9775,66 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
     use tempfile::tempdir;
+
+    fn hashes_of(texts: &[&str]) -> Vec<String> {
+        texts
+            .iter()
+            .map(|text| wilkes_core::embed::identity::sha256_bytes(text.as_bytes()))
+            .collect()
+    }
+
+    /// The forallx failure: a text appears in two chunks and its vector was
+    /// adopted. Both chunks must get it, and nothing is queued for embedding.
+    #[test]
+    fn a_repeated_adopted_text_fills_every_chunk_that_carries_it() {
+        let texts = ["boilerplate", "unique", "boilerplate"];
+        let hashes = hashes_of(&texts);
+        let mut vectors = HashMap::new();
+        vectors.insert(hashes[0].clone(), vec![1.0, 0.0]);
+        vectors.insert(hashes[1].clone(), vec![0.0, 1.0]);
+
+        assert!(texts_to_embed(texts.iter().copied(), &hashes, &vectors).is_empty());
+
+        let mut chunks: Vec<((), Vec<f32>)> = texts.iter().map(|_| ((), Vec::new())).collect();
+        fill_chunk_vectors(&mut chunks, &hashes, &vectors).unwrap();
+        let filled: Vec<Vec<f32>> = chunks.into_iter().map(|(_, v)| v).collect();
+        assert_eq!(filled, vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 0.0]]);
+    }
+
+    /// A text repeated among the chunks nothing was adopted for is embedded
+    /// once, and the one result fills each chunk carrying it.
+    #[test]
+    fn a_repeated_missing_text_is_embedded_once_and_fills_every_copy() {
+        let texts = ["adopted", "repeated", "fresh", "repeated"];
+        let hashes = hashes_of(&texts);
+        let mut vectors = HashMap::new();
+        vectors.insert(hashes[0].clone(), vec![9.0]);
+
+        let queued = texts_to_embed(texts.iter().copied(), &hashes, &vectors);
+        assert_eq!(
+            queued,
+            vec![
+                (hashes[1].clone(), "repeated".to_string()),
+                (hashes[2].clone(), "fresh".to_string()),
+            ]
+        );
+
+        vectors.extend(queued.into_iter().map(|(hash, _)| hash).zip([vec![1.0], vec![2.0]]));
+        let mut chunks: Vec<((), Vec<f32>)> = texts.iter().map(|_| ((), Vec::new())).collect();
+        fill_chunk_vectors(&mut chunks, &hashes, &vectors).unwrap();
+        let filled: Vec<Vec<f32>> = chunks.into_iter().map(|(_, v)| v).collect();
+        assert_eq!(filled, vec![vec![9.0], vec![1.0], vec![2.0], vec![1.0]]);
+    }
+
+    #[test]
+    fn a_chunk_with_no_vector_for_its_text_is_refused() {
+        let hashes = hashes_of(&["held", "absent"]);
+        let mut vectors = HashMap::new();
+        vectors.insert(hashes[0].clone(), vec![1.0]);
+        let mut chunks: Vec<((), Vec<f32>)> = vec![((), Vec::new()), ((), Vec::new())];
+        let error = fill_chunk_vectors(&mut chunks, &hashes, &vectors).unwrap_err();
+        assert_eq!(error.code(), Some(ConsumerErrorCode::DocumentIndexIncomplete));
+    }
 
     #[test]
     fn managed_backup_is_a_self_verifying_sqlite_snapshot() {
@@ -10053,6 +10144,80 @@ mod tests {
         assert_eq!(result.vectors.len(), 2);
         assert_eq!(result.vectors[0], vec![1.0, 0.0]);
         assert_eq!(result.vectors[1], vec![0.0, 1.0]);
+    }
+
+    /// An embedder whose two roles land in different places, which is the
+    /// whole reason the query role is worth an endpoint.
+    struct RoleEmbedder;
+
+    impl Embedder for RoleEmbedder {
+        fn embedding_space_identity(&self) -> wilkes_core::embed::EmbeddingSpaceIdentity {
+            wilkes_core::embed::EmbeddingSpaceIdentity::for_test(
+                self.engine(),
+                self.model_id(),
+                self.dimension(),
+            )
+        }
+
+        fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.0, 1.0]).collect())
+        }
+
+        fn embed_query(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+
+        fn model_id(&self) -> &str {
+            "role-test"
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+
+        fn engine(&self) -> EmbeddingEngine {
+            EmbeddingEngine::Fastembed
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_query_texts_answers_in_the_query_role() {
+        let (_dir, ctx) = test_ctx();
+
+        let err = ctx
+            .embed_query_texts(vec!["a".to_string()], None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Semantic model unavailable"), "{err}");
+
+        *ctx.embedder.lock() = Some(Arc::new(RoleEmbedder));
+
+        let err = ctx.embed_query_texts(Vec::new(), None).await.unwrap_err();
+        assert!(err.contains("No texts provided"), "{err}");
+        let err = ctx
+            .embed_query_texts(vec!["what".to_string(), "  ".to_string()], None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+
+        let texts = vec!["what binds".to_string(), "why it holds".to_string()];
+        let query = ctx
+            .embed_query_texts(texts.clone(), Some("space-under-test".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            query.embedding_space_id.as_deref(),
+            Some("space-under-test")
+        );
+        assert_eq!(query.model_id, "role-test");
+        assert_eq!(query.dimension, 2);
+        assert_eq!(query.vectors, vec![vec![1.0, 0.0], vec![1.0, 0.0]]);
+
+        let passage = ctx.embed_texts(texts, None).await.unwrap();
+        assert_ne!(
+            passage.vectors, query.vectors,
+            "the same words in the passage role are a different vector"
+        );
     }
 
     #[tokio::test]

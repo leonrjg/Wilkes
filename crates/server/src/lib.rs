@@ -38,8 +38,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 use wilkes_api::context::AppContext;
 use wilkes_api::workspace::{
-    ConsumerScope, EnsureManagedEmbeddingSpace, EnsureManagedWorkspace,
-    ManagedEmbeddingSpaceStatus, ManagedWorkspaceStatus, WorkspaceState, WorkspaceSummary,
+    corpus_spaces_remedy, describe_corpus_spaces, ConsumerScope, EnsureManagedEmbeddingSpace,
+    EnsureManagedWorkspace, ManagedEmbeddingSpaceStatus, ManagedWorkspaceStatus, WorkspaceState,
+    WorkspaceSummary,
 };
 use wilkes_core::completion::{CompletionFeedback, CompletionRequest};
 use wilkes_core::consumer::{ConsumerError, ConsumerErrorCode};
@@ -387,8 +388,8 @@ fn managed_status_with_pending(
     mut status: ManagedWorkspaceStatus,
     context: &AppContext,
 ) -> ManagedWorkspaceStatus {
-    // Builds are already in `status`: a projection's catch-up runs in its
-    // build slot, which the manager reads.
+    // Builds are already in `status`: the manager counts the projection
+    // builds it owns.
     status.pending_imports = context.managed_pending_imports();
     status
 }
@@ -459,16 +460,30 @@ struct ManagedImportBody {
     source: ManagedImportSource,
 }
 
+/// What `documents/import` answers: the admitted document, and the embedding
+/// spaces that hold it.
+#[derive(Serialize)]
+struct ManagedImportReply {
+    #[serde(flatten)]
+    document: wilkes_api::context::ManagedDocumentExport,
+    /// Every space of the corpus that is level with it once this import's
+    /// catch-up has run, so holds this document. Any of them is a valid
+    /// `expected_embedding_space_id` for the next import. A space that could
+    /// not follow is absent here, and logged; empty when the corpus has no
+    /// projection yet, which is also when the next import takes no pin.
+    spaces: Vec<String>,
+}
+
 async fn import_managed_document_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ManagedImportBody>,
-) -> Result<Json<wilkes_api::context::ManagedDocumentExport>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Json<ManagedImportReply>, (StatusCode, Json<ErrorBody>)> {
     let manager = state
         .workspaces
         .as_ref()
         .ok_or_else(workspace_manager_unavailable)?;
     let status = manager
-        .managed_workspace_status(&body.corpus_id)
+        .managed_spaces(&body.corpus_id)
         .await
         .map_err(consumer_anyhow_err)?;
     let expected_exists = match body.expected_embedding_space_id.as_deref() {
@@ -481,11 +496,19 @@ async fn import_managed_document_handler(
     if !expected_exists {
         return Err(consumer_err(ConsumerError::new(
             ConsumerErrorCode::EmbeddingSpaceMismatch,
-            format!(
-                "corpus={}, request={}",
-                describe_space(status.embedding_space_id.as_deref()),
-                describe_space(body.expected_embedding_space_id.as_deref())
-            ),
+            match body.expected_embedding_space_id.as_deref() {
+                Some(pin) => format!(
+                    "corpus={}, request={pin}; {}",
+                    describe_corpus_spaces(&status.spaces),
+                    corpus_spaces_remedy(&status.spaces),
+                ),
+                // Unpinned, which only a corpus with no spaces may be.
+                None => format!(
+                    "corpus={}, request=none; a corpus with spaces is imported into with one \
+                     of them as expected_embedding_space_id",
+                    describe_corpus_spaces(&status.spaces),
+                ),
+            },
         )));
     }
     let managed = manager
@@ -542,7 +565,15 @@ async fn import_managed_document_handler(
         // caller's own maintenance pass — is what clears it.
         tracing::warn!("embedding projection {space} did not follow the import: {error}");
     }
-    Ok(Json(exported))
+    let spaces = manager
+        .managed_spaces(&body.corpus_id)
+        .await
+        .map_err(consumer_anyhow_err)?
+        .level_space_ids();
+    Ok(Json(ManagedImportReply {
+        document: exported,
+        spaces,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -724,9 +755,10 @@ struct TextProbe {
 /// A probe is a vector the caller already holds or the text it wants searched
 /// for, and the two are not interchangeable in what they can express.
 ///
-/// A caller sending text gets its query embedded in the **query** role, which
-/// is the only way that role can be reached: `embed/text` answers in the
-/// passage role and has to, because the vectors it returns are stored. So
+/// A caller sending text gets its query embedded in the **query** role, as
+/// `embed/query` does for a caller ranking vectors it holds itself;
+/// `embed/text` answers in the passage role and has to, because the vectors it
+/// returns are stored. So
 /// "search the corpus for this text" used to be two calls of which the first
 /// could not know what the text was for. Sending text is also one round trip
 /// instead of two, and it lets a later model with query prefixes work without
@@ -1219,10 +1251,6 @@ fn workspace_manager_unavailable() -> (StatusCode, Json<ErrorBody>) {
 /// Render a corpus or request embedding space for an error message. A corpus
 /// with no index has no space, which is a distinct state from disagreeing
 /// about which space is in use.
-fn describe_space(space: Option<&str>) -> &str {
-    space.unwrap_or("none")
-}
-
 /// The index behind a scope, for a route that is about to name passages.
 ///
 /// Every `/api/chunks` route needs the same two things: the resolver's
@@ -1598,6 +1626,48 @@ async fn embed_text_handler(
         .embed_texts(body.texts, space)
         .await
         .map(Json)
+        .map_err(server_err)
+}
+
+/// What `/api/embed/query` answers: the passage route's reply, plus the role
+/// the vectors are in, so a caller can refuse a vector it did not ask for.
+#[derive(Serialize)]
+struct EmbeddedQueries {
+    #[serde(flatten)]
+    embedded: wilkes_api::context::EmbeddedTexts,
+    role: &'static str,
+}
+
+/// Embed strings in the **query** role, with the model the addressed index
+/// uses. The vectors are for ranking against passage vectors the caller
+/// holds and are never for storage: an asymmetric model places a query away
+/// from the passage of the same words on purpose.
+///
+/// A route of its own rather than a role field on `/api/embed/text`: the role
+/// is decided by the endpoint a caller reaches, never by a field it sets.
+/// Addressed exactly as `/api/embed/text` is, and refused the same way — a
+/// managed corpus routes on the pinned space, which must be one it holds and
+/// level with it; a model that cannot be loaded is an error, never a vector
+/// from some other space.
+async fn embed_query_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<EmbedTextBody>,
+) -> Result<Json<EmbeddedQueries>, (StatusCode, Json<ErrorBody>)> {
+    if body.texts.is_empty() {
+        return Err(err("texts must not be empty"));
+    }
+    let index = state.consumer_index(&body.scope).await?;
+    let space = index.embedding_space_id().map(str::to_string);
+    index
+        .into_context()
+        .embed_query_texts(body.texts, space)
+        .await
+        .map(|embedded| {
+            Json(EmbeddedQueries {
+                embedded,
+                role: "query",
+            })
+        })
         .map_err(server_err)
 }
 
@@ -2880,6 +2950,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/embed/ready", get(is_semantic_ready_handler))
         .route("/api/embed/text", post(embed_text_handler))
+        .route("/api/embed/query", post(embed_query_handler))
         .route("/api/export/chunks", post(export_chunks_handler))
         .route("/api/export/figures", post(export_figures_handler))
         .route("/api/chunks/figures", post(chunk_figures_handler))
@@ -3201,6 +3272,110 @@ mod tests {
             events_tx,
         });
         (dir, state)
+    }
+
+    /// The import reply names the spaces that hold the document, and no
+    /// space of the canonical corpus's own: that one embedded nothing, and a
+    /// caller that echoed it back as its next pin was refused.
+    fn example_import_reply() -> ManagedImportReply {
+        ManagedImportReply {
+            document: wilkes_api::context::ManagedDocumentExport {
+                corpus_id: "corpus".to_string(),
+                source_sha256: "sha".to_string(),
+                source_byte_len: 1,
+                media_type: "text/plain".to_string(),
+                snapshot_id: "snapshot".to_string(),
+                rendition_id: "rendition".to_string(),
+                extraction_recipe_id: "recipe".to_string(),
+                extracted_content_sha256: "content".to_string(),
+                chunk_count: 0,
+                outline: Vec::new(),
+                extraction: Default::default(),
+                chunks: Vec::new(),
+                embedding_work: wilkes_api::context::ManagedEmbeddingWork {
+                    chunks: 0,
+                    reused: 0,
+                    computed: 0,
+                },
+            },
+            spaces: vec!["space-a".to_string()],
+        }
+    }
+
+    #[test]
+    fn the_import_reply_names_the_spaces_holding_the_document() {
+        let reply = serde_json::to_value(example_import_reply()).unwrap();
+        assert_eq!(reply["spaces"], serde_json::json!(["space-a"]));
+        assert_eq!(reply["snapshot_id"], "snapshot", "the document stays flat");
+        for gone in [
+            "embedding_space_id",
+            "engine",
+            "model_id",
+            "dimension",
+            "passage_input_recipe",
+        ] {
+            assert!(reply.get(gone).is_none(), "{gone} is still reported");
+        }
+    }
+
+    /// The query route is reached, refuses what it cannot answer with an
+    /// error rather than a vector, and names its role. The role itself is
+    /// covered where the embedder is, in `embed_query_texts`.
+    #[tokio::test]
+    async fn the_query_embedding_route_refuses_rather_than_falls_back() {
+        let (_dir, state) = handler_state();
+        let empty = embed_query_handler(
+            State(Arc::clone(&state)),
+            Json(EmbedTextBody {
+                texts: Vec::new(),
+                scope: ConsumerScope::default(),
+            }),
+        )
+        .await
+        .err()
+        .expect("no texts is no request");
+        assert_eq!(empty.0, StatusCode::BAD_REQUEST);
+
+        let (status, body) = embed_query_handler(
+            State(Arc::clone(&state)),
+            Json(EmbedTextBody {
+                texts: vec!["what binds".to_string()],
+                scope: ConsumerScope::default(),
+            }),
+        )
+        .await
+        .err()
+        .expect("no model is not ready, not a vector");
+        assert!(status.is_server_error(), "{status}");
+        assert!(
+            body.error.contains("Semantic model unavailable"),
+            "{}",
+            body.error
+        );
+
+        let reply = serde_json::to_value(EmbeddedQueries {
+            embedded: wilkes_api::context::EmbeddedTexts {
+                embedding_space_id: Some("space-a".to_string()),
+                engine: "SBERT".to_string(),
+                model_id: "m".to_string(),
+                dimension: 2,
+                vectors: vec![vec![1.0, 0.0]],
+            },
+            role: "query",
+        })
+        .unwrap();
+        assert_eq!(
+            reply,
+            serde_json::json!({
+                "embedding_space_id": "space-a",
+                "engine": "SBERT",
+                "model_id": "m",
+                "dimension": 2,
+                "vectors": [[1.0, 0.0]],
+                "role": "query",
+            }),
+            "the passage route's reply, flat, plus the role"
+        );
     }
 
     #[tokio::test]
@@ -4540,23 +4715,18 @@ mod tests {
             wilkes_core::types::PrefixSource::Undetermined
         );
 
+        // Field for field what the import route serializes. A list of
+        // required names let the fixture keep five fields the reply had
+        // dropped, and the consumer that carries a copy of this file would
+        // have kept requiring them.
         let response = &fixture["import_response"];
-        for required in [
-            "corpus_id",
-            "snapshot_id",
-            "rendition_id",
-            "extracted_content_sha256",
-            "embedding_space_id",
-            "outline",
-            "extraction",
-            "chunks",
-            "embedding_work",
-        ] {
-            assert!(
-                response.get(required).is_some(),
-                "missing fixture field {required}"
-            );
-        }
+        let fixture_fields: std::collections::BTreeSet<&String> =
+            response.as_object().unwrap().keys().collect();
+        let served = serde_json::to_value(example_import_reply()).unwrap();
+        let served_fields: std::collections::BTreeSet<&String> =
+            served.as_object().unwrap().keys().collect();
+        assert_eq!(fixture_fields, served_fields);
+        assert_eq!(response["spaces"], serde_json::json!(["space-example"]));
 
         // The outline carries a position and says what established it, and the
         // extraction says what it had to decide to produce that position.

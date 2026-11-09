@@ -93,7 +93,9 @@ describe("useSettingsStore", () => {
     expect(state.favorites).toEqual(["/path/1"]);
     expect(state.directory).toBe("/path/1");
     expect(state.theme).toBe("Dark");
-    expect(document.documentElement.style.getPropertyValue("--pdf-dark-inversion")).toBe("0.65");
+    expect(document.documentElement.style.getPropertyValue("--pdf-dark-filter")).toBe(
+      "invert(0.65) hue-rotate(180deg) brightness(1.1)",
+    );
     expect(state.preferSemantic).toBe(true);
     expect(state.fileSortKey).toBe("modified");
     expect(state.fileSortDirection).toBe("desc");
@@ -120,22 +122,39 @@ describe("useSettingsStore", () => {
   });
 
   it("projects inversion patches, including zero, and restores the default for older settings", async () => {
+    const filter = () => document.documentElement.style.getPropertyValue("--pdf-dark-filter");
     vi.mocked(api.getSettings).mockResolvedValue({
       favorites: [], recent_dirs: [], last_directory: null,
       theme: "Dark", semantic: {},
     } as any);
     await useSettingsStore.getState().load();
-    expect(document.documentElement.style.getPropertyValue("--pdf-dark-inversion")).toBe("0.9");
+    expect(filter()).toBe("invert(0.9) hue-rotate(180deg) brightness(1.1)");
 
     useSettingsStore.getState().applySettingsPatch({ dark_mode_inversion: 0 });
     expect(useSettingsStore.getState().settings?.dark_mode_inversion).toBe(0);
-    expect(document.documentElement.style.getPropertyValue("--pdf-dark-inversion")).toBe("0");
+    expect(filter()).toBe("invert(0) hue-rotate(180deg) brightness(1.1)");
 
     const settings = useSettingsStore.getState().settings!;
     useSettingsStore.getState().replaceSettings({ ...settings, dark_mode_inversion: 100 });
-    expect(document.documentElement.style.getPropertyValue("--pdf-dark-inversion")).toBe("1");
+    expect(filter()).toBe("invert(1) hue-rotate(180deg) brightness(1.1)");
     useSettingsStore.getState().replaceSettings({ ...settings, dark_mode_inversion: undefined });
-    expect(document.documentElement.style.getPropertyValue("--pdf-dark-inversion")).toBe("0.9");
+    expect(filter()).toBe("invert(0.9) hue-rotate(180deg) brightness(1.1)");
+  });
+
+  it("dims pages instead of inverting them, keeping each strength for its own mode", async () => {
+    const filter = () => document.documentElement.style.getPropertyValue("--pdf-dark-filter");
+    vi.mocked(api.getSettings).mockResolvedValue({
+      favorites: [], recent_dirs: [], last_directory: null,
+      theme: "Dark", semantic: {}, dark_mode_inversion: 70,
+    } as any);
+    await useSettingsStore.getState().load();
+
+    useSettingsStore.getState().applySettingsPatch({ dark_mode_reading: "Dim" });
+    expect(filter()).toBe("brightness(0.5)");
+    useSettingsStore.getState().applySettingsPatch({ dark_mode_dimming: 30 });
+    expect(filter()).toBe("brightness(0.7)");
+    useSettingsStore.getState().applySettingsPatch({ dark_mode_reading: "Invert" });
+    expect(filter()).toBe("invert(0.7) hue-rotate(180deg) brightness(1.1)");
   });
 
   it("should update directory", async () => {

@@ -184,7 +184,7 @@ describe("CoverViewer", () => {
 
     render(<CoverViewer path="/library/a.pdf" onClose={vi.fn()} />);
 
-    expect(await screen.findByText("This cover could not be drawn.")).toBeInTheDocument();
+    expect(await screen.findByText("This picture could not be drawn.")).toBeInTheDocument();
     warn.mockRestore();
   });
 });

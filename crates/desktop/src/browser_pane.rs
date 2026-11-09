@@ -100,37 +100,43 @@ pub enum Step {
     Reload,
 }
 
-/// How strongly each window's pane inverts a light page, keyed by the owning
-/// window's label; a window without an entry does not invert. Kept here rather
-/// than in the page because every page load replaces the page.
+/// The filter each window's pane darkens a light page with, keyed by the
+/// owning window's label; a window without an entry does not darken. Kept here
+/// rather than in the page because every page load replaces the page.
 #[derive(Default)]
-pub struct Inversions(Mutex<HashMap<String, f64>>);
+pub struct DarkFilters(Mutex<HashMap<String, String>>);
 
-impl Inversions {
-    fn get(&self, owner: &str) -> Option<f64> {
-        self.0.lock().unwrap().get(owner).copied()
+impl DarkFilters {
+    fn get(&self, owner: &str) -> Option<String> {
+        self.0.lock().unwrap().get(owner).cloned()
     }
 
-    fn set(&self, owner: &str, strength: Option<f64>) {
-        let mut inversions = self.0.lock().unwrap();
-        match strength {
-            Some(strength) => inversions.insert(owner.to_string(), strength),
-            None => inversions.remove(owner),
+    fn set(&self, owner: &str, filter: Option<String>) {
+        let mut filters = self.0.lock().unwrap();
+        match filter {
+            Some(filter) => filters.insert(owner.to_string(), filter),
+            None => filters.remove(owner),
         };
     }
 }
 
-/// The script that inverts the page in view, or stops inverting it. It judges
+/// The script that darkens the page in view, or stops darkening it. It judges
 /// the page once its markup is in: a page whose own background is dark is
-/// already in dark mode. The filter is the reader's (`reader.css`,
-/// `.pdf-dark-mode`), on the root so it covers the whole canvas; the root's
-/// background is pinned to the page's light one, which is what turns dark.
-fn inversion_script(strength: Option<f64>) -> String {
-    let strength = strength.map_or_else(|| "null".to_string(), |s| s.to_string());
+/// already in dark mode. The filter is the one the reader's pages are drawn
+/// with (`--pdf-dark-filter`), on the root so it covers the whole canvas; the
+/// root's background is pinned to the page's light one, which is what turns
+/// dark.
+fn dark_filter_script(filter: Option<&str>) -> String {
+    // A JSON string is a JavaScript string literal, so the filter reaches the
+    // page as data however it is spelled.
+    let filter = filter.map_or_else(
+        || "null".to_string(),
+        |f| serde_json::to_string(f).expect("a string serializes"),
+    );
     format!(
         r#"(() => {{
-  const strength = {strength};
-  const id = "wilkes-dark-inversion";
+  const filter = {filter};
+  const id = "wilkes-dark-filter";
   const background = (element) => {{
     if (!element) return null;
     const parts = getComputedStyle(element).backgroundColor.match(/[\d.]+/g);
@@ -142,7 +148,7 @@ fn inversion_script(strength: Option<f64>) -> String {
     let style = document.getElementById(id);
     const [r, g, b] = background(document.body) ?? background(document.documentElement) ?? [255, 255, 255];
     const light = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 > 0.5;
-    if (strength === null || !light) {{
+    if (filter === null || !light) {{
       style?.remove();
       return;
     }}
@@ -151,7 +157,7 @@ fn inversion_script(strength: Option<f64>) -> String {
       style.id = id;
       document.documentElement.appendChild(style);
     }}
-    style.textContent = `html {{ filter: invert(${{strength}}) hue-rotate(180deg) brightness(1.1) !important; background-color: rgb(${{r}}, ${{g}}, ${{b}}) !important; }}`;
+    style.textContent = `html {{ filter: ${{filter}} !important; background-color: rgb(${{r}}, ${{g}}, ${{b}}) !important; }}`;
   }};
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", apply, {{ once: true }});
   else apply();
@@ -159,9 +165,9 @@ fn inversion_script(strength: Option<f64>) -> String {
     )
 }
 
-fn invert(webview: &Webview, strength: Option<f64>) {
-    if let Err(e) = webview.eval(inversion_script(strength)) {
-        error!("browser pane: could not apply dark-mode inversion: {e}");
+fn darken(webview: &Webview, filter: Option<&str>) {
+    if let Err(e) = webview.eval(dark_filter_script(filter)) {
+        error!("browser pane: could not apply the dark-mode filter: {e}");
     }
 }
 
@@ -373,7 +379,7 @@ pub async fn browser_pane_show(
                 // Started is the new page committed, so the script lands in it
                 // and judges it as soon as its markup is in. Finished judges
                 // it again with every stylesheet applied.
-                invert(&webview, app.state::<Inversions>().get(&owner));
+                darken(&webview, app.state::<DarkFilters>().get(&owner).as_deref());
                 if finished && first_load.swap(false, Ordering::Relaxed) {
                     paint_own_background(&webview);
                 }
@@ -434,20 +440,20 @@ pub async fn browser_pane_set_bounds(window: Window, bounds: PaneBounds) -> Resu
     }
 }
 
-/// How strongly the calling window's pane inverts light pages; `None` stops.
-/// Held for pages yet to load, and applied to the one in view.
+/// The filter the calling window's pane darkens light pages with; `None`
+/// stops. Held for pages yet to load, and applied to the one in view.
 #[tauri::command]
-pub async fn browser_pane_set_inversion(
+pub async fn browser_pane_set_dark_filter(
     window: Window,
-    strength: Option<f64>,
+    filter: Option<String>,
 ) -> Result<(), String> {
+    if let Ok(webview) = pane(&window) {
+        darken(&webview, filter.as_deref());
+    }
     window
         .app_handle()
-        .state::<Inversions>()
-        .set(window.label(), strength);
-    if let Ok(webview) = pane(&window) {
-        invert(&webview, strength);
-    }
+        .state::<DarkFilters>()
+        .set(window.label(), filter);
     Ok(())
 }
 
@@ -537,19 +543,22 @@ mod tests {
     }
 
     #[test]
-    fn the_inversion_script_carries_the_strength_or_stops() {
-        assert!(inversion_script(Some(0.9)).contains("const strength = 0.9;"));
-        assert!(inversion_script(None).contains("const strength = null;"));
+    fn the_dark_filter_script_carries_the_filter_as_a_string_or_stops() {
+        assert!(dark_filter_script(Some("brightness(0.5)"))
+            .contains(r#"const filter = "brightness(0.5)";"#));
+        assert!(dark_filter_script(Some(r#"x"); alert(1); ("#))
+            .contains(r#"const filter = "x\"); alert(1); (";"#));
+        assert!(dark_filter_script(None).contains("const filter = null;"));
     }
 
     #[test]
-    fn inversion_is_held_per_window() {
-        let inversions = Inversions::default();
-        inversions.set("main", Some(0.9));
-        assert_eq!(inversions.get("main"), Some(0.9));
-        assert_eq!(inversions.get("document"), None);
-        inversions.set("main", None);
-        assert_eq!(inversions.get("main"), None);
+    fn the_dark_filter_is_held_per_window() {
+        let filters = DarkFilters::default();
+        filters.set("main", Some("brightness(0.5)".to_string()));
+        assert_eq!(filters.get("main").as_deref(), Some("brightness(0.5)"));
+        assert_eq!(filters.get("document"), None);
+        filters.set("main", None);
+        assert_eq!(filters.get("main"), None);
     }
 
     #[test]

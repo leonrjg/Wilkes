@@ -234,7 +234,7 @@ pub async fn update_scoped_settings(
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    use wilkes_core::types::{FileDisplayField, FileSortDirection, FileSortKey};
+    use wilkes_core::types::{DarkModeReading, FileDisplayField, FileSortDirection, FileSortKey};
 
     #[tokio::test]
     async fn download_limit_defaults_migrates_and_persists() {
@@ -560,6 +560,49 @@ path = "/works?rows=0"
             .await
             .unwrap();
         assert_eq!(get_settings(&path).await.unwrap().dark_mode_inversion, 90);
+    }
+
+    #[tokio::test]
+    async fn dark_mode_dimming_is_an_alternative_to_inversion_with_its_own_bounds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let loaded = get_settings(&path).await.unwrap();
+        assert_eq!(loaded.dark_mode_reading, DarkModeReading::Invert);
+        assert_eq!(loaded.dark_mode_dimming, 50);
+
+        update_settings(
+            &path,
+            serde_json::json!({ "dark_mode_reading": "Dim", "dark_mode_dimming": 35 }),
+        )
+        .await
+        .unwrap();
+        let loaded = get_settings(&path).await.unwrap();
+        assert_eq!(loaded.dark_mode_reading, DarkModeReading::Dim);
+        assert_eq!(loaded.dark_mode_dimming, 35);
+        // Each mode keeps its own strength.
+        assert_eq!(loaded.dark_mode_inversion, 90);
+
+        for invalid in [
+            serde_json::json!({ "dark_mode_dimming": 101 }),
+            serde_json::json!({ "dark_mode_dimming": -1 }),
+            serde_json::json!({ "dark_mode_reading": "Sepia" }),
+        ] {
+            assert!(update_settings(&path, invalid).await.is_err());
+            let loaded = get_settings(&path).await.unwrap();
+            assert_eq!(loaded.dark_mode_reading, DarkModeReading::Dim);
+            assert_eq!(loaded.dark_mode_dimming, 35);
+        }
+
+        let mut legacy = serde_json::to_value(Settings::default()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("dark_mode_reading");
+        object.remove("dark_mode_dimming");
+        tokio::fs::write(&path, serde_json::to_vec(&legacy).unwrap())
+            .await
+            .unwrap();
+        let loaded = get_settings(&path).await.unwrap();
+        assert_eq!(loaded.dark_mode_reading, DarkModeReading::Invert);
+        assert_eq!(loaded.dark_mode_dimming, 50);
     }
 
     #[tokio::test]

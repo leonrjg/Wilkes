@@ -2473,7 +2473,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(NativeOpenState::default())
-        .manage(browser_pane::Inversions::default())
+        .manage(browser_pane::DarkFilters::default())
         .manage(browser_pane::Downloads::default())
         .setup(|app| {
             let startup = Arc::new(DesktopStartupState::default());
@@ -2692,7 +2692,7 @@ pub fn run() {
             browser_pane::browser_pane_show,
             browser_pane::browser_pane_set_bounds,
             browser_pane::browser_pane_set_visible,
-            browser_pane::browser_pane_set_inversion,
+            browser_pane::browser_pane_set_dark_filter,
             browser_pane::browser_pane_step,
             browser_pane::browser_pane_clear_data,
             browser_pane::browser_pane_save_page,
