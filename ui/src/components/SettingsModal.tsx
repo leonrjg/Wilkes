@@ -239,8 +239,8 @@ export default function SettingsModal({
   const [lanSharingError, setLanSharingError] = useState<string | null>(null);
   const customInstructionsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settingsSaveQueue = useRef<Promise<void> | null>(null);
-  const inversionRevision = useRef(0);
-  const [inversionSaveError, setInversionSaveError] = useState<string | null>(null);
+  const darkPagesRevision = useRef(0);
+  const [darkPagesSaveError, setDarkPagesSaveError] = useState<string | null>(null);
   const generationReady = useGenerationStore((state) => state.ready);
 
   useEffect(() => {
@@ -333,29 +333,39 @@ export default function SettingsModal({
   }, [settings, maxDownloadMbDirty]);
 
   const handleUpdateSettings = (patch: Partial<Settings>): Promise<void> => {
-    const previewsInversion = patch.dark_mode_inversion !== undefined;
-    if (previewsInversion) {
-      inversionRevision.current += 1;
-      setInversionSaveError(null);
+    // How pages are darkened is previewed as it is dragged or switched, before
+    // the save lands, so the reader behind the modal follows the control.
+    const previewsDarkPages =
+      patch.dark_mode_reading !== undefined ||
+      patch.dark_mode_inversion !== undefined ||
+      patch.dark_mode_dimming !== undefined;
+    if (previewsDarkPages) {
+      darkPagesRevision.current += 1;
+      setDarkPagesSaveError(null);
       setSettings((current) => current ? { ...current, ...patch } : current);
       onSettingsUpdate?.(patch);
     }
-    const revision = inversionRevision.current;
+    const revision = darkPagesRevision.current;
 
     const save = async () => {
       try {
         const newSettings = await api.updateSettings(patch);
         // A completed save must not move a slider that has since been dragged.
-        setSettings((current) => revision === inversionRevision.current
+        setSettings((current) => revision === darkPagesRevision.current
           ? newSettings
-          : { ...newSettings, dark_mode_inversion: current?.dark_mode_inversion });
-        if (!previewsInversion) onSettingsUpdate?.(patch);
+          : {
+              ...newSettings,
+              dark_mode_reading: current?.dark_mode_reading,
+              dark_mode_inversion: current?.dark_mode_inversion,
+              dark_mode_dimming: current?.dark_mode_dimming,
+            });
+        if (!previewsDarkPages) onSettingsUpdate?.(patch);
         if (patch.generation) {
           void useGenerationStore.getState().refreshReady();
         }
       } catch (e) {
-        if (previewsInversion && revision === inversionRevision.current) {
-          setInversionSaveError("Could not save color inversion. Adjust it to try again.");
+        if (previewsDarkPages && revision === darkPagesRevision.current) {
+          setDarkPagesSaveError("Could not save dark-mode reading. Adjust it to try again.");
         }
         console.error("Failed to update settings:", e);
         throw e;
@@ -696,29 +706,89 @@ export default function SettingsModal({
                           </button>
                         ))}
                       </div>
-                      <div className="space-y-1">
+                      <div className="space-y-2">
                         <div className="flex justify-between items-baseline">
-                          <label htmlFor="dark-mode-inversion" className="text-xs text-[var(--text-muted)]">
-                            Dark-mode color inversion
-                          </label>
-                          <output htmlFor="dark-mode-inversion" className="text-xs text-[var(--text-dim)]">
-                            {settings.dark_mode_inversion ?? 90}%
-                          </output>
+                          <span id="dark-mode-reading-label" className="text-xs text-[var(--text-muted)]">
+                            Dark-mode reading
+                          </span>
+                          <p className="text-[10px] text-[var(--text-dim)] italic">How light pages are darkened</p>
                         </div>
-                        <input
-                          id="dark-mode-inversion"
-                          type="range"
-                          min="0"
-                          max="100"
-                          step="1"
-                          value={settings.dark_mode_inversion ?? 90}
-                          onChange={(e) => {
-                            void handleUpdateSettings({ dark_mode_inversion: Number(e.target.value) }).catch(() => {});
-                          }}
-                          className="w-full accent-[var(--accent-blue)]"
-                        />
-                        {inversionSaveError && (
-                          <p role="alert" className="text-xs text-[var(--accent-red)]">{inversionSaveError}</p>
+                        <div
+                          role="radiogroup"
+                          aria-labelledby="dark-mode-reading-label"
+                          className="flex p-0.5 bg-[var(--bg-active)] rounded-lg w-fit"
+                        >
+                          {([["Invert", "Invert colors"], ["Dim", "Dim"]] as const).map(([mode, label]) => {
+                            const checked = (settings.dark_mode_reading ?? "Invert") === mode;
+                            return (
+                              <button
+                                key={mode}
+                                type="button"
+                                role="radio"
+                                aria-checked={checked}
+                                onClick={() => {
+                                  void handleUpdateSettings({ dark_mode_reading: mode }).catch(() => {});
+                                }}
+                                className={`px-3 py-1 rounded-md text-xs transition-all ${
+                                  checked
+                                    ? "bg-[var(--bg-app)] text-[var(--text-main)] shadow-sm"
+                                    : "text-[var(--text-dim)] hover:text-[var(--text-muted)]"
+                                }`}
+                              >
+                                {label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        {(settings.dark_mode_reading ?? "Invert") === "Invert" ? (
+                          <div className="space-y-1">
+                            <div className="flex justify-between items-baseline">
+                              <label htmlFor="dark-mode-inversion" className="text-xs text-[var(--text-muted)]">
+                                Dark-mode color inversion
+                              </label>
+                              <output htmlFor="dark-mode-inversion" className="text-xs text-[var(--text-dim)]">
+                                {settings.dark_mode_inversion ?? 90}%
+                              </output>
+                            </div>
+                            <input
+                              id="dark-mode-inversion"
+                              type="range"
+                              min="0"
+                              max="100"
+                              step="1"
+                              value={settings.dark_mode_inversion ?? 90}
+                              onChange={(e) => {
+                                void handleUpdateSettings({ dark_mode_inversion: Number(e.target.value) }).catch(() => {});
+                              }}
+                              className="w-full accent-[var(--accent-blue)]"
+                            />
+                          </div>
+                        ) : (
+                          <div className="space-y-1">
+                            <div className="flex justify-between items-baseline">
+                              <label htmlFor="dark-mode-dimming" className="text-xs text-[var(--text-muted)]">
+                                Dark-mode dimming
+                              </label>
+                              <output htmlFor="dark-mode-dimming" className="text-xs text-[var(--text-dim)]">
+                                {settings.dark_mode_dimming ?? 50}%
+                              </output>
+                            </div>
+                            <input
+                              id="dark-mode-dimming"
+                              type="range"
+                              min="0"
+                              max="100"
+                              step="1"
+                              value={settings.dark_mode_dimming ?? 50}
+                              onChange={(e) => {
+                                void handleUpdateSettings({ dark_mode_dimming: Number(e.target.value) }).catch(() => {});
+                              }}
+                              className="w-full accent-[var(--accent-blue)]"
+                            />
+                          </div>
+                        )}
+                        {darkPagesSaveError && (
+                          <p role="alert" className="text-xs text-[var(--accent-red)]">{darkPagesSaveError}</p>
                         )}
                       </div>
                     </div>

@@ -9,6 +9,7 @@ import { api } from "../services";
 import type { BrowserStep, PaneBounds, RgbColor } from "../services/api";
 import { useBrowserStore } from "../stores/useBrowserStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { darkPageFilter } from "../lib/darkPages";
 import { confirmDialog } from "../lib/utils/dialog";
 import CookieImportStrip from "./CookieImportStrip";
 import BrowserDownloads from "./BrowserDownloads";
@@ -77,15 +78,15 @@ export default function BrowserPane() {
   const loading = useBrowserStore((s) => s.loading);
   const held = useBrowserStore((s) => s.held);
   const closePane = useBrowserStore((s) => s.closePane);
-  const invertLightPages = useBrowserStore((s) => s.invertLightPages);
-  const toggleInversion = useBrowserStore((s) => s.toggleInversion);
+  const darkenLightPages = useBrowserStore((s) => s.darkenLightPages);
+  const toggleDarkening = useBrowserStore((s) => s.toggleDarkening);
   const finding = useBrowserStore((s) => s.finding);
   const findRequests = useBrowserStore((s) => s.findRequests);
   const hoveredLink = useBrowserStore((s) => s.hoveredLink);
   const dark = useSettingsStore((s) => s.colorScheme === "dark");
-  const inversionPercent = useSettingsStore((s) => s.settings?.dark_mode_inversion ?? 90);
-  // The reader's inversion, at the reader's strength.
-  const inversion = dark && invertLightPages ? inversionPercent / 100 : null;
+  // The reader's dark-mode filter: inverted or dimmed, as the reader's pages are.
+  const readerFilter = useSettingsStore((s) => darkPageFilter(s.settings ?? {}));
+  const darkFilter = dark && darkenLightPages ? readerFilter : null;
   const [draft, setDraft] = useState(request?.url ?? "");
   const [editing, setEditing] = useState(false);
   const [importingCookies, setImportingCookies] = useState(false);
@@ -148,8 +149,8 @@ export default function BrowserPane() {
   // Held by the shell for every page the pane loads, so it is sent whether or
   // not the webview exists yet.
   useEffect(() => {
-    api.browserPaneSetInversion?.(inversion).catch((e) => console.error("browser pane: could not set inversion", e));
-  }, [inversion]);
+    api.browserPaneSetDarkFilter?.(darkFilter).catch((e) => console.error("browser pane: could not set the dark filter", e));
+  }, [darkFilter]);
 
   useEffect(() => {
     if (!created.current) return;
@@ -244,13 +245,13 @@ export default function BrowserPane() {
           </button>
         </Tooltip>
         {dark && (
-          <Tooltip content={invertLightPages ? "Stop inverting light pages" : "Invert light pages"}>
+          <Tooltip content={darkenLightPages ? "Stop darkening light pages" : "Darken light pages"}>
             <button
               type="button"
-              aria-label="Invert light pages"
-              aria-pressed={invertLightPages}
-              onClick={toggleInversion}
-              className={`${iconButton} ${invertLightPages ? "text-[var(--accent-blue)]" : ""}`}
+              aria-label="Darken light pages"
+              aria-pressed={darkenLightPages}
+              onClick={toggleDarkening}
+              className={`${iconButton} ${darkenLightPages ? "text-[var(--accent-blue)]" : ""}`}
             >
               <Moon size={12} />
             </button>

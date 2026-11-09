@@ -422,10 +422,35 @@ describe("SettingsModal", () => {
     await act(async () => { render(<SettingsModal {...defaultProps} />); });
     const slider = screen.getByRole("slider", { name: "Dark-mode color inversion" });
     await act(async () => { fireEvent.change(slider, { target: { value: "70" } }); });
-    expect(screen.getByRole("alert")).toHaveTextContent("Could not save color inversion");
+    expect(screen.getByRole("alert")).toHaveTextContent("Could not save dark-mode reading");
     await act(async () => { fireEvent.change(slider, { target: { value: "80" } }); });
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(slider).toHaveValue("80");
+  });
+
+  it("dims pages instead of inverting them, with its own strength", async () => {
+    const onSettingsUpdate = vi.fn();
+    mockApi.updateSettings.mockImplementation(async (patch: any) => ({ ...mockSettings, ...patch }));
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} onSettingsUpdate={onSettingsUpdate} />);
+    });
+    expect(screen.getByRole("radio", { name: "Invert colors" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByRole("slider", { name: "Dark-mode dimming" })).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("radio", { name: "Dim" }));
+    });
+    expect(mockApi.updateSettings).toHaveBeenCalledWith({ dark_mode_reading: "Dim" });
+    expect(onSettingsUpdate).toHaveBeenCalledWith({ dark_mode_reading: "Dim" });
+    expect(screen.queryByRole("slider", { name: "Dark-mode color inversion" })).toBeNull();
+
+    const dimming = screen.getByRole("slider", { name: "Dark-mode dimming" });
+    expect(dimming).toHaveValue("50");
+    await act(async () => {
+      fireEvent.change(dimming, { target: { value: "35" } });
+    });
+    expect(mockApi.updateSettings).toHaveBeenLastCalledWith({ dark_mode_dimming: 35 });
+    expect(onSettingsUpdate).toHaveBeenLastCalledWith({ dark_mode_dimming: 35 });
   });
 
   it("updates the PDF auto-zoom target", async () => {

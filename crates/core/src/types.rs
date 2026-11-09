@@ -2719,6 +2719,16 @@ pub struct Settings {
         deserialize_with = "deserialize_dark_mode_inversion"
     )]
     pub dark_mode_inversion: u8,
+    /// How document pages are darkened in dark mode: inverted, or dimmed.
+    #[serde(default)]
+    pub dark_mode_reading: DarkModeReading,
+    /// How much of a page's brightness dimming takes away, as a percentage,
+    /// when pages are dimmed rather than inverted.
+    #[serde(
+        default = "default_dark_mode_dimming",
+        deserialize_with = "deserialize_dark_mode_dimming"
+    )]
+    pub dark_mode_dimming: u8,
     #[serde(default)]
     pub search_prefer_semantic: bool,
     /// When enabled, exact (grep) search reads a PDF's text from the semantic
@@ -2859,6 +2869,23 @@ where
     Ok(value)
 }
 
+fn default_dark_mode_dimming() -> u8 {
+    50
+}
+
+fn deserialize_dark_mode_dimming<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u8::deserialize(deserializer)?;
+    if value > 100 {
+        return Err(de::Error::custom(
+            "dark-mode dimming must be between 0 and 100",
+        ));
+    }
+    Ok(value)
+}
+
 fn default_pdf_auto_zoom_target_px() -> f64 {
     15.5
 }
@@ -2918,6 +2945,8 @@ impl Default for Settings {
             context_lines: 2,
             theme: Theme::default(),
             dark_mode_inversion: default_dark_mode_inversion(),
+            dark_mode_reading: DarkModeReading::default(),
+            dark_mode_dimming: default_dark_mode_dimming(),
             search_prefer_semantic: false,
             grep_use_index: default_grep_use_index(),
             semantic: SemanticSettings::default(),
@@ -3747,6 +3776,15 @@ pub struct CatalogueProviderStatus {
     pub grain: CatalogueGrain,
     pub records: i64,
     pub synced_at_ms: Option<i64>,
+}
+
+/// How document pages are darkened when the app is in dark mode. Inverting
+/// turns a white page dark; dimming keeps its colours and lowers its brightness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DarkModeReading {
+    #[default]
+    Invert,
+    Dim,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

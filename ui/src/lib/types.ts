@@ -1363,6 +1363,10 @@ export interface Settings {
   theme: Theme;
   /** Document canvas inversion in dark mode, as a percentage (0–100). */
   dark_mode_inversion?: number;
+  /** How document pages are darkened in dark mode. */
+  dark_mode_reading?: DarkModeReading;
+  /** Brightness taken away from a dimmed page, as a percentage (0–100). */
+  dark_mode_dimming?: number;
   search_prefer_semantic: boolean;
   grep_use_index: boolean;
   semantic: SemanticSettings;
@@ -1457,6 +1461,10 @@ export interface LanFileReceived {
 
 
 export type Theme = "System" | "Light" | "Dark";
+
+/** Inverting turns a white page dark; dimming keeps its colours and lowers its
+ *  brightness. */
+export type DarkModeReading = "Invert" | "Dim";
 export type BookmarkDock = "Left" | "Right";
 
 export interface SearchCapabilities {

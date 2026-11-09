@@ -164,8 +164,8 @@ export interface SearchApi {
   /** Native views take the pointer from the page; a drag in the page hides
    *  the pane until it ends. */
   browserPaneSetVisible?(visible: boolean): Promise<void>;
-  /** How strongly light pages in the pane are inverted (0 to 1); null stops. */
-  browserPaneSetInversion?(strength: number | null): Promise<void>;
+  /** The CSS filter light pages in the pane are darkened with; null stops. */
+  browserPaneSetDarkFilter?(filter: string | null): Promise<void>;
   browserPaneStep?(step: BrowserStep): Promise<void>;
   browserPaneClearData?(): Promise<void>;
   /** Save what the pane is showing into the library root, as a download. */

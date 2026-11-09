@@ -492,8 +492,8 @@ export class TauriSearchApi implements SearchApi {
     return invoke("browser_pane_set_visible", { visible });
   }
 
-  async browserPaneSetInversion(strength: number | null): Promise<void> {
-    return invoke("browser_pane_set_inversion", { strength });
+  async browserPaneSetDarkFilter(filter: string | null): Promise<void> {
+    return invoke("browser_pane_set_dark_filter", { filter });
   }
 
   async browserPaneStep(step: BrowserStep): Promise<void> {
