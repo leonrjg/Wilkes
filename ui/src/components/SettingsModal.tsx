@@ -185,7 +185,9 @@ export default function SettingsModal({
   onSettingsUpdate,
 }: SettingsModalProps) {
   type SettingsTab =
-    | "general"
+    | "interface"
+    | "search"
+    | "library"
     | "extensions"
     | "integrations"
     | "semantic-models"
@@ -200,7 +202,7 @@ export default function SettingsModal({
     | "logs"
     | "technical";
 
-  const [activeTab, setActiveTab] = useState<SettingsTab>("general");
+  const [activeTab, setActiveTab] = useState<SettingsTab>("interface");
   const chatBackendsLoaded = useChatStore((s) => s.backendsLoaded);
   const hasAvailableChatBackend = useChatStore((s) => s.hasAvailableBackend);
   const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
@@ -607,8 +609,10 @@ export default function SettingsModal({
           {/* Sidebar */}
           <div className="w-40 shrink-0 border-r border-[var(--border-main)] bg-[var(--bg-sidebar)] p-2 flex flex-col gap-3 overflow-y-auto">
             <div className="flex flex-col gap-0.5 shrink-0">
-              <TabButton id="general" label="General" />
-              <TabButton id="extensions" label="File extensions" />
+              <TabButton id="interface" label="Interface" />
+              <TabButton id="search" label="Search" />
+              <TabButton id="library" label="Library" />
+              <TabButton id="extensions" label="Files" accessibleLabel="Files and extensions" />
               <TabButton id="integrations" label="Integrations" />
               {isTauri && (
                 <TabButton
@@ -670,46 +674,151 @@ export default function SettingsModal({
               bottom padding follows the last control. Logs and the editor
               fill the viewport and manage their own internal scrolling. */}
           <div className="flex-1 overflow-y-auto p-4 pb-12 bg-[var(--bg-app)] relative">
-            <div className={activeTab === "general" ? "block min-h-full" : "hidden"}>
+            <div className={activeTab === "interface" ? "block min-h-full" : "hidden"}>
               {settings && (
                 <div className="space-y-4">
-                  <section className="space-y-1">
-                    <label htmlFor="max-download-size-mb" className="text-xs text-[var(--text-muted)]">Maximum download size (MB)</label>
-                    <input
-                      id="max-download-size-mb"
-                      type="number"
-                      min={0.000001}
-                      step="any"
-                      value={maxDownloadMbDraft}
-                      onChange={(e) => {
-                        downloadSizeRevision.current += 1;
-                        setMaxDownloadMbDraft(e.target.value);
-                        setMaxDownloadMbDirty(true);
-                        setDownloadSizeError(null);
-                      }}
-                      onBlur={() => void persistMaxDownloadSize()}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") e.currentTarget.blur();
-                      }}
-                      aria-invalid={!!downloadSizeError}
-                      aria-describedby={downloadSizeError ? "download-size-error" : undefined}
-                      className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
-                    />
-                    {downloadSizeError && <p id="download-size-error" role="alert" className="text-xs text-red-400">{downloadSizeError}</p>}
-                  </section>
                   <section>
-                    <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2.5 uppercase tracking-wider">Search Preferences</h3>
+                    <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Appearance</h3>
                     <div className="space-y-3">
-                      <label className="flex items-center gap-2.5 cursor-pointer group">
+                      <div className="flex p-0.5 bg-[var(--bg-active)] rounded-lg w-fit">
+                        {(["System", "Light", "Dark"] as const).map((t) => (
+                          <button
+                            key={t}
+                            type="button"
+                            onClick={() => handleUpdateSettings({ theme: t })}
+                            className={`px-3 py-1 rounded-md text-xs transition-all ${
+                              settings.theme === t
+                                ? "bg-[var(--bg-app)] text-[var(--text-main)] shadow-sm"
+                                : "text-[var(--text-dim)] hover:text-[var(--text-muted)]"
+                            }`}
+                          >
+                            {t}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="space-y-1">
+                        <div className="flex justify-between items-baseline">
+                          <label htmlFor="dark-mode-inversion" className="text-xs text-[var(--text-muted)]">
+                            Dark-mode color inversion
+                          </label>
+                          <output htmlFor="dark-mode-inversion" className="text-xs text-[var(--text-dim)]">
+                            {settings.dark_mode_inversion ?? 90}%
+                          </output>
+                        </div>
+                        <input
+                          id="dark-mode-inversion"
+                          type="range"
+                          min="0"
+                          max="100"
+                          step="1"
+                          value={settings.dark_mode_inversion ?? 90}
+                          onChange={(e) => {
+                            void handleUpdateSettings({ dark_mode_inversion: Number(e.target.value) }).catch(() => {});
+                          }}
+                          className="w-full accent-[var(--accent-blue)]"
+                        />
+                        {inversionSaveError && (
+                          <p role="alert" className="text-xs text-[var(--accent-red)]">{inversionSaveError}</p>
+                        )}
+                      </div>
+                    </div>
+                  </section>
+
+                  <section>
+                    <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">File list</h3>
+                    <div className="space-y-3">
+                      <label className="flex items-start gap-2.5 cursor-pointer group">
                         <input
                           type="checkbox"
-                          checked={settings.respect_gitignore}
-                          onChange={(e) => handleUpdateSettings({ respect_gitignore: e.target.checked })}
-                          className="w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
+                          aria-label="Show folders in file list"
+                          checked={settings.file_tree_enabled ?? false}
+                          onChange={(e) => handleUpdateSettings({ file_tree_enabled: e.target.checked })}
+                          className="mt-0.5 w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
                         />
-                        <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Respect .gitignore files</span>
+                        <span className="flex flex-col">
+                          <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Show folders in file list</span>
+                          <span className="text-[10px] text-[var(--text-dim)] italic">Groups files by folder and enables drag-and-drop moves between them</span>
+                        </span>
                       </label>
+                    </div>
+                  </section>
 
+                  <section>
+                    <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Reader</h3>
+                    <div className="space-y-3">
+                      <div className="space-y-1">
+                        <div className="flex justify-between items-baseline">
+                          <label htmlFor="pdf-auto-zoom-target" className="text-xs text-[var(--text-muted)]">
+                            PDF auto-zoom target (px)
+                          </label>
+                          <p className="text-[10px] text-[var(--text-dim)] italic">Body-text height</p>
+                        </div>
+                        <input
+                          id="pdf-auto-zoom-target"
+                          type="number"
+                          min={1}
+                          step={0.5}
+                          value={settings.pdf_auto_zoom_target_px}
+                          onChange={(e) => {
+                            const value = Number(e.target.value);
+                            if (value > 0) {
+                              handleUpdateSettings({ pdf_auto_zoom_target_px: value });
+                            }
+                          }}
+                          className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
+                        />
+                      </div>
+                    </div>
+                  </section>
+
+                  {isTauri && (
+                    <section>
+                      <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Links</h3>
+                      <label className="flex items-start gap-2.5 cursor-pointer group">
+                        <input
+                          type="checkbox"
+                          aria-label="Open web links in Wilkes"
+                          checked={settings.open_links_in_app}
+                          onChange={(e) => handleUpdateSettings({ open_links_in_app: e.target.checked })}
+                          className="mt-0.5 w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
+                        />
+                        <span className="flex flex-col">
+                          <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Open web links in Wilkes</span>
+                          <span className="text-[10px] text-[var(--text-dim)] italic">Shows them in a browser pane beside the document instead of your system browser</span>
+                        </span>
+                      </label>
+                    </section>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className={activeTab === "search" ? "block min-h-full" : "hidden"}>
+              {settings && (
+                <div className="space-y-4">
+                  <section>
+                    <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Results</h3>
+                    <div className="space-y-3">
+                      <div className="space-y-1">
+                        <div className="flex justify-between items-baseline">
+                          <label htmlFor="max-results" className="text-xs text-[var(--text-muted)]">Max results</label>
+                          <p className="text-[10px] text-[var(--text-dim)] italic">0 = unlimited</p>
+                        </div>
+                        <input
+                          id="max-results"
+                          type="number"
+                          min={0}
+                          value={settings.max_results}
+                          onChange={(e) => handleUpdateSettings({ max_results: parseInt(e.target.value) || 0 })}
+                          className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
+                        />
+                      </div>
+                    </div>
+                  </section>
+
+                  <section>
+                    <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Exact search</h3>
+                    <div className="space-y-3">
                       <label className="flex items-start gap-2.5 cursor-pointer group">
                         <input
                           type="checkbox"
@@ -722,68 +831,6 @@ export default function SettingsModal({
                           <span className="text-[10px] text-[var(--text-dim)] italic">Search cached text when available.</span>
                         </span>
                       </label>
-
-                      <div className="space-y-1">
-                        <div className="flex justify-between items-baseline">
-                          <label htmlFor="max-file-size-mb" className="text-xs text-[var(--text-muted)]">Max file size (MB)</label>
-                          <p className="text-[10px] text-[var(--text-dim)] italic">Skip larger files</p>
-                        </div>
-                        <input
-                          id="max-file-size-mb"
-                          type="number"
-                          min={0}
-                          step={1}
-                          value={maxFileSizeMbDraft}
-                          onChange={(e) => {
-                            setMaxFileSizeMbDraft(e.target.value);
-                            setMaxFileSizeMbDirty(true);
-                          }}
-                          onBlur={() => void persistMaxFileSize()}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") e.currentTarget.blur();
-                          }}
-                          className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
-                        />
-                      </div>
-
-                      <div className="space-y-1">
-                        <div className="flex justify-between items-baseline">
-                          <label className="text-xs text-[var(--text-muted)]">Max results</label>
-                          <p className="text-[10px] text-[var(--text-dim)] italic">0 = unlimited</p>
-                        </div>
-                        <input
-                          type="number"
-                          min={0}
-                          value={settings.max_results}
-                          onChange={(e) => handleUpdateSettings({ max_results: parseInt(e.target.value) || 0 })}
-                          className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
-                        />
-                      </div>
-
-                      <div className="space-y-1">
-                        <div className="flex justify-between items-baseline">
-                          <label className="text-xs text-[var(--text-muted)]">Primary metadata source</label>
-                          <p className="text-[10px] text-[var(--text-dim)] italic">Displayed first</p>
-                        </div>
-                        <select
-                          value={settings.primary_metadata_source ?? "zotero"}
-                          onChange={(e) =>
-                            handleUpdateSettings({
-                              primary_metadata_source: e.target.value as MetadataSourcePreference,
-                            })
-                          }
-                          className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
-                        >
-                          {metadataSources(
-                            literatureProviders,
-                            settings.primary_metadata_source ?? "zotero",
-                          ).map((source) => (
-                            <option key={source.value} value={source.value}>
-                              {source.label}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
                     </div>
                   </section>
 
@@ -933,107 +980,120 @@ export default function SettingsModal({
                       </section>
                     );
                   })()}
+                </div>
+              )}
+            </div>
+
+            <div className={activeTab === "library" ? "block min-h-full" : "hidden"}>
+              {settings && (
+                <div className="space-y-4">
+                  <section>
+                    <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Metadata</h3>
+                    <div className="space-y-3">
+                      <div className="space-y-1">
+                        <div className="flex justify-between items-baseline">
+                          <label htmlFor="primary-metadata-source" className="text-xs text-[var(--text-muted)]">Primary metadata source</label>
+                          <p className="text-[10px] text-[var(--text-dim)] italic">Displayed first</p>
+                        </div>
+                        <select
+                          id="primary-metadata-source"
+                          value={settings.primary_metadata_source ?? "zotero"}
+                          onChange={(e) =>
+                            handleUpdateSettings({
+                              primary_metadata_source: e.target.value as MetadataSourcePreference,
+                            })
+                          }
+                          className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
+                        >
+                          {metadataSources(
+                            literatureProviders,
+                            settings.primary_metadata_source ?? "zotero",
+                          ).map((source) => (
+                            <option key={source.value} value={source.value}>
+                              {source.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  </section>
 
                   <section>
-                    <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Appearance</h3>
+                    <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Downloads</h3>
                     <div className="space-y-3">
-                      <label className="flex items-start gap-2.5 cursor-pointer group">
+                      <div className="space-y-1">
+                        <div className="flex justify-between items-baseline">
+                          <label htmlFor="max-download-size-mb" className="text-xs text-[var(--text-muted)]">Maximum download size (MB)</label>
+                          <p className="text-[10px] text-[var(--text-dim)] italic">Larger files are refused</p>
+                        </div>
+                        <input
+                          id="max-download-size-mb"
+                          type="number"
+                          min={0.000001}
+                          step="any"
+                          value={maxDownloadMbDraft}
+                          onChange={(e) => {
+                            downloadSizeRevision.current += 1;
+                            setMaxDownloadMbDraft(e.target.value);
+                            setMaxDownloadMbDirty(true);
+                            setDownloadSizeError(null);
+                          }}
+                          onBlur={() => void persistMaxDownloadSize()}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") e.currentTarget.blur();
+                          }}
+                          aria-invalid={!!downloadSizeError}
+                          aria-describedby={downloadSizeError ? "download-size-error" : undefined}
+                          className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
+                        />
+                        {downloadSizeError && <p id="download-size-error" role="alert" className="text-xs text-red-400">{downloadSizeError}</p>}
+                      </div>
+                    </div>
+                  </section>
+                </div>
+              )}
+            </div>
+
+            <div className={activeTab === "extensions" ? "block min-h-full" : "hidden"}>
+              {settings && (
+                <div className="space-y-4">
+                  <section className="px-1">
+                    <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Scanning</h3>
+                    <div className="space-y-3">
+                      <label className="flex items-center gap-2.5 cursor-pointer group">
                         <input
                           type="checkbox"
-                          aria-label="Show folders in file list"
-                          checked={settings.file_tree_enabled ?? false}
-                          onChange={(e) => handleUpdateSettings({ file_tree_enabled: e.target.checked })}
-                          className="mt-0.5 w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
+                          checked={settings.respect_gitignore}
+                          onChange={(e) => handleUpdateSettings({ respect_gitignore: e.target.checked })}
+                          className="w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
                         />
-                        <span className="flex flex-col">
-                          <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Show folders in file list</span>
-                          <span className="text-[10px] text-[var(--text-dim)] italic">Groups files by folder and enables drag-and-drop moves between them</span>
-                        </span>
+                        <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Respect .gitignore files</span>
                       </label>
-                      <div className="flex p-0.5 bg-[var(--bg-active)] rounded-lg w-fit">
-                        {(["System", "Light", "Dark"] as const).map((t) => (
-                          <button
-                            key={t}
-                            type="button"
-                            onClick={() => handleUpdateSettings({ theme: t })}
-                            className={`px-3 py-1 rounded-md text-xs transition-all ${
-                              settings.theme === t
-                                ? "bg-[var(--bg-app)] text-[var(--text-main)] shadow-sm"
-                                : "text-[var(--text-dim)] hover:text-[var(--text-muted)]"
-                            }`}
-                          >
-                            {t}
-                          </button>
-                        ))}
-                      </div>
                       <div className="space-y-1">
                         <div className="flex justify-between items-baseline">
-                          <label htmlFor="dark-mode-inversion" className="text-xs text-[var(--text-muted)]">
-                            Dark-mode color inversion
-                          </label>
-                          <output htmlFor="dark-mode-inversion" className="text-xs text-[var(--text-dim)]">
-                            {settings.dark_mode_inversion ?? 90}%
-                          </output>
+                          <label htmlFor="max-file-size-mb" className="text-xs text-[var(--text-muted)]">Max file size (MB)</label>
+                          <p className="text-[10px] text-[var(--text-dim)] italic">Skip larger files</p>
                         </div>
                         <input
-                          id="dark-mode-inversion"
-                          type="range"
-                          min="0"
-                          max="100"
-                          step="1"
-                          value={settings.dark_mode_inversion ?? 90}
-                          onChange={(e) => {
-                            void handleUpdateSettings({ dark_mode_inversion: Number(e.target.value) }).catch(() => {});
-                          }}
-                          className="w-full accent-[var(--accent-blue)]"
-                        />
-                        {inversionSaveError && (
-                          <p role="alert" className="text-xs text-[var(--accent-red)]">{inversionSaveError}</p>
-                        )}
-                      </div>
-                      <div className="space-y-1">
-                        <div className="flex justify-between items-baseline">
-                          <label htmlFor="pdf-auto-zoom-target" className="text-xs text-[var(--text-muted)]">
-                            PDF auto-zoom target (px)
-                          </label>
-                          <p className="text-[10px] text-[var(--text-dim)] italic">Body-text height</p>
-                        </div>
-                        <input
-                          id="pdf-auto-zoom-target"
+                          id="max-file-size-mb"
                           type="number"
-                          min={1}
-                          step={0.5}
-                          value={settings.pdf_auto_zoom_target_px}
+                          min={0}
+                          step={1}
+                          value={maxFileSizeMbDraft}
                           onChange={(e) => {
-                            const value = Number(e.target.value);
-                            if (value > 0) {
-                              handleUpdateSettings({ pdf_auto_zoom_target_px: value });
-                            }
+                            setMaxFileSizeMbDraft(e.target.value);
+                            setMaxFileSizeMbDirty(true);
+                          }}
+                          onBlur={() => void persistMaxFileSize()}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") e.currentTarget.blur();
                           }}
                           className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)] transition-colors"
                         />
                       </div>
                     </div>
                   </section>
-
-                  {isTauri && (
-                    <section>
-                      <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Links</h3>
-                      <label className="flex items-start gap-2.5 cursor-pointer group">
-                        <input
-                          type="checkbox"
-                          aria-label="Open web links in Wilkes"
-                          checked={settings.open_links_in_app}
-                          onChange={(e) => handleUpdateSettings({ open_links_in_app: e.target.checked })}
-                          className="mt-0.5 w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
-                        />
-                        <span className="flex flex-col">
-                          <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Open web links in Wilkes</span>
-                          <span className="text-[10px] text-[var(--text-dim)] italic">Shows them in a browser pane beside the document instead of your system browser</span>
-                        </span>
-                      </label>
-                    </section>
-                  )}
+                  <ExtensionsPanel settings={settings} onUpdate={handleUpdateSettings} />
                 </div>
               )}
             </div>
@@ -1086,11 +1146,6 @@ export default function SettingsModal({
               )}
             </div>
 
-            <div className={activeTab === "extensions" ? "block min-h-full" : "hidden"}>
-              {settings && (
-                <ExtensionsPanel settings={settings} onUpdate={handleUpdateSettings} />
-              )}
-            </div>
 
             <div className={activeTab === "integrations" ? "block min-h-full" : "hidden"}>
               {settings && (

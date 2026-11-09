@@ -209,8 +209,45 @@ describe("SettingsModal", () => {
     await act(async () => {
       render(<SettingsModal {...defaultProps} />);
     });
-    fireEvent.click(screen.getByText("File extensions"));
+    fireEvent.click(screen.getByRole("button", { name: "Files and extensions" }));
     expect(screen.getByTestId("extensions-panel")).toBeInTheDocument();
+  });
+
+  it("files each former General setting under the page it belongs to", async () => {
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+    expect(screen.queryByRole("button", { name: "General" })).not.toBeInTheDocument();
+
+    // jsdom knows nothing of Tailwind, so ask which pane each control sits in.
+    const paneOf = (el: HTMLElement) => el.closest("div.block, div.hidden");
+    const pages: [string, HTMLElement[]][] = [
+      ["Interface", [
+        screen.getByRole("button", { name: "Dark" }),
+        screen.getByRole("slider", { name: "Dark-mode color inversion" }),
+        screen.getByLabelText("Show folders in file list"),
+        screen.getByLabelText("PDF auto-zoom target (px)"),
+        screen.getByLabelText("Open web links in Wilkes"),
+      ]],
+      ["Search", [
+        screen.getByLabelText("Max results"),
+        screen.getByLabelText(/Use index for exact search/),
+        screen.getByLabelText(/Pseudo-relevance feedback/),
+      ]],
+      ["Library", [
+        screen.getByLabelText("Primary metadata source"),
+        screen.getByLabelText("Maximum download size (MB)"),
+      ]],
+      ["Files and extensions", [
+        screen.getByLabelText("Respect .gitignore files"),
+        screen.getByLabelText("Max file size (MB)"),
+        screen.getByTestId("extensions-panel"),
+      ]],
+    ];
+    for (const [page, controls] of pages) {
+      fireEvent.click(screen.getByRole("button", { name: page }));
+      for (const control of controls) expect(paneOf(control)).toHaveClass("block");
+    }
   });
 
   it("groups Chat and Models under Generation", async () => {
