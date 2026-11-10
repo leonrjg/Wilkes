@@ -1,24 +1,30 @@
-//! Downloads the browser pane's context menu starts on macOS -- "Download
-//! Linked File", "Download Image" -- into the library like any other.
+//! Downloads in the browser pane on macOS that wry leaves unrouted, sent into
+//! the library like any other.
 //!
-//! WebKit tells the navigation delegate of those through a private callback,
+//! The context menu's -- "Download Linked File", "Download Image" -- WebKit
+//! reports to the navigation delegate through a private callback,
 //! `_webView:contextMenuDidCreateDownload:`, not the two public ones wry
 //! implements, so they reach no one: nothing says where to save them, and
 //! they go nowhere. The pane gets a stand-in in front of wry's navigation
 //! delegate that takes that one callback and hands every other on, and
-//! gives such a download a delegate of its own. That delegate decides
-//! nothing itself: it asks the pane's download routing, which every other
-//! download goes through as well.
+//! gives such a download a delegate of its own.
+//!
+//! Save to library starts its download here too, natively, rather than by a
+//! script in the page: a page served as an attachment -- a PDF from the ACM
+//! Digital Library -- is shown in a sandbox that runs no script at all.
+//!
+//! The downloads' delegate decides nothing itself: it asks the pane's
+//! download routing, which every other download goes through as well.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use block2::DynBlock;
+use block2::{DynBlock, RcBlock};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, Sel};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_foundation::{NSObject, NSString, NSURL};
+use objc2_foundation::{NSObject, NSString, NSURLRequest, NSURL};
 use tauri::webview::DownloadEvent;
 use tauri::{AppHandle, Url, Webview};
 use tracing::error;
@@ -117,8 +123,8 @@ impl DownloadDelegate {
 struct StandInIvars {
     /// wry's navigation delegate, which answers everything but this.
     original: Option<Retained<AnyObject>>,
-    /// Shared by every download the pane's context menu starts. WebKit holds
-    /// a download's delegate weakly, so it lives here.
+    /// Shared by every download started here. WebKit holds a download's
+    /// delegate weakly, so it lives here.
     downloads: Retained<DownloadDelegate>,
 }
 
@@ -166,7 +172,8 @@ thread_local! {
     static STAND_INS: RefCell<HashMap<String, Retained<NavigationStandIn>>> = RefCell::new(HashMap::new());
 }
 
-/// Route a pane's context-menu downloads into the library from now on.
+/// Route a pane's context-menu downloads, and what it is asked to save, into
+/// the library from now on.
 pub(crate) fn listen(webview: &Webview, app: &AppHandle, owner: &str) {
     let route = Route {
         app: app.clone(),
@@ -191,6 +198,49 @@ pub(crate) fn listen(webview: &Webview, app: &AppHandle, owner: &str) {
     });
     if let Err(e) = listening {
         error!("browser pane: could not take its context menu's downloads: {e}");
+    }
+}
+
+/// Download what the pane is showing -- the PDF in its viewer, the page's
+/// HTML -- from its own address, through the pane's own session, so a
+/// sign-in or a bot check the page needed carries over.
+pub(crate) fn save_page(webview: &Webview, owner: &str) {
+    let owner = owner.to_string();
+    let saving = webview.with_webview(move |platform| {
+        let Some(downloads) = STAND_INS.with_borrow(|stand_ins| {
+            stand_ins
+                .get(&owner)
+                .map(|stand_in| stand_in.ivars().downloads.clone())
+        }) else {
+            error!("browser pane: {owner}'s pane has no download delegate to save with");
+            return;
+        };
+        // SAFETY: `inner` is the pane's live WKWebView, on the main thread.
+        let view = unsafe { &*platform.inner().cast::<AnyObject>() };
+        let url: Option<Retained<NSURL>> = unsafe { msg_send![view, URL] };
+        let Some(url) = url else {
+            error!("browser pane: {owner}'s pane has no page to save");
+            return;
+        };
+        let request = NSURLRequest::requestWithURL(&url);
+        let started = RcBlock::new(move |download: *mut AnyObject| {
+            // SAFETY: WebKit hands over a live WKDownload, whose delegate it
+            // holds weakly; `downloads` is kept by the stand-in.
+            match unsafe { download.as_ref() } {
+                Some(download) => {
+                    let _: () = unsafe { msg_send![download, setDelegate: &*downloads] };
+                }
+                None => error!("browser pane: WebKit started no download to save the page"),
+            }
+        });
+        // SAFETY: WKWebView's startDownloadUsingRequest:completionHandler:
+        // (macOS 11.3), on the main thread.
+        let _: () = unsafe {
+            msg_send![view, startDownloadUsingRequest: &*request, completionHandler: &*started]
+        };
+    });
+    if let Err(e) = saving {
+        error!("browser pane: could not save its page: {e}");
     }
 }
 

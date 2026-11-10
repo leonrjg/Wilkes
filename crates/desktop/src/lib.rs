@@ -28,11 +28,11 @@ use wilkes_core::types::{
 };
 use wilkes_core::worker::manager::WorkerStatus;
 
-#[cfg(target_os = "macos")]
-mod browser_context_download;
 mod browser_find;
 mod browser_hover;
 mod browser_pane;
+#[cfg(target_os = "macos")]
+mod browser_webkit_download;
 mod chat;
 mod cookie_import;
 mod lan_share;
