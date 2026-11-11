@@ -185,6 +185,81 @@
       }
     ]
   },
+  "chunks_resolve_neighbors_request": {
+    "scope": {
+      "workspace_id": "managed-corpus-018f",
+      "expected_embedding_space_id": "space-example"
+    },
+    "chunk_refs": [
+      "chunk-example-middle"
+    ],
+    "neighbors": {
+      "before": 1,
+      "after": 1
+    }
+  },
+  "chunks_resolve_neighbors_response": {
+    "embedding_space_id": "space-example",
+    "chunks": [
+      {
+        "chunk_ref": "chunk-example-middle",
+        "ordinal": 1,
+        "text": "whether he is taking aspirin or the placebo.",
+        "text_sha256": "text-sha256-chunk-example-middle",
+        "byte_range": {
+          "start": 40,
+          "end": 84
+        },
+        "origin": {
+          "PdfPage": {
+            "page": 1,
+            "bbox": null
+          }
+        }
+      }
+    ],
+    "neighbors": [
+      {
+        "of": "chunk-example-middle",
+        "before": [
+          {
+            "chunk_ref": "chunk-example-before",
+            "ordinal": 0,
+            "text": "Each man in the trial does not know ",
+            "text_sha256": "text-sha256-chunk-example-before",
+            "byte_range": {
+              "start": 4,
+              "end": 40
+            },
+            "origin": {
+              "PdfPage": {
+                "page": 1,
+                "bbox": null
+              }
+            }
+          }
+        ],
+        "after": [
+          {
+            "chunk_ref": "chunk-example-after",
+            "ordinal": 2,
+            "text": " Neither does the doctor who examines him.",
+            "text_sha256": "text-sha256-chunk-example-after",
+            "byte_range": {
+              "start": 84,
+              "end": 126
+            },
+            "origin": {
+              "PdfPage": {
+                "page": 1,
+                "bbox": null
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
   "chunks_accumulate_request": {
     "scope": {
       "workspace_id": "managed-corpus-018f",

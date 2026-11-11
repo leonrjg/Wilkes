@@ -17,8 +17,8 @@ use wilkes_core::completion::{
 use wilkes_core::directory_watcher::{DirectoryChangeBatch, DirectoryWatcher};
 use wilkes_core::embed::cluster::WardTree;
 use wilkes_core::embed::index::db::{
-    BuildScope, ChunkAccumulation, ManagedChunkData, ManagedDocumentData, TopicChunkData,
-    TopicCoveragePrototype,
+    BuildScope, ChunkAccumulation, ManagedChunkData, ManagedChunkNeighbors, ManagedDocumentData,
+    TopicChunkData, TopicCoveragePrototype,
 };
 use wilkes_core::embed::index::semantic_updater::process_directory_change;
 use wilkes_core::embed::index::{
@@ -819,6 +819,19 @@ pub struct ChunkExport {
     pub origin: wilkes_core::types::SourceOrigin,
 }
 
+impl From<ManagedChunkData> for ChunkExport {
+    fn from(chunk: ManagedChunkData) -> Self {
+        ChunkExport {
+            chunk_ref: chunk.chunk_ref,
+            ordinal: chunk.ordinal,
+            text: chunk.text,
+            text_sha256: chunk.text_sha256,
+            byte_range: chunk.extraction_byte_range,
+            origin: chunk.origin,
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ManagedEmbeddingWork {
     pub chunks: usize,
@@ -1041,6 +1054,53 @@ pub struct ChunkAccumulations {
 pub struct ChunkResolution {
     pub embedding_space_id: String,
     pub chunks: Vec<ChunkExport>,
+    /// Present exactly when the request asked for a [`NeighborWindow`]: one
+    /// entry per requested ref, in request order, as `chunks` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neighbors: Option<Vec<ChunkNeighbors>>,
+}
+
+/// How many passages either side of each named one a `resolve` reply also
+/// carries, in the same rendition.
+///
+/// A passage is cut to a size, not to a sentence, so it routinely starts
+/// mid-clause; the passage before it is what says what the clause belongs
+/// to. Only Wilkes knows which passages are adjacent — a caller holds the
+/// refs it was handed and nothing that would let it name the ones between.
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NeighborWindow {
+    pub before: usize,
+    pub after: usize,
+}
+
+/// The passages either side of one requested passage, each side in reading
+/// order: the last of `before` immediately precedes `of`, the first of
+/// `after` immediately follows it. A side is shorter than asked only where
+/// the document starts or ends.
+///
+/// Full passages rather than refs into `chunks`: a neighbour is usually not
+/// one of the passages asked for, and a caller reading context should not
+/// have to look it up a second time.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ChunkNeighbors {
+    pub of: ChunkRef,
+    pub before: Vec<ChunkExport>,
+    pub after: Vec<ChunkExport>,
+}
+
+impl From<ManagedChunkNeighbors> for ChunkNeighbors {
+    fn from(neighbors: ManagedChunkNeighbors) -> Self {
+        ChunkNeighbors {
+            of: neighbors.of,
+            before: neighbors
+                .before
+                .into_iter()
+                .map(ChunkExport::from)
+                .collect(),
+            after: neighbors.after.into_iter().map(ChunkExport::from).collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -1373,7 +1433,9 @@ pub struct DocumentCoverExport {
     pub source_sha256: String,
 }
 
-/// Most chunk refs one `resolve` request may name.
+/// Most chunk refs one `resolve` request may name — and, with a
+/// [`NeighborWindow`], most passages its reply may carry, counting each ref
+/// once for itself and once for every neighbour asked of it.
 ///
 /// The two surfaces this replaces disagreed: the export route capped at 64 on
 /// the reasoning that displaying a passage should cost a passage, and the
@@ -1381,7 +1443,9 @@ pub struct DocumentCoverExport {
 /// operation returning two scalars per probe rather than one returning full
 /// text. This is chosen against what the reply actually weighs — roughly half
 /// a megabyte at typical chunk sizes, comparable to the other consumer
-/// responses — and callers wanting more page.
+/// responses — and callers wanting more page. Neighbours weigh what the
+/// passages asked for weigh, so they count against the same bound: a window
+/// of one either side leaves room for 170 refs.
 pub const MAX_RESOLVE_REFS: usize = 512;
 
 /// Maps each outline entry onto the first exported chunk at or after its
@@ -3788,18 +3852,7 @@ impl AppContext {
             chunk_count,
             outline,
             extraction: declared_outline.diagnostics,
-            chunks: document
-                .chunks
-                .into_iter()
-                .map(|chunk| ChunkExport {
-                    chunk_ref: chunk.chunk_ref,
-                    ordinal: chunk.ordinal,
-                    text: chunk.text,
-                    text_sha256: chunk.text_sha256,
-                    byte_range: chunk.extraction_byte_range,
-                    origin: chunk.origin,
-                })
-                .collect(),
+            chunks: document.chunks.into_iter().map(ChunkExport::from).collect(),
             embedding_work: ManagedEmbeddingWork {
                 chunks: chunk_count,
                 reused: if reused { chunk_count } else { 0 },
@@ -3848,6 +3901,7 @@ impl AppContext {
     pub async fn resolve_chunks(
         &self,
         refs: Vec<ChunkRef>,
+        neighbors: Option<NeighborWindow>,
     ) -> Result<ChunkResolution, ConsumerError> {
         if refs.is_empty() {
             return Err(ConsumerError::untyped(
@@ -3856,9 +3910,33 @@ impl AppContext {
         }
         if refs.len() > MAX_RESOLVE_REFS {
             return Err(ConsumerError::untyped(format!(
-                "Resolve request names {} chunk refs; {MAX_RESOLVE_REFS} is the most one request                  may ask for.",
+                "Resolve request names {} chunk refs; {MAX_RESOLVE_REFS} is the most one request \
+                 may ask for.",
                 refs.len(),
             )));
+        }
+        if let Some(window) = neighbors {
+            if window.before == 0 && window.after == 0 {
+                return Err(ConsumerError::untyped(
+                    "Resolve request asks for neighbors with a window of none before and none \
+                     after; omit `neighbors` to ask for none.",
+                ));
+            }
+            let carried = refs.len().saturating_mul(
+                1usize
+                    .saturating_add(window.before)
+                    .saturating_add(window.after),
+            );
+            if carried > MAX_RESOLVE_REFS {
+                return Err(ConsumerError::untyped(format!(
+                    "Resolve request names {} chunk refs with {} neighbor(s) before and {} after \
+                     each, up to {carried} passages; {MAX_RESOLVE_REFS} is the most one reply \
+                     may carry.",
+                    refs.len(),
+                    window.before,
+                    window.after,
+                )));
+            }
         }
         let index_arc = self.index.lock().clone();
         tokio::task::spawn_blocking(move || {
@@ -3871,22 +3949,18 @@ impl AppContext {
             let chunks = index
                 .managed_chunks_for_refs(&refs)
                 .map_err(|error| error.to_string())?;
+            let neighbors = neighbors
+                .map(|window| index.managed_chunk_neighbors(&refs, window.before, window.after))
+                .transpose()
+                .map_err(|error| error.to_string())?;
             Ok(ChunkResolution {
                 embedding_space_id: index
                     .embedding_space_id()
                     .map_err(|error| error.to_string())?
                     .0,
-                chunks: chunks
-                    .into_iter()
-                    .map(|chunk| ChunkExport {
-                        chunk_ref: chunk.chunk_ref,
-                        ordinal: chunk.ordinal,
-                        text: chunk.text,
-                        text_sha256: chunk.text_sha256,
-                        byte_range: chunk.extraction_byte_range,
-                        origin: chunk.origin,
-                    })
-                    .collect(),
+                chunks: chunks.into_iter().map(ChunkExport::from).collect(),
+                neighbors: neighbors
+                    .map(|entries| entries.into_iter().map(ChunkNeighbors::from).collect()),
             })
         })
         .await
@@ -13074,6 +13148,40 @@ title = "title[0]"
         assert!(ctx.embedder.lock().is_none());
         // The reading surfaces keep their store.
         assert!(ctx.is_index_loaded());
+    }
+
+    /// Neighbours weigh what the passages asked for weigh, so a window counts
+    /// against the same reply bound, and an empty window is not a request.
+    #[tokio::test]
+    async fn resolve_counts_a_neighbor_window_against_the_reply_bound() {
+        let (_dir, ctx) = test_ctx();
+        let refs = |count: usize| -> Vec<ChunkRef> {
+            (0..count).map(|n| ChunkRef(format!("chunk-{n}"))).collect()
+        };
+        let one_each_side = NeighborWindow {
+            before: 1,
+            after: 1,
+        };
+
+        let empty = ctx
+            .resolve_chunks(refs(1), Some(NeighborWindow { before: 0, after: 0 }))
+            .await
+            .unwrap_err();
+        assert!(empty.message().contains("omit `neighbors`"), "{empty}");
+
+        let over = ctx
+            .resolve_chunks(refs(171), Some(one_each_side))
+            .await
+            .unwrap_err();
+        assert!(over.message().contains("up to 513 passages"), "{over}");
+
+        // At the bound the request is admitted, and goes on to the index —
+        // which this context does not have.
+        let admitted = ctx
+            .resolve_chunks(refs(170), Some(one_each_side))
+            .await
+            .unwrap_err();
+        assert!(!admitted.message().contains("most one reply"), "{admitted}");
     }
 
     /// A text probe reaches the embedder in the query role and lands where
