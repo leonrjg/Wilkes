@@ -4128,4 +4128,40 @@ mod tests {
         );
         manager.shutdown_all().await;
     }
+
+    /// Switching away from a workspace frees its context, and with it every
+    /// database it opened.
+    ///
+    /// The context used to be held for good by the task forwarding its worker
+    /// managers' events, so each switch kept the retired workspace's index,
+    /// metadata, journal and research databases open until the process ran
+    /// out of file descriptors.
+    #[tokio::test]
+    async fn switching_away_frees_the_retired_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("global-settings.json");
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.path().to_path_buf(), settings_path, events).unwrap();
+        let first = manager.state().await.unwrap().active_workspace_id;
+        let second = manager.create("Second".to_string()).await.unwrap().id;
+        manager.switch(&second).await.unwrap();
+        // Open a database, as the interface does on arrival.
+        manager.active().list_bookmarks().await.unwrap();
+        let retired = Arc::downgrade(&manager.active());
+
+        manager.switch(&first).await.unwrap();
+
+        // Its restore task may still be finishing; nothing else should hold it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while retired.strong_count() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            retired.strong_count(),
+            0,
+            "the retired workspace's context is still alive after the switch"
+        );
+        manager.shutdown_all().await;
+    }
 }

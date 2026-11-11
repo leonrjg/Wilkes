@@ -166,7 +166,7 @@ impl WorkerManager {
             event_tx,
             Arc::clone(&active_pid),
             Arc::clone(&active_process),
-            Arc::clone(&sender),
+            Arc::downgrade(&sender),
             Arc::clone(&status),
             Arc::clone(&sealed),
         );
@@ -607,5 +607,37 @@ mod tests {
         let _loop_handle = tokio::spawn(loop_fut);
 
         manager.request_shutdown();
+    }
+
+    /// A manager's loop ends when the last handle to the manager is dropped.
+    ///
+    /// It used to hold a sender to its own channel, so the channel could never
+    /// close and the loop never ended — and with it the event channel, and
+    /// every task reading that. Each workspace switch left three such loops
+    /// behind, and the context they reported to with them.
+    #[tokio::test]
+    async fn dropping_the_last_manager_handle_ends_its_loop() {
+        let paths = WorkerPaths {
+            python_override: None,
+            python_package_dir: PathBuf::from("pkg"),
+            requirements_path: PathBuf::from("reqs.txt"),
+            uv_bin: PathBuf::from("venv"),
+            worker_bin: PathBuf::from("worker"),
+            data_dir: PathBuf::from("data"),
+        };
+        let (manager, mut event_rx, loop_fut) = WorkerManager::new(paths, WorkerKind::Embed);
+        let loop_handle = tokio::spawn(loop_fut);
+        let clone = manager.clone();
+        drop(manager);
+        drop(clone);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), loop_handle)
+            .await
+            .expect("the manager loop outlived every handle to it")
+            .unwrap();
+        assert!(
+            event_rx.recv().await.is_none(),
+            "the event channel stays open after its loop has ended"
+        );
     }
 }

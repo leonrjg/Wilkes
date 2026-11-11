@@ -99,7 +99,11 @@ pub(super) async fn supervised_manager_loop(
     event_tx: mpsc::Sender<ManagerEvent>,
     active_pid: Arc<AtomicU32>,
     active_process: ActiveProcessSlot,
-    sender_slot: Arc<std::sync::Mutex<mpsc::Sender<ManagerCommand>>>,
+    // Weak, because the slot is how the manager's handles reach this loop and
+    // the loop ends when its channel closes. A strong reference here kept a
+    // sender alive inside the loop itself, so the channel could never close:
+    // the loop, its event channel and whatever read that outlived every handle.
+    sender_slot: std::sync::Weak<std::sync::Mutex<mpsc::Sender<ManagerCommand>>>,
     status: Arc<RwLock<WorkerStatus>>,
     sealed: Arc<AtomicBool>,
 ) {
@@ -124,6 +128,16 @@ pub(super) async fn supervised_manager_loop(
         match handle.await {
             Ok(()) => break,
             Err(e) if e.is_panic() => {
+                // A restart replaces the channel the handles send on. With no
+                // handle left there is nobody to send, so there is nothing to
+                // restart for.
+                let Some(sender_slot) = sender_slot.upgrade() else {
+                    tracing::error!(
+                        "WorkerManager: loop panicked after its last handle was dropped; \
+                         not restarting: {e:?}"
+                    );
+                    break;
+                };
                 tracing::error!("WorkerManager: loop panicked, restarting: {e:?}");
                 rx = restart_runtime_after_panic(&active_pid, &status, &sender_slot);
             }

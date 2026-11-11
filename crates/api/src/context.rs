@@ -1771,10 +1771,14 @@ impl AppContext {
     ) {
         tokio::spawn(loop_fut);
 
-        let ctx1 = Arc::clone(&self);
-        tokio::spawn(async move {
-            ctx1.run_event_forwarder(event_rx).await;
-        });
+        // The forwarder gets the emitter, not the context. It runs for as long
+        // as the manager loops do, and they run for as long as the context's
+        // managers exist — so a forwarder holding the context would keep a
+        // retired workspace, and every database it opened, alive for good.
+        tokio::spawn(Self::run_event_forwarder(
+            Arc::clone(&self.events),
+            event_rx,
+        ));
 
         let ctx2 = Arc::clone(&self);
         tokio::spawn(async move {
@@ -1784,13 +1788,16 @@ impl AppContext {
 
     /// Forward manager-loop events through the EventEmitter. Run this as a
     /// background task after `new`.
-    pub async fn run_event_forwarder(self: Arc<Self>, mut rx: mpsc::Receiver<ManagerEvent>) {
+    pub async fn run_event_forwarder(
+        events: Arc<dyn EventEmitter>,
+        mut rx: mpsc::Receiver<ManagerEvent>,
+    ) {
         while let Some(event) = rx.recv().await {
             let name = match event {
                 ManagerEvent::WorkerStarting => "WorkerStarting",
                 ManagerEvent::ReindexingDone => "ReindexingDone",
             };
-            self.events.emit("manager-event", serde_json::json!(name));
+            events.emit("manager-event", serde_json::json!(name));
         }
     }
 
@@ -13804,7 +13811,10 @@ exit 0
         );
 
         let (tx, rx) = mpsc::channel(1);
-        let forwarder = tokio::spawn(ctx.run_event_forwarder(rx));
+        let forwarder = tokio::spawn(AppContext::run_event_forwarder(
+            Arc::clone(&ctx.events),
+            rx,
+        ));
 
         tx.send(ManagerEvent::WorkerStarting).await.unwrap();
         tx.send(ManagerEvent::ReindexingDone).await.unwrap();
