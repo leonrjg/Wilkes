@@ -26,10 +26,12 @@
 
 ### Changed
 
+- **API change:** `POST /api/catalogue/acquire` and the desktop `catalogue_acquire` command are removed. A result with a direct file, from a catalogue or any other provider, is added with `POST /api/literature/acquire` (desktop `literature_acquire`), so its provider decides what the file is called. Byte progress still arrives on `catalogue-download-progress`.
 - The Python worker's dependencies are pinned and locked per environment, so every install gets the same versions. `semantic-text-splitter`, `sqlite-vec` and PyMuPDF, which it never used, are gone.
 
 ### Fixed
 
+- LibreTexts books are saved as their title followed by the book's id, as in `Calculus (math-70414).pdf`. Every book was saved as `pdf.pdf`, so each one after the first was refused as a file already present.
 - SBERT models use the prefixes they ship. Each search query was embedded with the document prefix on Jina v5, because the model's default prompt applied to everything, and any other SBERT model's own prefixes were not read at all. Indexes built with Jina v5 stay valid. An index built with a custom SBERT model that ships prefixes should be rebuilt, because its passages were embedded without them.
 - OBLIQ-IR models use the `query: ` and `passage: ` prefixes their card requires.
 - SBERT models in their own environment load at the precision they ship in, instead of being expanded to 32-bit. This halves the memory of a `bfloat16` model, which is what lets ReasonIR-8B run on a 24 GB machine.

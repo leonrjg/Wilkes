@@ -8,7 +8,6 @@ import type {
   ModelSearchHit,
   Bookmark,
   BookmarkClustersQuery,
-  CatalogueDownload,
   CatalogueCourse,
   CatalogueCourseProgress,
   CatalogueDownloadProgress,
@@ -368,9 +367,6 @@ export interface SearchApi {
   /** Drops one catalogue's records from the mirror, so it is no longer
    *  searched. Syncing it again is how it comes back. */
   catalogueRemove(provider: string): Promise<CatalogueRemoveResponse>;
-  /** Fetches a candidate into the workspace's uploads directory. Getting it
-   *  from there into a library root is a separate, user-driven step. */
-  catalogueAcquire(url: string, filename?: string): Promise<CatalogueDownload>;
   /** Each page of a provider's catalogue, as it lands. A whole-catalogue fetch
    *  is minutes long, and this is the only thing that happens in the middle. */
   onCatalogueSyncProgress(

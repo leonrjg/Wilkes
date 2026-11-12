@@ -13,7 +13,6 @@ vi.mock("../services", () => ({
     markSavedWorkAcquired: vi.fn(() => Promise.resolve(null)),
     literatureProviders: vi.fn(),
     literatureSearch: vi.fn(),
-    catalogueAcquire: vi.fn(),
     listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
   },
   source: { type: "desktop", deletionKind: "trash", importFiles: vi.fn() },

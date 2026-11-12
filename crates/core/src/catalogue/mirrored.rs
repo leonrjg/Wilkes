@@ -22,9 +22,11 @@ use crate::integrations::custom::manifest::{
     BrowseControls, ControlOption, FilterControl, Manifest, SortControl,
 };
 use crate::integrations::{LiteratureSource, ProviderCapabilities};
+use crate::path::sanitize_file_name;
 use crate::types::{
-    BrowsePage, BrowseRequest, CatalogueAcquisition, CatalogueGrain, CatalogueRecord,
+    BrowsePage, BrowseRequest, CatalogueAcquisition, CatalogueGrain, CatalogueRecord, DownloadPlan,
     IntegrationState, IntegrationStatus, LiteratureAcquisition, LiteratureSearchResult,
+    ResolvedLiteratureDownload,
 };
 
 /// The filter and sort names a catalogue listing declares. Named once so the
@@ -434,6 +436,31 @@ impl LiteratureSource for MirroredSource {
         self.checked(request).map(|_| ())
     }
 
+    /// The record's file, under the name its catalogue gives it.
+    async fn resolve_download(
+        &self,
+        result: &LiteratureSearchResult,
+    ) -> anyhow::Result<Option<DownloadPlan>> {
+        let Some(url) = result.pdf_url.clone() else {
+            return Ok(None);
+        };
+        // Every mirror record has a title; the store refuses one without.
+        let title = result
+            .title
+            .as_deref()
+            .with_context(|| format!("{} result {} has no title", self.name(), result.id))?;
+        let filename = self
+            .fetch
+            .file_name(&result.id, title)
+            .map(|name| sanitize_file_name(&name).map_err(anyhow::Error::msg))
+            .transpose()
+            .with_context(|| format!("naming {} result {}", self.name(), result.id))?;
+        Ok(Some(DownloadPlan::Fetch(ResolvedLiteratureDownload {
+            url,
+            filename,
+        })))
+    }
+
     async fn status(&self, enabled: bool) -> anyhow::Result<IntegrationStatus> {
         let held = CatalogueStore::open(&self.mirror_dir)?
             .holdings()?
@@ -834,6 +861,40 @@ mod tests {
         assert!(libretexts
             .check_browse(&request(&[(SUBJECT, &["Algebra"]), (LIBRARY, &["math"])]))
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_libretexts_file_is_named_after_its_book_and_an_openstax_one_after_its_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = |provider: &str, id: &str, title: &str| LiteratureSearchResult {
+            title: Some(title.into()),
+            ..result_from(record(provider, id, title, CatalogueGrain::Textbook), None)
+        };
+        let plan = source(dir.path(), "libretexts")
+            .resolve_download(&result(
+                "libretexts",
+                "chem-1",
+                "Chem 4399/5399: Informatics",
+            ))
+            .await
+            .unwrap();
+        match plan {
+            Some(DownloadPlan::Fetch(fetch)) => {
+                assert_eq!(fetch.url, "https://example.test/chem-1.pdf");
+                // Two books may share a title; none shares an id. A separator
+                // in the title would otherwise be read as a directory.
+                assert_eq!(
+                    fetch.filename.as_deref(),
+                    Some("Chem 4399_5399_ Informatics (chem-1).pdf")
+                );
+            }
+            other => panic!("expected a fetch, got {other:?}"),
+        }
+        let plan = source(dir.path(), "openstax")
+            .resolve_download(&result("openstax", "7", "Physics"))
+            .await
+            .unwrap();
+        assert!(matches!(plan, Some(DownloadPlan::Fetch(ref fetch)) if fetch.filename.is_none()));
     }
 
     #[tokio::test]

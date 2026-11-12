@@ -31,7 +31,6 @@ export function useCatalogueAdd() {
   const setDirectory = useSettingsStore((s) => s.setDirectory);
   const refreshFileList = useSettingsStore((s) => s.refreshFileList);
   const readOnly = useActiveWorkspaceReadOnly();
-  const acquire = useCatalogueStore((s) => s.acquire);
   const acquireCourse = useCatalogueStore((s) => s.acquireCourse);
   const acquireFromProvider = useCatalogueStore((s) => s.acquireFromProvider);
   const adding = useCatalogueStore((s) => s.adding);
@@ -146,29 +145,20 @@ export function useCatalogueAdd() {
           return installed[0] ?? null;
         });
       }
-      if (acquisition === "direct" && work.pdf_url !== null) {
-        const url = work.pdf_url;
-        return runAdd(provider, work, async () => {
-          setAddStage(key, "fetching");
-          const staged = await acquire({ key, url });
-          setAddStage(key, "importing");
-          const installed = await install([staged]);
-          return installed[0] ?? null;
-        });
-      }
       return runAdd(provider, work, async () => {
-        // Resolving and fetching are one backend call, and a credentialed
-        // resolver or a program is not a fast one. It is named as its own
+        // A direct result is fetched from the URL it came with. Anything else
+        // is resolved and fetched in the same backend call, and a credentialed
+        // resolver or a program is not a fast one, so it is named as its own
         // stage rather than spent before the row has said anything is
         // happening.
-        setAddStage(key, "resolving");
+        setAddStage(key, acquisition === "direct" ? "fetching" : "resolving");
         const fetched = await acquireFromProvider(key, provider, work);
         setAddStage(key, "importing");
         const installed = await install(fetched.paths, fetched.folder);
         return installed[0] ?? null;
       });
     },
-    [canAdd, acquire, acquireCourse, acquireFromProvider, install, runAdd, setAddStage],
+    [canAdd, acquireCourse, acquireFromProvider, install, runAdd, setAddStage],
   );
 
   return {

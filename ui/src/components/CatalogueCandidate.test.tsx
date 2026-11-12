@@ -12,7 +12,7 @@ vi.mock("../services", () => ({
     saveWork: vi.fn(),
     removeSavedWork: vi.fn(() => Promise.resolve()),
     markSavedWorkAcquired: vi.fn(() => Promise.resolve(null)),
-    catalogueAcquire: vi.fn(),
+    literatureAcquire: vi.fn(),
     catalogueAcquireCourse: vi.fn(),
     openPath: vi.fn(() => Promise.resolve()),
     updateSettings: vi.fn(() => Promise.resolve({})),
@@ -91,7 +91,7 @@ const COURSE: LiteratureSearchResult = {
   acquisition: "course",
 };
 
-const acquire = api.catalogueAcquire as unknown as ReturnType<typeof vi.fn>;
+const acquire = api.literatureAcquire as unknown as ReturnType<typeof vi.fn>;
 const importFiles = (source as unknown as { importFiles: ReturnType<typeof vi.fn> })
   .importFiles;
 
@@ -99,9 +99,8 @@ describe("CatalogueCandidate", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     acquire.mockResolvedValue({
-      path: "/uploads/book.pdf",
-      bytes: 1_024,
-      already_present: false,
+      folder: null,
+      files: [{ path: "/uploads/book.pdf", bytes: 1_024, already_present: false }],
     });
     useCatalogueStore.getState().reset();
     useSavedWorksStore.setState({ works: [] });
@@ -228,7 +227,8 @@ describe("CatalogueCandidate", () => {
     render(<CatalogueCandidate provider="libretexts" work={HIT} />);
     fireEvent.click(screen.getByLabelText(/Add Combinatorial Optimization/));
     await waitFor(() => {
-      expect(acquire).toHaveBeenCalledWith("https://example.invalid/book.pdf");
+      // Through the provider, which names the file: a URL alone cannot.
+      expect(acquire).toHaveBeenCalledWith("libretexts", HIT);
       // No folder for a single document: one file belongs in the root, and
       // wrapping every book in a directory of its own would be worse.
       expect(importFiles).toHaveBeenCalledWith(

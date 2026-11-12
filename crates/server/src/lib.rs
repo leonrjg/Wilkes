@@ -907,9 +907,13 @@ struct LiteratureAcquireBody {
 }
 
 /// Fetches one provider result into uploads, however its provider says it is
-/// fetched. Ungated for the same reason `catalogue_acquire_handler` is: this
-/// is Wilkes writing into its own staging area, not the user writing into a
-/// library root.
+/// fetched.
+///
+/// Not gated by `ensure_writable`, unlike `/api/upload` into the same
+/// directory. The gate turns away the *user* adding documents to a library
+/// another application owns; this is that application fetching into Wilkes's
+/// own staging area on its way to the managed import API, which is the
+/// corpus's writer by contract.
 async fn literature_acquire_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<LiteratureAcquireBody>,
@@ -1103,31 +1107,6 @@ async fn catalogue_status_handler(
     (StatusCode, Json<ErrorBody>),
 > {
     wilkes_api::commands::catalogue::status(&catalogue_dir(&state))
-        .map(Json)
-        .map_err(catalogue_err)
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CatalogueAcquireBody {
-    url: String,
-    #[serde(default)]
-    filename: Option<String>,
-}
-
-/// Not gated by `ensure_writable`, unlike `/api/upload` into the same
-/// directory. The gate turns away the *user* adding documents to a library
-/// another application owns; this is that application fetching into Wilkes's
-/// own staging area on its way to the managed import API, which is the
-/// corpus's writer by contract.
-async fn catalogue_acquire_handler(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<CatalogueAcquireBody>,
-) -> Result<Json<wilkes_core::acquire::DownloadResponse>, (StatusCode, Json<ErrorBody>)> {
-    state
-        .context()
-        .catalogue_acquire(body.url, body.filename)
-        .await
         .map(Json)
         .map_err(catalogue_err)
 }
@@ -2875,7 +2854,6 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/catalogue/sync", post(catalogue_sync_handler))
         .route("/api/catalogue/remove", post(catalogue_remove_handler))
         .route("/api/catalogue/status", get(catalogue_status_handler))
-        .route("/api/catalogue/acquire", post(catalogue_acquire_handler))
         .route(
             "/api/catalogue/acquire-course",
             post(catalogue_acquire_course_handler),

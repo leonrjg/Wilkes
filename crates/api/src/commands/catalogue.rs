@@ -19,7 +19,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use wilkes_core::acquire::{download_to_root, DownloadParams, DownloadProgress, DownloadResponse};
+use wilkes_core::acquire::{download_to_root, DownloadParams, DownloadProgress};
 use wilkes_core::catalogue::ocw;
 use wilkes_core::catalogue::providers::FetchReporter;
 use wilkes_core::catalogue::{mirrored_sources, CatalogueStore};
@@ -410,38 +410,6 @@ pub fn remove(
     })
 }
 
-/// Fetches a candidate's bytes into this workspace's uploads directory.
-///
-/// Uploads rather than a library root because this is Wilkes writing into its
-/// own area: a library root is a place the user put their files, and dropping
-/// fetched bytes there would be writing to a directory whose contents the user
-/// believes they control. Importing from uploads into the root is a second,
-/// separate step, and it is the user's.
-pub async fn acquire(
-    uploads_dir: &Path,
-    url: String,
-    filename: Option<String>,
-    progress: Option<mpsc::Sender<DownloadProgress>>,
-    max_download_bytes: u64,
-) -> Result<DownloadResponse, CatalogueError> {
-    tokio::fs::create_dir_all(uploads_dir)
-        .await
-        .map_err(|error| {
-            CatalogueError::Failed(format!("Cannot prepare uploads directory: {error}"))
-        })?;
-    download_to_root(
-        uploads_dir,
-        DownloadParams { url, filename },
-        progress,
-        max_download_bytes,
-    )
-    .await
-    .map_err(|message| {
-        tracing::warn!("catalogue acquisition failed: {message}");
-        CatalogueError::Request(message)
-    })
-}
-
 /// Fetches one MIT OCW course: its documents, and a generated
 /// Markdown file describing them.
 ///
@@ -624,8 +592,9 @@ impl AppContext {
         .await
     }
 
-    /// Fetches one result a literature provider returned, however its
-    /// provider says it is fetched, reporting a download's bytes on
+    /// Fetches one result a literature provider returned — a catalogue's
+    /// file as much as any other provider's — however its provider says it is
+    /// fetched, into uploads, reporting a download's bytes on
     /// `catalogue-download-progress`. See
     /// [`crate::commands::integrations::literature::acquire`].
     pub async fn literature_acquire(
@@ -646,23 +615,6 @@ impl AppContext {
             Some(tx),
             provider,
             result,
-        )
-        .await
-    }
-
-    /// Fetches a candidate, reporting bytes on `catalogue-download-progress`.
-    pub async fn catalogue_acquire(
-        &self,
-        url: String,
-        filename: Option<String>,
-    ) -> Result<DownloadResponse, CatalogueError> {
-        let tx = forward::<DownloadProgress>(self.emitter(), DOWNLOAD_PROGRESS_EVENT);
-        acquire(
-            &self.data_dir.join("uploads"),
-            url,
-            filename,
-            Some(tx),
-            self.get_settings().await.max_download_bytes,
         )
         .await
     }

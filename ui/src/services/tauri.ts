@@ -8,7 +8,6 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import type {
   HttpCall,
-  CatalogueDownload,
   CatalogueCourse,
   CatalogueCourseProgress,
   CatalogueDownloadProgress,
@@ -695,10 +694,6 @@ export class TauriSearchApi implements SearchApi {
 
   async catalogueRemove(provider: string): Promise<CatalogueRemoveResponse> {
     return invoke<CatalogueRemoveResponse>("catalogue_remove", { provider });
-  }
-
-  async catalogueAcquire(url: string, filename?: string): Promise<CatalogueDownload> {
-    return invoke<CatalogueDownload>("catalogue_acquire", { url, filename });
   }
 
   async onCatalogueSyncProgress(

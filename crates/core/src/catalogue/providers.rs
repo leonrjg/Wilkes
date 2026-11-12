@@ -78,6 +78,10 @@ pub trait CatalogueFetch: Send + Sync {
     /// What a listing of this catalogue can be narrowed and ordered by.
     fn browse_facets(&self) -> BrowseFacets;
 
+    /// What a record's file is saved as, for a catalogue whose file URLs do
+    /// not name the work; `None` keeps the name the URL gives it.
+    fn file_name(&self, external_id: &str, title: &str) -> Option<String>;
+
     /// Everything the provider currently offers.
     ///
     /// Whole-catalogue rather than incremental because none of these providers
@@ -293,6 +297,13 @@ impl CatalogueFetch for LibreTexts {
         }
     }
 
+    /// Every book's PDF link ends in `/pdf`, and the file it redirects to is
+    /// `Full.pdf`, so the URL names none of them. The id is in the name
+    /// because titles repeat: there are eight books called "Calculus".
+    fn file_name(&self, external_id: &str, title: &str) -> Option<String> {
+        Some(format!("{title} ({external_id}).pdf"))
+    }
+
     async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>> {
         let mut out: Vec<CatalogueRecord> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -466,6 +477,11 @@ impl CatalogueFetch for OpenStax {
         }
     }
 
+    /// Each PDF URL already ends in the book's own name.
+    fn file_name(&self, _external_id: &str, _title: &str) -> Option<String> {
+        None
+    }
+
     async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>> {
         let url = format!(
             "{}/apps/cms/api/v2/pages/?type=books.Book&limit=500\
@@ -592,6 +608,11 @@ impl CatalogueFetch for MitOpenCourseWare {
             libraries: &[],
             pages: false,
         }
+    }
+
+    /// A course is not one file; its documents keep their own names.
+    fn file_name(&self, _external_id: &str, _title: &str) -> Option<String> {
+        None
     }
 
     async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>> {
@@ -750,6 +771,11 @@ impl CatalogueFetch for DevDocs {
             libraries: &[],
             pages: false,
         }
+    }
+
+    /// A documentation set has no file to save.
+    fn file_name(&self, _external_id: &str, _title: &str) -> Option<String> {
+        None
     }
 
     async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>> {

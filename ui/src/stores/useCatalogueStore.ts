@@ -244,11 +244,6 @@ export interface ComposeOutcome {
 export type AddStage = "resolving" | "fetching" | "importing";
 
 /** Something the pane can add: its store key and the URL that fetches it. */
-export interface Acquirable {
-  key: string;
-  url: string;
-  filename?: string;
-}
 /**
  * One pane's search: what it is asking, which sources it asks, how each of
  * them is filtered, and what came back.
@@ -440,10 +435,6 @@ interface CatalogueStore {
    *  a filter that outlived the provider it named does not refuse every
    *  search. */
   loadProviders: () => Promise<void>;
-  /** Fetches one file into uploads. Returns the staged path, and raises if it
-   *  could not be fetched — the caller drives the whole add and is the one
-   *  place that says what became of it. */
-  acquire: (item: Acquirable) => Promise<string>;
   /** Fetches a whole course from its landing page. Returns the folder it
    *  belongs in and the paths to import — the generated document first,
    *  because it is the thing that makes the rest a course. Raises if it could
@@ -452,10 +443,13 @@ interface CatalogueStore {
     key: string,
     courseUrl: string,
   ) => Promise<{ folder: string; paths: string[] }>;
-  /** Fetches a result its provider resolves on demand — by a URL it finds, or
-   *  by a program its manifest names — in one backend call. Returns the paths
-   *  to import and, when they belong together, the folder they keep. Raises
-   *  if it could not be fetched. */
+  /** Fetches a result into uploads however its provider says it is fetched —
+   *  the URL it already gave, one it resolves on demand, or a program its
+   *  manifest names — in one backend call, so the provider also decides what
+   *  the file is called. Returns the paths to import and, when they belong
+   *  together, the folder they keep. Raises if it could not be fetched: the
+   *  caller drives the whole add and is the one place that says what became
+   *  of it. */
   acquireFromProvider: (
     key: string,
     provider: string,
@@ -1331,37 +1325,26 @@ export const useCatalogueStore = create<CatalogueStore>((set, get) => ({
     }
   },
 
-  acquire: async ({ key, url, filename }) => {
-    try {
-      const download =
-        filename === undefined
-          ? await api.catalogueAcquire(url)
-          : await api.catalogueAcquire(url, filename);
+  acquireFromProvider: async (key, provider, work) => {
+    // The byte counter for the URL the row shows is this call's own, and is
+    // dropped whichever way the call ends. Saying what went wrong is the
+    // caller's: it owns the stage this failed in.
+    const dropCounter = () => {
+      const url = work.pdf_url;
+      if (url === null) return;
       set((state) => {
-        const { [url]: _finished, ...downloads } = state.downloads;
-        return {
-          downloads,
-          acquired: { ...state.acquired, [key]: download.path },
-        };
-      });
-      return download.path;
-    } catch (error) {
-      // The byte counter is this call's own and is dropped whichever way the
-      // call ends. Saying what went wrong is the caller's: it owns the stage
-      // this failed in, and there are two other stages that can fail too.
-      set((state) => {
-        const { [url]: _abandoned, ...downloads } = state.downloads;
+        const { [url]: _done, ...downloads } = state.downloads;
         return { downloads };
       });
-      throw error;
+    };
+    try {
+      const acquired = await api.literatureAcquire(provider, work);
+      const paths = acquired.files.map((file) => file.path);
+      set((state) => ({ acquired: { ...state.acquired, [key]: paths[0] } }));
+      return { folder: acquired.folder ?? undefined, paths };
+    } finally {
+      dropCounter();
     }
-  },
-
-  acquireFromProvider: async (key, provider, work) => {
-    const acquired = await api.literatureAcquire(provider, work);
-    const paths = acquired.files.map((file) => file.path);
-    set((state) => ({ acquired: { ...state.acquired, [key]: paths[0] } }));
-    return { folder: acquired.folder ?? undefined, paths };
   },
 
   acquireCourse: async (key, courseUrl) => {

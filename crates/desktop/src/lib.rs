@@ -2167,9 +2167,9 @@ async fn literature_search(
 }
 
 /// Fetches one provider result into the workspace's uploads directory, by URL
-/// or by the program its manifest names. Importing it is the separate step
-/// `catalogue_acquire` leaves too. A download's bytes arrive on
-/// `catalogue-download-progress`.
+/// or by the program its manifest names. Importing it into a library root is
+/// a separate step, and the user's: this writes only into Wilkes's own staging
+/// area. A download's bytes arrive on `catalogue-download-progress`.
 #[tauri::command]
 async fn literature_acquire(
     app: AppHandle,
@@ -2262,22 +2262,6 @@ async fn catalogue_sync(
 ) -> Result<wilkes_api::commands::catalogue::CatalogueSyncResponse, String> {
     app_context(&app)
         .catalogue_sync(providers)
-        .await
-        .map_err(catalogue_failed)
-}
-
-/// Fetches a candidate into the workspace's uploads directory. Importing it
-/// into a library root is a separate step, and the user's: this writes only
-/// into Wilkes's own staging area. Bytes are reported on
-/// `catalogue-download-progress` as they arrive.
-#[tauri::command]
-async fn catalogue_acquire(
-    app: AppHandle,
-    url: String,
-    filename: Option<String>,
-) -> Result<wilkes_core::acquire::DownloadResponse, String> {
-    app_context(&app)
-        .catalogue_acquire(url, filename)
         .await
         .map_err(catalogue_failed)
 }
@@ -2728,7 +2712,6 @@ pub fn run() {
             literature_provider_lookup,
             catalogue_sync,
             catalogue_remove,
-            catalogue_acquire,
             catalogue_acquire_course,
             image_recognizer_catalogue,
             image_recognizer_inventory,

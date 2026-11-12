@@ -2,7 +2,6 @@ import { decodeComicPage } from "../lib/comicPage";
 import type { ImagePage } from "@leonrjg/wilkes-reader";
 import type {
   HttpCall,
-  CatalogueDownload,
   CatalogueCourse,
   CatalogueCourseProgress,
   CatalogueDownloadProgress,
@@ -1024,16 +1023,6 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw await responseError(res, "catalogueRemove");
     return res.json() as Promise<CatalogueRemoveResponse>;
-  }
-
-  async catalogueAcquire(url: string, filename?: string): Promise<CatalogueDownload> {
-    const res = await fetch("/api/catalogue/acquire", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(filename === undefined ? { url } : { url, filename }),
-    });
-    if (!res.ok) throw await responseError(res, "catalogueAcquire");
-    return res.json() as Promise<CatalogueDownload>;
   }
 
   async onCatalogueSyncProgress(

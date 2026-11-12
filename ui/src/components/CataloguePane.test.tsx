@@ -19,7 +19,6 @@ vi.mock("../services", () => ({
     removeSavedWork: vi.fn(() => Promise.resolve()),
     markSavedWorkAcquired: vi.fn(() => Promise.resolve(null)),
     updateSavedWorkNote: vi.fn(),
-    catalogueAcquire: vi.fn(),
     catalogueAcquireCourse: vi.fn(),
     literatureProviders: vi.fn(),
     literatureSearch: vi.fn(),
@@ -251,7 +250,6 @@ const browse = api.literatureBrowse as unknown as ReturnType<typeof vi.fn>;
 const literatureAcquire = api.literatureAcquire as unknown as ReturnType<typeof vi.fn>;
 const composeCall = api.literatureCompose as unknown as ReturnType<typeof vi.fn>;
 const composeCancel = api.literatureComposeCancel as unknown as ReturnType<typeof vi.fn>;
-const acquire = api.catalogueAcquire as unknown as ReturnType<typeof vi.fn>;
 const acquireCourse = api.catalogueAcquireCourse as unknown as ReturnType<typeof vi.fn>;
 const importFiles = (source as unknown as { importFiles: ReturnType<typeof vi.fn> }).importFiles;
 
@@ -521,7 +519,7 @@ describe("CataloguePane", () => {
       );
     });
     expect(await screen.findByText(/1 document and a syllabus, 1 skipped/)).toBeTruthy();
-    expect(acquire).not.toHaveBeenCalled();
+    expect(literatureAcquire).not.toHaveBeenCalled();
   });
 
   /// The pane used to store a grain filter beside the provider filter. What
@@ -1385,12 +1383,18 @@ describe("CataloguePane", () => {
   });
 
   it("adds a paper through uploads and into the library", async () => {
-    acquire.mockResolvedValue({ path: "/uploads/lists.pdf", bytes: 10, already_present: false });
+    literatureAcquire.mockResolvedValue({
+      folder: null,
+      files: [{ path: "/uploads/lists.pdf", bytes: 10, already_present: false }],
+    });
     render(<CataloguePane pane={pane()} />);
     submit("python lists");
     fireEvent.click(await screen.findByLabelText("Add Persistent Lists Revisited to library"));
     await waitFor(() => {
-      expect(acquire).toHaveBeenCalledWith("https://example.invalid/lists.pdf");
+      expect(literatureAcquire).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ pdf_url: "https://example.invalid/lists.pdf" }),
+      );
       expect(importFiles).toHaveBeenCalledWith(["/uploads/lists.pdf"], "/library", "move", undefined);
     });
     expect(await screen.findByText("Added")).toBeTruthy();
@@ -1433,8 +1437,7 @@ describe("CataloguePane", () => {
         undefined,
       );
     });
-    // The backend fetched it: no URL came back to be fetched again from here.
-    expect(acquire).not.toHaveBeenCalled();
+    expect(literatureAcquire).toHaveBeenCalledTimes(1);
   });
 
   /// A provider whose manifest runs a downloader may get several files back,
