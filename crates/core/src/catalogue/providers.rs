@@ -189,6 +189,8 @@ struct LibreTextsBook {
     #[serde(default)]
     license: String,
     #[serde(default)]
+    thumbnail: Option<String>,
+    #[serde(default)]
     links: LibreTextsLinks,
     #[serde(rename = "exportInfo", default)]
     export_info: Option<LibreTextsExportInfo>,
@@ -206,6 +208,12 @@ struct LibreTextsLinks {
 struct LibreTextsExportInfo {
     #[serde(rename = "contentPageCount", default)]
     content_page_count: Option<i64>,
+}
+
+/// An image URL as a provider sent it, or none. An empty string is how the
+/// listings say a work has no picture, not a URL to try.
+fn image(url: Option<String>) -> Option<String> {
+    url.filter(|url| !url.trim().is_empty())
 }
 
 /// Enough pages to cover a catalogue several times the observed size, so a
@@ -275,6 +283,7 @@ impl CatalogueFetch for LibreTexts {
                     outline_url: book.links.online,
                     grain: CatalogueGrain::Textbook,
                     pages: book.export_info.and_then(|e| e.content_page_count),
+                    image_url: image(book.thumbnail),
                 });
             }
             progress.page(page, out.len());
@@ -340,6 +349,8 @@ struct OpenStaxBook {
     pdf_url: Option<String>,
     #[serde(default)]
     license_name: Option<String>,
+    #[serde(default)]
+    cover_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -387,7 +398,7 @@ impl CatalogueFetch for OpenStax {
     async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>> {
         let url = format!(
             "{}/apps/cms/api/v2/pages/?type=books.Book&limit=500\
-             &fields=title,book_subjects,description,pdf_url,license_name",
+             &fields=title,book_subjects,description,pdf_url,license_name,cover_url",
             self.base_url
         );
         let body: OpenStaxPage = self.http.get_json(url, &[]).await?;
@@ -409,6 +420,7 @@ impl CatalogueFetch for OpenStax {
                 outline_url: None,
                 grain: CatalogueGrain::Textbook,
                 pages: None,
+                image_url: image(book.cover_url),
             })
             .collect())
     }
@@ -469,6 +481,14 @@ struct MitCourse {
     /// asserting a fact about someone else's terms.
     #[serde(default)]
     license_cc: Option<bool>,
+    #[serde(default)]
+    image: Option<MitImage>,
+}
+
+#[derive(Deserialize)]
+struct MitImage {
+    #[serde(default)]
+    url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -554,6 +574,7 @@ impl CatalogueFetch for MitOpenCourseWare {
                     outline_url: course.url,
                     grain: CatalogueGrain::Course,
                     pages: None,
+                    image_url: image(course.image.and_then(|image| image.url)),
                 });
             }
             progress.page(page + 1, out.len());
@@ -677,6 +698,8 @@ impl CatalogueFetch for DevDocs {
                     )),
                     grain: CatalogueGrain::Reference,
                     pages: None,
+                    // DevDocs publishes no picture of a documentation set.
+                    image_url: None,
                 }
             })
             .collect())
@@ -735,6 +758,7 @@ mod tests {
                 r#"{"err":false,"numTotal":1,"books":[{
                     "bookID":"math-70414","title":"Calculus","summary":"Limits and derivatives.",
                     "subject":"","library":"math","author":"P. Seeburger","license":"ccbysa",
+                    "thumbnail":"https://example.invalid/thumb.png",
                     "links":{"online":"https://example.invalid/online","pdf":"https://example.invalid/pdf"},
                     "exportInfo":{"contentPageCount":330}}]}"#,
             )
@@ -768,6 +792,77 @@ mod tests {
         assert_eq!(book.subject, "math");
         assert_eq!(book.pages, Some(330));
         assert_eq!(book.grain, CatalogueGrain::Textbook);
+        assert_eq!(
+            book.image_url.as_deref(),
+            Some("https://example.invalid/thumb.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn openstax_reads_each_book_s_cover_and_an_empty_one_as_none() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/apps/cms/api/v2/pages/")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "fields".into(),
+                "title,book_subjects,description,pdf_url,license_name,cover_url".into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"items":[
+                    {"id":1,"title":"Algebra 1","cover_url":"https://example.invalid/algebra.svg"},
+                    {"id":2,"title":"Physics","cover_url":""}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let records = OpenStax::new(&server.url())
+            .fetch_all(&FetchReporter::silent())
+            .await
+            .expect("fetch");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].image_url.as_deref(),
+            Some("https://example.invalid/algebra.svg")
+        );
+        assert_eq!(records[1].image_url, None);
+    }
+
+    #[tokio::test]
+    async fn mit_ocw_reads_the_course_image() {
+        let mut server = mockito::Server::new_async().await;
+        let _first = server
+            .mock("GET", "/api/v1/courses/")
+            .match_query(mockito::Matcher::UrlEncoded("offset".into(), "0".into()))
+            .with_status(200)
+            .with_body(
+                r#"{"count":2,"results":[
+                    {"id":1,"title":"Linear Algebra","license_cc":true,
+                     "image":{"url":"https://example.invalid/18-06.jpg","alt":"A matrix."}},
+                    {"id":2,"title":"Thermodynamics","license_cc":true,"image":null}]}"#,
+            )
+            .create_async()
+            .await;
+        let _rest = server
+            .mock("GET", "/api/v1/courses/")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"count":2,"results":[]}"#)
+            .create_async()
+            .await;
+
+        let records = MitOpenCourseWare::new(&server.url())
+            .fetch_all(&FetchReporter::silent())
+            .await
+            .expect("fetch");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].image_url.as_deref(),
+            Some("https://example.invalid/18-06.jpg")
+        );
+        assert_eq!(records[1].image_url, None);
     }
 
     #[tokio::test]

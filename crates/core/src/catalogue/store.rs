@@ -11,8 +11,9 @@ use crate::types::{
 };
 
 /// v2 rebuilt `catalogue_records` without the grain CHECK constraint; see
-/// [`CatalogueStore::drop_grain_check`].
-const SCHEMA_VERSION: i64 = 2;
+/// [`CatalogueStore::drop_grain_check`]. v3 added `image_url`; see
+/// [`CatalogueStore::add_image_column`].
+const SCHEMA_VERSION: i64 = 3;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Ceiling on one search's returned rows. Recall is meant to be wide but a
@@ -53,6 +54,7 @@ const BASE_SCHEMA: &str = r#"
                 outline_url  TEXT,
                 grain        TEXT NOT NULL,
                 pages        INTEGER,
+                image_url    TEXT,
                 UNIQUE (provider, external_id)
             );
             CREATE INDEX IF NOT EXISTS idx_catalogue_provider
@@ -107,6 +109,7 @@ const REBUILD_TABLE: &str = "
                 outline_url  TEXT,
                 grain        TEXT NOT NULL,
                 pages        INTEGER,
+                image_url    TEXT,
                 UNIQUE (provider, external_id)
             );";
 
@@ -215,6 +218,7 @@ impl CatalogueStore {
         }
         self.conn.execute_batch(BASE_SCHEMA)?;
         self.drop_grain_check()?;
+        self.add_image_column()?;
         self.conn.execute(
             "INSERT OR REPLACE INTO catalogue_meta (key, value) VALUES ('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
@@ -274,6 +278,26 @@ impl CatalogueStore {
         Ok(())
     }
 
+    /// Adds `image_url` to a table created before it existed.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` leaves an existing table as it was, so the
+    /// column has to be added to it. Appended, which is also where the schema
+    /// declares it, so a migrated table and a fresh one have the same shape.
+    /// Existing rows hold no image until their provider is synced again.
+    fn add_image_column(&self) -> anyhow::Result<()> {
+        let present: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('catalogue_records') WHERE name = 'image_url'",
+            [],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            self.conn
+                .execute_batch("ALTER TABLE catalogue_records ADD COLUMN image_url TEXT;")
+                .context("adding image_url to catalogue_records")?;
+        }
+        Ok(())
+    }
+
     /// Replaces one provider's records wholesale.
     ///
     /// Wholesale because these catalogues have no change feed: a provider can
@@ -306,8 +330,8 @@ impl CatalogueStore {
             let mut stmt = tx.prepare(
                 "INSERT INTO catalogue_records
                     (provider, external_id, title, summary, subject, authors, license,
-                     landing_url, pdf_url, outline_url, grain, pages)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                     landing_url, pdf_url, outline_url, grain, pages, image_url)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             )?;
             for record in records {
                 if record.external_id.trim().is_empty() || record.title.trim().is_empty() {
@@ -333,6 +357,7 @@ impl CatalogueStore {
                     record.outline_url,
                     record.grain.as_str(),
                     record.pages,
+                    record.image_url,
                 ])?;
                 outcome.stored += 1;
             }
@@ -424,7 +449,7 @@ impl CatalogueStore {
         // better match and callers do not have to know that.
         let sql = "SELECT r.provider, r.external_id, r.title, r.summary, r.subject,
                           r.authors, r.license, r.landing_url, r.pdf_url, r.outline_url,
-                          r.grain, r.pages, -bm25(catalogue_fts, 4.0, 2.0, 1.0)
+                          r.grain, r.pages, -bm25(catalogue_fts, 4.0, 2.0, 1.0), r.image_url
                      FROM catalogue_fts
                      JOIN catalogue_records r ON r.rowid = catalogue_fts.rowid
                     WHERE catalogue_fts MATCH ?1
@@ -459,6 +484,7 @@ impl CatalogueStore {
                     outline_url: row.get(9)?,
                     grain: parse_grain(10, grain_text)?,
                     pages: row.get(11)?,
+                    image_url: row.get(13)?,
                 };
                 Ok(CatalogueHit {
                     acquisition: super::providers::acquisition(&record),
@@ -652,6 +678,7 @@ mod tests {
             outline_url: None,
             grain,
             pages: Some(200),
+            image_url: None,
         }
     }
 
@@ -1306,6 +1333,69 @@ mod tests {
                 .expect("count");
             assert_eq!(present, 1, "{object} did not survive the rebuild");
         }
+    }
+
+    /// A v2 database: the grain CHECK already gone, `image_url` not yet there.
+    fn v2_database() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = Connection::open(dir.path().join("catalogue.db")).expect("open");
+        let v2 = BASE_SCHEMA.replace("                image_url    TEXT,\n", "");
+        assert!(
+            !v2.contains("image_url"),
+            "v2 fixture kept the image column"
+        );
+        conn.execute_batch(&v2).expect("v2 schema");
+        conn.execute(
+            "INSERT INTO catalogue_records
+                (provider, external_id, title, summary, grain)
+             VALUES ('test','1','Convex Optimization','Duality and gradient methods.','textbook')",
+            [],
+        )
+        .expect("insert");
+        conn.execute(
+            "INSERT OR REPLACE INTO catalogue_meta (key, value) VALUES ('schema_version','2')",
+            [],
+        )
+        .expect("version");
+        dir
+    }
+
+    #[test]
+    fn opening_a_v2_database_adds_the_image_column_and_keeps_the_rows() {
+        let migrated_dir = v2_database();
+        let migrated = CatalogueStore::open(migrated_dir.path()).expect("open migrated");
+        let fresh_dir = tempfile::tempdir().expect("tempdir");
+        let fresh = CatalogueStore::open(fresh_dir.path()).expect("open fresh");
+        assert_eq!(
+            columns(&migrated.conn, "catalogue_records"),
+            columns(&fresh.conn, "catalogue_records"),
+        );
+        let hits = migrated
+            .search("duality and gradient methods", &[], 10)
+            .expect("search")
+            .hits;
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].record.image_url, None);
+    }
+
+    #[test]
+    fn a_stored_image_comes_back_with_its_record() {
+        let mut store = CatalogueStore::in_memory().expect("store");
+        let mut pictured = record(
+            "1",
+            "Convex Optimization",
+            "Duality and gradient methods.",
+            CatalogueGrain::Textbook,
+        );
+        pictured.image_url = Some("https://example.invalid/cover.png".into());
+        store
+            .replace_provider("test", &[pictured])
+            .expect("replace");
+        let hits = store.search("duality", &[], 10).expect("search").hits;
+        assert_eq!(
+            hits[0].record.image_url.as_deref(),
+            Some("https://example.invalid/cover.png")
+        );
     }
 
     #[test]

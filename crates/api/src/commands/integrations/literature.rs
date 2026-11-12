@@ -903,6 +903,7 @@ mod tests {
             outline_url: None,
             grain: wilkes_core::types::CatalogueGrain::Textbook,
             pages: None,
+            image_url: None,
         }
     }
 

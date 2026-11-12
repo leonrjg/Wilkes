@@ -92,7 +92,7 @@ fn result_from(hit: CatalogueHit) -> LiteratureSearchResult {
         // A documentation set has no landing page of its own; its outline is
         // where it is read.
         landing_page_url: record.landing_url.or(record.outline_url),
-        image_url: None,
+        image_url: record.image_url,
         open_access_status: None,
         license: present(record.license),
         authors: present(record.authors),
@@ -219,6 +219,7 @@ mod tests {
             outline_url: None,
             grain,
             pages: Some(412),
+            image_url: Some(format!("https://example.test/{id}.png")),
         }
     }
 
@@ -268,6 +269,10 @@ mod tests {
         assert_eq!(result.title.as_deref(), Some("Thermodynamics"));
         assert_eq!(result.kind.as_deref(), Some("textbook"));
         assert_eq!(result.pages, Some(412));
+        assert_eq!(
+            result.image_url.as_deref(),
+            Some("https://example.test/a.png")
+        );
         assert_eq!(result.acquisition, LiteratureAcquisition::Direct);
         assert!(result.summary.is_some());
         // An empty column is absent, not an empty string a row would print.

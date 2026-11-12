@@ -21,6 +21,8 @@
 - Add Custom in the embedding model list searches Hugging Face as you type, opening on the most downloaded models, and clicking a result adds it. Results are embedding models the engine could download: rerankers and gated repositories are left out, and for Candle so is any repository without the files it loads. A repository ID or URL can still be entered directly. On the server, `GET /api/embed/model-search?engine=&query=` runs the same search.
 - The desktop app can send files to other Wilkes on the local network. Turn on Settings › Servers › Local network, and every other instance with it on appears in a file's menu as Send to <computer>. Instances find each other over mDNS. A received file lands in the receiver's current folder without a prompt, under the same name, type and duplicate rules as a drop onto the file list, and up to the library download limit. Sharing is off by default.
 
+- Learning catalogue results show the work's picture: the cover for LibreTexts and OpenStax books and the course image for MIT OCW. DevDocs publishes none. A catalogue synced before this shows pictures once it is synced again.
+
 ### Changed
 
 - The Python worker's dependencies are pinned and locked per environment, so every install gets the same versions. `semantic-text-splitter`, `sqlite-vec` and PyMuPDF, which it never used, are gone.

@@ -807,6 +807,7 @@ mod tests {
                         outline_url: None,
                         grain: mirrored_sources(dir.path())[0].grain(),
                         pages: None,
+                        image_url: None,
                     }],
                 )
                 .unwrap();

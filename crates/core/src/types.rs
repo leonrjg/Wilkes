@@ -3655,6 +3655,9 @@ pub struct CatalogueRecord {
     pub outline_url: Option<String>,
     pub grain: CatalogueGrain,
     pub pages: Option<i64>,
+    /// The cover or picture the provider shows for the work. Optional by
+    /// design: DevDocs publishes none, and a few OpenStax books have no cover.
+    pub image_url: Option<String>,
 }
 
 /// How a record can be fetched, if it can be.
