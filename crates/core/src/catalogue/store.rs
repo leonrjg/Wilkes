@@ -21,6 +21,61 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 /// what `sync` produced — there is a status endpoint for that question.
 pub const MAX_SEARCH_LIMIT: usize = 200;
 
+/// What a record's several subjects are joined by in the `subject` column.
+///
+/// Subjects are not stored one per row, so a listing filtered by subject reads
+/// them back by splitting on this. Every fetcher that joins subjects joins
+/// with it, which is what lets the split find what the join put there. A
+/// subject that itself contains it is read back as two.
+pub const SUBJECT_SEPARATOR: &str = ", ";
+
+/// How a listing is ordered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListingOrder {
+    /// Best keyword match first. Only meaningful with a keyword.
+    Relevance,
+    /// By title, A to Z, ignoring case.
+    Title,
+    /// Most pages first; records with no page count last.
+    LongestFirst,
+}
+
+/// One page of a provider's records, filtered and ordered.
+#[derive(Clone, Debug)]
+pub struct ListingQuery<'a> {
+    pub provider: &'a str,
+    /// Free text, matched as [`CatalogueStore::search`] matches it.
+    pub keyword: Option<&'a str>,
+    /// Whole subjects, as [`CatalogueStore::subjects`] gives them. Empty
+    /// means any subject.
+    pub subjects: &'a [String],
+    /// Whether a record must carry every one of `subjects` rather than any.
+    pub all_subjects: bool,
+    /// The part of a record's external id before its first `-` — the
+    /// LibreTexts library (`math-24129`). Empty means any.
+    pub id_prefixes: &'a [String],
+    pub order: ListingOrder,
+    /// 1-based.
+    pub page: usize,
+    pub limit: usize,
+}
+
+/// A record in a listing, with its keyword score when there was a keyword.
+#[derive(Clone, Debug)]
+pub struct ListedRecord {
+    pub record: CatalogueRecord,
+    pub recall_score: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Listing {
+    /// The terms a keyword reduced to; empty when there was no keyword.
+    pub terms: Vec<String>,
+    pub records: Vec<ListedRecord>,
+    /// How many records match in all, across every page.
+    pub total: u64,
+}
+
 /// Everything the store needs to exist, stated once so that the initial
 /// creation and the post-rebuild repair cannot drift apart.
 ///
@@ -540,6 +595,150 @@ impl CatalogueStore {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// One provider's records by filter and order, a page at a time.
+    ///
+    /// Unlike [`Self::search`] this is a listing, not recall: every record
+    /// that matches is reachable by paging, and the total says how many there
+    /// are. A keyword that reduces to no terms is answered with no records and
+    /// no terms, for the caller to say so, as recall is.
+    pub fn list(&self, query: &ListingQuery<'_>) -> anyhow::Result<Listing> {
+        let keyword = query.keyword.map(str::trim).filter(|k| !k.is_empty());
+        let terms = keyword.map(query_terms).unwrap_or_default();
+        if keyword.is_some() && terms.is_empty() {
+            return Ok(Listing {
+                terms,
+                records: Vec::new(),
+                total: 0,
+            });
+        }
+        anyhow::ensure!(
+            keyword.is_some() || query.order != ListingOrder::Relevance,
+            "ordering by relevance needs a keyword"
+        );
+        let expression = keyword.map(|keyword| fts_expression(&query_phrases(keyword), &terms));
+        let as_json = |values: &[String]| -> anyhow::Result<Option<String>> {
+            Ok(if values.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(values)?)
+            })
+        };
+        let subjects = as_json(query.subjects)?;
+        let prefixes = as_json(query.id_prefixes)?;
+        // Every fragment below is a fixed string chosen by a branch: nothing a
+        // caller wrote reaches the SQL text, only its parameters.
+        let (from, score) = if expression.is_some() {
+            (
+                "FROM catalogue_fts JOIN catalogue_records r ON r.rowid = catalogue_fts.rowid
+                 WHERE catalogue_fts MATCH ?2 AND",
+                "-bm25(catalogue_fts, 4.0, 2.0, 1.0)",
+            )
+        } else {
+            ("FROM catalogue_records r WHERE", "NULL")
+        };
+        // A subject is matched whole: the column, fenced by separators, holds
+        // the subject fenced the same way.
+        let matches_subject = "instr(?5 || r.subject || ?5, ?5 || value || ?5) > 0";
+        let filters = format!(
+            "r.provider = ?1
+             AND (?3 IS NULL OR CASE WHEN ?4
+                   THEN NOT EXISTS (SELECT 1 FROM json_each(?3) WHERE NOT ({matches_subject}))
+                   ELSE EXISTS (SELECT 1 FROM json_each(?3) WHERE {matches_subject}) END)
+             AND (?6 IS NULL OR substr(r.external_id, 1, instr(r.external_id, '-') - 1)
+                   IN (SELECT value FROM json_each(?6)))"
+        );
+        let order = match query.order {
+            ListingOrder::Relevance => "bm25(catalogue_fts, 4.0, 2.0, 1.0), r.rowid",
+            ListingOrder::Title => "r.title COLLATE NOCASE, r.rowid",
+            ListingOrder::LongestFirst => {
+                "r.pages IS NULL, r.pages DESC, r.title COLLATE NOCASE, r.rowid"
+            }
+        };
+        let limit = query.limit.clamp(1, MAX_SEARCH_LIMIT);
+        let offset = (query.page.max(1) - 1).saturating_mul(limit);
+        // Numbered, so the count and the page share one set of filters; ?2 is
+        // only read when there is a keyword, and is NULL when there is not.
+        let filtering = params![
+            query.provider,
+            expression,
+            subjects,
+            query.all_subjects,
+            SUBJECT_SEPARATOR,
+            prefixes,
+        ];
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) {from} {filters}"),
+            filtering,
+            |row| row.get(0),
+        )?;
+        let paging = params![
+            query.provider,
+            expression,
+            subjects,
+            query.all_subjects,
+            SUBJECT_SEPARATOR,
+            prefixes,
+            limit as i64,
+            offset as i64,
+        ];
+        let sql = format!(
+            "SELECT r.provider, r.external_id, r.title, r.summary, r.subject,
+                    r.authors, r.license, r.landing_url, r.pdf_url, r.outline_url,
+                    r.grain, r.pages, {score}, r.image_url
+               {from} {filters}
+              ORDER BY {order}
+              LIMIT ?7 OFFSET ?8"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(paging, |row| {
+            let grain_text: String = row.get(10)?;
+            Ok(ListedRecord {
+                record: CatalogueRecord {
+                    provider: row.get(0)?,
+                    external_id: row.get(1)?,
+                    title: row.get(2)?,
+                    summary: row.get(3)?,
+                    subject: row.get(4)?,
+                    authors: row.get(5)?,
+                    license: row.get(6)?,
+                    landing_url: row.get(7)?,
+                    pdf_url: row.get(8)?,
+                    outline_url: row.get(9)?,
+                    grain: parse_grain(10, grain_text)?,
+                    pages: row.get(11)?,
+                    image_url: row.get(13)?,
+                },
+                recall_score: row.get(12)?,
+            })
+        })?;
+        let records = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(Listing {
+            terms,
+            records,
+            total: u64::try_from(total).context("negative listing count")?,
+        })
+    }
+
+    /// Every subject one provider's records carry, with how many carry it,
+    /// most-carried first.
+    pub fn subjects(&self, provider: &str) -> anyhow::Result<Vec<(String, usize)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT subject FROM catalogue_records WHERE provider = ?1")?;
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for joined in stmt.query_map([provider], |row| row.get::<_, String>(0))? {
+            for subject in joined?.split(SUBJECT_SEPARATOR) {
+                let subject = subject.trim();
+                if !subject.is_empty() {
+                    *counts.entry(subject.to_string()).or_default() += 1;
+                }
+            }
+        }
+        let mut subjects: Vec<(String, usize)> = counts.into_iter().collect();
+        subjects.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(subjects)
     }
 
     pub fn total_records(&self) -> anyhow::Result<i64> {

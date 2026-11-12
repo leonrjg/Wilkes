@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
+use super::store::SUBJECT_SEPARATOR;
 use crate::network::ProviderHttpClient;
 use crate::types::{CatalogueAcquisition, CatalogueFetchProgress, CatalogueGrain, CatalogueRecord};
 
@@ -74,6 +75,9 @@ pub trait CatalogueFetch: Send + Sync {
     /// of the source, not of each record.
     fn grain(&self) -> CatalogueGrain;
 
+    /// What a listing of this catalogue can be narrowed and ordered by.
+    fn browse_facets(&self) -> BrowseFacets;
+
     /// Everything the provider currently offers.
     ///
     /// Whole-catalogue rather than incremental because none of these providers
@@ -83,6 +87,39 @@ pub trait CatalogueFetch: Send + Sync {
     /// its catalogue whole reports once; a paged one reports per page.
     async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>>;
 }
+
+/// What a catalogue's records carry that a listing can be narrowed or ordered
+/// by. Stated per catalogue because the records differ: only LibreTexts says
+/// how long a book is or which library it is shelved in, and DevDocs files
+/// every set under the one subject.
+#[derive(Clone, Copy, Debug)]
+pub struct BrowseFacets {
+    /// Whether records carry subjects that tell them apart.
+    pub subjects: bool,
+    /// The groups a record's external id is prefixed with (`math-24129`), as
+    /// (prefix, label). Empty when ids carry no group.
+    pub libraries: &'static [(&'static str, &'static str)],
+    /// Whether records carry a page count.
+    pub pages: bool,
+}
+
+/// LibreTexts' libraries, by the prefix their book ids carry.
+const LIBRETEXTS_LIBRARIES: &[(&str, &str)] = &[
+    ("bio", "Biology"),
+    ("biz", "Business"),
+    ("chem", "Chemistry"),
+    ("eng", "Engineering"),
+    ("espanol", "Español"),
+    ("geo", "Geosciences"),
+    ("human", "Humanities"),
+    ("k12", "K12 Education"),
+    ("math", "Mathematics"),
+    ("med", "Medicine"),
+    ("phys", "Physics"),
+    ("socialsci", "Social Sciences"),
+    ("stats", "Statistics"),
+    ("workforce", "Workforce"),
+];
 
 /// How a stored record can be fetched.
 ///
@@ -248,6 +285,14 @@ impl CatalogueFetch for LibreTexts {
         CatalogueGrain::Textbook
     }
 
+    fn browse_facets(&self) -> BrowseFacets {
+        BrowseFacets {
+            subjects: true,
+            libraries: LIBRETEXTS_LIBRARIES,
+            pages: true,
+        }
+    }
+
     async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>> {
         let mut out: Vec<CatalogueRecord> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -374,7 +419,7 @@ fn openstax_subjects(values: &[serde_json::Value]) -> String {
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(SUBJECT_SEPARATOR)
 }
 
 #[async_trait]
@@ -393,6 +438,14 @@ impl CatalogueFetch for OpenStax {
 
     fn grain(&self) -> CatalogueGrain {
         CatalogueGrain::Textbook
+    }
+
+    fn browse_facets(&self) -> BrowseFacets {
+        BrowseFacets {
+            subjects: true,
+            libraries: &[],
+            pages: false,
+        }
     }
 
     async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>> {
@@ -515,6 +568,14 @@ impl CatalogueFetch for MitOpenCourseWare {
         CatalogueGrain::Course
     }
 
+    fn browse_facets(&self) -> BrowseFacets {
+        BrowseFacets {
+            subjects: true,
+            libraries: &[],
+            pages: false,
+        }
+    }
+
     async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>> {
         let mut out: Vec<CatalogueRecord> = Vec::new();
         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -564,7 +625,7 @@ impl CatalogueFetch for MitOpenCourseWare {
                         .iter()
                         .map(|t| t.name.as_str())
                         .collect::<Vec<_>>()
-                        .join(", "),
+                        .join(SUBJECT_SEPARATOR),
                     authors: "MIT".into(),
                     // Uniform across OCW and now only written for a
                     // record that said so above.
@@ -662,6 +723,15 @@ impl CatalogueFetch for DevDocs {
 
     fn grain(&self) -> CatalogueGrain {
         CatalogueGrain::Reference
+    }
+
+    fn browse_facets(&self) -> BrowseFacets {
+        // Every set is filed under the one subject.
+        BrowseFacets {
+            subjects: false,
+            libraries: &[],
+            pages: false,
+        }
     }
 
     async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>> {
