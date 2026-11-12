@@ -10,7 +10,7 @@ version = "1.0.1"
 # the tag *is* the version -- three copies of it would be three places to miss
 # when it moves.
 [workspace.dependencies]
-wilkes-chat = { git = "https://github.com/leonrjg/wilkes-chat", tag = "v0.1.5" }
+wilkes-chat = { git = "https://github.com/leonrjg/wilkes-chat", tag = "v0.1.6" }
 
 # futures-util 0.3.32 with a single change: `waker_vtable` in
 # stream/futures_unordered/task.rs is `#[inline(never)]`. Without it an open

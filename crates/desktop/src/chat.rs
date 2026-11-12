@@ -15,7 +15,7 @@
 //! and nothing to notice when it did not.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -52,47 +52,26 @@ pub struct ManagedChatSession {
     branch_history_pending: Mutex<bool>,
 }
 
-/// The saved conversations, and the one door to them.
-///
-/// One store for the installation, not one per workspace. A chat is the
-/// window's: it stays open across a workspace switch, and its agent reaches
-/// every workspace through the MCP server by name. Kept per workspace, a
-/// conversation started in one was missing from the history menu of every
-/// other, and one still open across a switch had its transcript written into
-/// a store that had never heard of it.
-///
-/// Every read and write goes through [`ConversationStore::with`], under one
-/// lock. The store is a single JSON file rewritten whole, read-modify-write:
-/// two panes finishing turns at once would otherwise each write back the
-/// file as they read it, and whichever wrote last would drop the other's
-/// conversation.
-pub(crate) struct ConversationStore {
-    dir: PathBuf,
-    lock: Mutex<()>,
-}
-
-impl ConversationStore {
-    fn with<T>(&self, f: impl FnOnce(&std::path::Path) -> anyhow::Result<T>) -> anyhow::Result<T> {
-        let _guard = self.lock.lock().unwrap();
-        f(&self.dir)
-    }
-}
-
 pub struct ChatManager {
     sessions: Mutex<HashMap<String, Arc<ManagedChatSession>>>,
-    store: ConversationStore,
+    /// Where the saved conversations are kept: the installation's shared data
+    /// directory, one store for every workspace. A chat is the window's: it
+    /// stays open across a workspace switch, and its agent reaches every
+    /// workspace through the MCP server by name. Kept per workspace, a
+    /// conversation started in one was missing from the history menu of every
+    /// other, and one still open across a switch had its transcript written
+    /// into a store that had never heard of it.
+    ///
+    /// Concurrent writes from several panes are `wilkes-chat`'s to serialize,
+    /// and it does.
+    store_dir: PathBuf,
 }
 
 impl ChatManager {
-    /// `store_dir` is the installation's shared data directory, where
-    /// `chat-conversations.json` lives.
     pub fn new(store_dir: PathBuf) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            store: ConversationStore {
-                dir: store_dir,
-                lock: Mutex::new(()),
-            },
+            store_dir,
         }
     }
 
@@ -201,7 +180,7 @@ fn forward_events(
 /// opened and never spoken to would otherwise leave an empty conversation in
 /// the history menu every time the pane was shown.
 fn ensure_conversation(
-    store: &ConversationStore,
+    store_dir: &Path,
     managed: &ManagedChatSession,
 ) -> Result<Option<String>, String> {
     if !is_resumable(managed.session.backend) {
@@ -213,17 +192,14 @@ fn ensure_conversation(
         return Ok(conversation_id.clone());
     }
 
-    let record = store
-        .with(|dir| {
-            wilkes_api::commands::chat::create_conversation(
-                dir,
-                managed.session.backend,
-                &managed.cwd,
-                managed.session.backend_session_id().to_string(),
-                &config_options,
-            )
-        })
-        .map_err(|e| e.to_string())?;
+    let record = wilkes_api::commands::chat::create_conversation(
+        store_dir,
+        managed.session.backend,
+        &managed.cwd,
+        managed.session.backend_session_id().to_string(),
+        &config_options,
+    )
+    .map_err(|e| e.to_string())?;
     *conversation_id = record.map(|record| record.conversation_id);
     Ok(conversation_id.clone())
 }
@@ -295,9 +271,7 @@ pub async fn chat_install_backend(
 pub async fn chat_list_conversations(
     app: AppHandle,
 ) -> Result<Vec<ChatConversationRecord>, String> {
-    manager(&app)
-        .store
-        .with(wilkes_api::commands::chat::list_conversations)
+    wilkes_api::commands::chat::list_conversations(&manager(&app).store_dir)
         .map_err(|e| format!("{e:#}"))
 }
 
@@ -306,9 +280,7 @@ pub async fn chat_forget_conversation(
     conversation_id: String,
     app: AppHandle,
 ) -> Result<(), String> {
-    manager(&app)
-        .store
-        .with(|dir| wilkes_api::commands::chat::forget_conversation(dir, &conversation_id))
+    wilkes_api::commands::chat::forget_conversation(&manager(&app).store_dir, &conversation_id)
         .map_err(|e| format!("{e:#}"))
 }
 
@@ -365,9 +337,7 @@ pub async fn chat_open_conversation(
 ) -> Result<ChatStartResult, String> {
     let ctx = app_context(&app);
     let chats = manager(&app);
-    let record = chats
-        .store
-        .with(|dir| wilkes_api::commands::chat::get_conversation(dir, &conversation_id))
+    let record = wilkes_api::commands::chat::get_conversation(&chats.store_dir, &conversation_id)
         .map_err(|e| format!("{e:#}"))?;
     let (spawned, wilkes) =
         wilkes_api::commands::chat::open(&record, Some(workspace_manager(&app)))
@@ -389,18 +359,15 @@ pub async fn chat_open_conversation(
             &record.messages,
         )));
     }
-    if let Err(e) = chats.store.with(|dir| {
-        wilkes_api::commands::chat::replace_conversation_messages(
-            dir,
-            &conversation_id,
-            messages.clone(),
-        )
-    }) {
+    if let Err(e) = wilkes_api::commands::chat::replace_conversation_messages(
+        &chats.store_dir,
+        &conversation_id,
+        messages.clone(),
+    ) {
         error!("chat: could not write back the replayed transcript: {e:#}");
     }
-    if let Err(e) = chats
-        .store
-        .with(|dir| wilkes_api::commands::chat::touch_conversation(dir, &conversation_id, None))
+    if let Err(e) =
+        wilkes_api::commands::chat::touch_conversation(&chats.store_dir, &conversation_id, None)
     {
         error!("chat: could not mark the conversation as opened: {e:#}");
     }
@@ -436,9 +403,7 @@ pub async fn chat_fork_conversation(
 ) -> Result<ChatStartResult, String> {
     let ctx = app_context(&app);
     let chats = manager(&app);
-    let source = chats
-        .store
-        .with(|dir| wilkes_api::commands::chat::get_conversation(dir, &conversation_id))
+    let source = wilkes_api::commands::chat::get_conversation(&chats.store_dir, &conversation_id)
         .map_err(|e| format!("{e:#}"))?;
     if !is_resumable(source.backend) {
         return Err("This chat backend does not support durable forks".to_string());
@@ -465,15 +430,13 @@ pub async fn chat_fork_conversation(
     let backend_session_id = session.backend_session_id().to_string();
     let auth = session.auth().clone();
 
-    let record = match chats.store.with(|dir| {
-        wilkes_api::commands::chat::create_fork_conversation(
-            dir,
-            &conversation_id,
-            &message_id,
-            include_message,
-            backend_session_id.clone(),
-        )
-    }) {
+    let record = match wilkes_api::commands::chat::create_fork_conversation(
+        &chats.store_dir,
+        &conversation_id,
+        &message_id,
+        include_message,
+        backend_session_id.clone(),
+    ) {
         Ok(record) => record,
         Err(e) => {
             // The agent is already running and now belongs to nothing.
@@ -538,9 +501,11 @@ pub async fn chat_set_config_option(
 
     let conversation_id = managed.conversation_id.lock().unwrap().clone();
     if let Some(conversation_id) = conversation_id {
-        if let Err(e) = manager(&app).store.with(|dir| {
-            wilkes_api::commands::chat::update_conversation_config(dir, &conversation_id, &options)
-        }) {
+        if let Err(e) = wilkes_api::commands::chat::update_conversation_config(
+            &manager(&app).store_dir,
+            &conversation_id,
+            &options,
+        ) {
             error!("chat: could not record the config change: {e:#}");
         }
     }
@@ -577,7 +542,7 @@ pub async fn chat_send(
         .session
         .set_instructions(Some(ctx.get_settings().await.chat_custom_instructions));
     let chats = manager(&app);
-    let conversation_id = ensure_conversation(&chats.store, &managed)?;
+    let conversation_id = ensure_conversation(&chats.store_dir, &managed)?;
 
     {
         // The conditions this turn is being sent under, so a branch taken from
@@ -648,30 +613,27 @@ pub async fn chat_send(
                 std::mem::replace(&mut *pending, false)
             };
             if carried {
-                if let Err(e) = chats.store.with(|dir| {
-                    wilkes_api::commands::chat::mark_branch_history_seeded(dir, conversation_id)
-                }) {
+                if let Err(e) = wilkes_api::commands::chat::mark_branch_history_seeded(
+                    &chats.store_dir,
+                    conversation_id,
+                ) {
                     error!("chat: could not mark the branch history as handed over: {e:#}");
                 }
             }
 
             let messages = managed_for_task.messages.lock().unwrap().clone();
-            if let Err(e) = chats.store.with(|dir| {
-                wilkes_api::commands::chat::replace_conversation_messages(
-                    dir,
-                    conversation_id,
-                    messages,
-                )
-            }) {
+            if let Err(e) = wilkes_api::commands::chat::replace_conversation_messages(
+                &chats.store_dir,
+                conversation_id,
+                messages,
+            ) {
                 error!("chat: could not save the transcript: {e:#}");
             }
-            if let Err(e) = chats.store.with(|dir| {
-                wilkes_api::commands::chat::touch_conversation(
-                    dir,
-                    conversation_id,
-                    Some(&title_hint),
-                )
-            }) {
+            if let Err(e) = wilkes_api::commands::chat::touch_conversation(
+                &chats.store_dir,
+                conversation_id,
+                Some(&title_hint),
+            ) {
                 error!("chat: could not update the conversation's metadata: {e:#}");
             }
         }
