@@ -24,8 +24,7 @@ use crate::integrations::custom::manifest::{
 use crate::integrations::{LiteratureSource, ProviderCapabilities};
 use crate::types::{
     BrowsePage, BrowseRequest, CatalogueAcquisition, CatalogueGrain, CatalogueRecord,
-    FilterSuggestion, IntegrationState, IntegrationStatus, LiteratureAcquisition,
-    LiteratureSearchResult,
+    IntegrationState, IntegrationStatus, LiteratureAcquisition, LiteratureSearchResult,
 };
 
 /// The filter and sort names a catalogue listing declares. Named once so the
@@ -40,8 +39,6 @@ const BY_LENGTH: &str = "pages";
 
 /// A listing page when the caller names no size.
 const DEFAULT_BROWSE_LIMIT: usize = 25;
-/// How many subjects one suggestion offers.
-const SUGGESTIONS: usize = 20;
 
 /// A browse request as the store is asked it: every name and value checked
 /// against what the catalogue declares.
@@ -81,8 +78,17 @@ impl MirroredSource {
     }
 
     /// What a listing of this catalogue offers, as the filter panel draws it.
-    fn browse_controls(&self) -> BrowseControls {
+    ///
+    /// The subjects are the ones the mirror holds for this catalogue, so the
+    /// list is what a listing can actually be narrowed to, and a catalogue
+    /// not yet fetched offers none.
+    fn browse_controls(&self) -> anyhow::Result<BrowseControls> {
         let facets = self.fetch.browse_facets();
+        let subjects = if facets.subjects {
+            CatalogueStore::open(&self.mirror_dir)?.subjects(self.id())?
+        } else {
+            Vec::new()
+        };
         let option = |value: &str, label: &str| ControlOption {
             value: value.to_string(),
             label: label.to_string(),
@@ -100,14 +106,12 @@ impl MirroredSource {
                 from_result: None,
             };
         let mut filters = Vec::new();
-        if facets.subjects {
-            filters.push(filter(
-                SUBJECT,
-                "Subject",
-                "suggest",
-                Vec::new(),
-                &[ANY, ALL],
-            ));
+        if !subjects.is_empty() {
+            let options = subjects
+                .iter()
+                .map(|(subject, count)| option(subject, &format!("{subject} ({count})")))
+                .collect();
+            filters.push(filter(SUBJECT, "Subject", "options", options, &[ANY, ALL]));
         }
         if !facets.libraries.is_empty() {
             let options = facets
@@ -125,7 +129,7 @@ impl MirroredSource {
         if facets.pages {
             orders.push(option(BY_LENGTH, "Longest first"));
         }
-        BrowseControls {
+        Ok(BrowseControls {
             keyword: true,
             keyword_required: false,
             total: true,
@@ -143,13 +147,13 @@ impl MirroredSource {
                 vec![option(ANY, "Any of"), option(ALL, "All of")]
             },
             filters,
-        }
+        })
     }
 
     /// Reads a browse request against [`Self::browse_controls`], refusing by
     /// name anything they do not declare.
     fn checked(&self, request: &BrowseRequest) -> anyhow::Result<CheckedListing> {
-        let controls = self.browse_controls();
+        let controls = self.browse_controls()?;
         let keyword = request
             .query
             .as_deref()
@@ -352,8 +356,18 @@ impl LiteratureSource for MirroredSource {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             paged_search: false,
-            // Recall is one page; a listing pages through every record.
-            browse: Some(self.browse_controls()),
+            // Recall is one page; a listing pages through every record. A
+            // mirror that cannot be read cannot be listed either.
+            browse: match self.browse_controls() {
+                Ok(controls) => Some(controls),
+                Err(error) => {
+                    tracing::error!(
+                        provider = self.id(),
+                        "catalogue browse controls could not be read: {error:#}"
+                    );
+                    None
+                }
+            },
             lookup: false,
             references: false,
             resolve_download: false,
@@ -418,41 +432,6 @@ impl LiteratureSource for MirroredSource {
 
     fn check_browse(&self, request: &BrowseRequest) -> anyhow::Result<()> {
         self.checked(request).map(|_| ())
-    }
-
-    /// The subjects this catalogue's records carry that contain `text`,
-    /// most-carried first, each with how many records carry it.
-    async fn suggest(&self, filter: &str, text: &str) -> anyhow::Result<Vec<FilterSuggestion>> {
-        let controls = self.browse_controls();
-        anyhow::ensure!(
-            controls
-                .filters
-                .iter()
-                .any(|declared| declared.name == filter && declared.input == "suggest"),
-            "{} suggests nothing for “{filter}”",
-            self.name()
-        );
-        let wanted = text.trim().to_lowercase();
-        let noun = match self.grain() {
-            CatalogueGrain::Textbook => ("book", "books"),
-            CatalogueGrain::Course => ("course", "courses"),
-            CatalogueGrain::Reference => ("set", "sets"),
-        };
-        Ok(self
-            .fetched_store()?
-            .subjects(self.id())?
-            .into_iter()
-            .filter(|(subject, _)| subject.to_lowercase().contains(&wanted))
-            .take(SUGGESTIONS)
-            .map(|(subject, count)| FilterSuggestion {
-                hint: Some(format!(
-                    "{count} {}",
-                    if count == 1 { noun.0 } else { noun.1 }
-                )),
-                label: subject.clone(),
-                value: subject,
-            })
-            .collect())
     }
 
     async fn status(&self, enabled: bool) -> anyhow::Result<IntegrationStatus> {
@@ -622,19 +601,25 @@ mod tests {
 
     #[test]
     fn each_catalogue_offers_only_the_filters_its_records_can_answer() {
-        let dir = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        // Not fetched: no subjects to list, but LibreTexts' libraries are
+        // its own and are there regardless.
+        assert_eq!(filters(&source(empty.path(), "libretexts")), [LIBRARY]);
+        assert!(filters(&source(empty.path(), "openstax")).is_empty());
+        let fetched = libretexts_mirror();
         assert_eq!(
-            filters(&source(dir.path(), "libretexts")),
+            filters(&source(fetched.path(), "libretexts")),
             [SUBJECT, LIBRARY]
         );
-        assert_eq!(filters(&source(dir.path(), "openstax")), [SUBJECT]);
-        assert_eq!(filters(&source(dir.path(), "mit_ocw")), [SUBJECT]);
         // One subject for every set: nothing to filter, but still an order.
-        let devdocs = source(dir.path(), "devdocs").capabilities().browse.unwrap();
+        let devdocs = source(empty.path(), "devdocs")
+            .capabilities()
+            .browse
+            .unwrap();
         assert!(devdocs.filters.is_empty() && devdocs.modes.is_empty());
         assert!(devdocs.sort.is_some());
         let orders = |id: &str| -> Vec<String> {
-            source(dir.path(), id)
+            source(empty.path(), id)
                 .capabilities()
                 .browse
                 .unwrap()
@@ -647,6 +632,32 @@ mod tests {
         };
         assert_eq!(orders("libretexts"), [BY_RELEVANCE, BY_TITLE, BY_LENGTH]);
         assert_eq!(orders("openstax"), [BY_RELEVANCE, BY_TITLE]);
+    }
+
+    #[test]
+    fn subjects_are_listed_whole_a_to_z_with_how_many_carry_each() {
+        let dir = libretexts_mirror();
+        let browse = source(dir.path(), "libretexts")
+            .capabilities()
+            .browse
+            .unwrap();
+        let subject = browse.filters.iter().find(|f| f.name == SUBJECT).unwrap();
+        assert_eq!(subject.input, "options");
+        let listed: Vec<(&str, &str)> = subject
+            .options
+            .iter()
+            .map(|o| (o.value.as_str(), o.label.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("Algebra", "Algebra (1)"),
+                ("Analysis", "Analysis (2)"),
+                ("Classical Mechanics", "Classical Mechanics (1)"),
+                ("Mechanics", "Mechanics (1)"),
+                ("Organic", "Organic (1)"),
+            ]
+        );
     }
 
     fn shelved(id: &str, title: &str, subject: &str, pages: Option<i64>) -> CatalogueRecord {
@@ -668,6 +679,7 @@ mod tests {
                     shelved("math-2", "Algebra", "Algebra, Analysis", Some(120)),
                     shelved("chem-3", "Organic Chemistry", "Organic", None),
                     shelved("phys-4", "Mechanics", "Classical Mechanics", Some(500)),
+                    shelved("phys-5", "Statics", "Mechanics", Some(80)),
                 ],
             )
             .unwrap();
@@ -705,9 +717,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             titles(&page),
-            ["Algebra", "Calculus", "Mechanics", "Organic Chemistry"]
+            [
+                "Algebra",
+                "Calculus",
+                "Mechanics",
+                "Organic Chemistry",
+                "Statics"
+            ]
         );
-        assert_eq!(page.total, Some(4));
+        assert_eq!(page.total, Some(5));
         // A listing without a keyword ranks nothing, so it claims no score.
         assert!(page.results.iter().all(|r| r.recall_score.is_none()));
     }
@@ -724,11 +742,11 @@ mod tests {
         assert_eq!(titles(&maths), ["Algebra", "Calculus"]);
 
         // A subject is matched whole: "Mechanics" is not "Classical Mechanics".
-        let partial = libretexts
+        let whole = libretexts
             .browse(&request(&[(SUBJECT, &["Mechanics"])]))
             .await
             .unwrap();
-        assert_eq!(partial.total, Some(0));
+        assert_eq!(titles(&whole), ["Statics"]);
 
         let any = libretexts
             .browse(&request(&[(SUBJECT, &["Algebra", "Organic"])]))
@@ -755,10 +773,10 @@ mod tests {
             .browse(&longest)
             .await
             .unwrap();
-        // 500, 300 | 120, then the book with no page count last.
-        assert_eq!(titles(&second), ["Algebra", "Organic Chemistry"]);
-        assert_eq!(second.total, Some(4));
-        longest.page = Some(3);
+        // 500, 300 | 120, 80 | then the book with no page count last.
+        assert_eq!(titles(&second), ["Algebra", "Statics"]);
+        assert_eq!(second.total, Some(5));
+        longest.page = Some(4);
         let past = source(dir.path(), "libretexts")
             .browse(&longest)
             .await
@@ -777,19 +795,21 @@ mod tests {
             .await
             .unwrap();
         // Every record's summary mentions heat and entropy; the library
-        // narrows those matches to three.
-        assert_eq!(page.total, Some(3));
+        // narrows those matches to four.
+        assert_eq!(page.total, Some(4));
         assert!(page.results.iter().all(|r| r.recall_score.is_some()));
     }
 
     #[test]
     fn what_a_catalogue_does_not_declare_is_refused_by_name() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = libretexts_mirror();
         let libretexts = source(dir.path(), "libretexts");
         let refusal = |request: BrowseRequest| {
             format!("{:#}", libretexts.check_browse(&request).unwrap_err())
         };
         assert!(refusal(request(&[("author", &["x"])])).contains("no filter “author”"));
+        // Only a subject the catalogue holds can be asked for.
+        assert!(refusal(request(&[(SUBJECT, &["Mechan"])])).contains("“Mechan”"));
         assert!(refusal(request(&[(LIBRARY, &["astrology"])])).contains("“astrology”"));
         let mut none = request(&[(LIBRARY, &["math"])]);
         none.modes.insert(LIBRARY.into(), ALL.into());
@@ -827,20 +847,5 @@ mod tests {
             format!("{error:#}").contains("has not been fetched"),
             "{error:#}"
         );
-    }
-
-    #[tokio::test]
-    async fn subjects_are_suggested_whole_and_most_carried_first() {
-        let dir = libretexts_mirror();
-        let libretexts = source(dir.path(), "libretexts");
-        let found = libretexts.suggest(SUBJECT, "a").await.unwrap();
-        let labels: Vec<_> = found.iter().map(|s| s.label.as_str()).collect();
-        assert_eq!(
-            labels,
-            ["Analysis", "Algebra", "Classical Mechanics", "Organic"]
-        );
-        assert_eq!(found[0].hint.as_deref(), Some("2 books"));
-        assert_eq!(found[1].hint.as_deref(), Some("1 book"));
-        assert!(libretexts.suggest(LIBRARY, "m").await.is_err());
     }
 }

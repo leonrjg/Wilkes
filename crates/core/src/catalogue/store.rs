@@ -722,7 +722,7 @@ impl CatalogueStore {
     }
 
     /// Every subject one provider's records carry, with how many carry it,
-    /// most-carried first.
+    /// A to Z.
     pub fn subjects(&self, provider: &str) -> anyhow::Result<Vec<(String, usize)>> {
         let mut stmt = self
             .conn
@@ -737,7 +737,11 @@ impl CatalogueStore {
             }
         }
         let mut subjects: Vec<(String, usize)> = counts.into_iter().collect();
-        subjects.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        subjects.sort_by(|a, b| {
+            a.0.to_lowercase()
+                .cmp(&b.0.to_lowercase())
+                .then_with(|| a.0.cmp(&b.0))
+        });
         Ok(subjects)
     }
 

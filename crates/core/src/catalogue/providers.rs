@@ -390,6 +390,10 @@ struct OpenStaxBook {
     meta: Option<OpenStaxMeta>,
     #[serde(default)]
     book_subjects: Vec<serde_json::Value>,
+    /// The finer filing under each subject: Calculus under Math, Physics
+    /// under Science. The subjects alone are about ten broad shelves.
+    #[serde(default)]
+    book_categories: Vec<OpenStaxCategory>,
     #[serde(default)]
     pdf_url: Option<String>,
     #[serde(default)]
@@ -404,22 +408,36 @@ struct OpenStaxMeta {
     html_url: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct OpenStaxCategory {
+    #[serde(default)]
+    subject_category: String,
+}
+
+/// A book's subjects, broad then fine, each once.
+///
 /// `book_subjects` arrives as objects in the listing and as bare strings in
-/// some older records; take whichever is there rather than assuming one.
-fn openstax_subjects(values: &[serde_json::Value]) -> String {
-    values
+/// some older records; take whichever is there rather than assuming one. The
+/// listing also repeats a subject for a book filed under it twice.
+fn openstax_subjects(values: &[serde_json::Value], categories: &[OpenStaxCategory]) -> String {
+    let broad = values.iter().filter_map(|value| match value {
+        serde_json::Value::String(s) => Some(s.as_str()),
+        serde_json::Value::Object(map) => map
+            .get("subject_name")
+            .or_else(|| map.get("name"))
+            .and_then(|v| v.as_str()),
+        _ => None,
+    });
+    let fine = categories
         .iter()
-        .filter_map(|value| match value {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Object(map) => map
-                .get("subject_name")
-                .or_else(|| map.get("name"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(SUBJECT_SEPARATOR)
+        .map(|category| category.subject_category.as_str());
+    let mut subjects: Vec<&str> = Vec::new();
+    for subject in broad.chain(fine).map(str::trim) {
+        if !subject.is_empty() && !subjects.contains(&subject) {
+            subjects.push(subject);
+        }
+    }
+    subjects.join(SUBJECT_SEPARATOR)
 }
 
 #[async_trait]
@@ -451,7 +469,7 @@ impl CatalogueFetch for OpenStax {
     async fn fetch_all(&self, progress: &FetchReporter) -> anyhow::Result<Vec<CatalogueRecord>> {
         let url = format!(
             "{}/apps/cms/api/v2/pages/?type=books.Book&limit=500\
-             &fields=title,book_subjects,description,pdf_url,license_name,cover_url",
+             &fields=title,book_subjects,book_categories,description,pdf_url,license_name,cover_url",
             self.base_url
         );
         let body: OpenStaxPage = self.http.get_json(url, &[]).await?;
@@ -465,7 +483,7 @@ impl CatalogueFetch for OpenStax {
                 external_id: book.id.to_string(),
                 title: clip(&book.title, 400),
                 summary: clip(&book.description, SUMMARY_CHARS),
-                subject: openstax_subjects(&book.book_subjects),
+                subject: openstax_subjects(&book.book_subjects, &book.book_categories),
                 authors: "OpenStax".into(),
                 license: book.license_name.unwrap_or_else(|| "cc-by".into()),
                 landing_url: book.meta.and_then(|m| m.html_url),
@@ -799,9 +817,27 @@ mod tests {
     #[test]
     fn openstax_subjects_read_both_wire_shapes() {
         let objects = vec![serde_json::json!({ "subject_name": "Mathematics" })];
-        assert_eq!(openstax_subjects(&objects), "Mathematics");
+        assert_eq!(openstax_subjects(&objects, &[]), "Mathematics");
         let strings = vec![serde_json::json!("Physics"), serde_json::json!("Chemistry")];
-        assert_eq!(openstax_subjects(&strings), "Physics, Chemistry");
+        assert_eq!(openstax_subjects(&strings, &[]), "Physics, Chemistry");
+    }
+
+    #[test]
+    fn openstax_subjects_add_the_finer_categories_once_each() {
+        let subjects = vec![
+            serde_json::json!({ "subject_name": "Science" }),
+            serde_json::json!({ "subject_name": "Science" }),
+        ];
+        let categories: Vec<OpenStaxCategory> = serde_json::from_value(serde_json::json!([
+            { "subject_name": "Science", "subject_category": "Physics" },
+            { "subject_name": "Science", "subject_category": "Physics" },
+            { "subject_name": "Science", "subject_category": "Astronomy" },
+        ]))
+        .unwrap();
+        assert_eq!(
+            openstax_subjects(&subjects, &categories),
+            "Science, Physics, Astronomy"
+        );
     }
 
     #[test]
@@ -875,7 +911,8 @@ mod tests {
             .mock("GET", "/apps/cms/api/v2/pages/")
             .match_query(mockito::Matcher::UrlEncoded(
                 "fields".into(),
-                "title,book_subjects,description,pdf_url,license_name,cover_url".into(),
+                "title,book_subjects,book_categories,description,pdf_url,license_name,cover_url"
+                    .into(),
             ))
             .with_status(200)
             .with_body(
