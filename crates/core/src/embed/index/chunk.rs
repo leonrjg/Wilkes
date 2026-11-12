@@ -18,6 +18,17 @@ pub struct Chunk {
 
 // ── Chunker ───────────────────────────────────────────────────────────────────
 
+/// How many windows long a chunk may grow to keep a formula or table whole.
+///
+/// The exception has to stop somewhere, because what is merged is not one
+/// table but a run: adjacent indivisible segments are one range, so a page of
+/// consecutive display formulas was one "formula" as long as the page, and
+/// that chunk reached the embedding model as a single text long enough to ask
+/// for a 32 GiB attention buffer. Four windows keeps any table or derivation a
+/// reader would call one thing whole at the default window, and keeps every
+/// passage far below the worker's sequence cap (`MAX_SEQ_LENGTH`).
+pub const CEILING_FACTOR: usize = 4;
+
 /// Split `content` into overlapping chunks, resolving each chunk's `SourceOrigin`
 /// from the embedded `SourceMap`.
 ///
@@ -42,7 +53,10 @@ pub struct Chunk {
 ///
 /// One rule overrides that: a boundary never falls inside a recognized formula
 /// or table. Those reconstruct to something a consumer can parse or to nothing
-/// at all, so one that exceeds the configured size is its own oversized chunk.
+/// at all, so one that exceeds the configured size is its own oversized chunk —
+/// up to [`CEILING_FACTOR`] windows, and no further. Past that it is cut where
+/// the splitter would have cut it, into pieces each as close to the ceiling as
+/// those cuts allow.
 pub fn chunk_content(
     content: &ExtractedContent,
     file_path: PathBuf,
@@ -78,7 +92,12 @@ pub fn chunk_content(
                 }
             })
             .collect();
-        spans.extend(keep_indivisible_whole(run_spans, &indivisible));
+        spans.extend(keep_indivisible_whole(
+            &content.text,
+            run_spans,
+            &indivisible,
+            window_chars * CEILING_FACTOR,
+        ));
     }
 
     let Some(first) = spans.first_mut() else {
@@ -234,7 +253,7 @@ fn indivisible_ranges(content: &ExtractedContent) -> Vec<ByteRange> {
 }
 
 /// Merge the spans of one run until no boundary falls strictly inside an
-/// indivisible range.
+/// indivisible range — unless the merge would exceed `ceiling_chars`.
 ///
 /// A merge and not a forced boundary: when the whole enrichment block already
 /// fits in one chunk — the ordinary case — nothing here changes anything, so
@@ -242,27 +261,48 @@ fn indivisible_ranges(content: &ExtractedContent) -> Vec<ByteRange> {
 /// transcription and its description stay together. It only bites where the
 /// splitter would otherwise have cut, and there it wins, which is what makes
 /// it the stronger of the two.
-fn keep_indivisible_whole(mut spans: Vec<ByteRange>, indivisible: &[ByteRange]) -> Vec<ByteRange> {
+///
+/// The ceiling is the one thing it does not win against. A range whose spans
+/// do not fit under it together is merged greedily instead: each span joins
+/// the piece before it while the piece stays under the ceiling, and starts a
+/// new piece when it would not. Every cut that remains is one the splitter
+/// chose, and a single span never exceeds the window, so no piece can exceed
+/// the ceiling. Measured in characters, like the window it is a multiple of.
+fn keep_indivisible_whole(
+    text: &str,
+    mut spans: Vec<ByteRange>,
+    indivisible: &[ByteRange],
+    ceiling_chars: usize,
+) -> Vec<ByteRange> {
     for range in indivisible {
-        // Every span this range touches becomes one span. Spans are ordered
-        // and tile the run, so the touched ones are contiguous.
+        // Every span this range touches becomes one span, ceiling allowing.
+        // Spans are ordered and tile the run, so the touched ones are
+        // contiguous.
         let touched: Vec<usize> = spans
             .iter()
             .enumerate()
             .filter(|(_, span)| span.start < range.end && span.end > range.start)
             .map(|(index, _)| index)
             .collect();
-        let (Some(first), Some(last)) = (touched.first(), touched.last()) else {
+        let (Some(&first), Some(&last)) = (touched.first(), touched.last()) else {
             continue;
         };
         if first == last {
             continue;
         }
-        let merged = ByteRange {
-            start: spans[*first].start,
-            end: spans[*last].end,
-        };
-        spans.splice(*first..=*last, [merged]);
+        let mut pieces: Vec<ByteRange> = Vec::new();
+        for span in &spans[first..=last] {
+            // Spans come from the splitter as subslices of `text`, so both
+            // ends of a merge are char boundaries.
+            let fits = |piece: &ByteRange| {
+                text[piece.start..span.end].chars().count() <= ceiling_chars
+            };
+            match pieces.last_mut() {
+                Some(piece) if fits(piece) => piece.end = span.end,
+                _ => pieces.push(span.clone()),
+            }
+        }
+        spans.splice(first..=last, pieces);
     }
     spans
 }
@@ -838,9 +878,15 @@ mod tests {
     /// A rendition whose enrichment block is one recognized table, marked in
     /// the source map as the indivisible thing it is.
     fn table_content(rows: usize) -> ExtractedContent {
+        table_content_labelled(rows, "Report")
+    }
+
+    /// [`table_content`] with `label` naming each row, for text whose
+    /// characters and bytes differ.
+    fn table_content_labelled(rows: usize, label: &str) -> ExtractedContent {
         let mut table = String::from("Image embedded table:\n| Corpus | Recall |\n| --- | --- |\n");
         for row in 0..rows {
-            table.push_str(&format!("| Report number {row} | 0.9{row} |\n"));
+            table.push_str(&format!("| {label} number {row} | 0.9{row} |\n"));
         }
         let prose = "The table below reports recall by corpus. ".repeat(6);
         let text = format!("{prose}\n{table}\nAnd the discussion continues afterwards.\n");
@@ -936,6 +982,81 @@ mod tests {
                 .map(|chunk| (&chunk.byte_range, chunk.text.as_str())),
         )
         .expect("the chunks rebuild the reading");
+    }
+
+    /// Past the ceiling the table is cut after all: no chunk is longer than
+    /// `CEILING_FACTOR` windows, however long the indivisible run.
+    #[test]
+    fn a_table_longer_than_the_ceiling_is_cut_at_it() {
+        let content = table_content(80);
+        let block = content.images[0]
+            .reading_range
+            .clone()
+            .expect("the block has a range");
+        let window = 200;
+        let ceiling = window * CEILING_FACTOR;
+        assert!(
+            content.text[block.start..block.end].chars().count() > ceiling,
+            "the fixture must exceed the ceiling for this to test anything"
+        );
+
+        let chunks = chunk_content(&content, PathBuf::from("doc.pdf"), window, 20);
+
+        for chunk in &chunks {
+            assert!(
+                chunk.text.chars().count() <= ceiling,
+                "a chunk of {} characters is over the ceiling of {ceiling}",
+                chunk.text.chars().count()
+            );
+        }
+        let pieces: Vec<&Chunk> = chunks
+            .iter()
+            .filter(|chunk| chunk.byte_range.start < block.end && chunk.byte_range.end > block.start)
+            .collect();
+        assert!(pieces.len() > 1, "the table was not cut");
+        assert!(
+            pieces
+                .iter()
+                .any(|chunk| chunk.text.chars().count() > window),
+            "the table was cut back to the window, not kept whole up to the ceiling"
+        );
+        ensure_chunks_reconstruct(
+            &content.text,
+            chunks
+                .iter()
+                .map(|chunk| (&chunk.byte_range, chunk.text.as_str())),
+        )
+        .expect("the chunks rebuild the reading");
+    }
+
+    /// The ceiling counts characters, not bytes: a table of multi-byte text
+    /// under it in characters stays whole although its bytes are over it.
+    #[test]
+    fn the_ceiling_counts_characters() {
+        let content = table_content_labelled(12, "Отчёт");
+        let block = content.images[0]
+            .reading_range
+            .clone()
+            .expect("the block has a range");
+        let table = &content.text[block.start..block.end];
+        let window = 100;
+        let ceiling = window * CEILING_FACTOR;
+        assert!(
+            table.chars().count() <= ceiling && table.len() > ceiling,
+            "the fixture must be under the ceiling in characters and over it in bytes \
+             ({} characters, {} bytes, ceiling {ceiling})",
+            table.chars().count(),
+            table.len()
+        );
+
+        let chunks = chunk_content(&content, PathBuf::from("doc.pdf"), window, 20);
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.text.contains("| Corpus | Recall |")
+                    && chunk.text.contains("| Отчёт number 11 |")),
+            "the table under the ceiling in characters was cut"
+        );
     }
 
     /// The rule only bites where the splitter would have cut. A table that

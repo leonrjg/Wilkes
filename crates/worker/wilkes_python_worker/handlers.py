@@ -5,7 +5,7 @@ from typing import Optional
 import numpy as np
 
 from .ipc import emit
-from .models import DEFAULT_BATCH_SIZE, get_model, safe_encode
+from .models import DEFAULT_BATCH_SIZE, get_model, safe_encode, warn_of_truncation
 from .protocol import (
     WorkerRequest,
     event_done,
@@ -42,6 +42,7 @@ def embed_texts(request: WorkerRequest) -> None:
         )
 
     model = get_model(model_id, device)
+    warn_of_truncation(model, texts)
     embeddings = safe_encode(
         model, texts, batch_size=batch_size, show_progress_bar=True
     )

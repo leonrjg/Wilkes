@@ -26,7 +26,13 @@ pub const POOLING_NORMALIZATION_RECIPE: &str = "engine-native-pooling+l2-output-
 /// carries its label — but the passages cut from them are not, so a v2
 /// rendition and a v3 one are different renditions of the same reading.
 pub const EXTRACTOR_RECIPE_VERSION: &str = "wilkes-extractors-v3";
-pub const CHUNKER_RECIPE_VERSION: &str = "text-splitter-0.27-trim-v1";
+/// Bumped whenever the passages cut from the same reading change.
+///
+/// ceiling-v1: a formula or table is kept whole only up to
+/// `chunk::CEILING_FACTOR` windows. Readings with no indivisible run longer
+/// than that cut exactly as before; the rest cut differently, so a rendition
+/// chunked without the ceiling is not one this runtime would reproduce.
+pub const CHUNKER_RECIPE_VERSION: &str = "text-splitter-0.27-trim-ceiling-v1";
 
 macro_rules! opaque_id {
     ($name:ident) => {
