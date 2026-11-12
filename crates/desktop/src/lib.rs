@@ -1270,8 +1270,10 @@ async fn switch_workspace(app: AppHandle, workspace_id: String) -> Result<Worksp
         return Err("Unknown workspace".to_string());
     }
 
+    // Open chats are left alone: a session is the window's, and its MCP server
+    // resolves the workspace on every call rather than holding the one it
+    // started in.
     active_searches_state(&app).cancel_all();
-    chat::close_all(&app);
 
     // The external MCP listener is not stopped and restarted around the
     // switch: it resolves its workspace through the manager on every call, so
@@ -2539,17 +2541,26 @@ pub fn run() {
 
             app.manage(Arc::clone(&workspaces));
             app.manage(Arc::new(ActiveSearches(Mutex::new(HashMap::new()))));
-            app.manage(Arc::new(ChatManager::default()));
-            // Conversations written before the chat moved into `wilkes-chat`
-            // are in a shape that crate does not read. Done here, once, before
-            // anything opens the store -- and a failure is logged rather than
-            // fatal, because a chat history that cannot be migrated is not a
-            // reason to refuse to start.
-            if let Err(e) = wilkes_api::commands::chat::migrate_legacy_conversations(
-                &app_context(&app.handle().clone()).data_dir,
-            ) {
+            // Saved chats are the installation's, not a workspace's: one
+            // store beside the workspaces, gathered here from the per-workspace
+            // stores earlier builds kept. Then conversations written before
+            // the chat moved into `wilkes-chat`, which are in a shape that
+            // crate does not read, are brought into it. Both before anything
+            // opens the store -- and a failure is logged rather than fatal,
+            // because a chat history that cannot be migrated is not a reason
+            // to refuse to start.
+            let chat_store_dir = ctx.shared_data_dir.clone();
+            if let Err(e) =
+                wilkes_api::commands::chat::gather_workspace_conversations(&chat_store_dir)
+            {
+                error!("chat: could not gather the workspaces' saved conversations: {e:#}");
+            }
+            if let Err(e) =
+                wilkes_api::commands::chat::migrate_legacy_conversations(&chat_store_dir)
+            {
                 error!("chat: could not migrate saved conversations: {e:#}");
             }
+            app.manage(Arc::new(ChatManager::new(chat_store_dir)));
             let lan_share = Arc::new(lan_share::LanShareManager::new(
                 &lan_share_data_dir,
                 Arc::clone(&workspaces),

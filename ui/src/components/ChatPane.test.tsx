@@ -33,8 +33,14 @@ async function mount() {
 
 const pane = () => useChatStore.getState().panes[0];
 
+/** A window with no chat open, as at launch. */
+function closeEveryPane() {
+  for (const open of useChatStore.getState().panes) open.session.getState().reset();
+  useChatStore.setState({ panesVisible: false, panes: [], focusedPane: null, readerDoc: null });
+}
+
 beforeEach(async () => {
-  useChatStore.getState().resetForWorkspace();
+  closeEveryPane();
   await useChatStore.getState().newPane();
   setContext([{ path: "/tmp/notes.md", pages: null }], { path: "/tmp/paper.pdf", page: 7 });
   useViewerStore.setState({ openMatch: vi.fn() });

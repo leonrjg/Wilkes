@@ -399,8 +399,13 @@ struct WorkspaceRegistryFile {
     workspace_ids: Vec<String>,
 }
 
+/// The directory every workspace's own directory sits in.
+pub(crate) fn workspaces_dir(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join("workspaces")
+}
+
 pub(crate) fn workspace_root(app_data_dir: &Path, id: &str) -> PathBuf {
-    app_data_dir.join("workspaces").join(id)
+    workspaces_dir(app_data_dir).join(id)
 }
 
 pub(crate) fn workspace_manifest_path(app_data_dir: &Path, id: &str) -> PathBuf {

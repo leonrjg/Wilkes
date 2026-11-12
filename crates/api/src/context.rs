@@ -1610,9 +1610,10 @@ pub enum ManagedRuntime {
 }
 
 pub struct AppContext {
-    /// Workspace-owned databases and conversation persistence.
+    /// Workspace-owned databases.
     pub data_dir: PathBuf,
-    /// Shared Python environment, managed backups, and other installation data.
+    /// Shared Python environment, managed backups, saved chat conversations,
+    /// and other installation data.
     pub shared_data_dir: PathBuf,
     /// The one model cache for the installation: `shared_data_dir/models`.
     ///

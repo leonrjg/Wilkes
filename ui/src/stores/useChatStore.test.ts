@@ -41,9 +41,15 @@ const { useSettingsStore } = await import("./useSettingsStore");
 const panes = () => useChatStore.getState().panes;
 const first = () => panes()[0];
 
+/** A window with no chat open, as at launch. */
+function closeEveryPane() {
+  for (const open of useChatStore.getState().panes) open.session.getState().reset();
+  useChatStore.setState({ panesVisible: false, panes: [], focusedPane: null, readerDoc: null });
+}
+
 beforeEach(() => {
   transport.hosts.length = 0;
-  useChatStore.getState().resetForWorkspace();
+  closeEveryPane();
   useSettingsStore.setState({ directory: "/library" });
 });
 
@@ -119,18 +125,24 @@ describe("the pane", () => {
     expect(useSettingsStore.getState().chatBackend).toBe("ClaudeCode");
   });
 
-  it("lets go of the documents when the workspace does", async () => {
-    // Every path in context belonged to the workspace that just closed, and
-    // so does the MCP server answering out of it.
+  it("lets go of the documents when the workspace does, and of nothing else", async () => {
+    // Every path in context belonged to the workspace that just closed. The
+    // chat did not: it is the window's, and its MCP server follows the active
+    // workspace on every call, so the pane stays open on the same session.
     await useChatStore.getState().showPanes();
-    const session = first().session;
-    useChatStore.getState().addContext(first().id, "/library/a.pdf");
+    const { id, session } = first();
+    const sessionId = session.getState().sessionId;
+    useChatStore.getState().addContext(id, "/library/a.pdf");
+    useChatStore.getState().setReaderDoc("/library/b.pdf", 3);
 
     useChatStore.getState().resetForWorkspace();
 
-    expect(panes()).toEqual([]);
-    expect(useChatStore.getState().panesVisible).toBe(false);
-    expect(session.getState().sessionId).toBeNull();
+    expect(panes().map((pane) => pane.id)).toEqual([id]);
+    expect(first().contextFiles).toEqual([]);
+    expect(first().activeDoc).toBeNull();
+    expect(useChatStore.getState().readerDoc).toBeNull();
+    expect(useChatStore.getState().panesVisible).toBe(true);
+    expect(session.getState().sessionId).toBe(sessionId);
   });
 
   it("knows which agents there are once a pane has asked", async () => {

@@ -103,8 +103,11 @@ interface ChatPanesStore {
   deselectActiveDoc: (paneId: string) => void;
   /** The reader moved: every pane is now about what it shows. */
   setReaderDoc: (path: string | null, page?: number | null) => void;
-  /** Everything the chat was about belonged to the workspace that just closed.
-   *  Ends every session too: their MCP server answers out of that workspace. */
+  /** The documents every pane was about belonged to the workspace that just
+   *  closed, so they leave the panes. The panes themselves stay, open or
+   *  hidden as they were, with their sessions: a chat is the window's, its
+   *  history is the installation's, and its MCP server resolves the workspace
+   *  on every call rather than holding the one it started in. */
   resetForWorkspace: () => void;
 }
 
@@ -315,8 +318,9 @@ export const useChatStore = create<ChatPanesStore>((set, get) => ({
     }));
   },
 
-  resetForWorkspace: () => {
-    for (const pane of get().panes) pane.session.getState().reset();
-    set({ panesVisible: false, panes: [], focusedPane: null, readerDoc: null });
-  },
+  resetForWorkspace: () =>
+    set((state) => ({
+      readerDoc: null,
+      panes: state.panes.map((pane) => ({ ...pane, contextFiles: [], activeDoc: null })),
+    })),
 }));

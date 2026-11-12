@@ -197,7 +197,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (state) {
         useEditorStore.getState().switchWorkspace(state.active_workspace_id);
         useFolderStateStore.getState().switchWorkspace(state.active_workspace_id);
-      useFolderStateStore.getState().switchWorkspace(state.active_workspace_id);
         await useViewerStore.getState().switchWorkspace(state.active_workspace_id);
         set({
           workspaces: state.workspaces,
