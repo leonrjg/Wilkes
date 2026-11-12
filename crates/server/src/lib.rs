@@ -692,6 +692,9 @@ struct ChunksResolveBody {
     #[serde(default)]
     scope: ConsumerScope,
     chunk_refs: Vec<ChunkRef>,
+    /// Absent, the reply carries the named passages and nothing else.
+    #[serde(default)]
+    neighbors: Option<wilkes_api::context::NeighborWindow>,
 }
 
 async fn chunks_resolve_handler(
@@ -700,7 +703,7 @@ async fn chunks_resolve_handler(
 ) -> Result<Json<wilkes_api::context::ChunkResolution>, (StatusCode, Json<ErrorBody>)> {
     addressable_context(&state, &body.scope)
         .await?
-        .resolve_chunks(body.chunk_refs)
+        .resolve_chunks(body.chunk_refs, body.neighbors)
         .await
         .map(Json)
         .map_err(consumer_err)
@@ -4769,6 +4772,41 @@ mod tests {
             resolved.get("chunk_id").is_none(),
             "a rowid is not part of this contract"
         );
+        assert!(
+            resolve.neighbors.is_none(),
+            "neighbours are asked for, never implied"
+        );
+        assert!(
+            fixture["chunks_resolve_response"]
+                .get("neighbors")
+                .is_none(),
+            "a reply that was not asked for neighbours carries no key for them"
+        );
+
+        // Asked for, neighbours come back keyed by the ref they surround, as
+        // whole passages carrying their own refs and ordinals.
+        let around: ChunksResolveBody =
+            serde_json::from_value(fixture["chunks_resolve_neighbors_request"].clone()).unwrap();
+        let window = around.neighbors.expect("the window the fixture asks for");
+        assert_eq!((window.before, window.after), (1, 1));
+        let entry = &fixture["chunks_resolve_neighbors_response"]["neighbors"][0];
+        assert_eq!(entry["of"], around.chunk_refs[0].as_str());
+        for side in ["before", "after"] {
+            let passage = &entry[side][0];
+            for required in [
+                "chunk_ref",
+                "ordinal",
+                "text",
+                "text_sha256",
+                "byte_range",
+                "origin",
+            ] {
+                assert!(
+                    passage.get(required).is_some(),
+                    "missing {side} neighbour field {required}"
+                );
+            }
+        }
 
         let accumulate: ChunksGroupsBody =
             serde_json::from_value(fixture["chunks_accumulate_request"].clone()).unwrap();

@@ -2039,6 +2039,107 @@ mod tests {
     }
 
     #[test]
+    fn managed_neighbors_are_the_adjacent_passages_of_the_same_rendition() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("managed_sources");
+        fs::create_dir_all(&root).unwrap();
+        let words = ["one", "two", "three", "four", "five"];
+        let write = |index: &mut SemanticIndex, name: &str| {
+            let document = root.join(name);
+            fs::write(&document, words.join(" ")).unwrap();
+            let mut start = 0;
+            let chunks = words
+                .iter()
+                .map(|word| {
+                    let mut chunk = test_chunk(&document, word);
+                    chunk.byte_range = ByteRange {
+                        start,
+                        end: start + word.len() + 1,
+                    };
+                    start += word.len() + 1;
+                    (chunk, vec![1.0, 0.0])
+                })
+                .collect();
+            index
+                .write_file_with_recipe(
+                    PreparedFile {
+                        retained: Default::default(),
+                        path: document.clone(),
+                        full_text: words.join(" "),
+                        chunks,
+                    },
+                    &ExtractionRecipe::new(100, 0),
+                    Some(&Path::new("managed_sources").join(name)),
+                    None,
+                    true,
+                    false,
+                    Some(name),
+                )
+                .unwrap()
+        };
+        let mut index =
+            SemanticIndex::create(dir.path(), "m", 2, EmbeddingEngine::Candle, Some(&root))
+                .unwrap();
+        let book = write(&mut index, "book.txt");
+        let refs: Vec<ChunkRef> = book.chunks.iter().map(|c| c.chunk_ref.clone()).collect();
+
+        let texts =
+            |chunks: &[ManagedChunkData]| chunks.iter().map(|c| c.text.clone()).collect::<Vec<_>>();
+        let around = index
+            .managed_chunk_neighbors(
+                &[
+                    refs[2].clone(),
+                    refs[0].clone(),
+                    refs[4].clone(),
+                    refs[2].clone(),
+                ],
+                2,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            around.len(),
+            4,
+            "one entry per requested ref, repeats included"
+        );
+        assert_eq!(around[0].of, refs[2]);
+        assert_eq!(
+            texts(&around[0].before),
+            vec!["one", "two"],
+            "reading order"
+        );
+        assert_eq!(texts(&around[0].after), vec!["four"]);
+        assert_eq!(
+            around[0]
+                .before
+                .iter()
+                .map(|c| c.ordinal)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            around[0].before[1].chunk_ref, refs[1],
+            "each neighbour carries its own ref"
+        );
+        assert!(around[1].before.is_empty(), "the document starts there");
+        assert_eq!(texts(&around[1].after), vec!["two"]);
+        assert_eq!(texts(&around[2].before), vec!["three", "four"]);
+        assert!(around[2].after.is_empty(), "the document ends there");
+        assert_eq!(texts(&around[3].before), texts(&around[0].before));
+
+        // A window wider than the document is the document.
+        let wide = index.managed_chunk_neighbors(&refs[1..2], 0, 50).unwrap();
+        assert_eq!(texts(&wide[0].after), vec!["three", "four", "five"]);
+        assert!(wide[0].before.is_empty());
+
+        assert!(index
+            .managed_chunk_neighbors(&[ChunkRef("chunk-missing".to_string())], 1, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("CHUNK_REF_NOT_FOUND"));
+    }
+
+    #[test]
     fn managed_refs_resolve_and_aggregate_without_exposing_rowids() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("managed_sources");
@@ -4261,6 +4362,51 @@ pub struct ManagedSnapshotSource {
 pub enum FigureDocument<'a> {
     Path(&'a Path),
     Chunk(&'a ChunkRef),
+}
+
+/// Columns [`managed_chunk_from_row`] reads, in the order it reads them.
+const MANAGED_CHUNK_COLUMNS: &str = "chunk_ref, chunk_idx, chunk_text, text_sha256,
+        byte_start, byte_end, origin_type, page, line, col,
+        bbox_x, bbox_y, bbox_w, bbox_h";
+
+fn managed_chunk_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedChunkData> {
+    let origin = source_origin_from_parts(
+        &row.get::<_, String>(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+    )
+    .ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(
+            6,
+            "origin_type".to_string(),
+            rusqlite::types::Type::Text,
+        )
+    })?;
+    Ok(ManagedChunkData {
+        chunk_ref: ChunkRef(row.get(0)?),
+        ordinal: row.get::<_, i64>(1)? as usize,
+        text: row.get(2)?,
+        text_sha256: row.get(3)?,
+        extraction_byte_range: ByteRange {
+            start: row.get::<_, i64>(4)? as usize,
+            end: row.get::<_, i64>(5)? as usize,
+        },
+        origin,
+    })
+}
+
+/// The passages either side of one named passage, as
+/// [`SemanticIndex::managed_chunk_neighbors`] answers for it.
+#[derive(Clone, Debug)]
+pub struct ManagedChunkNeighbors {
+    pub of: ChunkRef,
+    pub before: Vec<ManagedChunkData>,
+    pub after: Vec<ManagedChunkData>,
 }
 
 /// Stable, vector-free passage export used by managed-corpus consumers.
@@ -9138,43 +9284,12 @@ impl SemanticIndex {
         for batch in unique.chunks(REFS_PER_QUERY) {
             let placeholders = vec!["?"; batch.len()].join(",");
             let mut stmt = self.conn.prepare(&format!(
-                "SELECT chunk_ref, chunk_idx, chunk_text, text_sha256,
-                        byte_start, byte_end, origin_type, page, line, col,
-                        bbox_x, bbox_y, bbox_w, bbox_h
+                "SELECT {MANAGED_CHUNK_COLUMNS}
                  FROM chunks WHERE chunk_ref IN ({placeholders})"
             ))?;
             let rows = stmt.query_map(
                 params_from_iter(batch.iter().map(ChunkRef::as_str)),
-                |row| {
-                    let origin = source_origin_from_parts(
-                        &row.get::<_, String>(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                        row.get(10)?,
-                        row.get(11)?,
-                        row.get(12)?,
-                        row.get(13)?,
-                    )
-                    .ok_or_else(|| {
-                        rusqlite::Error::InvalidColumnType(
-                            6,
-                            "origin_type".to_string(),
-                            rusqlite::types::Type::Text,
-                        )
-                    })?;
-                    Ok(ManagedChunkData {
-                        chunk_ref: ChunkRef(row.get(0)?),
-                        ordinal: row.get::<_, i64>(1)? as usize,
-                        text: row.get(2)?,
-                        text_sha256: row.get(3)?,
-                        extraction_byte_range: ByteRange {
-                            start: row.get::<_, i64>(4)? as usize,
-                            end: row.get::<_, i64>(5)? as usize,
-                        },
-                        origin,
-                    })
-                },
+                managed_chunk_from_row,
             )?;
             for row in rows {
                 let chunk = row?;
@@ -9185,6 +9300,129 @@ impl SemanticIndex {
             .iter()
             .map(|stable_ref| found[stable_ref].clone())
             .collect())
+    }
+
+    /// The passages either side of each named one in its own rendition: up to
+    /// `before` immediately preceding it and up to `after` immediately
+    /// following it, each side in reading order. One entry per requested ref,
+    /// in request order.
+    ///
+    /// A window is cut short only by the start or the end of the document. An
+    /// ordinal inside the document that holds no passage means the rendition
+    /// is broken, and is refused rather than answered around: a caller reading
+    /// "the passage before" has no way to tell that one was skipped.
+    ///
+    /// Every row holding a ref holds the same rendition — a ref is a hash of
+    /// the rendition and the ordinal — so when one is indexed under two file
+    /// rows either answers.
+    pub fn managed_chunk_neighbors(
+        &self,
+        refs: &[ChunkRef],
+        before: usize,
+        after: usize,
+    ) -> anyhow::Result<Vec<ManagedChunkNeighbors>> {
+        let wanted: HashSet<ChunkRef> = refs.iter().cloned().collect();
+        self.resolve_chunk_refs(&wanted)?;
+
+        const REFS_PER_QUERY: usize = 300;
+        let unique: Vec<ChunkRef> = wanted.into_iter().collect();
+        let mut located: HashMap<ChunkRef, (i64, usize)> = HashMap::with_capacity(unique.len());
+        for batch in unique.chunks(REFS_PER_QUERY) {
+            let placeholders = vec!["?"; batch.len()].join(",");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT chunk_ref, file_id, chunk_idx
+                 FROM chunks WHERE chunk_ref IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(
+                params_from_iter(batch.iter().map(ChunkRef::as_str)),
+                |row| {
+                    Ok((
+                        ChunkRef(row.get(0)?),
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)? as usize,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (stable_ref, file_id, ordinal) = row?;
+                located.entry(stable_ref).or_insert((file_id, ordinal));
+            }
+        }
+
+        // The last ordinal of each document, so a window that reaches past
+        // either end is cut there, and every ordinal any window reaches.
+        let mut last_ordinal: HashMap<i64, usize> = HashMap::new();
+        for &(file_id, _) in located.values() {
+            if let std::collections::hash_map::Entry::Vacant(entry) = last_ordinal.entry(file_id) {
+                let last: i64 = self.conn.query_row(
+                    "SELECT MAX(chunk_idx) FROM chunks WHERE file_id = ?1",
+                    params![file_id],
+                    |row| row.get(0),
+                )?;
+                entry.insert(last as usize);
+            }
+        }
+        let window = |file_id: i64, ordinal: usize| {
+            let last = last_ordinal[&file_id];
+            (
+                ordinal.saturating_sub(before)..ordinal,
+                ordinal + 1..ordinal.saturating_add(after).min(last).saturating_add(1),
+            )
+        };
+        let mut reached: BTreeMap<i64, std::collections::BTreeSet<usize>> = BTreeMap::new();
+        for &(file_id, ordinal) in located.values() {
+            let (preceding, following) = window(file_id, ordinal);
+            reached
+                .entry(file_id)
+                .or_default()
+                .extend(preceding.chain(following));
+        }
+
+        const ORDINALS_PER_QUERY: usize = 400;
+        let mut passages: HashMap<(i64, usize), ManagedChunkData> = HashMap::new();
+        for (file_id, ordinals) in &reached {
+            let ordinals: Vec<i64> = ordinals.iter().map(|&ordinal| ordinal as i64).collect();
+            for batch in ordinals.chunks(ORDINALS_PER_QUERY) {
+                let placeholders = vec!["?"; batch.len()].join(",");
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT {MANAGED_CHUNK_COLUMNS}
+                     FROM chunks WHERE file_id = ? AND chunk_idx IN ({placeholders})"
+                ))?;
+                let bound: Vec<&dyn ToSql> = std::iter::once(file_id as &dyn ToSql)
+                    .chain(batch.iter().map(|ordinal| ordinal as &dyn ToSql))
+                    .collect();
+                let rows = stmt.query_map(bound.as_slice(), managed_chunk_from_row)?;
+                for row in rows {
+                    let chunk = row?;
+                    passages.insert((*file_id, chunk.ordinal), chunk);
+                }
+            }
+        }
+
+        let take = |file_id: i64, ordinals: std::ops::Range<usize>, of: &ChunkRef| {
+            ordinals
+                .map(|ordinal| {
+                    passages.get(&(file_id, ordinal)).cloned().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "The rendition holding {} has no passage at ordinal {ordinal}, \
+                             inside the document; it needs to be re-indexed.",
+                            of.as_str()
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        };
+        refs.iter()
+            .map(|stable_ref| {
+                let (file_id, ordinal) = located[stable_ref];
+                let (preceding, following) = window(file_id, ordinal);
+                Ok(ManagedChunkNeighbors {
+                    of: stable_ref.clone(),
+                    before: take(file_id, preceding, stable_ref)?,
+                    after: take(file_id, following, stable_ref)?,
+                })
+            })
+            .collect()
     }
 
     pub fn accumulate_chunk_refs(

@@ -426,7 +426,7 @@ pub async fn browser_pane_show(
     crate::browser_find::listen_for_find_key(&webview, &app, &owner);
     crate::browser_hover::listen_for_hover(&webview, &app, &owner);
     #[cfg(target_os = "macos")]
-    crate::browser_context_download::listen(&webview, &app, &owner);
+    crate::browser_webkit_download::listen(&webview, &app, &owner);
     Ok(())
 }
 
@@ -482,10 +482,13 @@ pub async fn browser_pane_step(window: Window, step: Step) -> Result<(), String>
     .map_err(|e| e.to_string())
 }
 
-/// Clicks a `download` link to the page's own address: WebKit then downloads
-/// what the address serves -- the PDF its viewer is showing, the page's HTML
-/// -- through the pane's own session, so a sign-in the page needed carries
-/// over, and the download is routed into the library root like any other.
+/// Clicks a `download` link to the page's own address: the webview then
+/// downloads what the address serves through the pane's own session, so a
+/// sign-in the page needed carries over, and the download is routed into the
+/// library root like any other. Not on macOS, where WebKit shows a page served
+/// as an attachment -- a PDF that asks to be downloaded -- in a sandbox that
+/// runs no script, so the pane starts the download natively instead.
+#[cfg(not(target_os = "macos"))]
 const SAVE_PAGE_SCRIPT: &str = r#"(() => {
   const link = document.createElement("a");
   link.href = location.href;
@@ -498,9 +501,14 @@ const SAVE_PAGE_SCRIPT: &str = r#"(() => {
 /// Save what the calling window's pane is showing into the library root.
 #[tauri::command]
 pub async fn browser_pane_save_page(window: Window) -> Result<(), String> {
-    pane(&window)?
-        .eval(SAVE_PAGE_SCRIPT)
-        .map_err(|e| e.to_string())
+    let webview = pane(&window)?;
+    #[cfg(target_os = "macos")]
+    {
+        crate::browser_webkit_download::save_page(&webview, window.label());
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    webview.eval(SAVE_PAGE_SCRIPT).map_err(|e| e.to_string())
 }
 
 /// Forget every cookie and site record the panes hold, then reload, so the
@@ -521,7 +529,7 @@ pub async fn browser_pane_close(window: Window) -> Result<(), String> {
             crate::browser_find::stop_listening(&webview, window.label());
             crate::browser_hover::stop_listening(&webview, window.label());
             #[cfg(target_os = "macos")]
-            crate::browser_context_download::stop_listening(&webview, window.label());
+            crate::browser_webkit_download::stop_listening(&webview, window.label());
             webview.close().map_err(|e| e.to_string())
         }
         Err(_) => Ok(()),
