@@ -125,7 +125,10 @@ describe("FeedsView", () => {
       }),
     ], [feed({ may_have_missed: true, last_error: "https://example.org/feed: HTTP 503" })]);
 
-    expect(await screen.findByText(/Refreshed 2 h ago · into Feeds\/Simon Willison/)).toBeInTheDocument();
+    expect(await screen.findByText(/Refreshed 2 h ago · into/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Change where Simon Willison imports" })).toHaveTextContent(
+      "Feeds/Simon Willison",
+    );
     expect(screen.getByText(/older ones may have been missed/)).toBeInTheDocument();
     expect(screen.getByText("https://example.org/feed: HTTP 503")).toBeInTheDocument();
     // No date from the source: when it was first seen, said as such.
@@ -178,6 +181,28 @@ describe("FeedsView", () => {
       root: "/library",
       auto_import: false,
     });
+  });
+
+  it("moves where a feed's new posts go, to another library and folder", async () => {
+    useSettingsStore.setState({ directory: "/library", favorites: ["/other"], recentDirs: [] });
+    mocked.feedUpdate.mockResolvedValue(feed({ root: "/other", folder: "Posts" }));
+    show([], [feed()]);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Change where Simon Willison imports" }));
+    expect(screen.getByText(/those already imported stay where they are/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Library Simon Willison writes into"), {
+      target: { value: "/other" },
+    });
+    fireEvent.change(screen.getByLabelText("Folder Simon Willison writes into"), {
+      target: { value: " Posts " },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    });
+    expect(mocked.feedUpdate).toHaveBeenCalledWith("f1", { root: "/other", folder: "Posts" });
+    expect(await screen.findByRole("button", { name: "Change where Simon Willison imports" })).toHaveTextContent(
+      "Posts",
+    );
   });
 
   it("follows a listing as it is filtered, without its page", async () => {

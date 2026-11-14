@@ -223,6 +223,7 @@ function FeedRow({
   const update = useFeedsStore((s) => s.update);
   const remove = useFeedsStore((s) => s.remove);
   const [failure, setFailure] = useState<string | null>(null);
+  const [moving, setMoving] = useState(false);
   const status =
     feed.last_success_at_ms === null
       ? feed.last_attempt_at_ms === null
@@ -275,7 +276,7 @@ function FeedRow({
                 onClick={async () => {
                   if (!(await confirmDialog(`Stop following ${feed.name}? Its inbox is cleared.`))) return;
                   const deleteFiles = await confirmDialog(
-                    `Also delete the files ${feed.name} imported into ${feed.folder}? Nothing else in that folder is touched.`,
+                    `Also delete the files ${feed.name} imported, wherever they were put? Nothing else is touched.`,
                   );
                   await remove(feed.id, deleteFiles).catch((error) => setFailure(`${error}`));
                 }}
@@ -288,9 +289,24 @@ function FeedRow({
         )}
       </div>
       <p className="text-[var(--text-dim)]">
-        {status} · into {feed.folder}
+        {status} · into{" "}
+        {readOnly ? (
+          <span title={`${feed.root}/${feed.folder}`}>{feed.folder}</span>
+        ) : (
+          <Tooltip content={`${feed.root}/${feed.folder} — change where new posts go`}>
+            <button
+              type="button"
+              aria-label={`Change where ${feed.name} imports`}
+              onClick={() => setMoving((open) => !open)}
+              className="hover:text-[var(--text-main)] hover:underline"
+            >
+              {feed.folder}
+            </button>
+          </Tooltip>
+        )}
         {pausedUntil !== null && ` · paused by the site until ${ago(pausedUntil).replace(" ago", "")}`}
       </p>
+      {moving && <MoveFeedForm feed={feed} onDone={() => setMoving(false)} />}
       {feed.may_have_missed && (
         <p className="text-amber-500">
           Every item the last refresh found was new, so older ones may have been missed.
@@ -299,6 +315,84 @@ function FeedRow({
       {feed.last_error !== null && <Failure>{feed.last_error}</Failure>}
       {failure !== null && <Failure>{failure}</Failure>}
     </div>
+  );
+}
+
+/** Where a feed's new imports go: a library of the workspace and a folder
+ *  in it. What it imported before stays where it is. */
+function MoveFeedForm({ feed, onDone }: { feed: Feed; onDone: () => void }) {
+  const update = useFeedsStore((s) => s.update);
+  const directory = useSettingsStore((s) => s.directory);
+  const favorites = useSettingsStore((s) => s.favorites);
+  const recentDirs = useSettingsStore((s) => s.recentDirs);
+  const roots = useMemo(
+    () => configuredLibraryRoots({ directory, favorites, recentDirs }),
+    [directory, favorites, recentDirs],
+  );
+  // The feed's root is stored resolved; it is listed even when the
+  // workspace names it another way.
+  const choices = roots.includes(feed.root) ? roots : [feed.root, ...roots];
+  const [root, setRoot] = useState(feed.root);
+  const [folder, setFolder] = useState(feed.folder);
+  const [busy, setBusy] = useState(false);
+  const [failure, setFailure] = useState<string | null>(null);
+  const unchanged = root === feed.root && folder.trim() === feed.folder;
+
+  return (
+    <form
+      className="mt-1 flex flex-col gap-1.5 rounded border border-[var(--border-main)] bg-[var(--bg-app)] p-2"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (busy || unchanged || folder.trim() === "") return;
+        setBusy(true);
+        setFailure(null);
+        update(feed.id, {
+          ...(root !== feed.root ? { root } : {}),
+          ...(folder.trim() !== feed.folder ? { folder: folder.trim() } : {}),
+        })
+          .then(onDone)
+          .catch((error) => setFailure(`${error}`))
+          .finally(() => setBusy(false));
+      }}
+    >
+      {choices.length > 1 && (
+        <label className="flex items-center gap-1.5 text-[10px] text-[var(--text-dim)]">
+          Into
+          <select
+            value={root}
+            onChange={(event) => setRoot(event.target.value)}
+            aria-label={`Library ${feed.name} writes into`}
+            className="min-w-0 flex-1 rounded border border-[var(--border-main)] bg-[var(--bg-sidebar)] px-1 py-0.5 text-[10px] text-[var(--text-main)]"
+          >
+            {choices.map((candidate) => (
+              <option key={candidate} value={candidate}>
+                {candidate}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      <input
+        value={folder}
+        onChange={(event) => setFolder(event.target.value)}
+        aria-label={`Folder ${feed.name} writes into`}
+        className="rounded border border-[var(--border-main)] bg-[var(--bg-sidebar)] px-1.5 py-1 text-[11px] text-[var(--text-main)] outline-none"
+      />
+      <p className="text-[var(--text-dim)]">New posts go here; those already imported stay where they are.</p>
+      {failure !== null && <Failure>{failure}</Failure>}
+      <div className="flex justify-end gap-2 text-[10px]">
+        <button type="button" onClick={onDone} className="text-[var(--text-dim)] hover:text-[var(--text-main)]">
+          Cancel
+        </button>
+        <button
+          type="submit"
+          disabled={busy || unchanged || folder.trim() === ""}
+          className="font-bold text-[var(--accent-blue)] hover:underline disabled:opacity-50"
+        >
+          Save
+        </button>
+      </div>
+    </form>
   );
 }
 

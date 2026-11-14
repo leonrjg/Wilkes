@@ -1814,6 +1814,8 @@ export interface NewFeed {
 
 export interface FeedUpdate {
   name?: string;
+  /** Where items imported from now on go; earlier imports stay put. */
+  root?: string;
   folder?: string;
   auto_import?: boolean;
 }

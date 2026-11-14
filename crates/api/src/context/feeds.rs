@@ -208,6 +208,10 @@ pub struct NewFeed {
 pub struct FeedUpdate {
     #[serde(default)]
     pub name: Option<String>,
+    /// Where items imported from now on go; what is already imported stays
+    /// where it is.
+    #[serde(default)]
+    pub root: Option<PathBuf>,
     #[serde(default)]
     pub folder: Option<String>,
     #[serde(default)]
@@ -415,18 +419,23 @@ impl AppContext {
         if let Some(folder) = folder {
             check_folder(folder)?;
         }
+        let root = match &update.root {
+            Some(root) => Some(self.feed_root(&self.get_settings().await, root)?),
+            None => None,
+        };
         let feed = self
             .feeds_store()?
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .update_feed(id, name, folder, update.auto_import)?;
+            .update_feed(id, name, root.as_deref(), folder, update.auto_import)?;
         self.emit_feeds_changed(vec![feed.id.clone()]);
         Ok(feed)
     }
 
     /// Remove a feed and its items. With `delete_files`, the files it
-    /// imported are deleted too, and its folder if that leaves it empty;
-    /// nothing else in the folder is touched.
+    /// imported are deleted too, wherever it put them — its root or folder may
+    /// have changed since — and each folder they leave empty; nothing else is
+    /// touched.
     pub async fn feed_remove(&self, id: &str, delete_files: bool) -> anyhow::Result<()> {
         self.ensure_writable().map_err(anyhow::Error::msg)?;
         let store = self.feeds_store()?;
@@ -453,22 +462,41 @@ impl AppContext {
             anyhow::bail!("no feed with id {id}");
         };
         if delete_files {
-            let folder = feed.root.join(&feed.folder);
+            let (roots, _) = super::library_roots(&self.get_settings().await);
+            let mut folders: Vec<PathBuf> = Vec::new();
             for path in imported {
-                // Only what this feed put in its own folder.
-                if !path.starts_with(&folder) {
+                // Wherever the feed put it, but never outside the workspace's
+                // library: a library removed from the workspace is not touched.
+                if !roots.iter().any(|root| path.starts_with(root)) {
+                    warn!(
+                        "feeds: {} is not in this workspace's library folders; it was not deleted",
+                        path.display()
+                    );
                     continue;
                 }
                 match tokio::fs::remove_file(&path).await {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => warn!("feeds: could not delete {}: {error}", path.display()),
+                    Err(error) => {
+                        warn!("feeds: could not delete {}: {error}", path.display());
+                        continue;
+                    }
+                }
+                if let Some(folder) = path.parent() {
+                    if !roots.iter().any(|root| root == folder)
+                        && !folders.iter().any(|held| held == folder)
+                    {
+                        folders.push(folder.to_path_buf());
+                    }
                 }
             }
-            if let Ok(mut entries) = tokio::fs::read_dir(&folder).await {
-                if entries.next_entry().await.ok().flatten().is_none() {
-                    if let Err(error) = tokio::fs::remove_dir(&folder).await {
-                        warn!("feeds: could not remove {}: {error}", folder.display());
+            // Each folder the feed imported into, if that leaves it empty.
+            for folder in folders {
+                if let Ok(mut entries) = tokio::fs::read_dir(&folder).await {
+                    if entries.next_entry().await.ok().flatten().is_none() {
+                        if let Err(error) = tokio::fs::remove_dir(&folder).await {
+                            warn!("feeds: could not remove {}: {error}", folder.display());
+                        }
                     }
                 }
             }
@@ -1821,6 +1849,90 @@ mod tests {
             .await
             .unwrap();
         assert!(!reload(&ctx, &feed.id).may_have_missed);
+    }
+
+    /// A feed moved to another library imports there from then on; what it
+    /// imported before stays put, and removing the feed with its files finds
+    /// both, leaving whatever else is in its folders.
+    #[tokio::test]
+    async fn a_moved_feed_imports_into_its_new_root_and_removal_finds_every_import() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let server = serve().await;
+        server.set("/feed", rss(&server, &[("/a".into(), Some(day(1)))]));
+        server.set("/a", article_page(&server, false));
+        server.set("/b", article_page(&server, false));
+        server.set("/img.png", png());
+        let (_dir, ctx) = context(first.path()).await;
+        ctx.update_settings(serde_json::json!({ "favorites": [second.path()] }))
+            .await
+            .unwrap();
+        let feed = feed_record(&ctx, first.path(), server.url("/feed"), true);
+        let cancel = CancellationToken::new();
+        ctx.refresh_feed(&feed, &cancel).await.unwrap();
+
+        let refused = ctx
+            .feed_update(
+                &feed.id,
+                FeedUpdate {
+                    root: Some(elsewhere.path().to_path_buf()),
+                    ..FeedUpdate::default()
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("not one of this workspace's library folders"),
+            "{refused}"
+        );
+
+        let moved = ctx
+            .feed_update(
+                &feed.id,
+                FeedUpdate {
+                    root: Some(second.path().to_path_buf()),
+                    folder: Some("Posts".into()),
+                    ..FeedUpdate::default()
+                },
+            )
+            .await
+            .unwrap();
+        let second_root = std::fs::canonicalize(second.path()).unwrap();
+        assert_eq!(moved.root, second_root);
+        server.set(
+            "/feed",
+            rss(
+                &server,
+                &[("/b".into(), Some(day(2))), ("/a".into(), Some(day(1)))],
+            ),
+        );
+        ctx.refresh_feed(&moved, &cancel).await.unwrap();
+
+        let first_folder = std::fs::canonicalize(first.path())
+            .unwrap()
+            .join("Feeds/Blog");
+        let second_folder = second_root.join("Posts");
+        let paths: Vec<PathBuf> = items(&ctx, FeedItemStatus::Imported)
+            .into_iter()
+            .map(|item| item.imported_path.unwrap())
+            .collect();
+        assert_eq!(paths.len(), 2);
+        assert!(
+            paths.iter().any(|path| path.starts_with(&first_folder)),
+            "{paths:?}"
+        );
+        assert!(
+            paths.iter().any(|path| path.starts_with(&second_folder)),
+            "{paths:?}"
+        );
+        std::fs::write(second_folder.join("notes.txt"), "mine").unwrap();
+
+        ctx.feed_remove(&feed.id, true).await.unwrap();
+        assert!(paths.iter().all(|path| !path.exists()));
+        assert!(!first_folder.exists());
+        assert!(second_folder.join("notes.txt").exists());
     }
 
     /// A paid post's page is a preview: it stays in the inbox, marked, and is

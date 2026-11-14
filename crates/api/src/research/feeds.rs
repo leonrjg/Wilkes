@@ -4,7 +4,7 @@
 //! exists.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -191,13 +191,21 @@ impl ResearchStore {
         &mut self,
         id: &str,
         name: Option<&str>,
+        root: Option<&Path>,
         folder: Option<&str>,
         auto_import: Option<bool>,
     ) -> anyhow::Result<FeedRecord> {
         let changed = self.conn.execute(
-            "UPDATE feeds SET name = COALESCE(?2, name), folder = COALESCE(?3, folder),
-               auto_import = COALESCE(?4, auto_import) WHERE id = ?1",
-            params![id, name, folder, auto_import.map(|on| on as i64)],
+            "UPDATE feeds SET name = COALESCE(?2, name), root = COALESCE(?3, root),
+               folder = COALESCE(?4, folder), auto_import = COALESCE(?5, auto_import)
+             WHERE id = ?1",
+            params![
+                id,
+                name,
+                root.map(|root| root.to_string_lossy().into_owned()),
+                folder,
+                auto_import.map(|on| on as i64)
+            ],
         )?;
         anyhow::ensure!(changed == 1, "no feed with id {id}");
         self.feed(id)?
