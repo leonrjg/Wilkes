@@ -17,6 +17,9 @@ use wilkes_core::types::{
     UpdateTag,
 };
 
+pub mod feeds;
+pub use feeds::{FeedItemRecord, FeedItemStatus, FeedRecord};
+
 const FILTER_SCHEMA_VERSION: i64 = 1;
 const MAX_EXPRESSION_BYTES: usize = 8 * 1024;
 
@@ -108,7 +111,7 @@ impl ResearchStore {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(
-            version <= 5,
+            version <= 6,
             "research database schema {version} is newer than this app supports"
         );
         self.conn.execute_batch(
@@ -178,7 +181,39 @@ impl ResearchStore {
                doi TEXT, payload_json TEXT NOT NULL, saved_at TEXT NOT NULL,
                UNIQUE(provider, work_id)
              );
-             CREATE INDEX IF NOT EXISTS saved_works_doi ON saved_works(doi);",
+             CREATE INDEX IF NOT EXISTS saved_works_doi ON saved_works(doi);
+             CREATE TABLE IF NOT EXISTS feeds (
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               source_json TEXT NOT NULL,
+               root TEXT NOT NULL,
+               folder TEXT NOT NULL,
+               auto_import INTEGER NOT NULL DEFAULT 0,
+               created_at_ms INTEGER NOT NULL,
+               last_attempt_at_ms INTEGER,
+               last_success_at_ms INTEGER,
+               last_error TEXT,
+               retry_after_ms INTEGER,
+               may_have_missed INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS feed_items (
+               id TEXT PRIMARY KEY,
+               feed_id TEXT NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
+               link_key TEXT NOT NULL,
+               link TEXT NOT NULL,
+               doi TEXT,
+               arxiv_id TEXT,
+               published TEXT,
+               first_seen_at_ms INTEGER NOT NULL,
+               status TEXT NOT NULL CHECK (status IN ('inbox', 'imported', 'dismissed', 'seen')),
+               preview_only INTEGER NOT NULL DEFAULT 0,
+               work_json TEXT NOT NULL,
+               imported_path TEXT,
+               last_error TEXT,
+               UNIQUE (feed_id, link_key)
+             );
+             CREATE INDEX IF NOT EXISTS feed_items_inbox ON feed_items(status, first_seen_at_ms DESC);
+             CREATE INDEX IF NOT EXISTS feed_items_doi ON feed_items(doi);",
         )?;
         self.conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(1, ?1)",
@@ -200,7 +235,11 @@ impl ResearchStore {
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(5, ?1)",
             [now_ms()],
         )?;
-        self.conn.pragma_update(None, "user_version", 5)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(6, ?1)",
+            [now_ms()],
+        )?;
+        self.conn.pragma_update(None, "user_version", 6)?;
         self.conn.execute(
             "UPDATE search_log SET status='cancelled', completed_at_ms=?1
              WHERE status='running'",

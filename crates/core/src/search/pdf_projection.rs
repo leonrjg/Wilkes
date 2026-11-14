@@ -1,3 +1,4 @@
+use crate::text_projection::TextProjection;
 use crate::types::ByteRange;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 
@@ -7,72 +8,26 @@ struct NormalizedChar {
     raw_range: ByteRange,
 }
 
-#[derive(Clone, Debug)]
-struct ProjectionSpan {
-    projected_range: ByteRange,
-    raw_range: ByteRange,
-}
-
-/// Search-only view of extracted PDF text: whitespace collapsed, ligatures
-/// expanded, typographic quotes and dashes folded, while `spans` maps every
-/// emitted scalar back to the extraction bytes SourceMap and preview
-/// highlighting are expressed in.
-///
-/// It does not repair line-wrap hyphenation. It used to, and that was
-/// compensation for a defect in the stored reading: a word the typesetter
-/// broke across a line was stored broken, and only literal search knew better.
-/// The reading is now sanitized where it is produced
-/// (`extract::document::sanitize`), so what remains here is a view over *how a page
-/// set* the text — never a second opinion about what the text says.
-#[derive(Clone, Debug)]
-pub(crate) struct PdfSearchProjection {
-    text: String,
-    spans: Vec<ProjectionSpan>,
-}
-
-impl PdfSearchProjection {
-    pub(crate) fn new(raw: &str) -> Self {
+impl TextProjection {
+    /// Search-only view of extracted PDF text: whitespace collapsed, ligatures
+    /// expanded, typographic quotes and dashes folded, every emitted scalar
+    /// mapped back to the extraction bytes SourceMap and preview highlighting
+    /// are expressed in.
+    ///
+    /// It does not repair line-wrap hyphenation. It used to, and that was
+    /// compensation for a defect in the stored reading: a word the typesetter
+    /// broke across a line was stored broken, and only literal search knew
+    /// better. The reading is now sanitized where it is produced
+    /// (`extract::document::sanitize`), so what remains here is a view over
+    /// *how a page set* the text — never a second opinion about what the text
+    /// says.
+    pub(crate) fn pdf_search(raw: &str) -> Self {
         let chars = normalize_text(raw);
-        let mut projection = Self {
-            text: String::with_capacity(raw.len()),
-            spans: Vec::with_capacity(chars.len()),
-        };
+        let mut projection = Self::with_capacity(raw.len());
         for NormalizedChar { c, raw_range } in chars {
             projection.push_scalar(c, raw_range);
         }
         projection
-    }
-
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        self.text.as_bytes()
-    }
-
-    /// Map a non-empty matcher range in projected bytes to the smallest raw
-    /// extraction range containing every contributing normalized scalar.
-    pub(crate) fn raw_range(&self, projected: ByteRange) -> Option<ByteRange> {
-        let mut overlapping = self.spans.iter().filter(|span| {
-            span.projected_range.start < projected.end && span.projected_range.end > projected.start
-        });
-        let first = overlapping.next()?;
-        let mut start = first.raw_range.start;
-        let mut end = first.raw_range.end;
-        for span in overlapping {
-            start = start.min(span.raw_range.start);
-            end = end.max(span.raw_range.end);
-        }
-        Some(ByteRange { start, end })
-    }
-
-    fn push_scalar(&mut self, c: char, raw_range: ByteRange) {
-        let start = self.text.len();
-        self.text.push(c);
-        self.spans.push(ProjectionSpan {
-            projected_range: ByteRange {
-                start,
-                end: self.text.len(),
-            },
-            raw_range,
-        });
     }
 }
 
@@ -88,7 +43,7 @@ enum QueryUnit {
     WrapHyphen,
 }
 
-/// Compile a non-regex PDF query against [`PdfSearchProjection`].
+/// Compile a non-regex PDF query against [`TextProjection::pdf_search`].
 ///
 /// A hyphen a paste shows at a line end is optional, because the reading
 /// resolved that break one of two ways and the person pasting cannot know
@@ -301,7 +256,7 @@ mod tests {
     use grep_matcher::Matcher;
 
     fn matches(raw: &str, query: &str) -> Vec<ByteRange> {
-        let projection = PdfSearchProjection::new(raw);
+        let projection = TextProjection::pdf_search(raw);
         let matcher = literal_matcher(query, true).unwrap();
         let mut ranges = Vec::new();
         matcher
@@ -394,7 +349,7 @@ mod tests {
 
     #[test]
     fn case_sensitivity_is_applied_after_projection() {
-        let projection = PdfSearchProjection::new("some thing");
+        let projection = TextProjection::pdf_search("some thing");
         let insensitive = literal_matcher("SOME THING", false).unwrap();
         let sensitive = literal_matcher("SOME THING", true).unwrap();
 
@@ -408,7 +363,7 @@ mod tests {
             .map(|index| format!("substantive{index}"))
             .collect::<Vec<_>>()
             .join(" ");
-        let projection = PdfSearchProjection::new(&query);
+        let projection = TextProjection::pdf_search(&query);
         let matcher = literal_matcher(&query, true).unwrap();
 
         assert!(matcher.is_match(projection.as_bytes()).unwrap());

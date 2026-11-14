@@ -1301,7 +1301,7 @@ fn exact_search_finds_a_transcribed_label_at_its_own_polygon() {
         None,
     );
 
-    let projection = crate::search::pdf_projection::PdfSearchProjection::new(&content.text);
+    let projection = crate::text_projection::TextProjection::pdf_search(&content.text);
     let matcher = crate::search::pdf_projection::literal_matcher("Expert knowledge", false)
         .expect("the matcher builds");
     let found = matcher
@@ -1413,7 +1413,7 @@ fn a_label_split_across_two_drawn_lines_is_two_regions_in_the_reading() {
         content.text
     );
 
-    let projection = crate::search::pdf_projection::PdfSearchProjection::new(&content.text);
+    let projection = crate::text_projection::TextProjection::pdf_search(&content.text);
     let finds = |needle: &str| {
         crate::search::pdf_projection::literal_matcher(needle, false)
             .expect("the matcher builds")

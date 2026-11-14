@@ -244,6 +244,11 @@ fn search_document_content(
 ) -> anyhow::Result<Vec<Match>> {
     let path = document.path.as_path();
     match &document.file_type {
+        // HTML is searched in the text the viewer shows, never in its markup,
+        // and every match is mapped back to the bytes of the file.
+        FileType::PlainText if crate::extract::html::is_html(path) => {
+            search_html_file(path, matcher)
+        }
         // Plain text is memory-mapped and already fast, with exact line/column
         // origins; the text index does not hold it.
         FileType::PlainText => search_text_file(path, matcher, query.context_lines as u64),
@@ -373,6 +378,57 @@ fn search_text_file(
     Ok(sink.matches)
 }
 
+// ── HTML search ───────────────────────────────────────────────────────────────
+
+/// Search an HTML file's visible text. A match is reported at the file bytes
+/// it was read from — the range the viewer highlights — on the line of the
+/// file where it starts, with context taken from the visible text around it.
+fn search_html_file(path: &Path, matcher: &RegexMatcher) -> anyhow::Result<Vec<Match>> {
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) => {
+            // The plain-text search skips a file it cannot read; so does this,
+            // but says so.
+            tracing::warn!("exact search could not read {}: {error}", path.display());
+            return Ok(Vec::new());
+        }
+    };
+    let (_, projection) = crate::extract::html::read(&source);
+    let visible = projection.as_str();
+    let mut matches = Vec::new();
+    matcher
+        .find_iter(projection.as_bytes(), |found| {
+            if found.start() == found.end() {
+                return true;
+            }
+            let projected = ByteRange {
+                start: found.start(),
+                end: found.end(),
+            };
+            let Some(raw) = projection.raw_range(projected.clone()) else {
+                return true;
+            };
+            let line_start = source[..raw.start].rfind('\n').map_or(0, |at| at + 1);
+            let line = source[..raw.start].matches('\n').count() as u32 + 1;
+            matches.push(Match {
+                text_range: Some(raw.clone()),
+                matched_text: visible[projected.start..projected.end].to_string(),
+                context_before: extract_context_before(visible, projected.start, 120)
+                    .replace(['\n', '\r'], " "),
+                context_after: extract_context_after(visible, projected.end, 120)
+                    .replace(['\n', '\r'], " "),
+                origin: SourceOrigin::TextFile {
+                    line,
+                    col: (raw.start - line_start) as u32,
+                },
+                score: None,
+            });
+            true
+        })
+        .map_err(anyhow::Error::from)?;
+    Ok(matches)
+}
+
 // ── Extracted content search (PDF / future formats) ──────────────────────────
 
 /// Extract a PDF live and search it. Used when stored text is disabled, or the
@@ -406,7 +462,7 @@ fn search_text_and_map(
     pdf_literal_matcher: Option<&RegexMatcher>,
 ) -> anyhow::Result<Vec<Match>> {
     if let Some(literal_matcher) = pdf_literal_matcher {
-        let projection = pdf_projection::PdfSearchProjection::new(full);
+        let projection = crate::text_projection::TextProjection::pdf_search(full);
         return collect_pdf_matches(
             full,
             source_map,
@@ -571,6 +627,48 @@ mod tests {
         query.case_sensitive = true;
         let matcher = GrepSearchProvider::build_matcher(&query).unwrap();
         assert!(!matcher.is_match("Hello".as_bytes()).unwrap());
+    }
+
+    /// An HTML file is searched in what the viewer shows: a word split by an
+    /// inline tag is one word, markup and pictures match nothing, and a match
+    /// is reported at the file bytes and line the viewer highlights.
+    #[test]
+    fn html_is_searched_in_its_visible_text_and_reported_at_file_bytes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("post.html");
+        let source = "<html><head><title>class title</title></head>\n<body>\n<p class=\"lead\">An un<em>believ</em>able caf&eacute; story.</p>\n<img src=\"data:image/png;base64,dW5iZWxpZXZhYmxl\" alt=\"class\">\n</body></html>\n";
+        fs::write(&path, source).unwrap();
+        let matcher = |pattern: &str| {
+            GrepSearchProvider::build_matcher(&SearchQuery {
+                pattern: pattern.to_string(),
+                is_regex: false,
+                case_sensitive: false,
+                root: dir.path().to_path_buf(),
+                max_results: 0,
+                respect_gitignore: false,
+                max_file_size: 0,
+                context_lines: 0,
+                mode: crate::types::SearchMode::Grep,
+                scope: Default::default(),
+                supported_extensions: vec!["html".into()],
+                collection_id: None,
+                tag_ids: Vec::new(),
+            })
+            .unwrap()
+        };
+
+        let found = search_html_file(&path, &matcher("unbelievable café")).unwrap();
+        assert_eq!(found.len(), 1);
+        let range = found[0].text_range.clone().unwrap();
+        assert_eq!(&source[range.start..range.end], "un<em>believ</em>able caf&eacute;");
+        assert_eq!(found[0].matched_text, "unbelievable café");
+        assert!(matches!(found[0].origin, SourceOrigin::TextFile { line: 3, .. }));
+        assert_eq!(found[0].context_after, " story.");
+
+        // Attributes, the title and the picture's bytes are not text.
+        for hidden in ["class", "lead", "base64", "title"] {
+            assert!(search_html_file(&path, &matcher(hidden)).unwrap().is_empty(), "{hidden}");
+        }
     }
 
     #[test]

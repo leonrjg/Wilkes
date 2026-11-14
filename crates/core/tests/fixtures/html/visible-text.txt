@@ -1,0 +1,12 @@
+The Visible Title
+A Writer · 31 Oct 2026 · example.org
+An unbelievable start, with a linked word.
+Entities: café & crème, don’t stop, ☺ and ☃.
+A caption.
+Metric Value
+Kept 12
+Text inside an unknown element.
+First item
+Second bold item
+code <kept> as text
+The end.

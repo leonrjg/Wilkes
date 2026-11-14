@@ -566,11 +566,16 @@ impl AppContext {
     /// The shell-facing half of [`sync`]: same operation, plus the event stream
     /// that turns a five-minute silence into something a panel can render.
     pub async fn catalogue_sync(
-        &self,
+        self: &Arc<Self>,
         providers: Option<Vec<String>>,
     ) -> Result<CatalogueSyncResponse, CatalogueError> {
         let tx = forward::<CatalogueFetchProgress>(self.emitter(), SYNC_PROGRESS_EVENT);
-        sync(&self.catalogue_dir, providers, Some(tx)).await
+        let synced = sync(&self.catalogue_dir, providers, Some(tx)).await;
+        if synced.is_ok() {
+            // A catalogue's listings change only when it syncs.
+            self.request_catalogue_feed_refresh();
+        }
+        synced
     }
 
     /// Fetches a whole course, reporting the walk and the documents on

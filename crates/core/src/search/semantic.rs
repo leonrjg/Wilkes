@@ -366,12 +366,39 @@ impl SearchProvider for SemanticSearchProvider {
         // 4. Seed direct filename/title hits in catalog order, then merge
         // score-ranked content chunks into those files or append content-only
         // files. This guarantees one result object per document.
+        // An HTML file's passages are cut from its visible text; the viewer
+        // highlights bytes of the file. Each such file is read once per search
+        // to map one onto the other.
+        let mut html_readings: HashMap<
+            std::path::PathBuf,
+            Option<crate::text_projection::TextProjection>,
+        > = HashMap::new();
         for chunk in results {
             let Some(document) = documents_by_path.get(&chunk.file_path) else {
                 continue;
             };
 
             let text_range = match &chunk.origin {
+                SourceOrigin::TextFile { .. }
+                    if crate::extract::html::is_html(&chunk.file_path) =>
+                {
+                    html_readings
+                        .entry(chunk.file_path.clone())
+                        .or_insert_with(|| match std::fs::read_to_string(&chunk.file_path) {
+                            Ok(source) => Some(crate::extract::html::read(&source).1),
+                            Err(error) => {
+                                warn!(
+                                    "[semantic] cannot read {} to place its passages: {error}",
+                                    chunk.file_path.display()
+                                );
+                                None
+                            }
+                        })
+                        .as_ref()
+                        .and_then(|projection| {
+                            projection.raw_range(chunk.extraction_byte_range.clone())
+                        })
+                }
                 SourceOrigin::TextFile { .. } => Some(chunk.extraction_byte_range.clone()),
                 SourceOrigin::PdfPage { .. } => None,
             };

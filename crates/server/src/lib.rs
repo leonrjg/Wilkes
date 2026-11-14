@@ -1022,6 +1022,103 @@ async fn literature_browse_handler(
         .map_err(|error| err(error.to_string()))
 }
 
+// ── Feeds ────────────────────────────────────────────────────────────────────
+
+async fn feeds_list_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<wilkes_api::research::FeedRecord>>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .feeds_list()
+        .map(Json)
+        .map_err(|error| server_err(format!("{error:#}")))
+}
+
+/// Add a feed and refresh it. Its root must be one of the served library's.
+async fn feed_add_handler(
+    State(state): State<Arc<AppState>>,
+    Json(feed): Json<wilkes_api::context::feeds::NewFeed>,
+) -> Result<Json<wilkes_api::research::FeedRecord>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .feed_add(feed)
+        .await
+        .map(Json)
+        .map_err(|error| err(format!("{error:#}")))
+}
+
+async fn feed_update_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(update): Json<wilkes_api::context::feeds::FeedUpdate>,
+) -> Result<Json<wilkes_api::research::FeedRecord>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .feed_update(&id, update)
+        .await
+        .map(Json)
+        .map_err(|error| err(format!("{error:#}")))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeedRemoveQuery {
+    #[serde(default)]
+    delete_files: bool,
+}
+
+async fn feed_remove_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<FeedRemoveQuery>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .feed_remove(&id, query.delete_files)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|error| err(format!("{error:#}")))
+}
+
+async fn feeds_refresh_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .feeds_refresh()
+        .map(|()| StatusCode::ACCEPTED)
+        .map_err(|error| err(format!("{error:#}")))
+}
+
+async fn feeds_refresh_cancel_handler(State(state): State<Arc<AppState>>) -> StatusCode {
+    state.context().feeds_refresh_cancel();
+    StatusCode::NO_CONTENT
+}
+
+async fn feed_items_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<wilkes_api::context::feeds::FeedItemsQuery>,
+) -> Result<Json<wilkes_api::context::feeds::FeedItemsPage>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .feed_items(query)
+        .map(Json)
+        .map_err(|error| server_err(format!("{error:#}")))
+}
+
+async fn feed_item_set_status_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(action): Json<wilkes_api::context::feeds::FeedItemAction>,
+) -> Result<Json<wilkes_api::research::FeedItemRecord>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .feed_item_set_status(&id, action)
+        .await
+        .map(Json)
+        .map_err(|error| err(format!("{error:#}")))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LiteratureSuggestBody {
@@ -2920,6 +3017,15 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/literature/search", post(literature_search_handler))
         .route("/api/literature/acquire", post(literature_acquire_handler))
         .route("/api/literature/browse", post(literature_browse_handler))
+        .route("/api/feeds", get(feeds_list_handler).post(feed_add_handler))
+        .route("/api/feeds/refresh", post(feeds_refresh_handler))
+        .route("/api/feeds/refresh/cancel", post(feeds_refresh_cancel_handler))
+        .route("/api/feeds/items", get(feed_items_handler))
+        .route("/api/feeds/items/{id}", post(feed_item_set_status_handler))
+        .route(
+            "/api/feeds/{id}",
+            patch(feed_update_handler).delete(feed_remove_handler),
+        )
         .route("/api/literature/suggest", post(literature_suggest_handler))
         .route("/api/literature/compose", post(literature_compose_handler))
         .route(
