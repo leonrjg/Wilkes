@@ -1,6 +1,9 @@
 import { decodeComicPage } from "../lib/comicPage";
 import type { ImagePage } from "@leonrjg/wilkes-reader";
 import { invoke } from "@tauri-apps/api/core";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import type { PdfEditExport, PdfFontRequest, ResolvedPdfFont } from "@leonrjg/wilkes-reader";
+import { editedCopyPath } from "../lib/editedCopy";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -426,6 +429,22 @@ export class TauriSearchApi implements SearchApi {
     const bytes = await invoke<ArrayBuffer | number[]>("file_cover", { path, maxEdge });
     signal.throwIfAborted();
     return bytes instanceof ArrayBuffer ? bytes : new Uint8Array(bytes).buffer;
+  }
+
+  async resolvePdfFont(font: PdfFontRequest): Promise<ResolvedPdfFont> {
+    const id = await invoke<string>("resolve_pdf_font", { request: font });
+    const bytes = await invoke<ArrayBuffer | number[]>("pdf_font_bytes", { id });
+    return { id, data: bytes instanceof ArrayBuffer ? bytes : new Uint8Array(bytes).buffer };
+  }
+
+  async savePdfEdits(source: string, edits: PdfEditExport): Promise<string | null> {
+    const destination = await saveDialog({
+      defaultPath: editedCopyPath(source),
+      filters: [{ name: "PDF", extensions: ["pdf"] }],
+    });
+    if (!destination) return null;
+    await invoke("save_pdf_edits", { source, destination, export: edits });
+    return destination;
   }
 
   async surrogateBytes(path: string): Promise<ArrayBuffer> {

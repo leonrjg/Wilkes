@@ -216,7 +216,7 @@ describe("App", () => {
       load: vi.fn().mockResolvedValue(undefined),
     });
     useViewerStore.setState({
-      activeTabId: null,
+      panes: [], focusedPaneId: null,
       tabs: [],
       sessionHydrated: false,
       restoreSession: viewerSessionActions.restoreSession,
@@ -251,9 +251,11 @@ describe("App", () => {
     } as const;
     act(() => {
       useViewerStore.setState({
-        activeTabId: "tab-1",
+        panes: [{ id: "pane", activeTabId: "tab-1" }],
+        focusedPaneId: "pane",
         tabs: [{
           id: "tab-1",
+          paneId: "pane",
           path: match.path,
           match,
           history: [match],
@@ -430,9 +432,11 @@ describe("App", () => {
       origin: { TextFile: { line: 1, col: 0 } },
     } as const;
     useViewerStore.setState({
-      activeTabId: "current-tab",
+      panes: [{ id: "pane", activeTabId: "current-tab" }],
+      focusedPaneId: "pane",
       tabs: [{
         id: "current-tab",
+        paneId: "pane",
         path: match.path,
         match,
         history: [match],

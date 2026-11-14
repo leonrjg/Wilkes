@@ -214,6 +214,75 @@ async fn surrogate_handler(
     ))
 }
 
+// ── Editing a PDF ─────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct PdfFontId {
+    id: String,
+}
+
+async fn resolve_pdf_font_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<wilkes_core::pdf_edit::fonts::FontRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, _) = state.workspace_snapshot();
+    let id = ctx
+        .resolve_pdf_font(request)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok(Json(PdfFontId { id }))
+}
+
+#[derive(Deserialize)]
+struct PdfFontQuery {
+    id: String,
+}
+
+async fn pdf_font_bytes_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PdfFontQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, _) = state.workspace_snapshot();
+    let bytes = ctx
+        .pdf_font_bytes(params.id)
+        .await
+        .map_err(|e| server_err(e.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "font/sfnt")],
+        bytes,
+    ))
+}
+
+#[derive(Deserialize)]
+struct PdfEditExportRequest {
+    source: String,
+    export: wilkes_core::pdf_edit::EditExport,
+}
+
+/// A PDF with a reader's edits applied, as the bytes of a new document.
+///
+/// Returned rather than written anywhere: the browser asking has no path on
+/// this machine to name, and is handed the result as a download instead.
+async fn export_pdf_edits_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PdfEditExportRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    // The same rule that decides which files this server will serve decides
+    // which it will read to edit.
+    let plan = asset_access_plan(Path::new(&request.source), &uploads_dir, &TokioServerFs).await?;
+    let bytes = ctx
+        .export_pdf_edits(plan.canonical.clone(), request.export)
+        .await
+        .map_err(|e| server_err(format!("{e:#}")))?;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/pdf")],
+        bytes,
+    ))
+}
+
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 async fn get_http_calls_handler() -> impl IntoResponse {
@@ -2792,6 +2861,14 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/citation-links", post(citation_links_handler))
         .route("/api/preview", post(preview_handler))
         .route("/api/surrogate", get(surrogate_handler))
+        .route("/api/pdf-edit/font", post(resolve_pdf_font_handler))
+        .route("/api/pdf-edit/font-bytes", get(pdf_font_bytes_handler))
+        .route(
+            "/api/pdf-edit/export",
+            // An export describes every moved area of every changed page; a
+            // long cascade is far past the default body limit.
+            post(export_pdf_edits_handler).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         .route("/api/comic/page", get(comic_page_handler))
         .route("/api/settings", get(get_settings_handler))
         .route("/api/settings", patch(update_settings_handler))

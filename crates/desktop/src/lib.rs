@@ -1448,6 +1448,46 @@ async fn surrogate_bytes(app: AppHandle, path: String) -> Result<tauri::ipc::Res
 }
 
 #[tauri::command]
+async fn resolve_pdf_font(
+    app: AppHandle,
+    request: wilkes_core::pdf_edit::fonts::FontRequest,
+) -> Result<String, String> {
+    app_context(&app)
+        .resolve_pdf_font(request)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// A font file, raw: the interface registers it as a `FontFace`.
+#[tauri::command]
+async fn pdf_font_bytes(app: AppHandle, id: String) -> Result<tauri::ipc::Response, String> {
+    app_context(&app)
+        .pdf_font_bytes(id)
+        .await
+        .map(tauri::ipc::Response::new)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn save_pdf_edits(
+    app: AppHandle,
+    source: String,
+    destination: String,
+    export: wilkes_core::pdf_edit::EditExport,
+) -> Result<(), String> {
+    app_context(&app)
+        .save_pdf_edits(
+            std::path::PathBuf::from(source),
+            std::path::PathBuf::from(destination),
+            export,
+        )
+        .await
+        // The whole chain: "writing page 3" without what went wrong on page 3
+        // is not something anyone can act on.
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
 async fn list_files(
     root: String,
     collection_id: Option<String>,
@@ -2598,6 +2638,9 @@ pub fn run() {
             citation_links,
             preview,
             surrogate_bytes,
+            resolve_pdf_font,
+            pdf_font_bytes,
+            save_pdf_edits,
             comic_page,
             file_cover,
             list_files,

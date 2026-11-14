@@ -9731,6 +9731,7 @@ dependencies = [
  "dom_query",
  "fastembed",
  "flate2",
+ "font-kit",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",

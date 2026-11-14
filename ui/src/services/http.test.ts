@@ -19,6 +19,34 @@ describe("HttpSearchApi", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("resolves a PDF font to an id and that font's file", async () => {
+    const file = new Uint8Array([0, 1, 0, 0]).buffer;
+    (fetch as any)
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ id: "Georgia" }) })
+      .mockResolvedValueOnce({ ok: true, arrayBuffer: () => Promise.resolve(file) });
+    const request = { name: "Georgia", bold: false, italic: false, generic: "serif" as const };
+    await expect(api.resolvePdfFont(request)).resolves.toEqual({ id: "Georgia", data: file });
+    expect(fetch).toHaveBeenLastCalledWith("/api/pdf-edit/font-bytes?id=Georgia");
+  });
+
+  it("hands an edited PDF to the browser as a download", async () => {
+    const createObjectURL = vi.fn(() => "blob:edited");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    (fetch as any).mockResolvedValue({ ok: true, blob: () => Promise.resolve(new Blob(["%PDF"])) });
+
+    const edits = { pages: [] };
+    await expect(api.savePdfEdits("/docs/paper.pdf", edits)).resolves.toBe("paper (edited).pdf");
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/pdf-edit/export",
+      expect.objectContaining({ body: JSON.stringify({ source: "/docs/paper.pdf", export: edits }) }),
+    );
+    expect(click).toHaveBeenCalled();
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:edited");
+    click.mockRestore();
+  });
+
   it("getSettings calls fetch and returns settings", async () => {
     const mockSettings = { semantic: { enabled: true } };
     (fetch as any).mockResolvedValue({

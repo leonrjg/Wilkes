@@ -3578,6 +3578,37 @@ impl AppContext {
         crate::commands::preview::comic_page(path, page).await
     }
 
+    /// The installed font that stands in for one a PDF names, by id.
+    pub async fn resolve_pdf_font(
+        &self,
+        request: wilkes_core::pdf_edit::fonts::FontRequest,
+    ) -> anyhow::Result<String> {
+        crate::commands::pdf_edit::resolve_font(request).await
+    }
+
+    pub async fn pdf_font_bytes(&self, id: String) -> anyhow::Result<Vec<u8>> {
+        crate::commands::pdf_edit::font_bytes(id).await
+    }
+
+    /// Write a PDF with a reader's edits applied to a new file. The source is
+    /// never the destination.
+    pub async fn save_pdf_edits(
+        &self,
+        source: std::path::PathBuf,
+        destination: std::path::PathBuf,
+        export: wilkes_core::pdf_edit::EditExport,
+    ) -> anyhow::Result<()> {
+        crate::commands::pdf_edit::save_edits(source, destination, export).await
+    }
+
+    pub async fn export_pdf_edits(
+        &self,
+        source: std::path::PathBuf,
+        export: wilkes_core::pdf_edit::EditExport,
+    ) -> anyhow::Result<Vec<u8>> {
+        crate::commands::pdf_edit::export_edits(source, export).await
+    }
+
     /// The pages of a book, as a PDF the reader can draw.
     ///
     /// A separate call from `preview` because these are megabytes: the preview

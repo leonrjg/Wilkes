@@ -1,4 +1,6 @@
 import { decodeComicPage } from "../lib/comicPage";
+import type { PdfEditExport, PdfFontRequest, ResolvedPdfFont } from "@leonrjg/wilkes-reader";
+import { editedCopyPath, fileNameOf } from "../lib/editedCopy";
 import type { ImagePage } from "@leonrjg/wilkes-reader";
 import type {
   HttpCall,
@@ -534,6 +536,38 @@ export class HttpSearchApi implements SearchApi {
     const res = await fetch(`/api/file/cover?path=${encodeURIComponent(path)}&max_edge=${maxEdge}`, { signal });
     if (!res.ok) throw new Error(`fileCover failed: ${res.status}`);
     return res.arrayBuffer();
+  }
+
+  async resolvePdfFont(font: PdfFontRequest): Promise<ResolvedPdfFont> {
+    const res = await fetch("/api/pdf-edit/font", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(font),
+    });
+    if (!res.ok) throw new Error(`resolvePdfFont failed: ${res.status}`);
+    const { id } = (await res.json()) as { id: string };
+    const bytes = await fetch(`/api/pdf-edit/font-bytes?id=${encodeURIComponent(id)}`);
+    if (!bytes.ok) throw new Error(`resolvePdfFont failed: ${bytes.status}`);
+    return { id, data: await bytes.arrayBuffer() };
+  }
+
+  async savePdfEdits(source: string, edits: PdfEditExport): Promise<string | null> {
+    const res = await fetch("/api/pdf-edit/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, export: edits }),
+    });
+    if (!res.ok) throw await responseError(res, "savePdfEdits");
+    // A browser has no path on the server to save to: the copy is handed to
+    // it as a download, and where that lands is the browser's business.
+    const name = fileNameOf(editedCopyPath(source));
+    const url = URL.createObjectURL(await res.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = name;
+    link.click();
+    URL.revokeObjectURL(url);
+    return name;
   }
 
   async surrogateBytes(path: string): Promise<ArrayBuffer> {

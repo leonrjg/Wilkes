@@ -3,6 +3,8 @@ import {
   MAX_REMEMBERED_DOCUMENTS,
   READER_POSITIONS_PERSIST_DELAY_MS,
   READER_POSITIONS_STORAGE_KEY,
+  PDF_EDIT_DRAFTS_STORAGE_KEY,
+  readerPdfEditStore as drafts,
   flushReaderPositions,
   forgetReaderPositionsWorkspace,
   readTextViewMode,
@@ -167,5 +169,59 @@ describe("readerPositions", () => {
     vi.runAllTimers();
 
     expect(stored("workspace-a")).toBeNull();
+  });
+});
+
+describe("unsaved PDF edits", () => {
+  const draft = { version: 2 as const, edits: [{ paragraph: { page: 2 }, runs: [] }] } as any;
+
+  beforeEach(() => {
+    localStorage.clear();
+    setReaderPositionPersistence(true);
+    switchReaderPositionsWorkspace("drafts");
+  });
+
+  it("keeps what was typed into a document across a restart", () => {
+    drafts.save("asset://paper.pdf", draft);
+    restart("drafts");
+    expect(drafts.read("asset://paper.pdf")).toEqual(draft);
+    expect(drafts.read("asset://other.pdf")).toBeNull();
+  });
+
+  it("forgets a document's edits once there are none", () => {
+    drafts.save("asset://paper.pdf", draft);
+    drafts.save("asset://paper.pdf", null);
+    restart("drafts");
+    expect(drafts.read("asset://paper.pdf")).toBeNull();
+    expect(localStorage.getItem(`${PDF_EDIT_DRAFTS_STORAGE_KEY}.drafts`)).toBeNull();
+  });
+
+  it("keeps workspaces apart, and goes with a workspace that is forgotten", () => {
+    drafts.save("asset://paper.pdf", draft);
+    switchReaderPositionsWorkspace("another");
+    expect(drafts.read("asset://paper.pdf")).toBeNull();
+    forgetReaderPositionsWorkspace("drafts");
+    switchReaderPositionsWorkspace("drafts");
+    expect(drafts.read("asset://paper.pdf")).toBeNull();
+  });
+
+  it("stores nothing for a standalone window", () => {
+    setReaderPositionPersistence(false);
+    drafts.save("asset://paper.pdf", draft);
+    expect(drafts.read("asset://paper.pdf")).toEqual(draft);
+    expect(localStorage.getItem(`${PDF_EDIT_DRAFTS_STORAGE_KEY}.drafts`)).toBeNull();
+  });
+
+  it("drops a malformed draft, says so, and keeps the rest", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    localStorage.setItem(
+      `${PDF_EDIT_DRAFTS_STORAGE_KEY}.drafts`,
+      JSON.stringify({ "asset://good.pdf": draft, "asset://bad.pdf": { version: 7 } }),
+    );
+    restart("drafts");
+    expect(drafts.read("asset://good.pdf")).toEqual(draft);
+    expect(drafts.read("asset://bad.pdf")).toBeNull();
+    expect(error).toHaveBeenCalled();
+    error.mockRestore();
   });
 });

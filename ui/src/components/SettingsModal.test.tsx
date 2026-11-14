@@ -86,6 +86,7 @@ describe("SettingsModal", () => {
     theme: "System",
     pdf_auto_zoom_target_px: 15.5,
     open_links_in_app: true,
+    editor_line_numbers: true,
     search_prefer_semantic: false,
     semantic: { enabled: true, index_path: null, worker_timeout_secs: 300, embed_batch_size: 16 },
     generation: {
@@ -351,6 +352,16 @@ describe("SettingsModal", () => {
     });
     fireEvent.click(screen.getByLabelText("Show folders in file list"));
     expect(mockApi.updateSettings).toHaveBeenCalledWith({ file_tree_enabled: true });
+  });
+
+  it("turns off line numbers in the editor", async () => {
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+    const toggle = screen.getByLabelText("Show line numbers in the editor");
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
+    expect(mockApi.updateSettings).toHaveBeenCalledWith({ editor_line_numbers: false });
   });
 
   it("turns off opening web links in the browser pane", async () => {

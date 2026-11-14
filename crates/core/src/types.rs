@@ -2778,6 +2778,9 @@ pub struct Settings {
     /// system browser. The web build has no pane and ignores it.
     #[serde(default = "default_open_links_in_app")]
     pub open_links_in_app: bool,
+    /// Show the line-number gutter in the document editor.
+    #[serde(default = "default_editor_line_numbers")]
+    pub editor_line_numbers: bool,
     /// Preferred agent backend for the "Ask the documents" chat pane. The
     /// in-pane selector and header dropdown may switch a session to a
     /// different backend transiently; this field is the single persisted
@@ -2895,6 +2898,10 @@ fn default_open_links_in_app() -> bool {
     true
 }
 
+fn default_editor_line_numbers() -> bool {
+    true
+}
+
 /// The text files a fresh install reads. The documents — PDF, EPUB, MOBI,
 /// KF8, FB2, comic archives — are deliberately absent: they are admitted by
 /// [`FileType::detect`] itself and are never a setting.
@@ -2962,6 +2969,7 @@ impl Default for Settings {
             file_tree_enabled: false,
             pdf_auto_zoom_target_px: default_pdf_auto_zoom_target_px(),
             open_links_in_app: default_open_links_in_app(),
+            editor_line_numbers: default_editor_line_numbers(),
             chat_backend: AgentBackend::default(),
             chat_config: Vec::new(),
             chat_custom_instructions: String::new(),
@@ -4513,6 +4521,25 @@ mod tests {
         let settings: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.grep_use_index, Settings::default().grep_use_index);
         assert!(settings.grep_use_index);
+    }
+
+    #[test]
+    fn editor_line_numbers_absent_from_an_older_settings_file_reads_as_shown() {
+        let json = r#"{
+            "favorites": [],
+            "recent_dirs": [],
+            "respect_gitignore": true,
+            "max_file_size": 10485760,
+            "context_lines": 2,
+            "theme": "System"
+        }"#;
+
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert!(settings.editor_line_numbers);
+        assert_eq!(
+            settings.editor_line_numbers,
+            Settings::default().editor_line_numbers
+        );
     }
 
     #[test]

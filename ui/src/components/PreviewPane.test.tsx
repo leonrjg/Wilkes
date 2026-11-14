@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import PreviewPane from "./PreviewPane";
 import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
@@ -64,6 +64,8 @@ vi.mock("../services", () => ({
     resolveAssetUrl: vi.fn((path: string) => path),
     comicPage: vi.fn(),
     surrogateBytes: vi.fn(() => Promise.resolve(new Uint8Array([1, 2, 3]).buffer)),
+    resolvePdfFont: vi.fn(),
+    savePdfEdits: vi.fn(() => Promise.resolve("/docs/test (edited).pdf")),
     relatedDocuments: vi.fn(() => Promise.resolve([])),
     chunkTopics: vi.fn(() => Promise.resolve({ topics: [] })),
     cancelChunkTopics: vi.fn(() => Promise.resolve()),
@@ -100,15 +102,17 @@ function setViewerState(state: {
   viewerMetadataStatus?: any;
 }) {
   if (!state.selectedMatch) {
-    useViewerStore.setState({ tabs: [], activeTabId: null });
+    useViewerStore.setState({ tabs: [], panes: [], focusedPaneId: null });
     return;
   }
   const match = state.selectedMatch;
   useViewerStore.setState({
-    activeTabId: "test-tab",
+    panes: [{ id: "pane", activeTabId: "test-tab" }],
+    focusedPaneId: "pane",
     tabs: [
       {
         id: "test-tab",
+        paneId: "pane",
         path: match.path,
         match,
         history: [match],
@@ -224,7 +228,7 @@ describe("PreviewPane", () => {
     });
   });
 
-  it("defaults Markdown files to rendered and toggles to source with an icon button", () => {
+  it("defaults Markdown files to rendered and toggles to editing its source with an icon button", () => {
     setViewerState({
       selectedMatch: { path: "markdown-toggle.md", origin: { TextFile: { line: 1, col: 0 } } },
       previewData: {
@@ -251,7 +255,7 @@ describe("PreviewPane", () => {
     render(<PreviewPane />);
 
     expect(screen.getByTestId("markdown-viewer")).toBeInTheDocument();
-    const toggle = screen.getByRole("button", { name: "View Markdown source" });
+    const toggle = screen.getByRole("button", { name: "Edit document" });
     expect(toggle.querySelector("svg")).toBeInTheDocument();
     expect(mockMarkdownViewer.mock.calls.at(-1)?.[0]).toEqual(
       expect.objectContaining({
@@ -271,12 +275,15 @@ describe("PreviewPane", () => {
 
     fireEvent.click(toggle);
 
-    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    expect(screen.getByTestId("document-editor")).toBeInTheDocument();
+    expect(screen.queryByTestId("code-viewer")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "View rendered Markdown" }).querySelector("svg"))
       .toBeInTheDocument();
+    // The one toggle is the only way in: there is no separate edit button.
+    expect(screen.getAllByRole("button", { name: /Edit document|View rendered Markdown/ })).toHaveLength(1);
   });
 
-  it("defaults HTML files to rendered and toggles to source with an icon button", () => {
+  it("defaults HTML files to rendered and toggles to editing its source with an icon button", () => {
     setViewerState({
       selectedMatch: { path: "page.html", origin: { TextFile: { line: 1, col: 0 } } },
       previewData: {
@@ -322,11 +329,9 @@ describe("PreviewPane", () => {
       }),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "View HTML source" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit document" }));
 
-    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
-    expect(decorationFor(mockCodeViewer.mock.calls.at(-1)?.[0], "html-bookmark").className)
-      .toBe("cm-bookmark-highlight");
+    expect(screen.getByTestId("document-editor")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "View rendered HTML" })).toBeInTheDocument();
   });
 
@@ -346,8 +351,51 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
 
-    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    expect(screen.getByTestId("document-editor")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "View rendered HTML" })).toBeInTheDocument();
+  });
+
+  it("toggles a plain text file between its read-only view and the editor", () => {
+    setViewerState({
+      selectedMatch: { path: "/docs/notes.txt", origin: { TextFile: { line: 0, col: 0 } } },
+      previewData: {
+        Text: {
+          content: "plain notes",
+          language: "plaintext",
+          highlight_line: 0,
+          highlight_range: { start: 0, end: 0 },
+        },
+      },
+    });
+
+    render(<PreviewPane />);
+
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit document" }));
+    expect(screen.getByTestId("document-editor")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "View document" }));
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+  });
+
+  it("shows read-only source in the standalone viewer, which has no editor", () => {
+    setViewerState({
+      selectedMatch: { path: "standalone.md", origin: { TextFile: { line: 0, col: 0 } } },
+      previewData: {
+        Text: {
+          content: "# Notes",
+          language: "markdown",
+          highlight_line: 0,
+          highlight_range: { start: 0, end: 0 },
+        },
+      },
+    });
+
+    render(<PreviewPane standalone />);
+
+    expect(screen.queryByRole("button", { name: "Edit document" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "View Markdown source" }));
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    expect(screen.queryByTestId("document-editor")).not.toBeInTheDocument();
   });
 
   it("offers the readers a URL for the files a document sits beside", () => {
@@ -404,7 +452,7 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
 
-    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    expect(screen.getByTestId("document-editor")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "View rendered Markdown" })).toBeInTheDocument();
   });
 
@@ -768,6 +816,75 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
     expect(screen.getByTestId("pdf-viewer")).toBeInTheDocument();
+  });
+
+  it("puts a PDF into in-place editing from the edit button", () => {
+    setViewerState({
+      selectedMatch: { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } },
+    });
+
+    render(<PreviewPane />);
+    expect(mockPdfViewer.mock.lastCall?.[0].editing).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit document" }));
+    expect(mockPdfViewer.mock.lastCall?.[0].editing).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Finish editing document" }));
+    expect(mockPdfViewer.mock.lastCall?.[0].editing).toBe(false);
+  });
+
+  it("saves an edited copy of a PDF from what the reader says is on screen", async () => {
+    setViewerState({
+      selectedMatch: { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } },
+    });
+    render(<PreviewPane />);
+    // Saving is part of editing: there is nothing to save from a document
+    // that is only being read.
+    expect(screen.queryByRole("button", { name: "Save an edited copy" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit document" }));
+
+    const edits = { pages: [] };
+    mockPdfViewer.mock.lastCall![0].ref.current = { exportEdits: () => edits };
+    fireEvent.click(screen.getByRole("button", { name: "Save an edited copy" }));
+    await waitFor(() => expect(api.savePdfEdits).toHaveBeenCalledWith("test.pdf", edits));
+  });
+
+  it("discards a PDF's changes only once that is confirmed", async () => {
+    setViewerState({
+      selectedMatch: { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } },
+    });
+    render(<PreviewPane />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit document" }));
+    const discardEdits = vi.fn();
+    mockPdfViewer.mock.lastCall![0].ref.current = { discardEdits };
+
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    await waitFor(() => expect(confirm).toHaveBeenCalledTimes(1));
+    expect(discardEdits).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    await waitFor(() => expect(discardEdits).toHaveBeenCalledTimes(1));
+    confirm.mockRestore();
+  });
+
+  it("writes nothing when the reader has changed nothing", async () => {
+    setViewerState({
+      selectedMatch: { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } },
+    });
+    render(<PreviewPane />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit document" }));
+    (api.savePdfEdits as any).mockClear();
+    mockPdfViewer.mock.lastCall![0].ref.current = { exportEdits: () => null };
+    fireEvent.click(screen.getByRole("button", { name: "Save an edited copy" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Save an edited copy" })).not.toBeDisabled(),
+    );
+    expect(api.savePdfEdits).not.toHaveBeenCalled();
   });
 
   it("publishes the active PDF and live page for external MCP without a chat session", async () => {
@@ -1398,7 +1515,7 @@ describe("PreviewPane", () => {
     fireEvent.click(screen.getByText("related.txt"));
     expect(useViewerStore.getState().tabs).toHaveLength(2);
     expect(useViewerStore.getState().tabs.find(
-      (tab) => tab.id === useViewerStore.getState().activeTabId,
+      (tab) => tab.id === (activeViewerTab(useViewerStore.getState())?.id ?? null),
     )?.path).toBe("/docs/related.txt");
 
     setViewerState({
@@ -1778,5 +1895,100 @@ describe("PreviewPane", () => {
     );
     expect(screen.getByText("Both measure cache behavior.")).toBeInTheDocument();
     expect(api.explainRelatedDocument).toHaveBeenCalledOnce();
+  });
+
+  describe("panes", () => {
+    const textTab = (id: string, path: string, paneId: string) => {
+      const match = { path, origin: { TextFile: { line: 0, col: 0 } } } as const;
+      return {
+        id,
+        path,
+        paneId,
+        match,
+        history: [match],
+        historyIndex: 0,
+        previewData: {
+          Text: { content: `contents of ${path}`, language: "plaintext", highlight_line: 0, highlight_range: { start: 0, end: 0 } },
+        },
+        previewLoading: false,
+        previewError: null,
+        pdfLoadAttempt: 0,
+        metadata: null,
+        metadataStatus: "idle" as const,
+        requestId: 1,
+      };
+    };
+
+    beforeEach(() => {
+      useViewerStore.setState({
+        tabs: [
+          textTab("a", "/docs/a.txt", "p1"),
+          textTab("b", "/docs/b.txt", "p2"),
+          textTab("c", "/docs/c.txt", "p3"),
+        ],
+        panes: [
+          { id: "p1", activeTabId: "a" },
+          { id: "p2", activeTabId: "b" },
+          { id: "p3", activeTabId: "c" },
+        ],
+        focusedPaneId: "p2",
+      });
+    });
+
+    it("shows every pane side by side with its own tabs and a handle between each pair", () => {
+      render(<PreviewPane />);
+
+      for (const index of [1, 2, 3]) {
+        expect(screen.getByRole("tablist", { name: `Open documents, pane ${index} of 3` })).toBeInTheDocument();
+      }
+      expect(screen.getAllByTestId("code-viewer")).toHaveLength(3);
+      for (const id of ["p1", "p2", "p3"]) {
+        expect(document.getElementById(`viewer-tabpanel-${id}`)).not.toBeNull();
+      }
+      expect(screen.getAllByRole("separator").map((element) => element.getAttribute("aria-label"))).toEqual([
+        "Resize panes 1 and 2",
+        "Resize panes 2 and 3",
+      ]);
+    });
+
+    it("makes only the focused pane's document the active one, and a click moves the focus", () => {
+      render(<PreviewPane />);
+
+      expect(api.setActiveDocument).toHaveBeenCalledWith("/docs/b.txt", null);
+      expect(api.setActiveDocument).not.toHaveBeenCalledWith("/docs/a.txt", null);
+      expect(api.setActiveDocument).not.toHaveBeenCalledWith("/docs/c.txt", null);
+
+      fireEvent.pointerDown(document.getElementById("viewer-tabpanel-p3")!);
+
+      expect(useViewerStore.getState().focusedPaneId).toBe("p3");
+      expect(activeViewerTab(useViewerStore.getState())?.path).toBe("/docs/c.txt");
+      expect(api.setActiveDocument).toHaveBeenLastCalledWith("/docs/c.txt", null);
+    });
+
+    it("resizes only the two panes a handle sits between", () => {
+      render(<PreviewPane />);
+      const [first, second] = screen.getAllByRole("separator");
+
+      fireEvent.keyDown(second, { key: "ArrowRight" });
+      expect(second).toHaveAttribute("aria-valuenow", "52");
+      // Pane 1 keeps its width; pane 2 grew, so it now has the larger share.
+      expect(first).toHaveAttribute("aria-valuenow", "49");
+      fireEvent.keyDown(second, { key: "ArrowRight", shiftKey: true });
+      expect(second).toHaveAttribute("aria-valuenow", "62");
+      fireEvent.doubleClick(second);
+      expect(second).toHaveAttribute("aria-valuenow", "50");
+    });
+
+    it("keeps a pane's document mounted while other panes close around it", () => {
+      render(<PreviewPane />);
+      const firstViewer = within(document.getElementById("viewer-tabpanel-p1")!).getByTestId("code-viewer");
+
+      act(() => useViewerStore.getState().closePane("p2"));
+      expect(within(document.getElementById("viewer-tabpanel-p1")!).getByTestId("code-viewer")).toBe(firstViewer);
+
+      act(() => useViewerStore.getState().joinPanes());
+      expect(screen.queryByRole("separator")).not.toBeInTheDocument();
+      expect(document.getElementById("viewer-tabpanel-p1")).not.toBeNull();
+    });
   });
 });

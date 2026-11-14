@@ -5,6 +5,7 @@ pub mod files;
 pub mod integrations;
 pub mod logs;
 pub mod metadata;
+pub mod pdf_edit;
 pub mod preview;
 pub mod search;
 pub mod settings;
