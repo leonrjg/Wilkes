@@ -11,16 +11,31 @@ pub enum SyndicationError {
     NotAFeed(String),
 }
 
+/// What a feed document says.
+#[derive(Clone, Debug)]
+pub struct FeedDocument {
+    /// The feed's own name for itself.
+    pub title: Option<String>,
+    pub entries: Vec<SourceEntry>,
+    /// Entries left out because they name no link to fetch.
+    pub without_link: usize,
+}
+
 /// The items a feed document lists: link, title, author, date and an inbox
 /// picture. The feed's own text is never read; every item is fetched from its
 /// link.
 ///
 /// An entry without a link cannot be fetched, so it is not an item. Each one
-/// left out is logged, and the count is returned beside the entries so the
+/// left out is logged, and counted in [`FeedDocument::without_link`] so the
 /// caller can say so.
-pub fn read_feed(bytes: &[u8]) -> Result<(Vec<SourceEntry>, usize), SyndicationError> {
+pub fn read_feed(bytes: &[u8]) -> Result<FeedDocument, SyndicationError> {
     let feed = feed_rs::parser::parse(bytes)
         .map_err(|error| SyndicationError::NotAFeed(error.to_string()))?;
+    let title = feed
+        .title
+        .as_ref()
+        .map(|title| collapse(&title.content))
+        .filter(|title| !title.is_empty());
     let mut entries = Vec::with_capacity(feed.entries.len());
     let mut without_link = 0usize;
     for entry in feed.entries {
@@ -67,7 +82,11 @@ pub fn read_feed(bytes: &[u8]) -> Result<(Vec<SourceEntry>, usize), SyndicationE
             image_url,
         });
     }
-    Ok((entries, without_link))
+    Ok(FeedDocument {
+        title,
+        entries,
+        without_link,
+    })
 }
 
 /// The first feed a web page advertises with `<link rel="alternate">`,
@@ -116,8 +135,10 @@ mod tests {
     <title>No link</title><id>tag:example.org,2026:2</id><updated>2026-11-08T10:00:00+00:00</updated>
   </entry>
 </feed>"#;
-        let (entries, without_link) = read_feed(feed).unwrap();
-        assert_eq!(without_link, 1);
+        let document = read_feed(feed).unwrap();
+        assert_eq!(document.title.as_deref(), Some("Weblog"));
+        assert_eq!(document.without_link, 1);
+        let entries = document.entries;
         assert_eq!(entries.len(), 1);
         let entry = &entries[0];
         assert_eq!(entry.link, "https://example.org/2026/Nov/9/beep/");
@@ -144,7 +165,7 @@ mod tests {
   </item>
   <item><title>Undated</title><link>https://example.org/undated/</link></item>
 </channel></rss>"#;
-        let (entries, _) = read_feed(feed).unwrap();
+        let entries = read_feed(feed).unwrap().entries;
         assert_eq!(entries.len(), 3);
         assert_eq!(
             entries[0].image_url.as_deref(),

@@ -949,6 +949,24 @@ impl MetadataCache {
     /// The DOI recorded for `path`, from any source, if the file is cached.
     /// Identity is not checked: a DOI is stable metadata, and the citation
     /// graph is keyed on it rather than on file content.
+    /// Of `dois`, those some file in this cache records as its own. Only files
+    /// whose metadata has been read are known here.
+    pub fn held_dois(
+        &self,
+        dois: &[String],
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let mut held = std::collections::HashSet::new();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT 1 FROM file_metadata WHERE key = ?1 AND value = ?2 LIMIT 1",
+        )?;
+        for doi in dois {
+            if stmt.exists(params![FIELD_DOI, doi])? {
+                held.insert(doi.clone());
+            }
+        }
+        Ok(held)
+    }
+
     pub fn doi_for_path(&self, path: &Path) -> anyhow::Result<Option<String>> {
         Ok(self
             .conn

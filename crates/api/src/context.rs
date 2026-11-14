@@ -80,6 +80,8 @@ use crate::commands::settings::{get_scoped_settings, update_scoped_settings};
 use crate::commands::settings::{get_settings, update_settings};
 use crate::research::{CachedBookmarkEmbedding, ResearchStore, SearchLogTracker};
 
+pub mod feeds;
+
 const BOOKMARK_EMBEDDING_RECIPE_VERSION: i64 = 1;
 
 /// Bump whenever the cluster-label prompt or grammar changes: that is the whole
@@ -1691,6 +1693,8 @@ pub struct AppContext {
     /// [`wilkes_core::text_index`].
     text_index: PLMutex<Option<Arc<DocumentTextIndex>>>,
     text_index_upkeep: TextIndexUpkeep,
+    /// The feeds' refresh runner, its request gate and its timer.
+    feed_upkeep: feeds::FeedUpkeep,
     directory_watcher: PLMutex<Option<DirectoryWatcher>>,
     embed_task: PLMutex<Option<EmbedTaskHandle>>,
     embed_cancel_in_progress: AtomicBool,
@@ -1823,6 +1827,7 @@ impl AppContext {
             research_store: PLMutex::new(None),
             text_index: PLMutex::new(None),
             text_index_upkeep: TextIndexUpkeep::default(),
+            feed_upkeep: feeds::FeedUpkeep::default(),
             directory_watcher: PLMutex::new(None),
             embed_task: PLMutex::new(None),
             embed_cancel_in_progress: AtomicBool::new(false),
@@ -9116,6 +9121,7 @@ impl AppContext {
         }
         self.stop_directory_watcher();
         self.cancel_text_index_upkeep();
+        self.shut_down_feeds();
         self.cancel_all_completions();
         self.cancel_embed().await;
         self.await_winddown().await;
@@ -9731,6 +9737,9 @@ impl AppContext {
         // After the index, so renditions it holds are copied, not read again.
         // Also what catches the documents that changed while Wilkes was closed.
         self.request_text_index_reconcile();
+        // Refreshes every feed now if the last refresh is older than the
+        // interval, then whenever the interval has passed.
+        self.start_feed_timer();
     }
 }
 

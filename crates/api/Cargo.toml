@@ -27,6 +27,7 @@ thiserror = "2"
 parking_lot = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 uuid = { version = "1", features = ["v4"] }
+url = "2"
 async-trait = "0.1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 cel-interpreter = "0.10"
