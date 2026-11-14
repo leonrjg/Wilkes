@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isPagedPath, isPdfPath, servesPagesOnDemand } from "../lib/documentFormats";
 import { readerLinks, readerOutline } from "../lib/surrogate";
-import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud, Share2, Edit3, Save } from "react-feather";
+import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud, Share2, Edit3, Save, RotateCcw } from "react-feather";
 import DocumentEditor from "./DocumentEditor";
 // Everything this pane takes from the readers comes through their public
 // surface -- the same entry point Underdog will import. Reaching past it into
@@ -23,7 +23,8 @@ import {
   type ReaderHostServices,
   type SelectionActionsSlot,
 } from "@leonrjg/wilkes-reader";
-import { readTextViewMode, readerPositionStore, saveTextViewMode } from "../stores/readerPositions";
+import { readTextViewMode, readerPdfEditStore, readerPositionStore, saveTextViewMode } from "../stores/readerPositions";
+import { confirmDialog } from "../lib/utils/dialog";
 import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useChatStore } from "../stores/useChatStore";
@@ -184,6 +185,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
       resolveLocalAsset,
       resolvePdfFont,
       positions: readerPositionStore,
+      pdfEdits: readerPdfEditStore,
     }),
     [colorScheme, pdfAutoZoomTargetPx, resolveLocalAsset, resolvePdfFont],
   );
@@ -795,6 +797,25 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
               className="inline-flex rounded border border-[var(--border-main)] p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-header)] hover:text-[var(--text-main)] disabled:opacity-50"
             >
               <Save size={16} />
+            </button>
+          </Tooltip>
+        )}
+
+        {!standalone && editing && isEditablePdf && (
+          <Tooltip content="Discard your changes">
+            <button
+              type="button"
+              onClick={() => {
+                void confirmDialog(
+                  "Discard every change made to this document? The document itself has not been altered.",
+                ).then((confirmed) => {
+                  if (confirmed) pdfReaderRef.current?.discardEdits();
+                });
+              }}
+              aria-label="Discard changes"
+              className="inline-flex rounded border border-[var(--border-main)] p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-header)] hover:text-[var(--text-main)]"
+            >
+              <RotateCcw size={16} />
             </button>
           </Tooltip>
         )}

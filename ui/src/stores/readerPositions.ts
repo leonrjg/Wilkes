@@ -1,6 +1,8 @@
 import {
   TEXT_MAX_ZOOM,
   TEXT_MIN_ZOOM,
+  type PdfEditDraft,
+  type PdfEditStore,
   type PdfScrollPosition,
   type ReaderPositionStore,
   type TextViewerMode,
@@ -188,6 +190,75 @@ export const readerPositionStore: ReaderPositionStore = {
   saveTextZoom: (documentPath, zoom) => update(documentPath, (reading) => ({ ...reading, zoom })),
 };
 
+// ── Unsaved PDF edits ────────────────────────────────────────────────────────
+//
+// What a reader typed into a PDF and has not saved as a copy. It is the same
+// kind of thing as a position -- how a document was left -- and follows the
+// same workspace, so it lives here and is switched by the same calls. It is
+// stored under a key of its own: a draft is kilobytes where a position is
+// bytes, and a browser that refuses to store the drafts must not thereby
+// refuse the positions.
+
+export const PDF_EDIT_DRAFTS_STORAGE_KEY = "wilkes.pdf-edit-drafts";
+const draftsKey = (workspaceId: string) => `${PDF_EDIT_DRAFTS_STORAGE_KEY}.${workspaceId}`;
+let drafts: Map<string, PdfEditDraft> | null = null;
+
+function isDraft(value: unknown): value is PdfEditDraft {
+  return isRecord(value) && value.version === 1 && Array.isArray(value.edits);
+}
+
+function loadDrafts(): Map<string, PdfEditDraft> {
+  const loaded = new Map<string, PdfEditDraft>();
+  if (!persistenceEnabled) return loaded;
+  let parsed: unknown;
+  try {
+    const raw = localStorage.getItem(draftsKey(activeWorkspaceId));
+    if (raw === null) return loaded;
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    console.error("Could not read unsaved PDF edits; starting without them:", error);
+    return loaded;
+  }
+  if (!isRecord(parsed)) {
+    console.error("Unsaved PDF edits have an unsupported shape; starting without them.");
+    return loaded;
+  }
+  for (const [key, draft] of Object.entries(parsed)) {
+    if (isDraft(draft)) loaded.set(key, draft);
+    else console.error("Dropped malformed unsaved PDF edits for:", key);
+  }
+  return loaded;
+}
+
+function currentDrafts(): Map<string, PdfEditDraft> {
+  drafts ??= loadDrafts();
+  return drafts;
+}
+
+/** Written at once: the reader only reports a draft when typing has paused,
+ *  and what is at stake is the reader's own words. */
+function writeDrafts(): void {
+  if (!persistenceEnabled || drafts === null) return;
+  try {
+    if (drafts.size === 0) localStorage.removeItem(draftsKey(activeWorkspaceId));
+    else localStorage.setItem(draftsKey(activeWorkspaceId), JSON.stringify(Object.fromEntries(drafts)));
+  } catch (error) {
+    console.error("Could not persist unsaved PDF edits:", error);
+  }
+}
+
+/** What the PDF reader is handed for its unsaved edits. Stable for the life of
+ *  the application, like `readerPositionStore`. */
+export const readerPdfEditStore: PdfEditStore = {
+  read: (documentKey) => currentDrafts().get(documentKey) ?? null,
+  save: (documentKey, draft) => {
+    const map = currentDrafts();
+    if (draft) map.set(documentKey, draft);
+    else if (!map.delete(documentKey)) return;
+    writeDrafts();
+  },
+};
+
 export function readTextViewMode(path: string): TextViewerMode {
   return current().get(path)?.viewMode ?? "rendered";
 }
@@ -208,6 +279,7 @@ export function switchReaderPositionsWorkspace(workspaceId: string): void {
   persistenceEnabled = true;
   activeWorkspaceId = workspaceId;
   documents = null;
+  drafts = null;
 }
 
 /** Mirrors the viewer session's persistence switch: a standalone document window
@@ -217,6 +289,7 @@ export function setReaderPositionPersistence(enabled: boolean): void {
   writeNow();
   persistenceEnabled = enabled;
   documents = null;
+  drafts = null;
 }
 
 export function forgetReaderPositionsWorkspace(workspaceId: string): void {
@@ -224,8 +297,10 @@ export function forgetReaderPositionsWorkspace(workspaceId: string): void {
     if (persistTimer !== null) clearTimeout(persistTimer);
     persistTimer = null;
     documents = null;
+    drafts = null;
   }
   try {
+    localStorage.removeItem(draftsKey(workspaceId));
     localStorage.removeItem(storageKey(workspaceId));
   } catch (error) {
     console.error("Could not clear the reader positions of a deleted workspace:", error);

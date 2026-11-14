@@ -805,6 +805,26 @@ describe("PreviewPane", () => {
     await waitFor(() => expect(api.savePdfEdits).toHaveBeenCalledWith("test.pdf", edits));
   });
 
+  it("discards a PDF's changes only once that is confirmed", async () => {
+    setViewerState({
+      selectedMatch: { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } },
+    });
+    render(<PreviewPane />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit document" }));
+    const discardEdits = vi.fn();
+    mockPdfViewer.mock.lastCall![0].ref.current = { discardEdits };
+
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    await waitFor(() => expect(confirm).toHaveBeenCalledTimes(1));
+    expect(discardEdits).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    await waitFor(() => expect(discardEdits).toHaveBeenCalledTimes(1));
+    confirm.mockRestore();
+  });
+
   it("writes nothing when the reader has changed nothing", async () => {
     setViewerState({
       selectedMatch: { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any,
