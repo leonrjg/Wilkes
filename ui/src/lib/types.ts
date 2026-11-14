@@ -1804,6 +1804,14 @@ export interface Feed {
   inbox_count: number;
 }
 
+/** A feed an address offers, as its own document describes it. */
+export interface OfferedFeed {
+  url: string;
+  title: string | null;
+  /** How many items it lists now. */
+  entries: number;
+}
+
 export interface NewFeed {
   source: FeedSource;
   name?: string | null;

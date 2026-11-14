@@ -18,10 +18,11 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+use wilkes_core::feeds::article::{self, SiteTemplate};
 use wilkes_core::feeds::document::{self, Picture, Provenance};
 use wilkes_core::feeds::identity::{self, link_identifiers, link_key, provider_key};
-use wilkes_core::feeds::syndication::{advertised_feed, read_feed};
-use wilkes_core::feeds::{article, FeedSource, SourceEntry};
+use wilkes_core::feeds::syndication::{offered_feeds, read_feed};
+use wilkes_core::feeds::{FeedSource, SourceEntry};
 use wilkes_core::network::{ProviderHttpClient, ProviderHttpError};
 use wilkes_core::types::{BrowseRequest, LiteratureAcquisition, LiteratureSearchResult};
 
@@ -77,6 +78,9 @@ pub(super) struct FeedUpkeep {
     lifetime: CancellationToken,
     gate: RequestGate,
     timer_started: std::sync::atomic::AtomicBool,
+    /// By host, the text of the last post page read from it and that page's
+    /// link key: what the next post of the site is read against.
+    templates: parking_lot::Mutex<HashMap<String, (String, Arc<SiteTemplate>)>>,
 }
 
 impl Default for FeedUpkeep {
@@ -89,6 +93,7 @@ impl Default for FeedUpkeep {
             lifetime,
             gate: RequestGate::new(REQUEST_SPACING),
             timer_started: std::sync::atomic::AtomicBool::new(false),
+            templates: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -151,6 +156,23 @@ async fn blocking<T: Send + 'static>(
         _ = cancel.cancelled() => Err(Cancelled),
         joined = task => Ok(joined.unwrap_or_else(|error| Err(anyhow::anyhow!("feed store task failed: {error}")))),
     }
+}
+
+/// An http(s) address, as typed.
+fn web_address(address: &str) -> anyhow::Result<String> {
+    let address = address.trim();
+    url::Url::parse(address)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| url.to_string())
+        .ok_or_else(|| anyhow::anyhow!("{address} is not a web address"))
+}
+
+/// A link's host, lowercased, as the template cache is keyed.
+fn link_host(link: &str) -> Option<String> {
+    url::Url::parse(link)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
 }
 
 fn now_ms() -> i64 {
@@ -216,6 +238,26 @@ pub struct FeedUpdate {
     pub folder: Option<String>,
     #[serde(default)]
     pub auto_import: Option<bool>,
+}
+
+/// A feed an address offers, as its own document describes it.
+#[derive(Clone, Debug, Serialize)]
+pub struct OfferedFeed {
+    pub url: String,
+    /// The feed's own name for itself.
+    pub title: Option<String>,
+    /// How many items it lists now.
+    pub entries: usize,
+}
+
+impl OfferedFeed {
+    fn read(url: String, document: &wilkes_core::feeds::syndication::FeedDocument) -> Self {
+        Self {
+            url,
+            title: document.title.clone(),
+            entries: document.entries.len() + document.without_link,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -329,9 +371,9 @@ impl AppContext {
             .feeds()
     }
 
-    /// Add a feed and refresh it. A syndication source given as a web page is
-    /// replaced by the first feed the page advertises; a page that advertises
-    /// none is refused, with what to do instead.
+    /// Add a feed and refresh it. A syndication source must be a feed itself:
+    /// the feeds a page offers are looked up with [`Self::feed_discover`], and
+    /// one of them chosen.
     pub async fn feed_add(self: &Arc<Self>, new: NewFeed) -> anyhow::Result<FeedRecord> {
         self.ensure_writable().map_err(anyhow::Error::msg)?;
         let settings = self.get_settings().await;
@@ -339,8 +381,14 @@ impl AppContext {
         let cancel = self.feed_upkeep.cancel.lock().clone();
         let (source, title) = match new.source {
             FeedSource::Syndication { url } => {
-                let (url, title) = self.resolve_syndication(url.trim(), &cancel).await?;
-                (FeedSource::Syndication { url }, title)
+                let url = web_address(&url)?;
+                let body = self.fetch(&url, &cancel).await?;
+                let document = read_feed(&body).map_err(|error| {
+                    anyhow::anyhow!(
+                        "{url} is not a feed ({error}); look up the feeds its page offers and choose one"
+                    )
+                })?;
+                (FeedSource::Syndication { url }, document.title)
             }
             FeedSource::Listing {
                 provider,
@@ -618,34 +666,41 @@ impl AppContext {
         Ok(canonical)
     }
 
-    /// The feed an address names: the address itself when it is a feed, or
-    /// the first one it advertises when it is a page.
-    async fn resolve_syndication(
-        &self,
-        address: &str,
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<(String, Option<String>)> {
-        let url = url::Url::parse(address)
-            .ok()
-            .filter(|url| matches!(url.scheme(), "http" | "https"))
-            .ok_or_else(|| anyhow::anyhow!("{address} is not a web address"))?
-            .to_string();
-        let body = self.fetch(&url, cancel).await?;
+    /// The feeds an address offers, each fetched and read to be sure it is
+    /// one: the address itself when it is a feed, or else those its page
+    /// advertises or links (see [`offered_feeds`]). Refused when there are
+    /// none, with what to do instead.
+    pub async fn feed_discover(&self, address: &str) -> anyhow::Result<Vec<OfferedFeed>> {
+        let url = web_address(address)?;
+        let cancel = self.feed_upkeep.cancel.lock().clone();
+        let body = self.fetch(&url, &cancel).await?;
         if let Ok(document) = read_feed(&body) {
-            return Ok((url, document.title));
+            return Ok(vec![OfferedFeed::read(url, &document)]);
         }
-        let page = String::from_utf8_lossy(&body);
-        let Some(feed_url) = advertised_feed(&page, &url) else {
-            anyhow::bail!(
-                "{url} is neither a feed nor a page that advertises one. To follow a page's links, \
-                 add the page as a custom provider and follow its listing."
-            );
-        };
-        let body = self.fetch(&feed_url, cancel).await?;
-        let document = read_feed(&body).map_err(|error| {
-            anyhow::anyhow!("the feed {feed_url} that {url} advertises: {error}")
-        })?;
-        Ok((feed_url, document.title))
+        let candidates = offered_feeds(&String::from_utf8_lossy(&body), &url);
+        let mut offered = Vec::new();
+        for candidate in candidates {
+            match self.fetch(&candidate, &cancel).await {
+                Ok(body) => match read_feed(&body) {
+                    Ok(document) => offered.push(OfferedFeed::read(candidate, &document)),
+                    Err(error) => {
+                        info!("feeds: {candidate}, linked from {url}, is not a feed: {error}")
+                    }
+                },
+                Err(error) => {
+                    if cancel.is_cancelled() {
+                        return Err(error);
+                    }
+                    warn!("feeds: {candidate}, linked from {url}, could not be read: {error:#}");
+                }
+            }
+        }
+        anyhow::ensure!(
+            !offered.is_empty(),
+            "{url} is neither a feed nor a page that offers one. To follow a page's links, \
+             add the page as a custom provider and follow its listing."
+        );
+        Ok(offered)
     }
 
     /// One GET through the gate.
@@ -1262,6 +1317,85 @@ impl AppContext {
         }))
     }
 
+    /// What the post's site puts on every page, read from another of its
+    /// posts: the last one read from the same host, or else the newest other
+    /// item of the feed on that host, fetched for it. `None` when the feed
+    /// holds no other post of the site — there is nothing to compare with,
+    /// and the article is kept as Readability found it.
+    async fn site_template(
+        &self,
+        feed: &FeedRecord,
+        item: &FeedItemRecord,
+        cancel: &CancellationToken,
+    ) -> Result<anyhow::Result<Option<Arc<SiteTemplate>>>, Cancelled> {
+        let Some(host) = link_host(&item.link) else {
+            return Ok(Err(anyhow::anyhow!("{} has no host", item.link)));
+        };
+        if let Some((key, template)) = self.feed_upkeep.templates.lock().get(&host) {
+            if *key != item.link_key {
+                return Ok(Ok(Some(Arc::clone(template))));
+            }
+        }
+        let other = match self.feeds_store().and_then(|store| {
+            let store = store.lock().unwrap_or_else(|p| p.into_inner());
+            let mut offset = 0;
+            loop {
+                let page = store.feed_items(None, Some(&feed.id), offset, 200)?;
+                if page.is_empty() {
+                    return Ok(None);
+                }
+                offset += page.len();
+                if let Some(other) = page.into_iter().find(|other| {
+                    other.link_key != item.link_key
+                        && link_host(&other.link).as_deref() == Some(host.as_str())
+                }) {
+                    return Ok(Some(other));
+                }
+            }
+        }) {
+            Ok(Some(other)) => other,
+            Ok(None) => {
+                info!(
+                    "feeds: {} is the only post of {host} in {}; it is kept as extracted",
+                    item.link, feed.name
+                );
+                return Ok(Ok(None));
+            }
+            Err(error) => return Ok(Err(error)),
+        };
+        let page = match self
+            .feed_upkeep
+            .gate
+            .run(
+                cancel,
+                http_client().get_bytes(other.link.clone(), &request_headers()),
+            )
+            .await?
+        {
+            Ok(page) => String::from_utf8_lossy(&page).into_owned(),
+            Err(error) => {
+                return Ok(Err(anyhow::anyhow!(
+                    "{}, the post its site's layout is read from, could not be fetched: {}",
+                    other.link,
+                    http_message(&error)
+                )))
+            }
+        };
+        let read = tokio::task::spawn_blocking(move || SiteTemplate::from_page(&page));
+        let template = tokio::select! {
+            _ = cancel.cancelled() => return Err(Cancelled),
+            joined = read => match joined {
+                Ok(template) => Arc::new(template),
+                Err(error) => return Ok(Err(anyhow::anyhow!("reading {}: {error}", other.link))),
+            },
+        };
+        self.feed_upkeep
+            .templates
+            .lock()
+            .insert(host, (other.link_key, Arc::clone(&template)));
+        Ok(Ok(Some(template)))
+    }
+
     /// A post: its page, its article, its pictures, one file.
     async fn import_post(
         &self,
@@ -1289,9 +1423,13 @@ impl AppContext {
         if identity::is_preview_only(&page) {
             return Ok(Ok(Imported::PreviewOnly));
         }
+        let template = match self.site_template(feed, item, cancel).await? {
+            Ok(template) => template,
+            Err(error) => return Ok(Err(error)),
+        };
         let extracted = {
             let link = item.link.clone();
-            tokio::task::spawn_blocking(move || article::extract(&page, &link))
+            tokio::task::spawn_blocking(move || article::extract(&page, &link, template.as_deref()))
         };
         let extracted = tokio::select! {
             _ = cancel.cancelled() => return Err(Cancelled),
@@ -1302,6 +1440,15 @@ impl AppContext {
             Ok(Err(error)) => return Ok(Err(anyhow::anyhow!("{error}"))),
             Err(error) => return Ok(Err(anyhow::anyhow!("extraction failed: {error}"))),
         };
+        if let Some(host) = link_host(&item.link) {
+            self.feed_upkeep.templates.lock().insert(
+                host,
+                (
+                    item.link_key.clone(),
+                    Arc::new(article.site_template.clone()),
+                ),
+            );
+        }
 
         let mut pictures: HashMap<String, Picture> = HashMap::new();
         for address in &article.pictures {
@@ -1720,20 +1867,36 @@ mod tests {
             .to_rfc2822()
     }
 
-    fn article_page(server: &Server, paid: bool) -> Reply {
+    /// A post page; `post` makes its text its own, as every post's is.
+    fn article_page(server: &Server, post: &str, paid: bool) -> Reply {
         let paragraphs: String = (0..8)
-            .map(|i| format!("<p>Paragraph {i} of the post, long enough to be read as prose by anyone who opens it and keeps reading.</p>"))
+            .map(|i| format!("<p>Paragraph {i} of the post {post}, long enough to be read as prose by anyone who opens it and keeps reading.</p>"))
             .collect();
-        let audience = if paid { "only_subscribers" } else { "everyone" };
         Reply::Ok(
             "text/html",
             format!(
-                "<html><head><title>Post</title><link rel=\"preconnect\" href=\"https://substackcdn.com\">\
-                 <script>window._preloads = {{\"post\":{{\"audience\":\"{audience}\"}}}}</script></head>\
+                "<html><head><title>Post</title>\
+                 <script type=\"application/ld+json\">{{\"@type\":\"NewsArticle\",\"isAccessibleForFree\":{}}}</script></head>\
                  <body><nav><a href=\"/\">Home</a></nav><article><h1>Post</h1>{paragraphs}\
                  <figure><img src=\"{}\"><figcaption>A figure</figcaption></figure></article>\
                  <footer>Footer</footer></body></html>",
+                !paid,
                 server.url("/img.png")
+            )
+            .into_bytes(),
+        )
+    }
+
+    /// A short post beside the sidebar its site puts on every page.
+    fn link_blog_page(post: &str) -> Reply {
+        Reply::Ok(
+            "text/html",
+            format!(
+                r#"<html><head><title>Post</title></head><body>
+<div id="wrapper"><div id="primary"><div class="entry"><div>{post}</div></div>
+<div class="recent"><h2>Recent articles</h2><ul><li><a href="/a/">An older article</a></li><li><a href="/b/">Another older one</a></li></ul></div></div>
+<div id="secondary"><section><h3>Monthly briefing</h3><p>Sponsor me for $10/month and get a curated email digest of the month's most important developments.</p><p>Pay me to send you less!</p></section></div></div>
+</body></html>"#
             )
             .into_bytes(),
         )
@@ -1861,8 +2024,8 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let server = serve().await;
         server.set("/feed", rss(&server, &[("/a".into(), Some(day(1)))]));
-        server.set("/a", article_page(&server, false));
-        server.set("/b", article_page(&server, false));
+        server.set("/a", article_page(&server, "a", false));
+        server.set("/b", article_page(&server, "b", false));
         server.set("/img.png", png());
         let (_dir, ctx) = context(first.path()).await;
         ctx.update_settings(serde_json::json!({ "favorites": [second.path()] }))
@@ -1935,6 +2098,65 @@ mod tests {
         assert!(second_folder.join("notes.txt").exists());
     }
 
+    /// The first post of a site is read against another of its posts, fetched
+    /// for it; the next is read against the page already read, with no
+    /// request of its own.
+    #[tokio::test]
+    async fn a_post_is_imported_without_what_its_site_puts_on_every_page() {
+        let library = tempfile::tempdir().unwrap();
+        let server = serve().await;
+        server.set(
+            "/feed",
+            rss(
+                &server,
+                &[
+                    ("/short".into(), Some(day(2))),
+                    ("/other".into(), Some(day(1))),
+                ],
+            ),
+        );
+        server.set("/short", link_blog_page("<p>A link post says, in one paragraph of real length, why the linked page is worth reading and what in it is new to anyone.</p><p>And a second paragraph adds a quote from the page itself.</p>"));
+        server.set("/other", link_blog_page("<p>Another post of the same blog, with its own paragraph of real length that says something different from the first one.</p><p>And a closing line of its own.</p>"));
+        let (_dir, ctx) = context(library.path()).await;
+        let feed = feed_record(&ctx, library.path(), server.url("/feed"), false);
+        let cancel = CancellationToken::new();
+        ctx.refresh_feed(&feed, &cancel).await.unwrap();
+        let inbox = items(&ctx, FeedItemStatus::Inbox);
+        let id = |path: &str| {
+            inbox
+                .iter()
+                .find(|item| item.link.contains(path))
+                .unwrap()
+                .id
+                .clone()
+        };
+
+        let action = FeedItemAction::Import {
+            allow_missing_images: false,
+        };
+        for path in ["/short", "/other"] {
+            let imported = ctx.feed_item_set_status(&id(path), action).await.unwrap();
+            let html = std::fs::read_to_string(imported.imported_path.unwrap()).unwrap();
+            assert!(html.contains("paragraph of real length"), "{html}");
+            for absent in ["Recent articles", "Monthly briefing", "Sponsor me"] {
+                assert!(!html.contains(absent), "{absent} kept in {path}: {html}");
+            }
+        }
+        let fetched = |path: &str| {
+            server
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(logged, _, _)| logged == path)
+                .count()
+        };
+        // `/other` once for `/short`'s template and once to import it;
+        // `/short` once.
+        assert_eq!(fetched("/other"), 2);
+        assert_eq!(fetched("/short"), 1);
+    }
+
     /// A paid post's page is a preview: it stays in the inbox, marked, and is
     /// never imported; the free one is written into the feed's folder with
     /// its picture inside.
@@ -1952,8 +2174,8 @@ mod tests {
                 ],
             ),
         );
-        server.set("/paid", article_page(&server, true));
-        server.set("/free", article_page(&server, false));
+        server.set("/paid", article_page(&server, "paid", true));
+        server.set("/free", article_page(&server, "free", false));
         server.set("/img.png", png());
         let (_dir, ctx) = context(library.path()).await;
         let feed = feed_record(&ctx, library.path(), server.url("/feed"), true);
@@ -2000,7 +2222,7 @@ mod tests {
         let library = tempfile::tempdir().unwrap();
         let server = serve().await;
         server.set("/feed", rss(&server, &[("/free".into(), Some(day(1)))]));
-        server.set("/free", article_page(&server, false));
+        server.set("/free", article_page(&server, "free", false));
         server.set("/img.png", Reply::Status(404));
         let (_dir, ctx) = context(library.path()).await;
         let feed = feed_record(&ctx, library.path(), server.url("/feed"), true);
@@ -2117,60 +2339,93 @@ mod tests {
         assert!(!ctx.feed_upkeep.cancel.lock().is_cancelled());
     }
 
-    /// A page address is replaced by the feed it advertises; a page that
-    /// advertises none is refused with what to do instead.
+    /// A page offers the feed its head advertises and the one its body links,
+    /// each read to be sure; what only looks like a feed is not offered. A
+    /// feed is added by its own address, never by a page's.
     #[tokio::test]
-    async fn adding_a_page_follows_the_feed_it_advertises() {
+    async fn a_page_offers_its_feeds_and_one_is_chosen() {
         let library = tempfile::tempdir().unwrap();
         let server = serve().await;
         server.set("/feed", rss(&server, &[]));
+        let Reply::Ok(kind, everything) = rss(&server, &[("/p/1/".into(), Some(day(1)))]) else {
+            unreachable!()
+        };
+        let entries = String::from_utf8(everything)
+            .unwrap()
+            .replace("<title>Blog</title>", "<title>Blog: Entries</title>");
+        server.set("/atom/entries/", Reply::Ok(kind, entries.into_bytes()));
         server.set(
             "/blog",
             Reply::Ok(
                 "text/html",
-                b"<html><head><link rel=\"alternate\" type=\"application/rss+xml\" href=\"/feed\"></head></html>".to_vec(),
+                b"<html><head><link rel=\"alternate\" type=\"application/rss+xml\" href=\"/feed\"></head>\
+                  <body><a href=\"/atom/entries/\" title=\"Atom feed\"></a><a href=\"/rss/old\">RSS</a></body></html>"
+                    .to_vec(),
             ),
         );
+        server.set("/rss/old", Reply::Status(404));
         server.set(
             "/nofeed",
             Reply::Ok("text/html", b"<html><body>hi</body></html>".to_vec()),
         );
         let (_dir, ctx) = context(library.path()).await;
+
+        let offered = ctx.feed_discover(&server.url("/blog")).await.unwrap();
+        let described: Vec<(String, Option<String>, usize)> = offered
+            .into_iter()
+            .map(|feed| (feed.url, feed.title, feed.entries))
+            .collect();
+        assert_eq!(
+            described,
+            vec![
+                (server.url("/feed"), Some("Blog".to_string()), 0),
+                (
+                    server.url("/atom/entries/"),
+                    Some("Blog: Entries".to_string()),
+                    1
+                ),
+            ]
+        );
+        // A feed's own address offers itself alone.
+        assert_eq!(
+            ctx.feed_discover(&server.url("/atom/entries/"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let error = ctx
+            .feed_discover(&server.url("/nofeed"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("custom provider"), "{error}");
+
+        let add = |url: String| NewFeed {
+            source: FeedSource::Syndication { url },
+            name: None,
+            root: library.path().to_path_buf(),
+            folder: None,
+            auto_import: false,
+        };
+        let error = ctx
+            .feed_add(add(server.url("/blog")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not a feed"), "{error}");
         let feed = ctx
-            .feed_add(NewFeed {
-                source: FeedSource::Syndication {
-                    url: server.url("/blog"),
-                },
-                name: None,
-                root: library.path().to_path_buf(),
-                folder: None,
-                auto_import: false,
-            })
+            .feed_add(add(server.url("/atom/entries/")))
             .await
             .unwrap();
         assert_eq!(
             feed.source,
             FeedSource::Syndication {
-                url: server.url("/feed")
+                url: server.url("/atom/entries/")
             }
         );
-        assert_eq!(feed.name, "Blog");
-        assert_eq!(feed.folder, "Feeds/Blog");
-
-        let error = ctx
-            .feed_add(NewFeed {
-                source: FeedSource::Syndication {
-                    url: server.url("/nofeed"),
-                },
-                name: None,
-                root: library.path().to_path_buf(),
-                folder: None,
-                auto_import: false,
-            })
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("custom provider"), "{error}");
+        assert_eq!(feed.name, "Blog: Entries");
+        assert_eq!(feed.folder, "Feeds/Blog Entries");
 
         let elsewhere = tempfile::tempdir().unwrap();
         assert!(ctx

@@ -7,6 +7,7 @@ vi.mock("../services", () => ({
   api: {
     feedsList: vi.fn(),
     feedItems: vi.fn(),
+    feedDiscover: vi.fn(),
     feedAdd: vi.fn(),
     feedUpdate: vi.fn(),
     feedRemove: vi.fn(() => Promise.resolve()),
@@ -166,6 +167,9 @@ describe("FeedsView", () => {
   });
 
   it("adds a blog by its address into the open library", async () => {
+    mocked.feedDiscover.mockResolvedValue([
+      { url: "https://simonwillison.net/atom/everything/", title: "Simon Willison's Weblog", entries: 30 },
+    ]);
     mocked.feedAdd.mockResolvedValue(feed());
     show([], []);
     fireEvent.click(await screen.findByRole("button", { name: "Add a feed" }));
@@ -175,12 +179,42 @@ describe("FeedsView", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Add feed" }));
     });
+    expect(mocked.feedDiscover).toHaveBeenCalledWith("https://simonwillison.net/");
+    // One feed offered: nothing to choose.
     expect(mocked.feedAdd).toHaveBeenCalledWith({
-      source: { kind: "syndication", url: "https://simonwillison.net/" },
+      source: { kind: "syndication", url: "https://simonwillison.net/atom/everything/" },
       name: null,
       root: "/library",
       auto_import: false,
     });
+  });
+
+  it("offers the choice when a page offers more than one feed", async () => {
+    mocked.feedDiscover.mockResolvedValue([
+      { url: "https://simonwillison.net/atom/everything/", title: "Simon Willison's Weblog", entries: 30 },
+      { url: "https://simonwillison.net/atom/entries/", title: "Simon Willison's Weblog: Entries", entries: 15 },
+    ]);
+    mocked.feedAdd.mockResolvedValue(feed());
+    show([], []);
+    fireEvent.click(await screen.findByRole("button", { name: "Add a feed" }));
+    fireEvent.change(screen.getByLabelText("Blog or feed address"), {
+      target: { value: "https://simonwillison.net/entries/" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Add feed" }));
+    });
+    expect(mocked.feedAdd).not.toHaveBeenCalled();
+    expect(screen.getByText("This page offers 2 feeds")).toBeInTheDocument();
+    expect(screen.getByText(/· 15 items/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("radio", { name: /Weblog: Entries/ }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Follow this feed" }));
+    });
+    expect(mocked.feedAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: { kind: "syndication", url: "https://simonwillison.net/atom/entries/" },
+      }),
+    );
   });
 
   it("moves where a feed's new posts go, to another library and folder", async () => {

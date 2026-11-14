@@ -338,8 +338,11 @@ export interface SearchApi {
   ): Promise<import("../lib/types").LiteratureProviderAnswer>;
   /** Every feed, with its status and inbox count. */
   feedsList(): Promise<import("../lib/types").Feed[]>;
-  /** Adds a feed and refreshes it. A page address is replaced by the feed the
-   *  page advertises; a listing is followed newest first. */
+  /** The feeds an address offers: itself when it is a feed, or those its page
+   *  advertises or links, each read to be sure it is one. */
+  feedDiscover(address: string): Promise<import("../lib/types").OfferedFeed[]>;
+  /** Adds a feed and refreshes it. A syndication source is a feed's own
+   *  address, as `feedDiscover` gave it; a listing is followed newest first. */
   feedAdd(feed: import("../lib/types").NewFeed): Promise<import("../lib/types").Feed>;
   feedUpdate(id: string, update: import("../lib/types").FeedUpdate): Promise<import("../lib/types").Feed>;
   /** Removes a feed and its items; `deleteFiles` deletes what it imported. */

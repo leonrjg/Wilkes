@@ -89,25 +89,95 @@ pub fn read_feed(bytes: &[u8]) -> Result<FeedDocument, SyndicationError> {
     })
 }
 
-/// The first feed a web page advertises with `<link rel="alternate">`,
-/// resolved against the page's address. `None` when it advertises none.
-pub fn advertised_feed(page_source: &str, page_url: &str) -> Option<String> {
-    let base = url::Url::parse(page_url).ok()?;
+/// The most feeds a page is taken to offer: each is fetched to be sure.
+pub const MAX_OFFERED_FEEDS: usize = 8;
+
+/// The feeds a web page may offer, resolved against its address, each once
+/// and in order: first those its head advertises with `<link rel="alternate">`,
+/// then the links in its body that look like feeds — a feed's media type, an
+/// address whose path is a feed's (`/feed`, `/rss`, `/atom/entries/`,
+/// `index.xml`), or a link that calls itself one ("Atom feed", "RSS"). A page
+/// often advertises only its main feed in its head and links the others, so
+/// both are read. They are only candidates: each is fetched and read before
+/// it is offered to anyone.
+pub fn offered_feeds(page_source: &str, page_url: &str) -> Vec<String> {
+    let Ok(base) = url::Url::parse(page_url) else {
+        return Vec::new();
+    };
     let document = dom_query::Document::from(page_source);
-    let selection = document.select("link[rel~=\"alternate\"][href]");
-    selection.iter().find_map(|link| {
-        let kind = link.attr("type")?.to_ascii_lowercase();
-        let is_feed = kind.contains("rss+xml")
-            || kind.contains("atom+xml")
-            || kind.contains("feed+json")
-            || kind == "application/json";
-        if !is_feed {
-            return None;
+    let mut found: Vec<String> = Vec::new();
+    let mut take = |href: &str| {
+        let Ok(url) = base.join(href.trim()) else {
+            return;
+        };
+        if !matches!(url.scheme(), "http" | "https") || url == base {
+            return;
         }
-        base.join(link.attr("href")?.trim())
-            .ok()
-            .map(|url| url.to_string())
-    })
+        let url = url.to_string();
+        if !found.contains(&url) && found.len() < MAX_OFFERED_FEEDS {
+            found.push(url);
+        }
+    };
+    for link in document.select("link[rel~=\"alternate\"][href]").iter() {
+        if link.attr("type").is_some_and(|kind| is_feed_type(&kind)) {
+            if let Some(href) = link.attr("href") {
+                take(&href);
+            }
+        }
+    }
+    for anchor in document.select("body a[href]").iter() {
+        let Some(href) = anchor.attr("href") else {
+            continue;
+        };
+        let typed = anchor.attr("type").is_some_and(|kind| is_feed_type(&kind));
+        let named = [
+            anchor.attr("title").map(|t| t.to_string()),
+            Some(anchor.text().to_string()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|label| names_a_feed(&label));
+        let addressed = base
+            .join(href.trim())
+            .is_ok_and(|url| path_is_a_feeds(url.path()));
+        if typed || named || addressed {
+            take(&href);
+        }
+    }
+    found
+}
+
+fn is_feed_type(kind: &str) -> bool {
+    let kind = kind.to_ascii_lowercase();
+    kind.contains("rss+xml")
+        || kind.contains("atom+xml")
+        || kind.contains("feed+json")
+        || kind == "application/json"
+}
+
+/// A path one of whose segments is a feed's name (`feed`, `rss`, `atom`), or
+/// that ends in a feed file's extension.
+fn path_is_a_feeds(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    segments
+        .iter()
+        .any(|segment| matches!(*segment, "feed" | "feeds" | "rss" | "atom"))
+        || segments.last().is_some_and(|last| {
+            [".xml", ".rss", ".atom", ".rdf"]
+                .iter()
+                .any(|extension| last.ends_with(extension))
+        })
+}
+
+/// A link's words that call it a feed: "RSS", "Atom", "feed" as words.
+fn names_a_feed(label: &str) -> bool {
+    label
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| matches!(word.to_ascii_lowercase().as_str(), "rss" | "atom" | "feed"))
 }
 
 fn collapse(text: &str) -> String {
@@ -181,20 +251,33 @@ mod tests {
         assert!(read_feed(b"<html><body>Not a feed</body></html>").is_err());
     }
 
+    /// Simon Willison's entries page, as served: its head advertises only
+    /// the main feed, and its body links the feed of entries alone.
     #[test]
-    fn a_page_advertises_its_feed() {
+    fn a_page_offers_the_feeds_its_head_advertises_and_its_body_links() {
         let page = r#"<html><head>
             <link rel="stylesheet" href="/style.css">
             <link rel="alternate" type="application/atom+xml" title="Atom" href="/atom/everything/">
-            <link rel="alternate" type="application/rss+xml" href="https://example.org/rss">
-        </head><body></body></html>"#;
+        </head><body>
+            <h2>Entries <a style="float: right" href="/atom/entries/" title="Atom feed"><svg></svg></a></h2>
+            <a href="/2026/Nov/9/mysterious-beeps/">Locating a beep</a>
+            <a href="/feedback/">Feedback</a>
+            <a href="https://example.org/comments/feed/">Comments</a>
+            <a href="/index.xml">Subscribe</a>
+            <a href="/atom/everything/">My Atom feed</a>
+            <a href="/about/">About this site's RSS</a>
+        </body></html>"#;
         assert_eq!(
-            advertised_feed(page, "https://example.org/2026/post/").as_deref(),
-            Some("https://example.org/atom/everything/")
+            offered_feeds(page, "https://simonwillison.net/entries/"),
+            vec![
+                "https://simonwillison.net/atom/everything/",
+                "https://simonwillison.net/atom/entries/",
+                "https://example.org/comments/feed/",
+                "https://simonwillison.net/index.xml",
+                // Said to be one; fetching it will say it is not.
+                "https://simonwillison.net/about/",
+            ]
         );
-        assert_eq!(
-            advertised_feed("<html></html>", "https://example.org/"),
-            None
-        );
+        assert!(offered_feeds("<html></html>", "https://example.org/").is_empty());
     }
 }

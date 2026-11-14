@@ -2232,6 +2232,18 @@ async fn feeds_list(app: AppHandle) -> Result<Vec<wilkes_api::research::FeedReco
         .map_err(|error| format!("{error:#}"))
 }
 
+/// The feeds an address offers, each read to be sure it is one.
+#[tauri::command]
+async fn feed_discover(
+    app: AppHandle,
+    address: String,
+) -> Result<Vec<wilkes_api::context::feeds::OfferedFeed>, String> {
+    app_context(&app)
+        .feed_discover(&address)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
 /// Add a feed and refresh it. "Follow this" calls it with the listing on screen.
 #[tauri::command]
 async fn feed_add(
@@ -2829,6 +2841,7 @@ pub fn run() {
             literature_acquire,
             literature_browse,
             feeds_list,
+            feed_discover,
             feed_add,
             feed_update,
             feed_remove,

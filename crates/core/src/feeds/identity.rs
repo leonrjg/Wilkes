@@ -99,64 +99,43 @@ pub fn link_identifiers(link: &str) -> (Option<String>, Option<String>) {
     (doi, arxiv)
 }
 
-/// What Wilkes knows about one publishing platform's pages, kept as data.
-pub struct Platform {
-    pub name: &'static str,
-    /// Text in a page's source that says it was published here: a platform's
-    /// own CDN appears on its custom domains too.
-    pub recognised_by: &'static str,
-    /// Text in the page's source that says the page shows only the start of
-    /// the post. Not the visible markup: the word "paywall" appears on free
-    /// Substack pages too.
-    pub paywall: Option<&'static str>,
-    /// Selectors for what extraction keeps and a reader does not want: share
-    /// and subscribe boxes inside the article.
-    pub remove: &'static [&'static str],
-}
-
-/// The platforms the survey's pages came from that need anything said about
-/// them. A page from anywhere else is extracted as it is.
-pub const PLATFORMS: &[Platform] = &[
-    Platform {
-        // Measured: on a short link-blog post the extraction took the sidebar
-        // too (tag counts, the monthly briefing, the sponsor box).
-        name: "Simon Willison's Weblog",
-        recognised_by: "https://simonwillison.net/atom/everything/",
-        paywall: None,
-        remove: &["#secondary", "#sponsored-banner", ".recent-articles", "#ft"],
-    },
-    Platform {
-        name: "Substack",
-        recognised_by: "substackcdn.com",
-        // In the post data embedded in the page: `"everyone"` on a free post.
-        paywall: Some(r#""post":{"audience":"only_subscribers""#),
-        remove: &[
-            ".subscription-widget-wrap",
-            ".subscription-widget-wrap-editor",
-            ".subscribe-widget",
-            ".button-wrapper",
-            ".share-dialog",
-            ".post-ufi",
-            ".paywall",
-            ".captioned-button-wrap",
-            "[data-component-name=\"SubscribeWidgetToDOM\"]",
-            "[data-component-name=\"ButtonCreateButton\"]",
-        ],
-    },
-];
-
-/// The platform a page was published on, if it is one Wilkes knows.
-pub fn platform(page_source: &str) -> Option<&'static Platform> {
-    PLATFORMS
-        .iter()
-        .find(|platform| page_source.contains(platform.recognised_by))
-}
-
-/// Whether the page shows only the start of a paid post.
+/// Whether the page shows only the start of a paid post, as the page itself
+/// says in schema.org's terms: an `isAccessibleForFree` of false in its
+/// JSON-LD, on the article or on a part of it. The markup search engines read
+/// paywalls by, so a publisher that has one says so there; nothing about a
+/// site is known here.
 pub fn is_preview_only(page_source: &str) -> bool {
-    platform(page_source)
-        .and_then(|platform| platform.paywall)
-        .is_some_and(|marker| page_source.contains(marker))
+    let document = dom_query::Document::from(page_source);
+    let blocks = document.select("script[type=\"application/ld+json\"]");
+    blocks.iter().any(|block| {
+        let text = block.text();
+        match serde_json::from_str::<serde_json::Value>(text.trim()) {
+            Ok(value) => not_free(&value),
+            Err(error) => {
+                tracing::warn!("feeds: a page's JSON-LD could not be read: {error}");
+                false
+            }
+        }
+    })
+}
+
+/// Whether a JSON-LD value marks itself, or anything inside it, as not free.
+fn not_free(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            let marked = object
+                .get("isAccessibleForFree")
+                .is_some_and(|free| match free {
+                    serde_json::Value::Bool(free) => !free,
+                    // Google's own examples write it as text.
+                    serde_json::Value::String(free) => free.trim().eq_ignore_ascii_case("false"),
+                    _ => false,
+                });
+            marked || object.values().any(not_free)
+        }
+        serde_json::Value::Array(values) => values.iter().any(not_free),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -238,15 +217,28 @@ mod tests {
         );
     }
 
+    /// Recorded from Gary Marcus's Substack: a paid post's JSON-LD says it
+    /// is not free, a free one's that it is.
     #[test]
-    fn a_paid_substack_post_is_a_preview_and_a_free_one_is_not() {
-        let paid = r#"<script src="https://substackcdn.com/x.js"></script><script>window._preloads = {"post":{"audience":"only_subscribers","title":"x"}}</script><p>There is a paywall here</p>"#;
-        let free = r#"<script src="https://substackcdn.com/x.js"></script><script>window._preloads = {"post":{"audience":"everyone","title":"x"}}</script><p>Subscribe; no paywall</p>"#;
-        assert!(is_preview_only(paid));
-        assert!(!is_preview_only(free));
-        // The same marker on a page from no known platform is not a paywall.
-        assert!(!is_preview_only(
-            r#"{"post":{"audience":"only_subscribers"}}"#
-        ));
+    fn a_page_that_says_it_is_not_free_is_a_preview() {
+        let page = |head: &str| format!("<html><head>{head}</head><body><p>Text</p></body></html>");
+        let paid = page(
+            r#"<script nonce="x" type="application/ld+json">{"@context":"https://schema.org","@type":"NewsArticle","headline":"Just say no","datePublished":"2026-11-10T14:37:21+00:00","isAccessibleForFree":false}</script>"#,
+        );
+        let free = page(
+            r#"<script type="application/ld+json">{"@type":"NewsArticle","isAccessibleForFree":true}</script>"#,
+        );
+        assert!(is_preview_only(&paid));
+        assert!(!is_preview_only(&free));
+        // A paywalled part, as Google's guidance marks one, written as text.
+        let part = page(
+            r#"<script type="application/ld+json">{"@graph":[{"@type":"Article","hasPart":{"@type":"WebPageElement","isAccessibleForFree":"False","cssSelector":".paywall"}}]}</script>"#,
+        );
+        assert!(is_preview_only(&part));
+        // The words alone, outside JSON-LD, say nothing.
+        assert!(!is_preview_only(&page(
+            r#"<script>var post = {"isAccessibleForFree":false}</script>"#
+        )));
+        assert!(!is_preview_only(&page("")));
     }
 }

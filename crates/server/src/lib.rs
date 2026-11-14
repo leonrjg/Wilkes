@@ -1034,6 +1034,25 @@ async fn feeds_list_handler(
         .map_err(|error| server_err(format!("{error:#}")))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeedDiscoverBody {
+    address: String,
+}
+
+/// The feeds an address offers, each read to be sure it is one.
+async fn feed_discover_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<FeedDiscoverBody>,
+) -> Result<Json<Vec<wilkes_api::context::feeds::OfferedFeed>>, (StatusCode, Json<ErrorBody>)> {
+    state
+        .context()
+        .feed_discover(&body.address)
+        .await
+        .map(Json)
+        .map_err(|error| err(format!("{error:#}")))
+}
+
 /// Add a feed and refresh it. Its root must be one of the served library's.
 async fn feed_add_handler(
     State(state): State<Arc<AppState>>,
@@ -3018,8 +3037,12 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/literature/acquire", post(literature_acquire_handler))
         .route("/api/literature/browse", post(literature_browse_handler))
         .route("/api/feeds", get(feeds_list_handler).post(feed_add_handler))
+        .route("/api/feeds/discover", post(feed_discover_handler))
         .route("/api/feeds/refresh", post(feeds_refresh_handler))
-        .route("/api/feeds/refresh/cancel", post(feeds_refresh_cancel_handler))
+        .route(
+            "/api/feeds/refresh/cancel",
+            post(feeds_refresh_cancel_handler),
+        )
         .route("/api/feeds/items", get(feed_items_handler))
         .route("/api/feeds/items/{id}", post(feed_item_set_status_handler))
         .route(

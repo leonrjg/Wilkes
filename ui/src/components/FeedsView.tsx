@@ -1,7 +1,8 @@
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Check, Plus, RefreshCw, Square, Trash2, X } from "react-feather";
-import type { BrowseRequest, Feed, FeedItem } from "../lib/types";
+import type { BrowseRequest, Feed, FeedItem, OfferedFeed } from "../lib/types";
+import { api } from "../services";
 import { configuredLibraryRoots } from "../lib/configuredRoots";
 import { formatTimestampFullDate } from "../lib/dateFormatting";
 import { confirmDialog } from "../lib/utils/dialog";
@@ -83,7 +84,8 @@ export default function FeedsView({ readOnly }: { readOnly: boolean }) {
   );
 }
 
-/** A blog by its address: the feed itself, or a page that advertises one. */
+/** A blog by its address: the feed itself, or a page whose feeds are looked
+ *  up and, when it offers more than one, chosen among. */
 function AddFeedForm({ onDone }: { onDone: () => void }) {
   const add = useFeedsStore((s) => s.add);
   const directory = useSettingsStore((s) => s.directory);
@@ -99,6 +101,9 @@ function AddFeedForm({ onDone }: { onDone: () => void }) {
   const [autoImport, setAutoImport] = useState(false);
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
+  // The feeds the address offers, once looked up; null until then.
+  const [offered, setOffered] = useState<OfferedFeed[] | null>(null);
+  const [chosen, setChosen] = useState("");
 
   if (roots.length === 0) {
     return <Hint>Choose a library directory first: a feed's posts are written into one.</Hint>;
@@ -112,25 +117,57 @@ function AddFeedForm({ onDone }: { onDone: () => void }) {
         if (url.trim() === "" || busy) return;
         setBusy(true);
         setFailure(null);
-        add({
-          source: { kind: "syndication", url: url.trim() },
-          name: name.trim() === "" ? null : name.trim(),
-          root,
-          auto_import: autoImport,
-        })
-          .then(onDone)
-          .catch((error) => setFailure(`${error}`))
-          .finally(() => setBusy(false));
+        const follow = (feedUrl: string) =>
+          add({
+            source: { kind: "syndication", url: feedUrl },
+            name: name.trim() === "" ? null : name.trim(),
+            root,
+            auto_import: autoImport,
+          }).then(onDone);
+        const step =
+          offered !== null
+            ? follow(chosen)
+            : api.feedDiscover(url.trim()).then((feeds) => {
+                if (feeds.length === 1) return follow(feeds[0].url);
+                setOffered(feeds);
+                setChosen(feeds[0].url);
+              });
+        step.catch((error) => setFailure(`${error}`)).finally(() => setBusy(false));
       }}
     >
       <input
         value={url}
-        onChange={(event) => setUrl(event.target.value)}
+        onChange={(event) => {
+          setUrl(event.target.value);
+          setOffered(null);
+        }}
         placeholder="Blog or feed address"
         aria-label="Blog or feed address"
         autoFocus
         className="rounded border border-[var(--border-main)] bg-[var(--bg-sidebar)] px-1.5 py-1 text-[11px] text-[var(--text-main)] outline-none"
       />
+      {offered !== null && (
+        <fieldset className="flex flex-col gap-1 text-[10px]">
+          <legend className="mb-0.5 text-[var(--text-dim)]">This page offers {offered.length} feeds</legend>
+          {offered.map((feed) => (
+            <label key={feed.url} className="flex items-start gap-1.5">
+              <input
+                type="radio"
+                name="offered-feed"
+                value={feed.url}
+                checked={chosen === feed.url}
+                onChange={() => setChosen(feed.url)}
+                className="mt-0.5"
+              />
+              <span className="min-w-0">
+                <span className="text-[var(--text-main)]">{feed.title ?? feed.url}</span>
+                <span className="text-[var(--text-dim)]"> · {feed.entries} items</span>
+                <span className="block truncate text-[var(--text-dim)]">{feed.url}</span>
+              </span>
+            </label>
+          ))}
+        </fieldset>
+      )}
       <input
         value={name}
         onChange={(event) => setName(event.target.value)}
@@ -173,7 +210,7 @@ function AddFeedForm({ onDone }: { onDone: () => void }) {
           disabled={busy || url.trim() === ""}
           className="font-bold text-[var(--accent-blue)] hover:underline disabled:opacity-50"
         >
-          {busy ? "Adding…" : "Add feed"}
+          {offered === null ? (busy ? "Looking…" : "Add feed") : busy ? "Adding…" : "Follow this feed"}
         </button>
       </div>
     </form>

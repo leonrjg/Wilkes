@@ -99,6 +99,7 @@ import type {
   FeedsChanged,
   FeedUpdate,
   NewFeed,
+  OfferedFeed,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type {
@@ -682,6 +683,10 @@ export class TauriSearchApi implements SearchApi {
 
   async feedsList(): Promise<Feed[]> {
     return invoke<Feed[]>("feeds_list");
+  }
+
+  async feedDiscover(address: string): Promise<OfferedFeed[]> {
+    return invoke<OfferedFeed[]>("feed_discover", { address });
   }
 
   async feedAdd(feed: NewFeed): Promise<Feed> {
