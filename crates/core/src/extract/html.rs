@@ -36,7 +36,7 @@ pub const HTML_RECIPE: &str = "html-visible-v1";
 /// Elements removed with their contents, as the reader's sanitizer removes
 /// them (`STRIPPED` in `htmlDocument.ts`). Anything else is unwrapped there and
 /// keeps its text, so it keeps it here.
-const STRIPPED: &[&str] = &[
+pub(crate) const STRIPPED: &[&str] = &[
     "script", "style", "title", "head", "noscript", "template", "iframe", "frame", "frameset",
     "object", "embed", "applet", "form", "button", "select", "textarea", "canvas", "audio",
     "video", "svg", "math", "link", "meta", "base", "dialog", "portal",
