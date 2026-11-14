@@ -85,23 +85,17 @@ pub fn resolve(request: &FontRequest) -> anyhow::Result<ResolvedFont> {
         GenericFamily::Monospace => FamilyName::Monospace,
     };
     // The family the named font says it belongs to, when it is installed.
-    // Otherwise a guess from its name -- `Times-Bold`, `Arial,Italic`: what
-    // precedes the separator is the family as often as not, and costs nothing
-    // to try before the generic one.
-    let family = named
-        .as_ref()
-        .and_then(|handle| handle.load().ok())
-        .map(|font| font.family_name())
-        .or_else(|| {
-            request
-                .name
-                .split(['-', ','])
-                .next()
-                .filter(|family| !family.is_empty())
-                .map(str::to_string)
-        })
-        .map(FamilyName::Title);
-    let families: Vec<FamilyName> = family.into_iter().chain([generic]).collect();
+    // Otherwise guesses from its name, which cost nothing to try before the
+    // generic family.
+    let known: Vec<String> = match named.as_ref().and_then(|handle| handle.load().ok()) {
+        Some(font) => vec![font.family_name()],
+        None => family_guesses(&request.name),
+    };
+    let families: Vec<FamilyName> = known
+        .into_iter()
+        .map(FamilyName::Title)
+        .chain([generic])
+        .collect();
     let handle = source
         .select_best_match(&families, &properties)
         .map_err(|error| {
@@ -118,6 +112,34 @@ pub fn resolve(request: &FontRequest) -> anyhow::Result<ResolvedFont> {
         );
     }
     Ok(resolved)
+}
+
+/// The families a font's name may belong to, likeliest first. What precedes
+/// the separator is the family as often as not -- `Times-Bold`,
+/// `Arial,Italic` -- as written, or with the words it runs together set
+/// apart: `GillSans-ExtraBold` is a face of "Gill Sans".
+fn family_guesses(name: &str) -> Vec<String> {
+    let Some(stem) = name
+        .split(['-', ','])
+        .next()
+        .filter(|stem| !stem.is_empty())
+    else {
+        return Vec::new();
+    };
+    let mut spaced = String::with_capacity(stem.len() + 4);
+    let mut previous: Option<char> = None;
+    for character in stem.chars() {
+        if character.is_uppercase() && previous.is_some_and(char::is_lowercase) {
+            spaced.push(' ');
+        }
+        spaced.push(character);
+        previous = Some(character);
+    }
+    if spaced == stem {
+        vec![stem.to_string()]
+    } else {
+        vec![stem.to_string(), spaced]
+    }
 }
 
 /// A font [`resolve`] returned earlier, by its id.
@@ -280,6 +302,20 @@ mod tests {
     #[test]
     fn a_face_the_collection_does_not_have_is_an_error() {
         assert!(standalone(&collection(), 2).is_err());
+    }
+
+    #[test]
+    fn a_family_is_guessed_from_what_precedes_the_style() {
+        assert_eq!(
+            family_guesses("GillSans-ExtraBold"),
+            ["GillSans", "Gill Sans"]
+        );
+        assert_eq!(family_guesses("Arial,Italic"), ["Arial"]);
+        assert_eq!(
+            family_guesses("SourceSansPro-Regular"),
+            ["SourceSansPro", "Source Sans Pro"]
+        );
+        assert!(family_guesses("").is_empty());
     }
 
     #[test]
