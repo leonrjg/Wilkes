@@ -17,9 +17,11 @@ pub struct Provenance {
     pub author: Option<String>,
     pub link: String,
     pub published: Option<DateTime<Utc>>,
-    pub feed: String,
+    /// The feed it was imported from; none for a page saved from the browser.
+    pub feed: Option<String>,
     pub fetched: DateTime<Utc>,
-    pub item_id: String,
+    /// The feed item it was; none for a page saved from the browser.
+    pub item_id: Option<String>,
 }
 
 /// A fetched picture, ready to be written inside the file.
@@ -94,14 +96,18 @@ pub fn render(provenance: &Provenance, article_html: &str) -> String {
             &published.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         );
     }
-    meta("wilkes:feed", &provenance.feed);
+    if let Some(feed) = &provenance.feed {
+        meta("wilkes:feed", feed);
+    }
     meta(
         "wilkes:fetched",
         &provenance
             .fetched
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     );
-    meta("wilkes:feed-item", &provenance.item_id);
+    if let Some(item_id) = &provenance.item_id {
+        meta("wilkes:feed-item", item_id);
+    }
 
     let mut byline: Vec<String> = Vec::new();
     if let Some(author) = &provenance.author {
@@ -184,12 +190,12 @@ mod tests {
             author: Some("Gary Marcus".into()),
             link: "https://garymarcus.substack.com/p/report-from-the-vatican".into(),
             published: Utc.with_ymd_and_hms(2026, 10, 31, 15, 17, 33).single(),
-            feed: "Gary Marcus".into(),
+            feed: Some("Gary Marcus".into()),
             fetched: Utc
                 .with_ymd_and_hms(2026, 11, 14, 15, 2, 11)
                 .single()
                 .unwrap(),
-            item_id: "5f0c2d9e-8a41".into(),
+            item_id: Some("5f0c2d9e-8a41".into()),
         }
     }
 
@@ -217,10 +223,13 @@ mod tests {
         bare.title = None;
         bare.author = None;
         bare.published = None;
+        bare.feed = None;
+        bare.item_id = None;
         let html = render(&bare, "<p>Body.</p>");
         assert!(!html.contains("<title>"));
         assert!(!html.contains("name=\"author\""));
         assert!(!html.contains("wilkes:published"));
+        assert!(!html.contains("wilkes:feed"));
         assert!(!html.contains("<h1>"));
         assert!(!html.contains("content=\"\""));
     }
