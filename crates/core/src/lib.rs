@@ -14,6 +14,7 @@ pub mod metadata;
 pub mod models;
 pub mod network;
 pub mod path;
+pub mod pdf_edit;
 mod program;
 pub mod search;
 pub mod types;
