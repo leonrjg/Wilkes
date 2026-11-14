@@ -64,7 +64,7 @@ const INLINE: &[&str] = &[
 ];
 
 /// Elements that end a line of text where they open or close.
-const BLOCK: &[&str] = &[
+pub(crate) const BLOCK: &[&str] = &[
     "address",
     "article",
     "aside",
