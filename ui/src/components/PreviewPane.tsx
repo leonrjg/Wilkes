@@ -184,7 +184,6 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   );
   const [sidePanel, setSidePanel] = useState<ViewerSidePanel>(null);
   const [textView, setTextView] = useState<"source" | "rendered">("rendered");
-  const [editing, setEditing] = useState(false);
   const [openBookmarkTarget, setOpenBookmarkTarget] = useState<{
     id: string;
     anchor: ElementAnchor;
@@ -197,7 +196,6 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   useEffect(() => {
     setOpenBookmarkTarget(null);
     setDeletingBookmark(false);
-    setEditing(false);
   }, [selectedMatch?.path]);
 
   // A reflowable book's pages. Wilkes lays them out and
@@ -363,6 +361,15 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   // bookmark is drawn in -- is the same question for both.
   const isRenderableFile = isMarkdownFile || isHtmlFile;
   const renderedFileLabel = isHtmlFile ? "HTML" : "Markdown";
+  // A text document has one toggle between viewing and its source. Where the
+  // editor is available the source is edited in it; the standalone viewer has
+  // no editor, and there only a renderable document has a source to switch to.
+  const isTextFile = !isPagedFile && displayData != null && "Text" in displayData;
+  const canEdit = !standalone && isTextFile;
+  const editingSource = canEdit && textView === "source";
+  const viewToggleLabel = textView === "rendered"
+    ? (canEdit ? "Edit document" : `View ${renderedFileLabel} source`)
+    : (isRenderableFile ? `View rendered ${renderedFileLabel}` : "View document");
   const shouldRestoreSourceScroll =
     !isPagedFile &&
     "TextFile" in selectedMatch.origin &&
@@ -724,31 +731,18 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
           </button>
         </Tooltip>}
 
-        {isRenderableFile && (
-          <Tooltip content={textView === "rendered" ? `View ${renderedFileLabel} source` : `View rendered ${renderedFileLabel}`}>
+        {(isRenderableFile || canEdit) && (
+          <Tooltip content={viewToggleLabel}>
             <button
               type="button"
               onClick={() => setRememberedTextView(textView === "rendered" ? "source" : "rendered")}
-              aria-label={textView === "rendered" ? `View ${renderedFileLabel} source` : `View rendered ${renderedFileLabel}`}
-              className="inline-flex p-1 rounded border border-[var(--border-main)] bg-[var(--bg-active)] text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-header)] hover:text-[var(--text-main)]"
+              aria-label={viewToggleLabel}
+              aria-pressed={canEdit ? editingSource : undefined}
+              className={`inline-flex p-1 rounded border border-[var(--border-main)] text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-header)] hover:text-[var(--text-main)] ${
+                editingSource ? "bg-[var(--bg-active)] text-[var(--text-main)]" : "bg-[var(--bg-active)]"
+              }`}
             >
-              {textView === "rendered" ? <Code size={16} /> : <Eye size={16} />}
-            </button>
-          </Tooltip>
-        )}
-
-        {!standalone && !isPagedFile && displayData && "Text" in displayData && (
-          <Tooltip content={editing ? "Return to document viewer" : "Edit document"}>
-            <button
-              type="button"
-              onClick={() => {
-                setEditing((current) => !current);
-                if (!editing) setRememberedTextView("source");
-              }}
-              aria-label={editing ? "Finish editing document" : "Edit document"}
-              className={`inline-flex rounded border border-[var(--border-main)] p-1 text-[var(--text-dim)] ${editing ? "bg-[var(--bg-active)] text-[var(--text-main)]" : ""}`}
-            >
-              <Edit3 size={16} />
+              {textView === "source" ? <Eye size={16} /> : canEdit ? <Edit3 size={16} /> : <Code size={16} />}
             </button>
           </Tooltip>
         )}
@@ -857,7 +851,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
                 decorations={readerDecorations}
                 slots={{ selectionActions: selectionActionsSlot }}
               />
-            ) : displayData && "Text" in displayData && editing ? (
+            ) : displayData && "Text" in displayData && editingSource ? (
               <DocumentEditor
                 content={displayData.Text.content}
                 language={displayData.Text.language}

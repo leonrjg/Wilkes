@@ -28,6 +28,7 @@
 
 ### Changed
 
+- A text document has one toggle in the viewer's toolbar, between viewing it and editing it; the separate Edit button is gone. For Markdown and HTML, editing takes the place of the read-only source view, so the toggle goes between the rendered page and the editor. Other text files go between the read-only view and the editor. The choice is remembered per document, as the view/source choice was. The standalone viewer, which has no editor, keeps the read-only source.
 - **API change:** `POST /api/catalogue/acquire` and the desktop `catalogue_acquire` command are removed. A result with a direct file, from a catalogue or any other provider, is added with `POST /api/literature/acquire` (desktop `literature_acquire`), so its provider decides what the file is called. Byte progress still arrives on `catalogue-download-progress`.
 - The Python worker's dependencies are pinned and locked per environment, so every install gets the same versions. `semantic-text-splitter`, `sqlite-vec` and PyMuPDF, which it never used, are gone.
 

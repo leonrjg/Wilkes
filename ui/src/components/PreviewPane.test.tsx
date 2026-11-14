@@ -224,7 +224,7 @@ describe("PreviewPane", () => {
     });
   });
 
-  it("defaults Markdown files to rendered and toggles to source with an icon button", () => {
+  it("defaults Markdown files to rendered and toggles to editing its source with an icon button", () => {
     setViewerState({
       selectedMatch: { path: "markdown-toggle.md", origin: { TextFile: { line: 1, col: 0 } } },
       previewData: {
@@ -251,7 +251,7 @@ describe("PreviewPane", () => {
     render(<PreviewPane />);
 
     expect(screen.getByTestId("markdown-viewer")).toBeInTheDocument();
-    const toggle = screen.getByRole("button", { name: "View Markdown source" });
+    const toggle = screen.getByRole("button", { name: "Edit document" });
     expect(toggle.querySelector("svg")).toBeInTheDocument();
     expect(mockMarkdownViewer.mock.calls.at(-1)?.[0]).toEqual(
       expect.objectContaining({
@@ -271,12 +271,15 @@ describe("PreviewPane", () => {
 
     fireEvent.click(toggle);
 
-    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    expect(screen.getByTestId("document-editor")).toBeInTheDocument();
+    expect(screen.queryByTestId("code-viewer")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "View rendered Markdown" }).querySelector("svg"))
       .toBeInTheDocument();
+    // The one toggle is the only way in: there is no separate edit button.
+    expect(screen.getAllByRole("button", { name: /Edit document|View rendered Markdown/ })).toHaveLength(1);
   });
 
-  it("defaults HTML files to rendered and toggles to source with an icon button", () => {
+  it("defaults HTML files to rendered and toggles to editing its source with an icon button", () => {
     setViewerState({
       selectedMatch: { path: "page.html", origin: { TextFile: { line: 1, col: 0 } } },
       previewData: {
@@ -322,11 +325,9 @@ describe("PreviewPane", () => {
       }),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "View HTML source" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit document" }));
 
-    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
-    expect(decorationFor(mockCodeViewer.mock.calls.at(-1)?.[0], "html-bookmark").className)
-      .toBe("cm-bookmark-highlight");
+    expect(screen.getByTestId("document-editor")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "View rendered HTML" })).toBeInTheDocument();
   });
 
@@ -346,8 +347,51 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
 
-    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    expect(screen.getByTestId("document-editor")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "View rendered HTML" })).toBeInTheDocument();
+  });
+
+  it("toggles a plain text file between its read-only view and the editor", () => {
+    setViewerState({
+      selectedMatch: { path: "/docs/notes.txt", origin: { TextFile: { line: 0, col: 0 } } },
+      previewData: {
+        Text: {
+          content: "plain notes",
+          language: "plaintext",
+          highlight_line: 0,
+          highlight_range: { start: 0, end: 0 },
+        },
+      },
+    });
+
+    render(<PreviewPane />);
+
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit document" }));
+    expect(screen.getByTestId("document-editor")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "View document" }));
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+  });
+
+  it("shows read-only source in the standalone viewer, which has no editor", () => {
+    setViewerState({
+      selectedMatch: { path: "standalone.md", origin: { TextFile: { line: 0, col: 0 } } },
+      previewData: {
+        Text: {
+          content: "# Notes",
+          language: "markdown",
+          highlight_line: 0,
+          highlight_range: { start: 0, end: 0 },
+        },
+      },
+    });
+
+    render(<PreviewPane standalone />);
+
+    expect(screen.queryByRole("button", { name: "Edit document" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "View Markdown source" }));
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    expect(screen.queryByTestId("document-editor")).not.toBeInTheDocument();
   });
 
   it("offers the readers a URL for the files a document sits beside", () => {
@@ -404,7 +448,7 @@ describe("PreviewPane", () => {
 
     render(<PreviewPane />);
 
-    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    expect(screen.getByTestId("document-editor")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "View rendered Markdown" })).toBeInTheDocument();
   });
 
