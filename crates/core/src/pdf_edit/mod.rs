@@ -39,6 +39,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use mupdf::pdf::{PdfAnnotationType, PdfDocument, PdfObject, PdfPage, PdfWriteOptions};
 use mupdf::{Buffer, Font, Matrix, Rect, Size};
 use serde::Deserialize;
@@ -51,6 +52,20 @@ pub use geometry::Area;
 #[serde(rename_all = "camelCase")]
 pub struct EditExport {
     pub pages: Vec<ExportPage>,
+    /// Fonts the text is set in that are not installed fonts: the document's
+    /// own, which the reader made typeable and sends with its file.
+    #[serde(default)]
+    pub fonts: Vec<ExportFont>,
+}
+
+/// A font that came with the edits.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportFont {
+    /// What the text's [`TextChunk::font`] calls it.
+    pub id: String,
+    /// The font file, base64.
+    pub data: String,
 }
 
 /// One page of the result. Everything is in the page's own space: points,
@@ -90,7 +105,7 @@ pub struct TextChunk {
     pub x: f32,
     pub baseline: f32,
     pub text: String,
-    /// A font id from [`fonts::resolve`].
+    /// A font id from [`fonts::resolve`], or one of [`EditExport::fonts`].
     pub font: String,
     pub size: f32,
     pub color: [u8; 3],
@@ -776,19 +791,36 @@ impl FontTable {
 
         let mut fonts = HashMap::new();
         for (number, (id, text)) in text_in.into_iter().enumerate() {
-            let resolved = fonts::load(id)?;
-            let font = Font::from_bytes(id, &resolved.data)
+            let data = match export.fonts.iter().find(|font| font.id == id) {
+                Some(sent) => STANDARD
+                    .decode(&sent.data)
+                    .with_context(|| format!("font {id} came with the edits unreadable"))?,
+                None => fonts::load(id)?.data,
+            };
+            // The name MuPDF gives the embedded font: a sent font's id says
+            // where it came from in characters a PDF name would escape.
+            let name: String = id
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            let font = Font::from_bytes(&name, &data)
                 .with_context(|| format!("MuPDF could not read font {id}"))?;
             let glyphs: BTreeSet<u16> = glyph_ids(&font, &text).into_iter().collect();
-            let cut = subset::subset(&resolved.data, &glyphs)
+            let cut = subset::subset(&data, &glyphs)
                 .with_context(|| format!("cutting font {id} down to what is used"))?;
             debug!(
                 "pdf_edit: font {id}: {} glyph(s) used, {} of {} bytes embedded",
                 glyphs.len(),
                 cut.len(),
-                resolved.data.len()
+                data.len()
             );
-            let embedded = Font::from_bytes(id, &cut)
+            let embedded = Font::from_bytes(&name, &cut)
                 .with_context(|| format!("MuPDF could not read the subset of font {id}"))?;
             let object = doc.add_font(&embedded)?;
             let name = format!("WkF{number}");

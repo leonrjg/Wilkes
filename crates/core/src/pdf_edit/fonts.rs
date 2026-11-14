@@ -8,9 +8,12 @@
 //!
 //! The font is the system's: the document's own face if it is installed,
 //! otherwise the platform's serif, sans-serif or monospace at the same weight
-//! and slant. That is a substitution, and a visible one in a document set in a
-//! face nobody has installed; it is the honest alternative to drawing new
-//! characters in a font that does not contain them.
+//! and slant. That is a substitution, and would be a visible one in a document
+//! set in a face nobody has installed -- so the reader does not set text in it
+//! where it can help it. Where the document's own subset has a character, the
+//! reader sets it in that, made typeable, and sends the file with the edits
+//! ([`super::EditExport::fonts`]); the font resolved here is what stands in
+//! for the characters the subset never had.
 
 use std::sync::Arc;
 
