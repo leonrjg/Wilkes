@@ -814,6 +814,23 @@ export default function SettingsModal({
                   </section>
 
                   <section>
+                    <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Editor</h3>
+                    <label className="flex items-start gap-2.5 cursor-pointer group">
+                      <input
+                        type="checkbox"
+                        aria-label="Show line numbers in the editor"
+                        checked={settings.editor_line_numbers}
+                        onChange={(e) => handleUpdateSettings({ editor_line_numbers: e.target.checked })}
+                        className="mt-0.5 w-3.5 h-3.5 rounded border-[var(--border-strong)] bg-[var(--bg-input)] text-[var(--accent-blue)] focus:ring-[var(--accent-blue)] focus:ring-offset-[var(--bg-app)]"
+                      />
+                      <span className="flex flex-col">
+                        <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Show line numbers in the editor</span>
+                        <span className="text-[10px] text-[var(--text-dim)] italic">The gutter beside documents opened for editing</span>
+                      </span>
+                    </label>
+                  </section>
+
+                  <section>
                     <h3 className="text-[10px] font-medium text-[var(--text-dim)] mb-2 uppercase tracking-wider">Reader</h3>
                     <div className="space-y-3">
                       <div className="space-y-1">

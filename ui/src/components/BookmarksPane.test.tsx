@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import BookmarksPane from "./BookmarksPane";
 import { ToastProvider } from "./Toast";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
-import { useViewerStore } from "../stores/useViewerStore";
+import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
 import { useGenerationStore } from "../stores/useGenerationStore";
@@ -76,9 +76,11 @@ describe("BookmarksPane", () => {
         origin: { PdfPage: { page: 1, bbox: null } },
       } as const;
     useViewerStore.setState({
-      activeTabId: "current-tab",
+      panes: [{ id: "pane", activeTabId: "current-tab" }],
+      focusedPaneId: "pane",
       tabs: [{
         id: "current-tab",
+        paneId: "pane",
         path: match.path,
         match,
         history: [match],
@@ -150,9 +152,11 @@ describe("BookmarksPane", () => {
         origin: { TextFile: { line: 1, col: 0 } },
       } as const;
     useViewerStore.setState({
-      activeTabId: "text-tab",
+      panes: [{ id: "pane", activeTabId: "text-tab" }],
+      focusedPaneId: "pane",
       tabs: [{
         id: "text-tab",
+        paneId: "pane",
         path: match.path,
         match,
         history: [match],
@@ -215,7 +219,7 @@ describe("BookmarksPane", () => {
     act(() => {
       useViewerStore.setState((state) => ({
         tabs: state.tabs.map((tab) =>
-          tab.id === state.activeTabId
+          tab.id === activeViewerTab(state)?.id
             ? {
                 ...tab,
                 path: otherMatch.path,

@@ -4,6 +4,8 @@ import type { MatchRef, PreviewData } from "../lib/types";
 import { useSettingsStore } from "./useSettingsStore";
 import {
   activeViewerTab,
+  paneActiveTab,
+  paneTabs,
   useViewerStore,
   VIEWER_SESSION_STORAGE_KEY,
 } from "./useViewerStore";
@@ -45,7 +47,7 @@ describe("useViewerStore", () => {
     useViewerStore.setState({
       mode: "workspace",
       tabs: [],
-      activeTabId: null,
+      panes: [], focusedPaneId: null,
       sessionHydrated: false,
     });
     localStorage.clear();
@@ -113,21 +115,21 @@ describe("useViewerStore", () => {
 
   it("creates one tab per path and activates an existing tab on reopen", () => {
     useViewerStore.getState().openMatch(textMatch("/docs/one.txt"));
-    const firstId = useViewerStore.getState().activeTabId;
+    const firstId = (activeViewerTab(useViewerStore.getState())?.id ?? null);
     useViewerStore.getState().openMatch(textMatch("/docs/two.txt"));
     useViewerStore.getState().openMatch(textMatch("/docs/one.txt"));
 
     expect(useViewerStore.getState().tabs).toHaveLength(2);
-    expect(useViewerStore.getState().activeTabId).toBe(firstId);
+    expect((activeViewerTab(useViewerStore.getState())?.id ?? null)).toBe(firstId);
     expect(api.getFileMetadata).toHaveBeenCalledTimes(2);
   });
 
   it("keeps independent histories per tab", () => {
     useViewerStore.getState().openMatch(textMatch("/docs/one.txt", 1));
     useViewerStore.getState().openMatch(textMatch("/docs/one.txt", 5));
-    const firstId = useViewerStore.getState().activeTabId!;
+    const firstId = (activeViewerTab(useViewerStore.getState())?.id ?? null)!;
     useViewerStore.getState().openMatch(textMatch("/docs/two.txt", 3));
-    const secondId = useViewerStore.getState().activeTabId!;
+    const secondId = (activeViewerTab(useViewerStore.getState())?.id ?? null)!;
 
     useViewerStore.getState().goBack();
     expect(activeViewerTab(useViewerStore.getState())?.match.origin).toEqual({
@@ -168,26 +170,26 @@ describe("useViewerStore", () => {
 
     useViewerStore.getState().activateTab(two.id);
     useViewerStore.getState().closeTab(two.id);
-    expect(useViewerStore.getState().activeTabId).toBe(three.id);
+    expect((activeViewerTab(useViewerStore.getState())?.id ?? null)).toBe(three.id);
 
     useViewerStore.getState().closeTab(three.id);
-    expect(useViewerStore.getState().activeTabId).toBe(one.id);
+    expect((activeViewerTab(useViewerStore.getState())?.id ?? null)).toBe(one.id);
 
     useViewerStore.getState().closeTab(one.id);
     expect(useViewerStore.getState()).toEqual(
-      expect.objectContaining({ tabs: [], activeTabId: null }),
+      expect.objectContaining({ tabs: [], panes: [], focusedPaneId: null }),
     );
   });
 
   it("does not change the active tab when closing an inactive path", () => {
     useViewerStore.getState().openFile("/docs/one.txt");
-    const oneId = useViewerStore.getState().activeTabId;
+    const oneId = (activeViewerTab(useViewerStore.getState())?.id ?? null);
     useViewerStore.getState().openFile("/docs/two.txt");
-    const twoId = useViewerStore.getState().activeTabId;
+    const twoId = (activeViewerTab(useViewerStore.getState())?.id ?? null);
 
     useViewerStore.getState().closePath("/docs/one.txt");
 
-    expect(useViewerStore.getState().activeTabId).toBe(twoId);
+    expect((activeViewerTab(useViewerStore.getState())?.id ?? null)).toBe(twoId);
     expect(useViewerStore.getState().tabs.map((tab) => tab.id)).not.toContain(oneId);
   });
 
@@ -197,7 +199,7 @@ describe("useViewerStore", () => {
       .mockResolvedValueOnce(textPreview("second"));
 
     useViewerStore.getState().openFile("/docs/one.txt");
-    const firstId = useViewerStore.getState().activeTabId!;
+    const firstId = (activeViewerTab(useViewerStore.getState())?.id ?? null)!;
     useViewerStore.getState().openFile("/docs/two.txt");
     await vi.waitFor(() =>
       expect(useViewerStore.getState().tabs.every((tab) => !tab.previewLoading)).toBe(true),
@@ -277,8 +279,11 @@ describe("useViewerStore", () => {
           path: "/docs/one.txt",
           history: [textMatch("/docs/one.txt", 3)],
           historyIndex: 0,
+          pane: 0,
         }],
         activePath: "/docs/one.txt",
+        paneActivePaths: ["/docs/one.txt"],
+        focusedPane: 0,
       },
       version: 1,
     });
@@ -296,7 +301,7 @@ describe("useViewerStore", () => {
     useViewerStore.getState().activateTab(firstId);
     const persisted = localStorage.getItem(VIEWER_SESSION_STORAGE_KEY)!;
 
-    useViewerStore.setState({ tabs: [], activeTabId: null, sessionHydrated: false });
+    useViewerStore.setState({ tabs: [], panes: [], focusedPaneId: null, sessionHydrated: false });
     localStorage.setItem(VIEWER_SESSION_STORAGE_KEY, persisted);
     vi.clearAllMocks();
     vi.mocked(api.preview).mockImplementation(async (match) => textPreview(match.path));
@@ -361,7 +366,7 @@ describe("useViewerStore", () => {
     await useViewerStore.getState().restoreSession();
     expect(useViewerStore.getState().tabs).toEqual([]);
 
-    useViewerStore.setState({ tabs: [], activeTabId: null, sessionHydrated: false });
+    useViewerStore.setState({ tabs: [], panes: [], focusedPaneId: null, sessionHydrated: false });
     localStorage.setItem(
       VIEWER_SESSION_STORAGE_KEY,
       JSON.stringify({ version: 1, state: { tabs: [{ path: 42 }], activePath: 42 } }),
@@ -371,7 +376,7 @@ describe("useViewerStore", () => {
     expect(useViewerStore.getState().tabs).toEqual([]);
     expect(api.preview).not.toHaveBeenCalled();
 
-    useViewerStore.setState({ tabs: [], activeTabId: null, sessionHydrated: false });
+    useViewerStore.setState({ tabs: [], panes: [], focusedPaneId: null, sessionHydrated: false });
     localStorage.setItem(VIEWER_SESSION_STORAGE_KEY, "{not valid JSON");
 
     await expect(useViewerStore.getState().restoreSession()).resolves.toBeUndefined();
@@ -390,7 +395,7 @@ describe("useViewerStore", () => {
       ),
     );
 
-    useViewerStore.getState().retryTab(useViewerStore.getState().activeTabId!);
+    useViewerStore.getState().retryTab((activeViewerTab(useViewerStore.getState())?.id ?? null)!);
 
     await vi.waitFor(() =>
       expect(activeViewerTab(useViewerStore.getState())?.previewData).toEqual(
@@ -437,12 +442,175 @@ describe("useViewerStore", () => {
 
     await useViewerStore.getState().restoreSession();
     expect(api.preview).toHaveBeenCalledTimes(1);
-    const activeId = useViewerStore.getState().activeTabId!;
+    const activeId = (activeViewerTab(useViewerStore.getState())?.id ?? null)!;
 
     useViewerStore.getState().closeTab(activeId);
 
     expect(activeViewerTab(useViewerStore.getState())?.path).toBe("/docs/two.txt");
     expect(api.preview).toHaveBeenCalledTimes(2);
     expect(api.preview).toHaveBeenLastCalledWith(textMatch("/docs/two.txt"));
+  });
+
+  describe("panes", () => {
+    const open = (...paths: string[]) => {
+      for (const path of paths) useViewerStore.getState().openMatch(textMatch(path));
+    };
+    const tabId = (path: string) =>
+      useViewerStore.getState().tabs.find((tab) => tab.path === path)!.id;
+    /** Each pane's tabs, left to right, with the one it shows starred. */
+    const layout = () => {
+      const state = useViewerStore.getState();
+      return state.panes.map((pane) =>
+        paneTabs(state, pane.id).map((tab) => {
+          const name = tab.path.replace("/docs/", "").replace(".txt", "");
+          return pane.activeTabId === tab.id ? `${name}*` : name;
+        }),
+      );
+    };
+    const focused = () => {
+      const state = useViewerStore.getState();
+      return state.panes.findIndex((pane) => pane.id === state.focusedPaneId);
+    };
+
+    it("splits tabs off into as many panes as asked, each to the right of its own", () => {
+      open("/docs/one.txt", "/docs/two.txt", "/docs/three.txt", "/docs/four.txt");
+
+      useViewerStore.getState().splitTab(tabId("/docs/four.txt"));
+      useViewerStore.getState().focusPane(useViewerStore.getState().panes[0].id);
+      useViewerStore.getState().splitTab(tabId("/docs/two.txt"));
+
+      expect(layout()).toEqual([["one", "three*"], ["two*"], ["four*"]]);
+      expect(focused()).toBe(1);
+      expect(activeViewerTab(useViewerStore.getState())?.path).toBe("/docs/two.txt");
+    });
+
+    it("does not split a pane's only tab away from it", () => {
+      open("/docs/one.txt");
+
+      useViewerStore.getState().splitTab(tabId("/docs/one.txt"));
+
+      expect(layout()).toEqual([["one*"]]);
+    });
+
+    it("opens new documents in the focused pane", () => {
+      open("/docs/one.txt", "/docs/two.txt");
+      useViewerStore.getState().splitTab(tabId("/docs/two.txt"));
+
+      open("/docs/three.txt");
+      useViewerStore.getState().focusPane(useViewerStore.getState().panes[0].id);
+      open("/docs/four.txt");
+
+      expect(layout()).toEqual([["one", "four*"], ["two", "three*"]]);
+      expect(focused()).toBe(0);
+    });
+
+    it("shows a document already open in another pane there instead of opening it twice", () => {
+      open("/docs/one.txt", "/docs/two.txt");
+      useViewerStore.getState().splitTab(tabId("/docs/two.txt"));
+      useViewerStore.getState().focusPane(useViewerStore.getState().panes[0].id);
+
+      useViewerStore.getState().openMatch(textMatch("/docs/two.txt", 9));
+
+      const state = useViewerStore.getState();
+      expect(state.tabs.filter((tab) => tab.path === "/docs/two.txt")).toHaveLength(1);
+      expect(focused()).toBe(1);
+      expect(activeViewerTab(state)?.match).toEqual(textMatch("/docs/two.txt", 9));
+    });
+
+    it("moves a tab between panes, closing a pane it leaves empty", () => {
+      open("/docs/one.txt", "/docs/two.txt", "/docs/three.txt");
+      useViewerStore.getState().splitTab(tabId("/docs/two.txt"));
+      useViewerStore.getState().splitTab(tabId("/docs/three.txt"));
+      // Each split opens directly right of the pane the tab came from.
+      expect(layout()).toEqual([["one*"], ["three*"], ["two*"]]);
+
+      const [first] = useViewerStore.getState().panes;
+      useViewerStore.getState().moveTabToPane(tabId("/docs/two.txt"), first.id);
+
+      expect(layout()).toEqual([["one", "two*"], ["three*"]]);
+      expect(focused()).toBe(0);
+    });
+
+    it("loads the tab every pane shows", () => {
+      open("/docs/one.txt", "/docs/two.txt", "/docs/three.txt");
+      useViewerStore.getState().splitTab(tabId("/docs/three.txt"));
+      useViewerStore.setState((state) => ({
+        tabs: state.tabs.map((tab) => ({ ...tab, previewData: null, previewLoading: false })),
+      }));
+      vi.mocked(api.preview).mockClear();
+
+      useViewerStore.getState().splitTab(tabId("/docs/two.txt"));
+
+      expect(vi.mocked(api.preview).mock.calls.map(([match]) => match.path).sort())
+        .toEqual(["/docs/one.txt", "/docs/three.txt", "/docs/two.txt"]);
+    });
+
+    it("hands the focus to the pane that took a closed pane's place, else the one left of it", () => {
+      open("/docs/one.txt", "/docs/two.txt", "/docs/three.txt");
+      useViewerStore.getState().splitTab(tabId("/docs/two.txt"));
+      useViewerStore.getState().splitTab(tabId("/docs/three.txt"));
+      useViewerStore.getState().focusPane(useViewerStore.getState().panes[1].id);
+
+      useViewerStore.getState().closeTab(tabId("/docs/two.txt"));
+      expect(layout()).toEqual([["one*"], ["three*"]]);
+      expect(focused()).toBe(1);
+
+      useViewerStore.getState().closeTab(tabId("/docs/three.txt"));
+      expect(layout()).toEqual([["one*"]]);
+      expect(focused()).toBe(0);
+    });
+
+    it("closes one pane's tabs, or joins every pane back into the first", () => {
+      open("/docs/one.txt", "/docs/two.txt", "/docs/three.txt", "/docs/four.txt");
+      useViewerStore.getState().splitTab(tabId("/docs/three.txt"));
+      useViewerStore.getState().splitTab(tabId("/docs/four.txt"));
+
+      expect(layout()).toEqual([["one", "two*"], ["four*"], ["three*"]]);
+
+      useViewerStore.getState().closePane(useViewerStore.getState().panes[1].id);
+      expect(layout()).toEqual([["one", "two*"], ["three*"]]);
+
+      // The tab being worked with stays the one shown.
+      useViewerStore.getState().joinPanes();
+      expect(layout()).toEqual([["one", "two", "three*"]]);
+      expect(focused()).toBe(0);
+    });
+
+    it("restores every pane, the tab each shows and which has the focus", async () => {
+      open("/docs/one.txt", "/docs/two.txt", "/docs/three.txt", "/docs/four.txt");
+      useViewerStore.getState().splitTab(tabId("/docs/three.txt"));
+      useViewerStore.getState().splitTab(tabId("/docs/four.txt"));
+      useViewerStore.getState().activateTab(tabId("/docs/one.txt"));
+      useViewerStore.getState().focusPane(useViewerStore.getState().panes[1].id);
+      const persisted = localStorage.getItem(VIEWER_SESSION_STORAGE_KEY)!;
+
+      useViewerStore.setState({ tabs: [], panes: [], focusedPaneId: null, sessionHydrated: false });
+      localStorage.setItem(VIEWER_SESSION_STORAGE_KEY, persisted);
+      await useViewerStore.getState().restoreSession();
+
+      expect(layout()).toEqual([["one*", "two"], ["four*"], ["three*"]]);
+      expect(focused()).toBe(1);
+      expect(activeViewerTab(useViewerStore.getState())?.path).toBe("/docs/four.txt");
+      expect(paneActiveTab(useViewerStore.getState(), useViewerStore.getState().panes[2].id)?.path)
+        .toBe("/docs/three.txt");
+    });
+
+    it("restores a session saved before panes into one", async () => {
+      localStorage.setItem(VIEWER_SESSION_STORAGE_KEY, JSON.stringify({
+        state: {
+          tabs: [
+            { path: "/docs/one.txt", history: [textMatch("/docs/one.txt")], historyIndex: 0 },
+            { path: "/docs/two.txt", history: [textMatch("/docs/two.txt")], historyIndex: 0 },
+          ],
+          activePath: "/docs/two.txt",
+        },
+        version: 1,
+      }));
+
+      await useViewerStore.getState().restoreSession();
+
+      expect(layout()).toEqual([["one", "two*"]]);
+      expect(focused()).toBe(0);
+    });
   });
 });

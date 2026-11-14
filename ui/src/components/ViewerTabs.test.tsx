@@ -1,14 +1,14 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import { useEditorStore } from "../stores/useEditorStore";
-import { useViewerStore, type ViewerTab } from "../stores/useViewerStore";
+import { activeViewerTab, useViewerStore, type ViewerTab } from "../stores/useViewerStore";
 import { ToastProvider } from "./Toast";
 import ViewerTabs from "./ViewerTabs";
 
 function renderTabs() {
   return render(
     <ToastProvider>
-      <ViewerTabs />
+      <ViewerTabs paneId="pane" />
     </ToastProvider>,
   );
 }
@@ -21,6 +21,7 @@ function tab(id: string, path: string): ViewerTab {
   return {
     id,
     path,
+    paneId: "pane",
     match,
     history: [match],
     historyIndex: 0,
@@ -43,7 +44,8 @@ describe("ViewerTabs", () => {
         tab("two", "/other/two.txt"),
         tab("three", "/docs/three.txt"),
       ],
-      activeTabId: "one",
+      panes: [{ id: "pane", activeTabId: "one" }],
+      focusedPaneId: "pane",
     });
   });
 
@@ -62,7 +64,7 @@ describe("ViewerTabs", () => {
 
     fireEvent.click(screen.getByRole("tab", { name: "two.txt" }));
 
-    expect(useViewerStore.getState().activeTabId).toBe("two");
+    expect((activeViewerTab(useViewerStore.getState())?.id ?? null)).toBe("two");
     expect(screen.getByRole("tab", { name: "two.txt" })).toHaveAttribute(
       "aria-selected",
       "true",
@@ -74,13 +76,13 @@ describe("ViewerTabs", () => {
     const first = screen.getByRole("tab", { name: "one.txt" });
 
     fireEvent.keyDown(first, { key: "ArrowRight" });
-    expect(useViewerStore.getState().activeTabId).toBe("two");
+    expect((activeViewerTab(useViewerStore.getState())?.id ?? null)).toBe("two");
 
     fireEvent.keyDown(screen.getByRole("tab", { name: "two.txt" }), { key: "End" });
-    expect(useViewerStore.getState().activeTabId).toBe("three");
+    expect((activeViewerTab(useViewerStore.getState())?.id ?? null)).toBe("three");
 
     fireEvent.keyDown(screen.getByRole("tab", { name: "three.txt" }), { key: "Home" });
-    expect(useViewerStore.getState().activeTabId).toBe("one");
+    expect((activeViewerTab(useViewerStore.getState())?.id ?? null)).toBe("one");
   });
 
   it("closes tabs from the close button, Delete key, and middle click", () => {
@@ -113,7 +115,7 @@ describe("ViewerTabs", () => {
     fireEvent.contextMenu(screen.getByRole("tab", { name: "three.txt" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "Open" }));
 
-    expect(useViewerStore.getState().activeTabId).toBe("three");
+    expect((activeViewerTab(useViewerStore.getState())?.id ?? null)).toBe("three");
   });
 
   it("closes the right-clicked tab from the context menu", () => {
@@ -123,7 +125,7 @@ describe("ViewerTabs", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Close" }));
 
     expect(useViewerStore.getState().tabs.map((tab) => tab.id)).toEqual(["one", "three"]);
-    expect(useViewerStore.getState().activeTabId).toBe("one");
+    expect((activeViewerTab(useViewerStore.getState())?.id ?? null)).toBe("one");
   });
 
   it("closes every tab from the context menu", () => {
@@ -133,7 +135,7 @@ describe("ViewerTabs", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Close All" }));
 
     expect(useViewerStore.getState().tabs).toEqual([]);
-    expect(useViewerStore.getState().activeTabId).toBeNull();
+    expect((activeViewerTab(useViewerStore.getState())?.id ?? null)).toBeNull();
   });
 
   it("pins another viewer tab into the active editor completion scope", () => {
@@ -149,6 +151,102 @@ describe("ViewerTabs", () => {
       mode: "prefer",
       pinned: ["/other/two.txt"],
       excluded: [],
+    });
+  });
+
+  describe("with several panes", () => {
+    beforeEach(() => {
+      useViewerStore.setState({
+        tabs: [
+          { ...tab("one", "/docs/one.txt"), paneId: "left" },
+          { ...tab("two", "/other/two.txt"), paneId: "middle" },
+          { ...tab("four", "/docs/four.txt"), paneId: "middle" },
+          { ...tab("three", "/docs/three.txt"), paneId: "right" },
+        ],
+        panes: [
+          { id: "left", activeTabId: "one" },
+          { id: "middle", activeTabId: "two" },
+          { id: "right", activeTabId: "three" },
+        ],
+        focusedPaneId: "middle",
+      });
+    });
+
+    const renderPane = (paneId: string) =>
+      render(
+        <ToastProvider>
+          <ViewerTabs paneId={paneId} />
+        </ToastProvider>,
+      );
+
+    it("shows only its own pane's tabs, says which pane it is, and marks the focused one", () => {
+      renderPane("middle");
+
+      expect(screen.getByRole("tablist", { name: "Open documents, pane 2 of 3" })).toBeInTheDocument();
+      expect(screen.getAllByRole("tab").map((element) => element.textContent)).toEqual(["two.txt", "four.txt"]);
+      expect(screen.getByRole("tab", { name: "two.txt" })).toHaveAttribute("aria-controls", "viewer-tabpanel-middle");
+      expect(screen.getByRole("tab", { name: "two.txt" }).closest(".group")).toHaveClass("border-t-[var(--accent-blue)]");
+    });
+
+    it("does not mark the active tab of an unfocused pane as focused", () => {
+      renderPane("left");
+
+      expect(screen.getByRole("tab", { name: "one.txt" }).closest(".group")).toHaveClass("border-t-[var(--border-strong)]");
+    });
+
+    it("splits a tab off to the right of its pane", () => {
+      renderPane("middle");
+
+      fireEvent.contextMenu(screen.getByRole("tab", { name: "four.txt" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: "Split Right" }));
+
+      const state = useViewerStore.getState();
+      expect(state.panes.map((pane) => pane.id)).toHaveLength(4);
+      expect(state.panes[2].activeTabId).toBe("four");
+      expect(state.focusedPaneId).toBe(state.panes[2].id);
+    });
+
+    it("moves a tab into the pane to either side", () => {
+      const { unmount } = renderPane("middle");
+
+      fireEvent.contextMenu(screen.getByRole("tab", { name: "four.txt" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: "Move to Left Pane" }));
+      expect(useViewerStore.getState().tabs.find((candidate) => candidate.id === "four")?.paneId).toBe("left");
+      unmount();
+
+      renderPane("middle");
+      fireEvent.contextMenu(screen.getByRole("tab", { name: "two.txt" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: "Move to Right Pane" }));
+      const state = useViewerStore.getState();
+      expect(state.tabs.find((candidate) => candidate.id === "two")?.paneId).toBe("right");
+      // The middle pane had nothing left, so it is gone.
+      expect(state.panes.map((pane) => pane.id)).toEqual(["left", "right"]);
+    });
+
+    it("offers no move past the outermost panes, and no split of a pane's only tab", () => {
+      renderPane("left");
+
+      fireEvent.contextMenu(screen.getByRole("tab", { name: "one.txt" }));
+
+      expect(screen.queryByRole("menuitem", { name: "Move to Left Pane" })).not.toBeInTheDocument();
+      expect(screen.getByRole("menuitem", { name: "Move to Right Pane" })).toBeInTheDocument();
+      expect(screen.queryByRole("menuitem", { name: "Split Right" })).not.toBeInTheDocument();
+    });
+
+    it("joins every pane, or closes only its own", () => {
+      const { unmount } = renderPane("right");
+
+      fireEvent.contextMenu(screen.getByRole("tab", { name: "three.txt" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: "Close All in Pane" }));
+      expect(useViewerStore.getState().tabs.map((candidate) => candidate.id)).toEqual(["one", "two", "four"]);
+      expect(useViewerStore.getState().panes.map((pane) => pane.id)).toEqual(["left", "middle"]);
+      unmount();
+
+      renderPane("left");
+      fireEvent.contextMenu(screen.getByRole("tab", { name: "one.txt" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: "Join All Panes" }));
+      expect(useViewerStore.getState().panes).toHaveLength(1);
+      expect(useViewerStore.getState().tabs.every((candidate) => candidate.paneId === "left")).toBe(true);
     });
   });
 });

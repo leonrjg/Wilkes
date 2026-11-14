@@ -7,7 +7,6 @@ import {
   keymap,
   WidgetType,
 } from "@codemirror/view";
-import { basicSetup } from "codemirror";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { Check, ChevronDown, RefreshCw, Save, X } from "react-feather";
 import { api } from "../services";
@@ -18,6 +17,9 @@ import { fileName } from "./DocumentEntryRow";
 import { getLanguageExtension } from "@leonrjg/wilkes-reader";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
+import { editorSetup, type EditorSetup } from "../lib/editorSetup";
+import { markdownLivePreview } from "../lib/markdownLivePreview";
+import { openLink } from "../lib/openLink";
 
 const setGhost = StateEffect.define<{ position: number; text: string } | null>();
 
@@ -100,6 +102,7 @@ export default function DocumentEditor({
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
+  const setupRef = useRef<EditorSetup | null>(null);
   const debounceRef = useRef<number | null>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
   const activeRequestRef = useRef<string | null>(null);
@@ -108,6 +111,10 @@ export default function DocumentEditor({
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [steering, setSteering] = useState<SessionSteering | null>(null);
   const isDark = useSettingsStore((state) => state.colorScheme) === "dark";
+  // Shown until the settings have loaded, as they were before the setting.
+  const showLineNumbers = useSettingsStore((state) => state.settings?.editor_line_numbers ?? true);
+  const showLineNumbersRef = useRef(showLineNumbers);
+  showLineNumbersRef.current = showLineNumbers;
   const readOnly = useActiveWorkspaceReadOnly();
   const buffer = useEditorStore((state) => state.buffers[documentPath]);
   const tabs = useViewerStore((state) => state.tabs);
@@ -242,9 +249,22 @@ export default function DocumentEditor({
 
   useEffect(() => {
     if (!containerRef.current || !buffer) return;
-    const languageExtension = getLanguageExtension(language);
+    // Markdown is edited in live preview, which brings its own Markdown
+    // language; every other language is plain source.
+    const languageExtension = language === "markdown"
+      ? markdownLivePreview({
+          documentPath,
+          dark: isDark,
+          resolveAsset: (path) => api.resolveAssetUrl(path),
+          openLink: (target) => {
+            openLink(target).catch((error) => console.error("Open link failed:", error));
+          },
+        })
+      : getLanguageExtension(language);
+    const setup = editorSetup(showLineNumbersRef.current);
+    setupRef.current = setup;
     const extensions = [
-      basicSetup,
+      setup.extension,
       ghostField,
       completionTheme,
       EditorView.lineWrapping,
@@ -287,10 +307,17 @@ export default function DocumentEditor({
       cancelActive(active?.text ? "dismissed" : undefined);
       view.destroy();
       viewRef.current = null;
+      setupRef.current = null;
     };
     // The editor owns subsequent buffer changes; remount only for a new path/theme/language.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [documentPath, language, isDark, readOnly, semanticReady, generationReady, Boolean(buffer)]);
+
+  // Toggled in place: remounting would drop the view's undo history.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (view) setupRef.current?.setLineNumbers(view, showLineNumbers);
+  }, [showLineNumbers]);
 
   const shown = buffer?.completion?.text ? buffer.completion : null;
   const inspect = buffer?.completion ?? buffer?.lastCompletion ?? null;
@@ -320,7 +347,12 @@ export default function DocumentEditor({
   };
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col">
+    // With the view split there may be two editors; the one last focused is
+    // the one the rest of the app means by "the editor".
+    <div
+      className="relative flex h-full min-h-0 flex-col"
+      onFocusCapture={() => useEditorStore.getState().setActiveEditor(documentPath)}
+    >
       <div className="flex flex-wrap items-center gap-2 border-b border-[var(--border-main)] bg-[var(--bg-header)] px-2 py-1.5 text-[10px]">
         <span className="text-[var(--text-muted)]">Context</span>
         {buffer?.scope.pinned.map((path) => (
