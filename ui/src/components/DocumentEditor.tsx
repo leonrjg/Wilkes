@@ -18,6 +18,8 @@ import { fileName } from "./DocumentEntryRow";
 import { getLanguageExtension } from "@leonrjg/wilkes-reader";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
+import { markdownLivePreview } from "../lib/markdownLivePreview";
+import { openLink } from "../lib/openLink";
 
 const setGhost = StateEffect.define<{ position: number; text: string } | null>();
 
@@ -242,7 +244,18 @@ export default function DocumentEditor({
 
   useEffect(() => {
     if (!containerRef.current || !buffer) return;
-    const languageExtension = getLanguageExtension(language);
+    // Markdown is edited in live preview, which brings its own Markdown
+    // language; every other language is plain source.
+    const languageExtension = language === "markdown"
+      ? markdownLivePreview({
+          documentPath,
+          dark: isDark,
+          resolveAsset: (path) => api.resolveAssetUrl(path),
+          openLink: (target) => {
+            openLink(target).catch((error) => console.error("Open link failed:", error));
+          },
+        })
+      : getLanguageExtension(language);
     const extensions = [
       basicSetup,
       ghostField,
