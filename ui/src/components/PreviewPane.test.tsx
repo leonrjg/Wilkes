@@ -770,6 +770,22 @@ describe("PreviewPane", () => {
     expect(screen.getByTestId("pdf-viewer")).toBeInTheDocument();
   });
 
+  it("puts a PDF into in-place editing from the edit button", () => {
+    setViewerState({
+      selectedMatch: { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } },
+    });
+
+    render(<PreviewPane />);
+    expect(mockPdfViewer.mock.lastCall?.[0].editing).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit document" }));
+    expect(mockPdfViewer.mock.lastCall?.[0].editing).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Finish editing document" }));
+    expect(mockPdfViewer.mock.lastCall?.[0].editing).toBe(false);
+  });
+
   it("publishes the active PDF and live page for external MCP without a chat session", async () => {
     setViewerState({
       selectedMatch: {

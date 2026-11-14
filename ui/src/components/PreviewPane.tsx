@@ -353,6 +353,9 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   const isPagedFile = "PdfPage" in selectedMatch.origin;
   const isComic = isPagedFile && servesPagesOnDemand(selectedMatch.path);
   const isBook = isPagedFile && !isComic && !isPdfPath(selectedMatch.path);
+  // A PDF's own pages can be edited in place. A book's are a rendering Wilkes
+  // made of it, and a comic's are pictures: neither has text of its own there.
+  const isEditablePdf = isPagedFile && !isComic && !isBook;
   const isMarkdownFile =
     !isPagedFile && displayData != null && "Text" in displayData && displayData.Text.language === "markdown";
   const isHtmlFile =
@@ -737,13 +740,14 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
           </Tooltip>
         )}
 
-        {!standalone && !isPagedFile && displayData && "Text" in displayData && (
+        {!standalone && (isEditablePdf || (!isPagedFile && displayData && "Text" in displayData)) && (
           <Tooltip content={editing ? "Return to document viewer" : "Edit document"}>
             <button
               type="button"
               onClick={() => {
                 setEditing((current) => !current);
-                if (!editing) setRememberedTextView("source");
+                // A text file is edited as source; a PDF is edited where it is read.
+                if (!editing && !isPagedFile) setRememberedTextView("source");
               }}
               aria-label={editing ? "Finish editing document" : "Edit document"}
               className={`inline-flex rounded border border-[var(--border-main)] p-1 text-[var(--text-dim)] ${editing ? "bg-[var(--bg-active)] text-[var(--text-main)]" : ""}`}
@@ -834,6 +838,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
                 search_locator={pdfSearchLocator}
                 decorations={readerDecorations}
                 textSubstitutions={pdfSuperseded}
+                editing={editing && isEditablePdf}
                 slots={{ selectionActions: selectionActionsSlot }}
                 onRenderSuccess={() => setIsPdfRendering(false)}
                 onLoadError={(error) => reportTabLoadError(activeTab.id, error)}
