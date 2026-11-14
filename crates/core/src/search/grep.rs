@@ -244,6 +244,11 @@ fn search_document_content(
 ) -> anyhow::Result<Vec<Match>> {
     let path = document.path.as_path();
     match &document.file_type {
+        // HTML is searched in the text the viewer shows, never in its markup,
+        // and every match is mapped back to the bytes of the file.
+        FileType::PlainText if crate::extract::html::is_html(path) => {
+            search_html_file(path, matcher)
+        }
         // Plain text is memory-mapped and already fast, with exact line/column
         // origins; the text index does not hold it.
         FileType::PlainText => search_text_file(path, matcher, query.context_lines as u64),
@@ -373,6 +378,57 @@ fn search_text_file(
     Ok(sink.matches)
 }
 
+// ── HTML search ───────────────────────────────────────────────────────────────
+
+/// Search an HTML file's visible text. A match is reported at the file bytes
+/// it was read from — the range the viewer highlights — on the line of the
+/// file where it starts, with context taken from the visible text around it.
+fn search_html_file(path: &Path, matcher: &RegexMatcher) -> anyhow::Result<Vec<Match>> {
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) => {
+            // The plain-text search skips a file it cannot read; so does this,
+            // but says so.
+            tracing::warn!("exact search could not read {}: {error}", path.display());
+            return Ok(Vec::new());
+        }
+    };
+    let (_, projection) = crate::extract::html::read(&source);
+    let visible = projection.as_str();
+    let mut matches = Vec::new();
+    matcher
+        .find_iter(projection.as_bytes(), |found| {
+            if found.start() == found.end() {
+                return true;
+            }
+            let projected = ByteRange {
+                start: found.start(),
+                end: found.end(),
+            };
+            let Some(raw) = projection.raw_range(projected.clone()) else {
+                return true;
+            };
+            let line_start = source[..raw.start].rfind('\n').map_or(0, |at| at + 1);
+            let line = source[..raw.start].matches('\n').count() as u32 + 1;
+            matches.push(Match {
+                text_range: Some(raw.clone()),
+                matched_text: visible[projected.start..projected.end].to_string(),
+                context_before: extract_context_before(visible, projected.start, 120)
+                    .replace(['\n', '\r'], " "),
+                context_after: extract_context_after(visible, projected.end, 120)
+                    .replace(['\n', '\r'], " "),
+                origin: SourceOrigin::TextFile {
+                    line,
+                    col: (raw.start - line_start) as u32,
+                },
+                score: None,
+            });
+            true
+        })
+        .map_err(anyhow::Error::from)?;
+    Ok(matches)
+}
+
 // ── Extracted content search (PDF / future formats) ──────────────────────────
 
 /// Extract a PDF live and search it. Used when stored text is disabled, or the
@@ -406,7 +462,7 @@ fn search_text_and_map(
     pdf_literal_matcher: Option<&RegexMatcher>,
 ) -> anyhow::Result<Vec<Match>> {
     if let Some(literal_matcher) = pdf_literal_matcher {
-        let projection = pdf_projection::PdfSearchProjection::new(full);
+        let projection = crate::text_projection::TextProjection::pdf_search(full);
         return collect_pdf_matches(
             full,
             source_map,

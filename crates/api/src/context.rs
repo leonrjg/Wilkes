@@ -8063,10 +8063,13 @@ impl AppContext {
     /// reading first and only land here when there is none to consult. Where
     /// the index holds the document, the index is what is read.
     fn read_document_text(path: &Path) -> Result<String, String> {
-        let text = if path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+        // A PDF's glyphs, and an HTML file's visible text: neither file's
+        // bytes are what a summary or a citation label should read.
+        let text = if wilkes_core::extract::html::is_html(path)
+            || path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
         {
             wilkes_core::extract::native_text_registry()
                 .find(path, None)

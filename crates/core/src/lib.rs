@@ -18,5 +18,6 @@ pub mod pdf_edit;
 mod program;
 pub mod search;
 pub mod text_index;
+pub(crate) mod text_projection;
 pub mod types;
 pub mod worker;

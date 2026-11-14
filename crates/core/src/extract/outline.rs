@@ -73,7 +73,7 @@ fn heading(line: &str, offset: usize) -> Option<OutlineEntry> {
 pub fn title_offset(text: &str, title: &str) -> Option<usize> {
     use grep_matcher::Matcher;
 
-    let projection = crate::search::pdf_projection::PdfSearchProjection::new(text);
+    let projection = crate::text_projection::TextProjection::pdf_search(text);
     let matcher = crate::search::pdf_projection::literal_matcher(title, false).ok()?;
     let found = matcher.find(projection.as_bytes()).ok()??;
     projection
