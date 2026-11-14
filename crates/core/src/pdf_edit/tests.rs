@@ -116,6 +116,7 @@ fn system_font() -> String {
         bold: false,
         italic: false,
         generic: GenericFamily::SansSerif,
+        sibling: false,
     })
     .expect("a system has a sans-serif font")
     .id

@@ -31,6 +31,11 @@ pub struct FontRequest {
     pub bold: bool,
     pub italic: bool,
     pub generic: GenericFamily,
+    /// Set when the weight and slant asked for are not the named font's own
+    /// but another face of its family: a reader made a word bold. The name
+    /// then says which family, not which font.
+    #[serde(default)]
+    pub sibling: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -52,10 +57,14 @@ pub struct ResolvedFont {
 /// The installed font nearest to the one a document asks for.
 pub fn resolve(request: &FontRequest) -> anyhow::Result<ResolvedFont> {
     let source = SystemSource::new();
-    if !request.name.is_empty() {
-        if let Ok(handle) = source.select_by_postscript_name(&request.name) {
-            return from_handle(&handle);
-        }
+    let named = if request.name.is_empty() {
+        None
+    } else {
+        source.select_by_postscript_name(&request.name).ok()
+    };
+    // The document's own font, when that is what is asked for and it is here.
+    if let (Some(handle), false) = (&named, request.sibling) {
+        return from_handle(handle);
     }
 
     let mut properties = Properties::new();
@@ -75,14 +84,23 @@ pub fn resolve(request: &FontRequest) -> anyhow::Result<ResolvedFont> {
         GenericFamily::SansSerif => FamilyName::SansSerif,
         GenericFamily::Monospace => FamilyName::Monospace,
     };
-    // `Times-Bold`, `Arial,Italic`: what precedes the separator is the family
-    // as often as not, and costs nothing to try before the generic one.
-    let family = request
-        .name
-        .split(['-', ','])
-        .next()
-        .filter(|family| !family.is_empty())
-        .map(|family| FamilyName::Title(family.to_string()));
+    // The family the named font says it belongs to, when it is installed.
+    // Otherwise a guess from its name -- `Times-Bold`, `Arial,Italic`: what
+    // precedes the separator is the family as often as not, and costs nothing
+    // to try before the generic one.
+    let family = named
+        .as_ref()
+        .and_then(|handle| handle.load().ok())
+        .map(|font| font.family_name())
+        .or_else(|| {
+            request
+                .name
+                .split(['-', ','])
+                .next()
+                .filter(|family| !family.is_empty())
+                .map(str::to_string)
+        })
+        .map(FamilyName::Title);
     let families: Vec<FamilyName> = family.into_iter().chain([generic]).collect();
     let handle = source
         .select_best_match(&families, &properties)
@@ -93,10 +111,12 @@ pub fn resolve(request: &FontRequest) -> anyhow::Result<ResolvedFont> {
             )
         })?;
     let resolved = from_handle(&handle)?;
-    debug!(
-        "pdf_edit: {:?} is not installed; setting it in {}",
-        request.name, resolved.id
-    );
+    if named.is_none() {
+        debug!(
+            "pdf_edit: {:?} is not installed; setting it in {}",
+            request.name, resolved.id
+        );
+    }
     Ok(resolved)
 }
 
@@ -269,10 +289,48 @@ mod tests {
             bold: false,
             italic: false,
             generic: GenericFamily::Serif,
+            sibling: false,
         };
         let resolved = resolve(&request).expect("a system has a serif font");
         assert!(resolved.data.get(0..4) != Some(b"ttcf"));
         let again = load(&resolved.id).expect("its id names it");
         assert_eq!(again.data, resolved.data);
+    }
+
+    #[test]
+    fn a_sibling_request_resolves_to_another_face_of_the_same_family() {
+        let regular = FontRequest {
+            name: String::new(),
+            bold: false,
+            italic: false,
+            generic: GenericFamily::Serif,
+            sibling: false,
+        };
+        let own = resolve(&regular).expect("a system has a serif font");
+        // The same font by name, asked for in bold.
+        let bold = resolve(&FontRequest {
+            name: own.id.clone(),
+            bold: true,
+            sibling: true,
+            ..regular.clone()
+        })
+        .expect("a face of the same family");
+        let family_of = |id: &str| {
+            SystemSource::new()
+                .select_by_postscript_name(id)
+                .unwrap()
+                .load()
+                .unwrap()
+                .family_name()
+        };
+        assert_eq!(family_of(&bold.id), family_of(&own.id));
+        // Without `sibling` the name wins, whatever weight is asked for.
+        let named = resolve(&FontRequest {
+            name: own.id.clone(),
+            bold: true,
+            ..regular
+        })
+        .unwrap();
+        assert_eq!(named.id, own.id);
     }
 }
