@@ -7,15 +7,23 @@ that do not update them on read, which is why `cargo sweep` is not what does
 this job -- it would evict in creation order and take the live dependency tree
 first.
 
-So when the directory is over the limit, eviction goes by what it costs to get
-back:
+What is in there falls into two kinds, and they are limited differently.
 
-1. Incremental caches, least recently compiled first. rustc rewrites a crate's
-   cache every time it compiles that crate, so the cache directory's mtime *is*
-   a last-use time -- the one trustworthy one in here. Losing a cache costs a
-   single cold compile of that crate.
-2. Whole profile directories, largest first. Nothing finer can be told apart
-   safely. Losing one costs a cold build of that profile.
+Incremental caches are the one thing with a trustworthy last-use time: rustc
+rewrites a crate's cache every time it compiles that crate, so the cache
+directory's mtime says when it was last of use. They are evicted least recently
+compiled first, and losing one costs a single cold compile of that crate.
+
+Everything else in a profile directory -- dependencies, build script output,
+binaries -- cannot be told apart, live from stale. It only ever goes all at
+once, and losing it costs a cold build of that profile. The caches survive it:
+the rebuilt dependencies are the same ones, so the caches still apply.
+
+Left to themselves the stale dependency builds would pile up until the caches
+had no room at all, and every commit would throw away the caches the last build
+wrote. So the caches are owed a share of the limit. When the rest has grown into
+that share, the profile holding the most of it is cleared -- and only then are
+caches evicted, as far as it takes to fit.
 
 A profile directory is only touched while holding Cargo's own build lock on it,
 so a build in another session is never pulled out from under itself. A profile
@@ -34,8 +42,12 @@ from pathlib import Path
 
 LIMIT_GB = 20
 
+# The part of the limit that incremental caches are owed.
+CACHE_SHARE = 0.25
+
 # Cargo takes an exclusive flock on this file for the length of a build.
 BUILD_LOCK = ".cargo-lock"
+INCREMENTAL = "incremental"
 
 
 def disk_usage(root: Path) -> int:
@@ -79,16 +91,16 @@ def try_lock(profile: Path) -> int | None:
 
 
 def incremental_caches(profile: Path) -> list[Path]:
-    incremental = profile / "incremental"
+    incremental = profile / INCREMENTAL
     if not incremental.is_dir():
         return []
     return [cache for cache in incremental.iterdir() if cache.is_dir()]
 
 
 def clear_profile(profile: Path) -> None:
-    """Empty a profile directory, leaving the lock file this process holds."""
+    """Empty a profile directory of all but its caches and the lock this process holds."""
     for child in profile.iterdir():
-        if child.name == BUILD_LOCK:
+        if child.name in (BUILD_LOCK, INCREMENTAL):
             continue
         if child.is_dir() and not child.is_symlink():
             shutil.rmtree(child)
@@ -123,31 +135,37 @@ def limit(target: Path, limit_bytes: int, dry_run: bool) -> bool:
         else:
             locks[profile] = fd
 
-    # What each profile still holds, kept current as its caches go, so that
-    # clearing a profile afterwards is not credited with them a second time.
-    sizes = {profile: disk_usage(profile) for profile in locks}
+    caches = {cache: disk_usage(cache) for profile in locks for cache in incremental_caches(profile)}
+    # What each profile holds besides its caches.
+    rest = {
+        profile: disk_usage(profile) - sum(size for cache, size in caches.items()
+                                           if cache.parent.parent == profile)
+        for profile in locks
+    }
 
-    caches = [(cache, profile) for profile in locks for cache in incremental_caches(profile)]
-    caches.sort(key=lambda entry: entry[0].stat().st_mtime)
-    for cache, profile in caches:
-        if total <= limit_bytes:
-            break
-        size = disk_usage(cache)
-        last_compiled = cache.stat().st_mtime
-        if not dry_run:
-            shutil.rmtree(cache)
-        total -= size
-        sizes[profile] -= size
-        print(f"  {verb} incremental cache {cache.relative_to(target)} "
-              f"({gb(size)}, last compiled {age(last_compiled)})")
-
-    for profile in sorted(locks, key=sizes.get, reverse=True):
-        if total <= limit_bytes or not sizes[profile]:
+    # The caches' share first. What is not a cache is everything outside them,
+    # busy profiles and stray files included, so that is what is measured.
+    rest_limit = limit_bytes * (1 - CACHE_SHARE)
+    not_caches = total - sum(caches.values())
+    for profile in sorted(locks, key=rest.get, reverse=True):
+        if not_caches <= rest_limit or not rest[profile]:
             break
         if not dry_run:
             clear_profile(profile)
-        total -= sizes[profile]
-        print(f"  {verb} everything else in {profile.relative_to(target)} ({gb(sizes[profile])})")
+        total -= rest[profile]
+        not_caches -= rest[profile]
+        print(f"  {verb} everything but the caches in {profile.relative_to(target)} "
+              f"({gb(rest[profile])})")
+
+    for cache in sorted(caches, key=lambda cache: cache.stat().st_mtime):
+        if total <= limit_bytes:
+            break
+        last_compiled = cache.stat().st_mtime
+        if not dry_run:
+            shutil.rmtree(cache)
+        total -= caches[cache]
+        print(f"  {verb} incremental cache {cache.relative_to(target)} "
+              f"({gb(caches[cache])}, last compiled {age(last_compiled)})")
 
     for fd in locks.values():
         os.close(fd)
