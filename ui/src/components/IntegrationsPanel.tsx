@@ -12,7 +12,7 @@ interface IntegrationsPanelProps {
   settings: Settings;
   onUpdate: (patch: Partial<Settings>) => Promise<void> | void;
   /** Sends a message to the chat, when there is one. */
-  onSendToChat?: (message: string) => void;
+  onSendToChat?: (message: string, opts?: { newSession?: boolean }) => void;
 }
 
 /** The custom tab is not a provider, so it is not a row. */

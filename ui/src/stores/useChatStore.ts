@@ -90,8 +90,10 @@ interface ChatPanesStore {
    *  does. */
   closePane: (id: string) => void;
   focusPane: (id: string) => void;
-  /** Sends `text` from the pane in use, showing one if none is. */
-  openPaneAndSend: (text: string) => Promise<void>;
+  /** Sends `text` from the pane in use, showing one if none is. With
+   *  `newPane`, it is sent from a new pane instead, which opens a session of
+   *  its own: for a task that is not the conversation already going on. */
+  openPaneAndSend: (text: string, opts?: { newPane?: boolean }) => Promise<void>;
   /** Puts a document in the context of the pane in use, showing one if none
    *  is. */
   askAbout: (path: string) => Promise<void>;
@@ -270,8 +272,9 @@ export const useChatStore = create<ChatPanesStore>((set, get) => ({
     if (get().focusedPane !== id) set({ focusedPane: id });
   },
 
-  openPaneAndSend: async (text) => {
-    await get().showPanes();
+  openPaneAndSend: async (text, opts = {}) => {
+    if (opts.newPane) await get().newPane();
+    else await get().showPanes();
     const pane = focused(get());
     if (pane === null || !pane.session.getState().sessionId) return;
     await pane.session.getState().sendMessage(text);

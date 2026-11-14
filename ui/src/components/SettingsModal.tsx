@@ -208,9 +208,9 @@ export default function SettingsModal({
   const openChatPaneAndSend = useChatStore((s) => s.openPaneAndSend);
   const chatAvailable = isTauri && chatBackendsLoaded && hasAvailableChatBackend;
   /** Settings covers the window, so it closes for the chat to be seen. */
-  const sendToChat = (message: string) => {
+  const sendToChat = (message: string, opts?: { newSession?: boolean }) => {
     onClose();
-    openChatPaneAndSend(message).catch((e) =>
+    openChatPaneAndSend(message, { newPane: opts?.newSession }).catch((e) =>
       console.error("Sending an integration to the chat failed:", e),
     );
   };

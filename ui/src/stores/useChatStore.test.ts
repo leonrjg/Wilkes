@@ -201,6 +201,24 @@ describe("several panes", () => {
     expect(b.id).toBe(panes()[1].id);
   });
 
+  it("send a task of its own from a new pane, leaving the others' conversations alone", async () => {
+    await useChatStore.getState().showPanes();
+    const existing = first();
+
+    const sent = useChatStore.getState().openPaneAndSend("Add an integration", { newPane: true });
+    await vi.waitFor(() => expect(transport.turns.length).toBe(1));
+    const turn = transport.lastTurn();
+    turn.finish();
+    await sent;
+
+    expect(panes()).toHaveLength(2);
+    const added = panes()[1];
+    expect(useChatStore.getState().focusedPane).toBe(added.id);
+    expect(turn.text).toBe("Add an integration");
+    expect(turn.sessionId).toBe(added.session.getState().sessionId);
+    expect(turn.sessionId).not.toBe(existing.session.getState().sessionId);
+  });
+
   it("all let go of a document that left the library", async () => {
     await useChatStore.getState().showPanes();
     await useChatStore.getState().newPane();

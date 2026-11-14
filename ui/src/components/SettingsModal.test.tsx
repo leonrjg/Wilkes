@@ -176,7 +176,9 @@ describe("SettingsModal", () => {
       await waitFor(() => expect(integrationsPanel.props?.onSendToChat).toBeDefined());
       act(() => integrationsPanel.props!.onSendToChat!("change it"));
       expect(onClose).toHaveBeenCalledOnce();
-      expect(openPaneAndSend).toHaveBeenCalledWith("change it");
+      expect(openPaneAndSend).toHaveBeenCalledWith("change it", { newPane: undefined });
+      act(() => integrationsPanel.props!.onSendToChat!("add one", { newSession: true }));
+      expect(openPaneAndSend).toHaveBeenLastCalledWith("add one", { newPane: true });
 
       act(() => useChatStore.setState({ hasAvailableBackend: false }));
       expect(integrationsPanel.props?.onSendToChat).toBeUndefined();

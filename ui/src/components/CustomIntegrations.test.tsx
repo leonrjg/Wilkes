@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import CustomIntegrations from "./CustomIntegrations";
+import CustomIntegrations, { chatCreateMessage } from "./CustomIntegrations";
 import type {
   CustomIntegrationConfig,
   ProbeReport,
@@ -884,6 +884,42 @@ describe("CustomIntegrations", () => {
     expect(screen.queryByRole("button", { name: "Send to chat" })).not.toBeInTheDocument();
   });
 
+  it("starts a chat session to create an integration from a URL and an optional note", () => {
+    const onSendToChat = vi.fn();
+    render(
+      <CustomIntegrations
+        api={apiWith()}
+        settings={settings()}
+        onUpdate={vi.fn()}
+        onSendToChat={onSendToChat}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Create with chat" }));
+    const start = screen.getByRole("button", { name: "Start chat" });
+    expect(start).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Service URL"), {
+      target: { value: "  https://library.example  " },
+    });
+    fireEvent.change(screen.getByLabelText("Note (optional)"), {
+      target: { value: "only the open-access collection" },
+    });
+    fireEvent.click(start);
+
+    expect(onSendToChat).toHaveBeenCalledTimes(1);
+    const [message, opts] = onSendToChat.mock.calls[0];
+    expect(message).toContain("Add a custom integration for the service at https://library.example.");
+    expect(message).toContain("Note: only the open-access collection");
+    expect(message).toContain("save_custom_integration");
+    expect(opts).toEqual({ newSession: true });
+    expect(screen.queryByRole("button", { name: "Start chat" })).not.toBeInTheDocument();
+  });
+
+  it("leaves the note out of the creation message when none is given", () => {
+    const message = chatCreateMessage("https://library.example", "");
+    expect(message).not.toContain("Note:");
+  });
+
   it("offers no chat edit when there is no chat", () => {
     render(
       <CustomIntegrations
@@ -893,5 +929,6 @@ describe("CustomIntegrations", () => {
       />,
     );
     expect(screen.queryByRole("button", { name: "Edit with chat" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Create with chat" })).not.toBeInTheDocument();
   });
 });

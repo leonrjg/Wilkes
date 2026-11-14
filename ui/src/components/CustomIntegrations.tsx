@@ -29,9 +29,10 @@ interface CustomIntegrationsProps {
   /** A provider the user asked to extend from its own tab: the editor opens
    *  on a manifest that takes that provider's capabilities. */
   extending?: LiteratureProviderInfo | null;
-  /** Sends a message to the chat. Absent when there is no chat to send to,
-   *  and then a row offers no "Edit with chat". */
-  onSendToChat?: (message: string) => void;
+  /** Sends a message to the chat, from a session of its own with
+   *  `newSession`. Absent when there is no chat to send to, and then there is
+   *  no "Edit with chat" or "Create with chat". */
+  onSendToChat?: (message: string, opts?: { newSession?: boolean }) => void;
 }
 
 /** The longest run of backticks in `text`, plus one, so a fence around it
@@ -64,6 +65,19 @@ export function chatEditMessage(
     fence,
     "",
     "Read the manifest format with read_custom_integrations (authoring_guide=true), check the change with probe_custom_integration, and save it with save_custom_integration under the same id.",
+  ].join("\n");
+}
+
+/**
+ * The message that asks the chat to write a new integration for the service
+ * at `url`. The note, when the user gives one, says what they want from it.
+ */
+export function chatCreateMessage(url: string, note: string): string {
+  return [
+    `Add a custom integration for the service at ${url}.`,
+    ...(note ? ["", `Note: ${note}`] : []),
+    "",
+    "Read the manifest format with read_custom_integrations (authoring_guide=true), work out from the service how it is searched and how its documents are fetched, check the manifest with probe_custom_integration, and save it with save_custom_integration.",
   ].join("\n");
 }
 
@@ -170,6 +184,9 @@ export default function CustomIntegrations({
   /** Which row's manifest is being handed to the chat, and the change asked
    *  for. */
   const [asking, setAsking] = useState<{ id: string; value: string } | null>(null);
+  /** The service a new integration is asked of the chat for, and the user's
+   *  note on it. */
+  const [creating, setCreating] = useState<{ url: string; note: string } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -365,6 +382,16 @@ export default function CustomIntegrations({
     setAsking(null);
   };
 
+  const createWithChat = () => {
+    if (creating === null || !onSendToChat) return;
+    const url = creating.url.trim();
+    if (!url) return;
+    // A new integration is a task of its own, so it starts its own session
+    // rather than joining whatever the chat is in the middle of.
+    onSendToChat(chatCreateMessage(url, creating.note.trim()), { newSession: true });
+    setCreating(null);
+  };
+
   const setEnabled = async (config: CustomIntegrationConfig, enabled: boolean) => {
     await writeCustom(
       configured.map((existing) =>
@@ -404,19 +431,88 @@ export default function CustomIntegrations({
     <div className="space-y-3">
       <div className="flex items-start justify-between gap-3">
         <p className="text-xs text-[var(--text-muted)]">
-          Copy the prompt to generate a provider manifest from service documentation.
+          {onSendToChat
+            ? "Have the chat write a provider manifest for a service, or copy the prompt to generate one from service documentation."
+            : "Copy the prompt to generate a provider manifest from service documentation."}
         </p>
-        <CopyButton
-          copy={copyAuthoringPrompt}
-          onCopyError={reportCopyError}
-          aria-label="Copy manifest generation prompt"
-          copiedAriaLabel="Manifest generation prompt copied"
-          copiedChildren="Prompt copied"
-          className={`${GHOST_BUTTON_CLASS} shrink-0`}
-        >
-          Copy generation prompt
-        </CopyButton>
+        <div className="flex items-center gap-1.5 shrink-0">
+          {onSendToChat && (
+            <button
+              type="button"
+              onClick={() => setCreating({ url: "", note: "" })}
+              className={GHOST_BUTTON_CLASS}
+            >
+              Create with chat
+            </button>
+          )}
+          <CopyButton
+            copy={copyAuthoringPrompt}
+            onCopyError={reportCopyError}
+            aria-label="Copy manifest generation prompt"
+            copiedAriaLabel="Manifest generation prompt copied"
+            copiedChildren="Prompt copied"
+            className={GHOST_BUTTON_CLASS}
+          >
+            Copy generation prompt
+          </CopyButton>
+        </div>
       </div>
+
+      {creating !== null && (
+        <form
+          className="space-y-2 border border-[var(--border-main)] rounded p-2.5"
+          onSubmit={(e) => {
+            e.preventDefault();
+            createWithChat();
+          }}
+          onKeyDown={(e) => e.key === "Escape" && setCreating(null)}
+        >
+          <div className="space-y-1">
+            <label className={FIELD_LABEL_CLASS} htmlFor="create-with-chat-url">
+              Service URL
+            </label>
+            <input
+              id="create-with-chat-url"
+              type="text"
+              inputMode="url"
+              autoFocus
+              placeholder="https://library.example"
+              value={creating.url}
+              onChange={(e) => setCreating({ ...creating, url: e.target.value })}
+              className={INPUT_CLASS}
+            />
+          </div>
+          <div className="space-y-1">
+            <label className={FIELD_LABEL_CLASS} htmlFor="create-with-chat-note">
+              Note (optional)
+            </label>
+            <textarea
+              id="create-with-chat-note"
+              rows={3}
+              placeholder="Anything the chat should know, such as which part of the service to search."
+              value={creating.note}
+              onChange={(e) => setCreating({ ...creating, note: e.target.value })}
+              className={INPUT_CLASS}
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="submit"
+              disabled={!creating.url.trim()}
+              className={BUTTON_CLASS}
+            >
+              Start chat
+            </button>
+            <button
+              type="button"
+              onClick={() => setCreating(null)}
+              className={GHOST_BUTTON_CLASS}
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
 
       {copyError && <p className={ERROR_TEXT_CLASS}>{copyError}</p>}
 
