@@ -328,15 +328,21 @@ impl AppContext {
                 let (url, title) = self.resolve_syndication(url.trim(), &cancel).await?;
                 (FeedSource::Syndication { url }, title)
             }
-            FeedSource::Listing { provider, request } => {
-                let name = crate::commands::integrations::literature::providers(
+            FeedSource::Listing {
+                provider,
+                mut request,
+            } => {
+                let info = crate::commands::integrations::literature::providers(
                     &settings.integrations,
                     Some(&self.catalogue_dir),
                 )
                 .into_iter()
                 .find(|known| known.provider == provider)
-                .map(|known| known.name)
                 .ok_or_else(|| anyhow::anyhow!("no literature provider named {provider}"))?;
+                let name = info.name.clone();
+                request.sort = newest_first(&info)?;
+                request.page = None;
+                request.limit = None;
                 let title = request
                     .query
                     .as_deref()
@@ -605,6 +611,35 @@ impl AppContext {
             Ok(Ok(body)) => Ok(body),
         }
     }
+}
+
+/// The sort a followed listing is read in: the provider's newest-first, so
+/// what is new comes first and a refresh can stop at what it has seen. A
+/// listing with no sort at all — a page of links read through a custom
+/// manifest — is read in its own order. A provider that sorts but cannot
+/// sort newest first cannot be followed.
+fn newest_first(
+    info: &crate::commands::integrations::literature::LiteratureProviderInfo,
+) -> anyhow::Result<Option<String>> {
+    let Some(browse) = info.capabilities.browse.as_ref() else {
+        anyhow::bail!(
+            "{} cannot list works by filter, so there is no listing to follow",
+            info.name
+        );
+    };
+    let Some(sort) = browse.sort.as_ref() else {
+        return Ok(None);
+    };
+    sort.equivalent_to
+        .iter()
+        .find(|(_, canonical)| canonical.as_str() == "newest")
+        .map(|(value, _)| Some(value.clone()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} cannot list its works newest first, so a refresh could not tell what is new",
+                info.name
+            )
+        })
 }
 
 /// The DOIs an item is known by: its own, and its arXiv id's.

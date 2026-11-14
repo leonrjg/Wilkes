@@ -1355,6 +1355,8 @@ export interface WorkerStatus {
 
 export interface Settings {
   max_download_bytes: number;
+  /** Hours between feed refreshes, for every feed. */
+  feeds_refresh_hours?: number;
   favorites: string[];
   recent_dirs: string[];
   last_directory: string | null;
@@ -1772,4 +1774,89 @@ export interface HttpCall {
   status: number | null;
   duration_ms: number | null;
   error: string | null;
+}
+
+// ── Feeds ────────────────────────────────────────────────────────────────────
+
+/** What a feed watches: a syndication feed, or a provider's listing (a page
+ *  of links, through a custom manifest, is one too). */
+export type FeedSource =
+  | { kind: "syndication"; url: string }
+  | { kind: "listing"; provider: string; request: BrowseRequest };
+
+export interface Feed {
+  id: string;
+  name: string;
+  source: FeedSource;
+  root: string;
+  /** Under `root`, `/`-separated. */
+  folder: string;
+  auto_import: boolean;
+  created_at_ms: number;
+  last_attempt_at_ms: number | null;
+  last_success_at_ms: number | null;
+  last_error: string | null;
+  /** The source asked to be left alone until then. */
+  retry_after_ms: number | null;
+  /** Every item the last refresh returned was new: older ones may have gone
+   *  by unseen. */
+  may_have_missed: boolean;
+  inbox_count: number;
+}
+
+export interface NewFeed {
+  source: FeedSource;
+  name?: string | null;
+  root: string;
+  folder?: string | null;
+  auto_import?: boolean;
+}
+
+export interface FeedUpdate {
+  name?: string;
+  folder?: string;
+  auto_import?: boolean;
+}
+
+export type FeedItemStatus = "inbox" | "imported" | "dismissed" | "seen";
+
+export interface FeedItem {
+  id: string;
+  feed_id: string;
+  link_key: string;
+  link: string;
+  doi: string | null;
+  arxiv_id: string | null;
+  /** RFC 3339; null when the source gave no real date. */
+  published: string | null;
+  first_seen_at_ms: number;
+  status: FeedItemStatus;
+  /** The page shows only the start of a paid post. */
+  preview_only: boolean;
+  work: LiteratureSearchResult;
+  imported_path: string | null;
+  last_error: string | null;
+  /** The library holds this work already, by DOI or arXiv id. */
+  held: boolean;
+}
+
+export interface FeedItemsQuery {
+  status?: FeedItemStatus | null;
+  feed_id?: string | null;
+  offset?: number;
+  limit?: number;
+}
+
+export interface FeedItemsPage {
+  items: FeedItem[];
+  inbox_total: number;
+}
+
+export type FeedItemAction =
+  | { action: "import"; allow_missing_images?: boolean }
+  | { action: "dismiss" };
+
+export interface FeedsChanged {
+  feed_ids: string[];
+  inbox: number;
 }

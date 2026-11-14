@@ -1,6 +1,6 @@
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Bookmark, Search, Sliders, Square, X } from "react-feather";
+import { Bookmark, Rss, Search, Sliders, Square, X } from "react-feather";
 import type {
   BrowseControls,
   CatalogueGrain,
@@ -33,6 +33,8 @@ import { useGenerationStore } from "../stores/useGenerationStore";
 import { useCatalogueAdd } from "../hooks/useCatalogueAdd";
 import { api } from "../services";
 import CatalogueCandidate from "./CatalogueCandidate";
+import FeedsView, { FollowButton } from "./FeedsView";
+import { useFeedsStore } from "../stores/useFeedsStore";
 import { useSavedWorksStore } from "../stores/useSavedWorksStore";
 import { useViewerStore } from "../stores/useViewerStore";
 import type { SavedWork } from "../lib/types";
@@ -110,8 +112,16 @@ function CataloguePaneBody({ paneId }: { paneId: string }) {
   const [composeMode, setComposeMode] = useState(false);
   // Which the pane shows: what the sources hold, or what the user kept. Held
   // per pane, so a second pane can search while another lists the saved.
-  const [view, setView] = useState<"search" | "saved">("search");
+  const [view, setView] = useState<"search" | "saved" | "feeds">("search");
   const savedCount = useSavedWorksStore((s) => s.works.length);
+  const inboxCount = useFeedsStore((s) => s.inboxTotal);
+  const loadFeeds = useFeedsStore((s) => s.load);
+
+  // Read when the pane opens, so the count beside the Feeds button is the
+  // inbox as it stands rather than nothing until Feeds is first opened.
+  useEffect(() => {
+    void loadFeeds();
+  }, [loadFeeds]);
 
   // The filter is offered before anything has been asked, so the list it is
   // built from is read when the pane opens rather than from a search.
@@ -143,9 +153,23 @@ function CataloguePaneBody({ paneId }: { paneId: string }) {
     <div className="flex h-full flex-col border-l border-[var(--border-main)] bg-[var(--bg-sidebar)]">
       <div className="flex items-center justify-between border-b border-[var(--border-main)] px-3 py-1.5">
         <h2 className="text-[11px] font-bold uppercase tracking-wider text-[var(--text-dim)]">
-          {view === "saved" ? "Saved works" : "Catalogues & literature"}
+          {view === "saved" ? "Saved works" : view === "feeds" ? "Feeds" : "Catalogues & literature"}
         </h2>
         <div className="flex items-center gap-1">
+          <Tooltip content={view === "feeds" ? "Back to search" : "Feeds you follow, and what they found"}>
+            <button
+              type="button"
+              onClick={() => setView(view === "feeds" ? "search" : "feeds")}
+              aria-pressed={view === "feeds"}
+              aria-label="Feeds"
+              className={`flex h-[22px] items-center gap-1 rounded px-1 text-[10px] tabular-nums transition-colors hover:text-[var(--text-main)] ${
+                view === "feeds" ? "text-[var(--accent-blue)]" : "text-[var(--text-dim)]"
+              }`}
+            >
+              <Rss size={12} />
+              {inboxCount > 0 && inboxCount}
+            </button>
+          </Tooltip>
           <Tooltip content={view === "saved" ? "Back to search" : "Works you saved for later"}>
             <button
               type="button"
@@ -235,6 +259,8 @@ function CataloguePaneBody({ paneId }: { paneId: string }) {
 
         {view === "saved" ? (
           <SavedWorksList />
+        ) : view === "feeds" ? (
+          <FeedsView readOnly={readOnly} />
         ) : (
           <>
             {providerOptionsError !== null ? (
@@ -1397,6 +1423,7 @@ function optionLabel(
  * does not look like one that was ignored.
  */
 function ListingBody({ provider, name }: { provider: string; name: string }) {
+  const { readOnly } = useCatalogueAdd();
   const listing = useCatalogueSearch((s) => s.listings[provider]);
   const more = useCatalogueSearch((s) => s.browseMore);
   const answer = listing?.answer ?? null;
@@ -1417,6 +1444,9 @@ function ListingBody({ provider, name }: { provider: string; name: string }) {
                 : ""
             }`}
         </span>
+        {answer !== null && !readOnly && (
+          <FollowButton provider={provider} name={name} request={answer.request} />
+        )}
       </h4>
       {answer === null && loading && <Spinner />}
       {error !== null && !loading && (
@@ -1510,6 +1540,7 @@ function ProviderResults({
             entry={entry}
             paged={info?.capabilities.paged_search === true}
             grain={info?.mirror?.grain ?? null}
+            followable={info?.capabilities.browse?.keyword === true}
           />
         );
       })}
@@ -1524,13 +1555,18 @@ function ProviderEntry({
   entry,
   paged,
   grain,
+  followable,
 }: {
   answer: LiteratureAnswer;
   entry: LiteratureProviderAnswer;
   paged: boolean;
   /** What a learning catalogue holds; null for any other provider. */
   grain: CatalogueGrain | null;
+  /** Whether the provider's listing takes a keyword, so this answer can be
+   *  followed as one. */
+  followable: boolean;
 }) {
+  const { readOnly } = useCatalogueAdd();
   const moreLoading = useCatalogueSearch((s) => s.literatureMore);
   const moreError = useCatalogueSearch((s) => s.literatureMoreError);
   const loadMore = useCatalogueSearch((s) => s.loadMoreLiterature);
@@ -1549,6 +1585,9 @@ function ProviderEntry({
               .filter((part) => part !== null)
               .join(" · ")}
           </span>
+        )}
+        {followable && !readOnly && entry.error === null && (
+          <FollowButton provider={entry.provider} name={entry.name} request={{ query: answer.query }} />
         )}
       </h4>
       {entry.error !== null || entry.results === null ? (

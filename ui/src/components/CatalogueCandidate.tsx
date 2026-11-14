@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useId, useState, type ReactNode } from "react";
 import { Bookmark, Check, Download, ExternalLink } from "react-feather";
 import type {
   CatalogueCourseProgress,
@@ -31,6 +31,7 @@ const KIND_LABELS: Record<string, string> = {
   textbook: "Textbook",
   course: "Course",
   reference: "Reference",
+  post: "Post",
 };
 
 /**
@@ -148,6 +149,9 @@ interface Props {
    *  where the pane is not showing a search, so a filter would refine one
    *  nobody can see. */
   refinable?: boolean;
+  /** In place of the row's save and add buttons, for a list whose rows come
+   *  into the library another way: a feed's inbox imports through its feed. */
+  actions?: ReactNode;
 }
 
 /**
@@ -166,6 +170,7 @@ export default function CatalogueCandidate({
   compact = false,
   source,
   refinable = !compact,
+  actions,
 }: Props) {
   const { add, canAdd, needsDirectory, readOnly, stageOf, isAdded } = useCatalogueAdd();
   const stage = stageOf(provider, work);
@@ -255,9 +260,10 @@ export default function CatalogueCandidate({
           </div>
 
           <div className="flex shrink-0 items-center gap-1">
-            <SaveButton provider={provider} work={work} title={title} />
+            {actions === undefined && <SaveButton provider={provider} work={work} title={title} />}
             {link !== null && <OpenLink link={link} title={title} />}
-            {acquirable && (
+            {actions}
+            {actions === undefined && acquirable && (
               <AddButton
                 title={title}
                 tooltip={added ? "Added to this library" : addTitle}
@@ -298,7 +304,7 @@ export default function CatalogueCandidate({
             taken. What adding a course *does* is the button's own tooltip:
             a paragraph of it under every course row was the same sentence
             repeated down the pane. */}
-        {!acquirable && (work.kind !== null || work.is_open_access) && (
+        {actions === undefined && !acquirable && (work.kind !== null || work.is_open_access) && (
           <span className="text-[10px] leading-snug text-[var(--text-dim)]">
             {work.kind !== null
               ? "No downloadable copy — open it to read it where it lives."

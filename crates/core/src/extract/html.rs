@@ -714,6 +714,18 @@ mod tests {
         }
     }
 
+    /// The fixture the reader's own rendering is checked against
+    /// (`ui/src/components/HtmlReading.test.tsx`): what the viewer shows of it
+    /// and what search reads of it are the same text.
+    #[test]
+    fn the_fixture_reads_as_its_expected_visible_text() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/html");
+        let source = std::fs::read_to_string(fixtures.join("visible-text.html")).unwrap();
+        let expected = std::fs::read_to_string(fixtures.join("visible-text.txt")).unwrap();
+        let (_, projection) = read(&source);
+        assert_eq!(projection.as_str(), expected.trim_end_matches('\n'));
+    }
+
     #[test]
     fn an_unknown_entity_is_text_as_written() {
         assert_eq!(visible("a &unknownentity; b"), "a &unknownentity; b");

@@ -28,6 +28,10 @@ vi.mock("../services", () => ({
     literatureComposeCancel: vi.fn(() => Promise.resolve()),
     literatureAcquire: vi.fn(),
     listFiles: vi.fn(() => Promise.resolve({ files: [], omitted: [] })),
+    feedsList: vi.fn(() => Promise.resolve([])),
+    feedItems: vi.fn(() => Promise.resolve({ items: [], inbox_total: 0 })),
+    feedAdd: vi.fn(),
+    onFeedsChanged: vi.fn(() => Promise.resolve(() => {})),
   },
   source: {
     type: "desktop",
