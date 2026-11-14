@@ -63,6 +63,7 @@ fn kept(source: u32, line: usize, dy: f32) -> Strip {
         rect,
         x: rect.x,
         y: rect.y + dy,
+        graphics_only: false,
     }
 }
 
@@ -168,6 +169,7 @@ fn a_line_pushed_off_a_page_arrives_on_the_next_and_leaves_the_first() {
         rect: line_area(2),
         x: LEFT,
         y: first_line_top,
+        graphics_only: false,
     };
     let export = EditExport {
         pages: vec![
@@ -204,6 +206,7 @@ fn content_past_the_last_page_gets_a_page_of_its_own() {
         rect: line_area(2),
         x: LEFT,
         y: line_area(0).y,
+        graphics_only: false,
     };
     let export = EditExport {
         pages: vec![
@@ -218,6 +221,33 @@ fn content_past_the_last_page_gets_a_page_of_its_own() {
     let appended = lines(&destination, 1);
     assert_eq!(appended.len(), 1);
     assert!(has(&appended, "P1 line three gamma"));
+}
+
+#[test]
+fn what_a_paragraph_stood_on_is_kept_without_its_words() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = fixture(directory.path(), 1);
+    let destination = directory.path().join("edited.pdf");
+
+    // Line two is drawn again as paper only -- twice, as a paragraph that grew
+    // by a line would have it -- and line three follows below.
+    let paper = |dy: f32| Strip {
+        graphics_only: true,
+        ..kept(1, 1, dy)
+    };
+    let export = EditExport {
+        pages: vec![page(
+            1,
+            vec![kept(1, 0, 0.0), paper(0.0), paper(20.0), kept(1, 2, 20.0)],
+            vec![],
+        )],
+    };
+    write_edited_pdf(&source, &export, &destination).unwrap();
+
+    let edited = lines(&destination, 0);
+    assert!(!has(&edited, "two beta"), "the words came along: {edited:?}");
+    assert!(has(&edited, "P1 line one alpha"));
+    assert!(has(&edited, "P1 line three gamma"));
 }
 
 #[test]

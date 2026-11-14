@@ -70,6 +70,10 @@ pub struct Strip {
     /// Where its top-left corner goes on this page.
     pub x: f32,
     pub y: f32,
+    /// Drawn without its text: what an edited paragraph stood on -- a tint, a
+    /// border, a rule beside it -- with the words it used to hold taken out.
+    #[serde(default)]
+    pub graphics_only: bool,
 }
 
 /// A run of text on one baseline, in one font.
@@ -278,6 +282,7 @@ struct Group<'a> {
     source: u32,
     dx: f32,
     dy: f32,
+    graphics_only: bool,
     strips: Vec<&'a Strip>,
 }
 
@@ -289,6 +294,7 @@ fn groups(page: &ExportPage) -> Vec<Group<'_>> {
         // hundredth of a point are one move.
         let existing = groups.iter_mut().find(|group| {
             group.source == strip.source
+                && group.graphics_only == strip.graphics_only
                 && (group.dx - dx).abs() < 0.01
                 && (group.dy - dy).abs() < 0.01
         });
@@ -298,10 +304,13 @@ fn groups(page: &ExportPage) -> Vec<Group<'_>> {
                 source: strip.source,
                 dx,
                 dy,
+                graphics_only: strip.graphics_only,
                 strips: vec![strip],
             }),
         }
     }
+    // What a paragraph stood on goes down first, under everything drawn whole.
+    groups.sort_by_key(|group| !group.graphics_only);
     groups
 }
 
@@ -322,7 +331,7 @@ fn write_page(
             .get(&group.source)
             .ok_or_else(|| anyhow!("source page {} was not read", group.source))?;
         let kept: Vec<Area> = group.strips.iter().map(|strip| strip.rect).collect();
-        let form = cut_form(doc, original, &kept)
+        let form = cut_form(doc, original, &kept, group.graphics_only)
             .with_context(|| format!("cutting areas out of page {}", group.source))?;
         let name = format!("Wk{number}");
         xobjects.dict_put(name.as_str(), form)?;
@@ -358,14 +367,24 @@ fn write_page(
 }
 
 /// A source page with everything but `kept` taken out, as a Form XObject in
-/// the page's own user space.
-fn cut_form(doc: &mut PdfDocument, original: &Original, kept: &[Area]) -> anyhow::Result<PdfObject> {
+/// the page's own user space. With `graphics_only`, the text inside `kept`
+/// is taken out as well: redaction removes text and leaves what is drawn.
+fn cut_form(
+    doc: &mut PdfDocument,
+    original: &Original,
+    kept: &[Area],
+    graphics_only: bool,
+) -> anyhow::Result<PdfObject> {
     let page_area = original.page_area();
-    let safe: Vec<Area> = kept
-        .iter()
-        .map(|area| area.expanded(KEEP_MARGIN_X, KEEP_MARGIN_Y))
-        .collect();
-    let redactions = geometry::complement(page_area, &safe);
+    let redactions = if graphics_only {
+        vec![page_area]
+    } else {
+        let safe: Vec<Area> = kept
+            .iter()
+            .map(|area| area.expanded(KEEP_MARGIN_X, KEEP_MARGIN_Y))
+            .collect();
+        geometry::complement(page_area, &safe)
+    };
 
     // A scratch page with its own copy of the content: redaction rewrites a
     // page's stream in place, and the source's must stay as it is for every
