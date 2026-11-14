@@ -1,4 +1,9 @@
-import type { ImagePage } from "@leonrjg/wilkes-reader";
+import type {
+  ImagePage,
+  PdfEditExport,
+  PdfFontRequest,
+  ResolvedPdfFont,
+} from "@leonrjg/wilkes-reader";
 import type {
   HttpCall,
   EmbedDone,
@@ -273,6 +278,15 @@ export interface SearchApi {
    *  is nothing for `resolveAssetUrl` to point at, and the rendering comes
    *  across as bytes instead. */
   surrogateBytes(path: string): Promise<ArrayBuffer>;
+  /** A whole, installed font for text typed into a PDF, standing in for one
+   *  the document names. The id comes back when the document is saved, and
+   *  names the same file: that is what keeps the saved lines the ones on
+   *  screen. */
+  resolvePdfFont(font: PdfFontRequest): Promise<ResolvedPdfFont>;
+  /** Save a copy of a PDF with the reader's edits applied, wherever the user
+   *  chooses. Resolves to where it went, or null if they chose nowhere. The
+   *  document itself is never written. */
+  savePdfEdits(source: string, edits: PdfEditExport): Promise<string | null>;
   comicPage(path: string, page: number, signal: AbortSignal): Promise<ImagePage>;
   /** A document's first page as PNG bytes, fitted inside `maxEdge` pixels. The
    *  host keeps what it draws, so asking again costs a read. */

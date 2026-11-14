@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { TauriSearchApi, TauriSourceApi } from "./tauri";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { save } from "@tauri-apps/plugin-dialog";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -48,6 +49,38 @@ describe("TauriSearchApi", () => {
     answers[2]();
     await second;
     expect(invoke).toHaveBeenLastCalledWith("browser_pane_show", expect.objectContaining({ url: "https://example.org/" }));
+  });
+
+  it("resolves a PDF font to an id and that font's file", async () => {
+    const file = new Uint8Array([0, 1, 0, 0]).buffer;
+    (invoke as any).mockImplementation((command: string) =>
+      Promise.resolve(command === "resolve_pdf_font" ? "Georgia" : file),
+    );
+    const request = { name: "Georgia", bold: false, italic: false, generic: "serif" as const };
+    await expect(api.resolvePdfFont(request)).resolves.toEqual({ id: "Georgia", data: file });
+    expect(invoke).toHaveBeenCalledWith("resolve_pdf_font", { request });
+    expect(invoke).toHaveBeenCalledWith("pdf_font_bytes", { id: "Georgia" });
+  });
+
+  it("saves an edited PDF where the user chose, offering a name beside the original", async () => {
+    (save as any).mockResolvedValue("/docs/paper (edited).pdf");
+    (invoke as any).mockResolvedValue(undefined);
+    const edits = { pages: [] };
+    await expect(api.savePdfEdits("/docs/paper.pdf", edits)).resolves.toBe("/docs/paper (edited).pdf");
+    expect(save).toHaveBeenCalledWith(
+      expect.objectContaining({ defaultPath: "/docs/paper (edited).pdf" }),
+    );
+    expect(invoke).toHaveBeenCalledWith("save_pdf_edits", {
+      source: "/docs/paper.pdf",
+      destination: "/docs/paper (edited).pdf",
+      export: edits,
+    });
+  });
+
+  it("writes nothing when the user chooses nowhere to save an edited PDF", async () => {
+    (save as any).mockResolvedValue(null);
+    await expect(api.savePdfEdits("/docs/paper.pdf", { pages: [] })).resolves.toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it("reads generic startup status before the app runtime is used", async () => {

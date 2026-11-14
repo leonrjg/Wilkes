@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isPagedPath, isPdfPath, servesPagesOnDemand } from "../lib/documentFormats";
 import { readerLinks, readerOutline } from "../lib/surrogate";
-import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud, Share2, Edit3 } from "react-feather";
+import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud, Share2, Edit3, Save } from "react-feather";
 import DocumentEditor from "./DocumentEditor";
 // Everything this pane takes from the readers comes through their public
 // surface -- the same entry point Underdog will import. Reaching past it into
@@ -18,6 +18,8 @@ import {
   type Decoration,
   type DocumentSelection,
   type ElementAnchor,
+  type PdfFontRequest,
+  type PdfReaderHandle,
   type ReaderHostServices,
   type SelectionActionsSlot,
 } from "@leonrjg/wilkes-reader";
@@ -44,6 +46,7 @@ import CitationGraphPane from "./CitationGraphPane";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSearchStore } from "../stores/useSearchStore";
 import { openLink } from "../lib/openLink";
+import { fileNameOf } from "../lib/editedCopy";
 
 type ViewerSidePanel = "related" | "citations" | "summary" | "topics" | null;
 
@@ -168,6 +171,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   // reaches it -- the readers refuse those before asking. Kept stable on its
   // own, because a reader re-parses its document when this changes.
   const resolveLocalAsset = useCallback((path: string) => api.resolveAssetUrl(path), []);
+  const resolvePdfFont = useCallback((font: PdfFontRequest) => api.resolvePdfFont(font), []);
   // Everything the readers need from this application. They take it from here
   // rather than importing the Tauri bridge and the settings store directly, so
   // the same components can be mounted by a host that has neither.
@@ -178,13 +182,16 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
       colorScheme,
       pdfAutoZoomTargetPx,
       resolveLocalAsset,
+      resolvePdfFont,
       positions: readerPositionStore,
     }),
-    [colorScheme, pdfAutoZoomTargetPx, resolveLocalAsset],
+    [colorScheme, pdfAutoZoomTargetPx, resolveLocalAsset, resolvePdfFont],
   );
   const [sidePanel, setSidePanel] = useState<ViewerSidePanel>(null);
   const [textView, setTextView] = useState<"source" | "rendered">("rendered");
   const [editing, setEditing] = useState(false);
+  const pdfReaderRef = useRef<PdfReaderHandle>(null);
+  const [savingEdits, setSavingEdits] = useState(false);
   const [openBookmarkTarget, setOpenBookmarkTarget] = useState<{
     id: string;
     anchor: ElementAnchor;
@@ -356,6 +363,27 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   // A PDF's own pages can be edited in place. A book's are a rendering Wilkes
   // made of it, and a comic's are pictures: neither has text of its own there.
   const isEditablePdf = isPagedFile && !isComic && !isBook;
+  // The edits live in the reader; what is written is what the reader says is
+  // on screen. The document itself is never the file that is written.
+  const saveEditedCopy = async () => {
+    setSavingEdits(true);
+    try {
+      const edits = pdfReaderRef.current?.exportEdits() ?? null;
+      if (!edits) {
+        addToast("Nothing has been changed", { type: "info" });
+        return;
+      }
+      const saved = await api.savePdfEdits(selectedMatch.path, edits);
+      if (saved) addToast(`Saved a copy as ${fileNameOf(saved)}`, { type: "success" });
+    } catch (error) {
+      console.error("Saving an edited copy failed:", error);
+      addToast(`Could not save the edited copy: ${error instanceof Error ? error.message : String(error)}`, {
+        type: "error",
+      });
+    } finally {
+      setSavingEdits(false);
+    }
+  };
   const isMarkdownFile =
     !isPagedFile && displayData != null && "Text" in displayData && displayData.Text.language === "markdown";
   const isHtmlFile =
@@ -757,6 +785,20 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
           </Tooltip>
         )}
 
+        {!standalone && editing && isEditablePdf && (
+          <Tooltip content="Save a copy with your changes">
+            <button
+              type="button"
+              onClick={() => void saveEditedCopy()}
+              disabled={savingEdits}
+              aria-label="Save an edited copy"
+              className="inline-flex rounded border border-[var(--border-main)] p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-header)] hover:text-[var(--text-main)] disabled:opacity-50"
+            >
+              <Save size={16} />
+            </button>
+          </Tooltip>
+        )}
+
       </div>
 
       {/* Content */}
@@ -839,6 +881,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
                 decorations={readerDecorations}
                 textSubstitutions={pdfSuperseded}
                 editing={editing && isEditablePdf}
+                ref={pdfReaderRef}
                 slots={{ selectionActions: selectionActionsSlot }}
                 onRenderSuccess={() => setIsPdfRendering(false)}
                 onLoadError={(error) => reportTabLoadError(activeTab.id, error)}

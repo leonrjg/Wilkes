@@ -64,6 +64,8 @@ vi.mock("../services", () => ({
     resolveAssetUrl: vi.fn((path: string) => path),
     comicPage: vi.fn(),
     surrogateBytes: vi.fn(() => Promise.resolve(new Uint8Array([1, 2, 3]).buffer)),
+    resolvePdfFont: vi.fn(),
+    savePdfEdits: vi.fn(() => Promise.resolve("/docs/test (edited).pdf")),
     relatedDocuments: vi.fn(() => Promise.resolve([])),
     chunkTopics: vi.fn(() => Promise.resolve({ topics: [] })),
     cancelChunkTopics: vi.fn(() => Promise.resolve()),
@@ -784,6 +786,39 @@ describe("PreviewPane", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Finish editing document" }));
     expect(mockPdfViewer.mock.lastCall?.[0].editing).toBe(false);
+  });
+
+  it("saves an edited copy of a PDF from what the reader says is on screen", async () => {
+    setViewerState({
+      selectedMatch: { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } },
+    });
+    render(<PreviewPane />);
+    // Saving is part of editing: there is nothing to save from a document
+    // that is only being read.
+    expect(screen.queryByRole("button", { name: "Save an edited copy" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit document" }));
+
+    const edits = { pages: [] };
+    mockPdfViewer.mock.lastCall![0].ref.current = { exportEdits: () => edits };
+    fireEvent.click(screen.getByRole("button", { name: "Save an edited copy" }));
+    await waitFor(() => expect(api.savePdfEdits).toHaveBeenCalledWith("test.pdf", edits));
+  });
+
+  it("writes nothing when the reader has changed nothing", async () => {
+    setViewerState({
+      selectedMatch: { path: "test.pdf", origin: { PdfPage: { page: 1, bbox: null } } } as any,
+      previewData: { Pdf: { page: 1, highlight_bbox: null } },
+    });
+    render(<PreviewPane />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit document" }));
+    (api.savePdfEdits as any).mockClear();
+    mockPdfViewer.mock.lastCall![0].ref.current = { exportEdits: () => null };
+    fireEvent.click(screen.getByRole("button", { name: "Save an edited copy" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Save an edited copy" })).not.toBeDisabled(),
+    );
+    expect(api.savePdfEdits).not.toHaveBeenCalled();
   });
 
   it("publishes the active PDF and live page for external MCP without a chat session", async () => {
