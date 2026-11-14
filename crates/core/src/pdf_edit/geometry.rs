@@ -121,7 +121,12 @@ mod tests {
     use super::*;
 
     fn area(x: f32, y: f32, width: f32, height: f32) -> Area {
-        Area { x, y, width, height }
+        Area {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     #[test]
@@ -134,7 +139,10 @@ mod tests {
     fn a_band_across_the_page_leaves_what_is_above_and_below() {
         let page = area(0.0, 0.0, 100.0, 200.0);
         let left = complement(page, &[area(0.0, 50.0, 100.0, 20.0)]);
-        assert_eq!(left, vec![area(0.0, 0.0, 100.0, 50.0), area(0.0, 70.0, 100.0, 130.0)]);
+        assert_eq!(
+            left,
+            vec![area(0.0, 0.0, 100.0, 50.0), area(0.0, 70.0, 100.0, 130.0)]
+        );
     }
 
     #[test]
@@ -156,6 +164,9 @@ mod tests {
             page,
             &[area(10.0, 0.0, 50.0, 100.0), area(30.0, 0.0, 50.0, 100.0)],
         );
-        assert_eq!(left, vec![area(0.0, 0.0, 10.0, 100.0), area(80.0, 0.0, 20.0, 100.0)]);
+        assert_eq!(
+            left,
+            vec![area(0.0, 0.0, 10.0, 100.0), area(80.0, 0.0, 20.0, 100.0)]
+        );
     }
 }

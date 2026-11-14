@@ -28,6 +28,7 @@ mod content;
 pub mod fonts;
 mod geometry;
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -130,8 +131,8 @@ pub fn write_edited_pdf(
     // a page that is both a source and a destination must be read as it was.
     let mut originals: HashMap<u32, Original> = HashMap::new();
     for strip in export.pages.iter().flat_map(|page| &page.strips) {
-        if !originals.contains_key(&strip.source) {
-            originals.insert(strip.source, Original::read(&mut doc, strip.source)?);
+        if let Entry::Vacant(unread) = originals.entry(strip.source) {
+            unread.insert(Original::read(&mut doc, strip.source)?);
         }
     }
 
@@ -141,11 +142,16 @@ pub fn write_edited_pdf(
         }
     }
 
+    // Before the pages are rewritten: where an annotation goes is decided by
+    // where the page it is on had it.
+    let annotations = relocated_annotations(&doc, export, &originals, source_pages)?;
+
     let mut fonts = FontTable::default();
     for page in &export.pages {
         write_page(&mut doc, page, &originals, &mut fonts)
             .with_context(|| format!("writing page {}", page.page))?;
     }
+    attach_annotations(&mut doc, export, annotations)?;
 
     let mut options = PdfWriteOptions::default();
     // Collect what the rewritten pages no longer reference: the original
@@ -184,7 +190,10 @@ fn validate(export: &EditExport, source_pages: u32) -> anyhow::Result<()> {
     let mut previous = 0;
     for page in &export.pages {
         if page.page <= previous {
-            bail!("export pages are not in ascending order at page {}", page.page);
+            bail!(
+                "export pages are not in ascending order at page {}",
+                page.page
+            );
         }
         previous = page.page;
         if page.page > source_pages {
@@ -431,6 +440,166 @@ fn cut_form(
     let mut form = doc.add_object(&form)?;
     form.write_stream_buffer(&Buffer::from_bytes(&redacted)?)?;
     Ok(form)
+}
+
+/// An annotation with somewhere to be on a rewritten page.
+struct Relocated {
+    destination: u32,
+    annotation: PdfObject,
+    /// Its `/Rect` and `/QuadPoints` there, in that page's user space.
+    rect: [f32; 4],
+    quads: Option<Vec<f32>>,
+}
+
+/// Where the annotations of every rewritten page belong now.
+///
+/// A link is an area of a page, kept beside the content rather than in it, so
+/// moving the content does not move the link: without this, a citation pushed
+/// down two lines leaves its link where it was, over whatever is there now. An
+/// annotation goes with the strip its centre is in -- to wherever that strip
+/// went, on whichever page. One whose text was replaced is in no strip, and is
+/// dropped: it was a link on words that are gone.
+fn relocated_annotations(
+    doc: &PdfDocument,
+    export: &EditExport,
+    originals: &HashMap<u32, Original>,
+    source_pages: u32,
+) -> anyhow::Result<Vec<Relocated>> {
+    let mut relocated = Vec::new();
+    for page in export.pages.iter().filter(|page| page.page <= source_pages) {
+        let object = doc.find_page(page.page as i32 - 1)?;
+        let Some(annotations) = object.get_dict("Annots")? else {
+            continue;
+        };
+        let source_ctm = object.page_ctm()?;
+        let mut dropped = 0;
+        for index in 0..annotations.len()? {
+            let Some(annotation) = annotations.get_array(index as i32)? else {
+                continue;
+            };
+            let Some(rect) = numbers(&annotation, "Rect")?.filter(|rect| rect.len() == 4) else {
+                dropped += 1;
+                continue;
+            };
+            let (x0, y0) = content::apply(&source_ctm, rect[0], rect[1]);
+            let (x1, y1) = content::apply(&source_ctm, rect[2], rect[3]);
+            let centre = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+
+            let landing = export.pages.iter().find_map(|destination| {
+                destination
+                    .strips
+                    .iter()
+                    .find(|strip| {
+                        strip.source == page.page
+                            && !strip.graphics_only
+                            && strip.rect.contains(centre.0, centre.1)
+                    })
+                    .map(|strip| {
+                        (
+                            destination.page,
+                            strip.x - strip.rect.x,
+                            strip.y - strip.rect.y,
+                        )
+                    })
+            });
+            let Some((destination, dx, dy)) = landing else {
+                dropped += 1;
+                continue;
+            };
+            if !originals.contains_key(&page.page) {
+                bail!("page {} has a strip but was not read", page.page);
+            }
+
+            // Through this page's space, moved, and back out through the
+            // destination's: the two pages need not share an origin.
+            let to_destination =
+                content::invert(&doc.find_page(destination as i32 - 1)?.page_ctm()?)?;
+            let moved = |x: f32, y: f32| {
+                let (px, py) = content::apply(&source_ctm, x, y);
+                content::apply(&to_destination, px + dx, py + dy)
+            };
+            let (ax, ay) = moved(rect[0], rect[1]);
+            let (bx, by) = moved(rect[2], rect[3]);
+            let quads = numbers(&annotation, "QuadPoints")?.map(|points| {
+                points
+                    .chunks_exact(2)
+                    .flat_map(|point| {
+                        let (x, y) = moved(point[0], point[1]);
+                        [x, y]
+                    })
+                    .collect()
+            });
+            relocated.push(Relocated {
+                destination,
+                annotation,
+                rect: [ax.min(bx), ay.min(by), ax.max(bx), ay.max(by)],
+                quads,
+            });
+        }
+        if dropped > 0 {
+            debug!(
+                "pdf_edit: page {}: {dropped} annotation(s) sat on text that was replaced and were dropped",
+                page.page
+            );
+        }
+    }
+    Ok(relocated)
+}
+
+/// Give every rewritten page the annotations that belong on it now.
+fn attach_annotations(
+    doc: &mut PdfDocument,
+    export: &EditExport,
+    relocated: Vec<Relocated>,
+) -> anyhow::Result<()> {
+    let mut by_page: HashMap<u32, Vec<Relocated>> = HashMap::new();
+    for entry in relocated {
+        by_page.entry(entry.destination).or_default().push(entry);
+    }
+    for page in &export.pages {
+        let mut object = doc.find_page(page.page as i32 - 1)?;
+        let mut list = doc.new_array()?;
+        for mut entry in by_page.remove(&page.page).unwrap_or_default() {
+            entry
+                .annotation
+                .dict_put("Rect", number_array(doc, &entry.rect)?)?;
+            if let Some(quads) = &entry.quads {
+                entry
+                    .annotation
+                    .dict_put("QuadPoints", number_array(doc, quads)?)?;
+            }
+            // The page it is on now, which need not be the one it was on.
+            entry.annotation.dict_put("P", object.try_clone()?)?;
+            list.array_push(entry.annotation)?;
+        }
+        object.dict_put("Annots", list)?;
+    }
+    Ok(())
+}
+
+fn numbers(object: &PdfObject, key: &str) -> anyhow::Result<Option<Vec<f32>>> {
+    let Some(array) = object.get_dict(key)? else {
+        return Ok(None);
+    };
+    if !array.is_array()? {
+        return Ok(None);
+    }
+    let mut values = Vec::with_capacity(array.len()?);
+    for index in 0..array.len()? {
+        match array.get_array(index as i32)? {
+            Some(value) => values.push(value.as_float()?),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(values))
+}
+
+fn number_array(doc: &PdfDocument, values: &[f32]) -> anyhow::Result<PdfObject> {
+    let mut array = doc.new_array()?;
+    for value in values {
+        array.array_push(PdfObject::new_real(*value)?)?;
+    }
+    Ok(array)
 }
 
 /// The fonts already added to the document being written.

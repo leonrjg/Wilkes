@@ -60,8 +60,16 @@ pub fn resolve(request: &FontRequest) -> anyhow::Result<ResolvedFont> {
 
     let mut properties = Properties::new();
     properties
-        .weight(if request.bold { Weight::BOLD } else { Weight::NORMAL })
-        .style(if request.italic { Style::Italic } else { Style::Normal });
+        .weight(if request.bold {
+            Weight::BOLD
+        } else {
+            Weight::NORMAL
+        })
+        .style(if request.italic {
+            Style::Italic
+        } else {
+            Style::Normal
+        });
     let generic = match request.generic {
         GenericFamily::Serif => FamilyName::Serif,
         GenericFamily::SansSerif => FamilyName::SansSerif,
@@ -78,7 +86,12 @@ pub fn resolve(request: &FontRequest) -> anyhow::Result<ResolvedFont> {
     let families: Vec<FamilyName> = family.into_iter().chain([generic]).collect();
     let handle = source
         .select_best_match(&families, &properties)
-        .map_err(|error| anyhow!("no installed font can stand in for {:?}: {error}", request.name))?;
+        .map_err(|error| {
+            anyhow!(
+                "no installed font can stand in for {:?}: {error}",
+                request.name
+            )
+        })?;
     let resolved = from_handle(&handle)?;
     debug!(
         "pdf_edit: {:?} is not installed; setting it in {}",
@@ -129,7 +142,9 @@ fn standalone(data: &[u8], index: u32) -> anyhow::Result<Vec<u8>> {
     }
     let count = read_u32(data, 8)?;
     if index >= count {
-        return Err(anyhow!("collection has {count} fonts, not one numbered {index}"));
+        return Err(anyhow!(
+            "collection has {count} fonts, not one numbered {index}"
+        ));
     }
     let directory = read_u32(data, 12 + 4 * index as usize)? as usize;
     let table_count = read_u16(data, directory + 4)? as usize;
@@ -191,7 +206,10 @@ mod tests {
         data.extend_from_slice(&2u32.to_be_bytes());
         data.extend_from_slice(&(header_len as u32).to_be_bytes());
         data.extend_from_slice(&((header_len + directory_len) as u32).to_be_bytes());
-        for second in [(b"bbbb", b_at, table_b.len()), (b"cccc", c_at, table_c.len())] {
+        for second in [
+            (b"bbbb", b_at, table_b.len()),
+            (b"cccc", c_at, table_c.len()),
+        ] {
             data.extend_from_slice(&0x0001_0000u32.to_be_bytes());
             data.extend_from_slice(&2u16.to_be_bytes());
             data.extend_from_slice(&[0; 6]);

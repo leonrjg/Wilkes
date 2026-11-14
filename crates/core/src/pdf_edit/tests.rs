@@ -28,7 +28,10 @@ fn fixture(directory: &Path, pages: u32) -> PathBuf {
         object.dict_put("Resources", resources).unwrap();
 
         let mut stream = String::new();
-        for (baseline, words) in BASELINES.iter().zip(["one alpha", "two beta", "three gamma"]) {
+        for (baseline, words) in BASELINES
+            .iter()
+            .zip(["one alpha", "two beta", "three gamma"])
+        {
             stream.push_str(&format!(
                 "BT /F1 12 Tf {LEFT} {} Td (P{page} line {words}) Tj ET\n",
                 HEIGHT - baseline
@@ -138,13 +141,19 @@ fn text_that_was_replaced_is_gone_and_what_followed_it_moved() {
         pages: vec![page(
             1,
             vec![kept(1, 0, 0.0), kept(1, 2, 20.0)],
-            vec![typed(80.0, "Typed in place of it"), typed(100.0, "and a second line")],
+            vec![
+                typed(80.0, "Typed in place of it"),
+                typed(100.0, "and a second line"),
+            ],
         )],
     };
     write_edited_pdf(&source, &export, &destination).unwrap();
 
     let edited = lines(&destination, 0);
-    assert!(!has(&edited, "two beta"), "replaced text survived: {edited:?}");
+    assert!(
+        !has(&edited, "two beta"),
+        "replaced text survived: {edited:?}"
+    );
     assert!(has(&edited, "Typed in place of it"));
     assert!(has(&edited, "and a second line"));
     let moved = top_of(&edited, "P1 line three gamma") - top_of(&original, "P1 line three gamma");
@@ -152,7 +161,13 @@ fn text_that_was_replaced_is_gone_and_what_followed_it_moved() {
     let stayed = top_of(&edited, "P1 line one alpha") - top_of(&original, "P1 line one alpha");
     assert!(stayed.abs() < 0.5, "line one moved by {stayed}");
     // Each kept line is in the file once, not once per copy of its page.
-    assert_eq!(edited.iter().filter(|(words, _)| words.contains("one alpha")).count(), 1);
+    assert_eq!(
+        edited
+            .iter()
+            .filter(|(words, _)| words.contains("one alpha"))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -176,7 +191,12 @@ fn a_line_pushed_off_a_page_arrives_on_the_next_and_leaves_the_first() {
             page(1, vec![kept(1, 0, 0.0), kept(1, 1, 0.0)], vec![]),
             page(
                 2,
-                vec![carried, kept(2, 0, 20.0), kept(2, 1, 20.0), kept(2, 2, 20.0)],
+                vec![
+                    carried,
+                    kept(2, 0, 20.0),
+                    kept(2, 1, 20.0),
+                    kept(2, 2, 20.0),
+                ],
                 vec![],
             ),
         ],
@@ -185,14 +205,20 @@ fn a_line_pushed_off_a_page_arrives_on_the_next_and_leaves_the_first() {
 
     let first = lines(&destination, 0);
     assert!(has(&first, "P1 line two beta"));
-    assert!(!has(&first, "three gamma"), "the carried line stayed behind: {first:?}");
+    assert!(
+        !has(&first, "three gamma"),
+        "the carried line stayed behind: {first:?}"
+    );
 
     let second = lines(&destination, 1);
     let carried_top = top_of(&second, "P1 line three gamma");
     assert!(carried_top < top_of(&second, "P2 line one alpha"));
     let original = lines(&source, 1);
     let moved = top_of(&second, "P2 line three gamma") - top_of(&original, "P2 line three gamma");
-    assert!((moved - 20.0).abs() < 0.5, "page 2's lines moved by {moved}");
+    assert!(
+        (moved - 20.0).abs() < 0.5,
+        "page 2's lines moved by {moved}"
+    );
 }
 
 #[test]
@@ -245,9 +271,122 @@ fn what_a_paragraph_stood_on_is_kept_without_its_words() {
     write_edited_pdf(&source, &export, &destination).unwrap();
 
     let edited = lines(&destination, 0);
-    assert!(!has(&edited, "two beta"), "the words came along: {edited:?}");
+    assert!(
+        !has(&edited, "two beta"),
+        "the words came along: {edited:?}"
+    );
     assert!(has(&edited, "P1 line one alpha"));
     assert!(has(&edited, "P1 line three gamma"));
+}
+
+/// The fixture with a link over each of page 1's second and third lines.
+fn fixture_with_links(directory: &Path) -> PathBuf {
+    let plain = fixture(directory, 1);
+    let mut doc = PdfDocument::open(plain.to_str().unwrap()).unwrap();
+    let mut annotations = doc.new_array().unwrap();
+    for line in [1, 2] {
+        let area = line_area(line);
+        // User space is y-up: the area's bottom edge is the lower y.
+        let link = doc
+            .new_object_from_str(&format!(
+                "<< /Type /Annot /Subtype /Link /Rect [{} {} {} {}] /Border [0 0 0] \
+                 /A << /S /URI /URI (https://example.org/{line}) >> >>",
+                area.x,
+                HEIGHT - area.bottom(),
+                area.right(),
+                HEIGHT - area.y
+            ))
+            .unwrap();
+        annotations
+            .array_push(doc.add_object(&link).unwrap())
+            .unwrap();
+    }
+    doc.find_page(0)
+        .unwrap()
+        .dict_put("Annots", annotations)
+        .unwrap();
+    let path = directory.join("linked.pdf");
+    doc.save(path.to_str().unwrap()).unwrap();
+    path
+}
+
+/// Each link on a page: where it points, and the top of its area in page space.
+fn links(path: &Path, page: i32) -> Vec<(String, f32)> {
+    let doc = PdfDocument::open(path.to_str().unwrap()).unwrap();
+    let object = doc.find_page(page).unwrap();
+    let Some(annotations) = object.get_dict("Annots").unwrap() else {
+        return Vec::new();
+    };
+    (0..annotations.len().unwrap())
+        .map(|index| {
+            let annotation = annotations.get_array(index as i32).unwrap().unwrap();
+            let rect = annotation.get_dict("Rect").unwrap().unwrap();
+            let upper = rect.get_array(3).unwrap().unwrap().as_float().unwrap();
+            let uri = annotation
+                .get_dict("A")
+                .unwrap()
+                .unwrap()
+                .get_dict("URI")
+                .unwrap()
+                .unwrap();
+            (uri.as_string().unwrap().to_string(), HEIGHT - upper)
+        })
+        .collect()
+}
+
+#[test]
+fn a_link_follows_the_line_it_is_on_and_goes_with_text_that_was_replaced() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = fixture_with_links(directory.path());
+    let destination = directory.path().join("edited.pdf");
+    assert_eq!(links(&source, 0).len(), 2);
+
+    // Line two is replaced; line three moves down by 20.
+    let export = EditExport {
+        pages: vec![page(1, vec![kept(1, 0, 0.0), kept(1, 2, 20.0)], vec![])],
+    };
+    write_edited_pdf(&source, &export, &destination).unwrap();
+
+    let after = links(&destination, 0);
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert_eq!(after[0].0, "https://example.org/2");
+    assert!(
+        (after[0].1 - (line_area(2).y + 20.0)).abs() < 0.01,
+        "{after:?}"
+    );
+}
+
+#[test]
+fn a_link_goes_to_the_next_page_with_its_line() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = fixture_with_links(directory.path());
+    let destination = directory.path().join("edited.pdf");
+    let carried = Strip {
+        source: 1,
+        rect: line_area(2),
+        x: LEFT,
+        y: line_area(0).y,
+        graphics_only: false,
+    };
+    let export = EditExport {
+        pages: vec![
+            page(1, vec![kept(1, 0, 0.0), kept(1, 1, 0.0)], vec![]),
+            page(2, vec![carried], vec![]),
+        ],
+    };
+    write_edited_pdf(&source, &export, &destination).unwrap();
+
+    assert_eq!(
+        links(&destination, 0)
+            .iter()
+            .map(|link| link.0.as_str())
+            .collect::<Vec<_>>(),
+        ["https://example.org/1"]
+    );
+    let carried = links(&destination, 1);
+    assert_eq!(carried.len(), 1);
+    assert_eq!(carried[0].0, "https://example.org/2");
+    assert!((carried[0].1 - line_area(0).y).abs() < 0.01, "{carried:?}");
 }
 
 #[test]

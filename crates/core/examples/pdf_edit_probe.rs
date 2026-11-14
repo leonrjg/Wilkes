@@ -19,7 +19,12 @@ use wilkes_core::pdf_edit::{self, fonts, EditExport};
 
 fn main() -> anyhow::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    match arguments.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+    match arguments
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         ["font", request, output] => {
             let request: fonts::FontRequest =
                 serde_json::from_str(request).context("parsing the font request")?;
@@ -40,6 +45,8 @@ fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
-        _ => bail!("usage: pdf_edit_probe font <request json> <out> | write <source> <export json> <dest>"),
+        _ => bail!(
+            "usage: pdf_edit_probe font <request json> <out> | write <source> <export json> <dest>"
+        ),
     }
 }

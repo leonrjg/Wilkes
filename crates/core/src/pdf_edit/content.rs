@@ -31,7 +31,14 @@ impl Stream {
     /// Draw a source page's form, moved by `(dx, dy)` and visible only inside
     /// `clip`. The form is in its source page's user space, which
     /// `source_ctm` takes to page space.
-    pub(super) fn draw_form(&mut self, name: &str, clip: &[Area], dx: f32, dy: f32, source_ctm: &Matrix) {
+    pub(super) fn draw_form(
+        &mut self,
+        name: &str,
+        clip: &[Area],
+        dx: f32,
+        dy: f32,
+        source_ctm: &Matrix,
+    ) {
         self.out.push_str("q\n");
         for area in clip {
             let _ = writeln!(
@@ -56,7 +63,9 @@ impl Stream {
         if glyphs.is_empty() {
             return;
         }
-        let [red, green, blue] = chunk.color.map(|channel| number(f32::from(channel) / 255.0));
+        let [red, green, blue] = chunk
+            .color
+            .map(|channel| number(f32::from(channel) / 255.0));
         let _ = writeln!(self.out, "BT\n/{font} 1 Tf\n{red} {green} {blue} rg");
         let _ = writeln!(
             self.out,
@@ -103,7 +112,15 @@ fn number(value: f32) -> String {
     }
 }
 
-fn invert(matrix: &Matrix) -> anyhow::Result<Matrix> {
+/// A point taken through a matrix.
+pub(super) fn apply(matrix: &Matrix, x: f32, y: f32) -> (f32, f32) {
+    (
+        x * matrix.a + y * matrix.c + matrix.e,
+        x * matrix.b + y * matrix.d + matrix.f,
+    )
+}
+
+pub(super) fn invert(matrix: &Matrix) -> anyhow::Result<Matrix> {
     let determinant = matrix.a * matrix.d - matrix.b * matrix.c;
     if determinant.abs() < f32::EPSILON {
         bail!("a page's transform cannot be inverted");
