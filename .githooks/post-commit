@@ -1,0 +1,7 @@
+#!/bin/sh
+# Cargo never evicts anything from target/. This holds it to the limit set in
+# scripts/limit_target.py, and runs here because a commit is the one checkpoint
+# every session passes through -- whoever ran the builds, and however.
+#
+# Enabled per clone with `just hooks`.
+exec python3 "$(git rev-parse --show-toplevel)/scripts/limit_target.py"

@@ -1,6 +1,10 @@
 default:
     just --list
 
+# Use the checked-in git hooks (once per clone). post-commit holds target/ under its size limit.
+hooks:
+    git config core.hooksPath .githooks
+
 # Install UI dependencies
 ui-install:
     npm --prefix ui install
