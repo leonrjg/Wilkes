@@ -1,8 +1,8 @@
 //! A font cut down to the glyphs a document uses.
 //!
-//! Edited text is set in whole system fonts, and a whole font is hundreds of
-//! kilobytes -- several times the size of a typical paper, for a sentence of
-//! changes. The saved file needs the outlines of the glyphs it shows and no
+//! Edited text is set partly in whole system fonts, and a whole font is
+//! hundreds of kilobytes -- several times the size of a typical paper, for a
+//! sentence of changes. The saved file needs the outlines of the glyphs it shows and no
 //! others.
 //!
 //! This is the plainest subset there is: every glyph keeps its number, and
