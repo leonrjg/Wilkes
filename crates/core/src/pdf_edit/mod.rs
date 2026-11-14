@@ -158,6 +158,15 @@ pub fn write_edited_pdf(
     Ok(())
 }
 
+/// The edited document as bytes, for a caller with nowhere of its own to put a
+/// file -- a browser that will be handed it as a download.
+pub fn edited_pdf_bytes(source: &Path, export: &EditExport) -> anyhow::Result<Vec<u8>> {
+    let directory = tempfile::tempdir().context("creating a scratch directory")?;
+    let destination = directory.path().join("edited.pdf");
+    write_edited_pdf(source, export, &destination)?;
+    std::fs::read(&destination).context("reading the edited document back")
+}
+
 fn same_file(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
