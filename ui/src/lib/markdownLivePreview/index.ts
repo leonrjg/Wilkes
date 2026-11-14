@@ -3,6 +3,10 @@ import { LanguageSupport, syntaxTree } from "@codemirror/language";
 import { Prec, StateField, type Extension } from "@codemirror/state";
 import { EditorView, keymap, type Command } from "@codemirror/view";
 import { getLanguageExtension } from "@leonrjg/wilkes-reader";
+import "@fontsource/open-sans/400.css";
+import "@fontsource/open-sans/400-italic.css";
+import "@fontsource/open-sans/700.css";
+import "@fontsource/open-sans/700-italic.css";
 import { buildPreview, type PreviewState } from "./decorations";
 import { mathSyntax } from "./mathSyntax";
 import { classifyReference } from "./references";
@@ -50,9 +54,11 @@ function codeLanguage(info: string) {
 const MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace';
 
 const previewTheme = () => EditorView.theme({
+  // MarkText's prose settings: Open Sans at 16px with a 1.6 line height.
   ".cm-content": {
-    fontFamily: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif',
-    lineHeight: "1.65",
+    fontFamily: '"Open Sans", sans-serif',
+    fontSize: "16px",
+    lineHeight: "1.6",
   },
   // The syntax highlighter colours and underlines the spans inside a line;
   // rendered constructs take the document's own colours instead, so the

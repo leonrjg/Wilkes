@@ -1,8 +1,11 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../services";
 import { useEditorStore } from "../stores/useEditorStore";
+import { editorSetup } from "../lib/editorSetup";
 import { markdownLivePreview } from "../lib/markdownLivePreview";
+import { useSettingsStore } from "../stores/useSettingsStore";
+import type { Settings } from "../lib/types";
 import DocumentEditor from "./DocumentEditor";
 
 vi.mock("../services", () => ({
@@ -22,6 +25,11 @@ vi.mock("../services", () => ({
 // against the real one in its own suite.
 vi.mock("../lib/markdownLivePreview", () => ({
   markdownLivePreview: vi.fn(() => []),
+}));
+
+const setLineNumbers = vi.fn();
+vi.mock("../lib/editorSetup", () => ({
+  editorSetup: vi.fn(() => ({ extension: [], setLineNumbers })),
 }));
 
 describe("DocumentEditor grounded completion", () => {
@@ -185,5 +193,21 @@ describe("DocumentEditor grounded completion", () => {
       <DocumentEditor content="{}" language="json" documentPath="/library/data.json" semanticReady generationReady />,
     );
     expect(markdownLivePreview).not.toHaveBeenCalled();
+  });
+
+  it("follows the line-number setting without remounting the editor", () => {
+    useSettingsStore.setState({ settings: { editor_line_numbers: false } as Settings });
+    useEditorStore.getState().ensureBuffer("/library/draft.md", "# Draft");
+    render(
+      <DocumentEditor content="# Draft" language="markdown" documentPath="/library/draft.md" semanticReady generationReady />,
+    );
+    expect(editorSetup).toHaveBeenCalledOnce();
+    expect(editorSetup).toHaveBeenCalledWith(false);
+
+    act(() => {
+      useSettingsStore.setState({ settings: { editor_line_numbers: true } as Settings });
+    });
+    expect(editorSetup).toHaveBeenCalledOnce();
+    expect(setLineNumbers).toHaveBeenLastCalledWith(expect.anything(), true);
   });
 });

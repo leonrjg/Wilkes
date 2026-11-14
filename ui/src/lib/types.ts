@@ -1389,6 +1389,8 @@ export interface Settings {
   pdf_auto_zoom_target_px: number;
   /** Desktop only: web links open in the docked browser pane. */
   open_links_in_app: boolean;
+  /** Show the line-number gutter in the document editor. */
+  editor_line_numbers: boolean;
   /** Persisted default agent for the chat pane (`SettingsModal`). The in-pane
    *  selector and header split-button dropdown may switch a session to a
    *  different backend transiently without touching this field. */
