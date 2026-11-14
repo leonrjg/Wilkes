@@ -1,20 +1,33 @@
 import { useEffect, useRef } from "react";
-import { X, XSquare } from "react-feather";
-import { useViewerStore } from "../stores/useViewerStore";
+import { ArrowLeft, ArrowRight, Columns, Minimize2, X, XSquare } from "react-feather";
+import type { ContextMenuItem } from "./ContextMenu";
+import { paneActiveTab, useViewerStore } from "../stores/useViewerStore";
 import { fileName } from "./DocumentEntryRow";
 import { useFileContextMenu } from "./FileContextMenu";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 
 interface ViewerTabsProps {
   standalone?: boolean;
+  /** The pane whose tabs this strip shows. */
+  paneId: string;
 }
 
-export default function ViewerTabs({ standalone = false }: ViewerTabsProps) {
-  const tabs = useViewerStore((state) => state.tabs);
-  const activeTabId = useViewerStore((state) => state.activeTabId);
+export default function ViewerTabs({ standalone = false, paneId }: ViewerTabsProps) {
+  const allTabs = useViewerStore((state) => state.tabs);
+  const tabs = allTabs.filter((tab) => tab.paneId === paneId);
+  const panes = useViewerStore((state) => state.panes);
+  const paneIndex = panes.findIndex((pane) => pane.id === paneId);
+  const leftPane = panes[paneIndex - 1] ?? null;
+  const rightPane = panes[paneIndex + 1] ?? null;
+  const split = panes.length > 1;
+  const activeTabId = useViewerStore((state) => paneActiveTab(state, paneId)?.id ?? null);
+  const focused = useViewerStore((state) => state.focusedPaneId === paneId);
   const activateTab = useViewerStore((state) => state.activateTab);
   const closeTab = useViewerStore((state) => state.closeTab);
-  const closeAllTabs = useViewerStore((state) => state.clear);
+  const closePane = useViewerStore((state) => state.closePane);
+  const splitTab = useViewerStore((state) => state.splitTab);
+  const moveTabToPane = useViewerStore((state) => state.moveTabToPane);
+  const joinPanes = useViewerStore((state) => state.joinPanes);
   const { openFileMenu, fileMenu } = useFileContextMenu();
   const tabRefs = useRef(new Map<string, HTMLButtonElement>());
 
@@ -52,7 +65,7 @@ export default function ViewerTabs({ standalone = false }: ViewerTabsProps) {
     <>
       <div
         role="tablist"
-        aria-label="Open documents"
+        aria-label={split ? `Open documents, pane ${paneIndex + 1} of ${panes.length}` : "Open documents"}
         className="flex min-h-9 flex-shrink-0 items-end overflow-x-auto border-b border-[var(--border-main)] bg-[var(--bg-sidebar)] custom-scrollbar"
       >
         {tabs.map((tab, index) => {
@@ -71,6 +84,40 @@ export default function ViewerTabs({ standalone = false }: ViewerTabsProps) {
                     open: () => activateTab(tab.id),
                   },
                   [
+                    // A pane's only tab split off would leave its pane empty,
+                    // which is the same layout it started from.
+                    ...(tabs.length > 1
+                      ? [{
+                          id: "split-right",
+                          label: "Split Right",
+                          icon: Columns,
+                          run: () => splitTab(tab.id),
+                        } satisfies ContextMenuItem]
+                      : []),
+                    ...(leftPane
+                      ? [{
+                          id: "move-to-left-pane",
+                          label: "Move to Left Pane",
+                          icon: ArrowLeft,
+                          run: () => moveTabToPane(tab.id, leftPane.id),
+                        } satisfies ContextMenuItem]
+                      : []),
+                    ...(rightPane
+                      ? [{
+                          id: "move-to-right-pane",
+                          label: "Move to Right Pane",
+                          icon: ArrowRight,
+                          run: () => moveTabToPane(tab.id, rightPane.id),
+                        } satisfies ContextMenuItem]
+                      : []),
+                    ...(split
+                      ? [{
+                          id: "join-panes",
+                          label: "Join All Panes",
+                          icon: Minimize2,
+                          run: () => joinPanes(),
+                        } satisfies ContextMenuItem]
+                      : []),
                     {
                       id: "close-tab",
                       label: "Close",
@@ -79,9 +126,9 @@ export default function ViewerTabs({ standalone = false }: ViewerTabsProps) {
                     },
                     {
                       id: "close-all-tabs",
-                      label: "Close All",
+                      label: split ? "Close All in Pane" : "Close All",
                       icon: XSquare,
-                      run: () => closeAllTabs(),
+                      run: () => closePane(paneId),
                     },
                   ],
                 );
@@ -89,7 +136,7 @@ export default function ViewerTabs({ standalone = false }: ViewerTabsProps) {
               className={[
                 "group flex h-9 min-w-[8rem] max-w-[14rem] flex-shrink-0 items-center border-r border-t-2 border-[var(--border-main)]",
                 active
-                  ? "border-t-[var(--accent-blue)] bg-[var(--bg-app)] text-[var(--text-main)]"
+                  ? `${focused ? "border-t-[var(--accent-blue)]" : "border-t-[var(--border-strong)]"} bg-[var(--bg-app)] text-[var(--text-main)]`
                   : "border-t-transparent bg-[var(--bg-sidebar)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)]",
               ].join(" ")}
             >
@@ -104,7 +151,7 @@ export default function ViewerTabs({ standalone = false }: ViewerTabsProps) {
                 role="tab"
                 aria-label={name}
                 aria-selected={active}
-                aria-controls="viewer-tabpanel"
+                aria-controls={`viewer-tabpanel-${paneId}`}
                 tabIndex={active ? 0 : -1}
                 onClick={() => activateTab(tab.id)}
                 onAuxClick={(event) => {

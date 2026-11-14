@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import PreviewPane from "./PreviewPane";
 import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
@@ -100,15 +100,17 @@ function setViewerState(state: {
   viewerMetadataStatus?: any;
 }) {
   if (!state.selectedMatch) {
-    useViewerStore.setState({ tabs: [], activeTabId: null });
+    useViewerStore.setState({ tabs: [], panes: [], focusedPaneId: null });
     return;
   }
   const match = state.selectedMatch;
   useViewerStore.setState({
-    activeTabId: "test-tab",
+    panes: [{ id: "pane", activeTabId: "test-tab" }],
+    focusedPaneId: "pane",
     tabs: [
       {
         id: "test-tab",
+        paneId: "pane",
         path: match.path,
         match,
         history: [match],
@@ -1442,7 +1444,7 @@ describe("PreviewPane", () => {
     fireEvent.click(screen.getByText("related.txt"));
     expect(useViewerStore.getState().tabs).toHaveLength(2);
     expect(useViewerStore.getState().tabs.find(
-      (tab) => tab.id === useViewerStore.getState().activeTabId,
+      (tab) => tab.id === (activeViewerTab(useViewerStore.getState())?.id ?? null),
     )?.path).toBe("/docs/related.txt");
 
     setViewerState({
@@ -1822,5 +1824,100 @@ describe("PreviewPane", () => {
     );
     expect(screen.getByText("Both measure cache behavior.")).toBeInTheDocument();
     expect(api.explainRelatedDocument).toHaveBeenCalledOnce();
+  });
+
+  describe("panes", () => {
+    const textTab = (id: string, path: string, paneId: string) => {
+      const match = { path, origin: { TextFile: { line: 0, col: 0 } } } as const;
+      return {
+        id,
+        path,
+        paneId,
+        match,
+        history: [match],
+        historyIndex: 0,
+        previewData: {
+          Text: { content: `contents of ${path}`, language: "plaintext", highlight_line: 0, highlight_range: { start: 0, end: 0 } },
+        },
+        previewLoading: false,
+        previewError: null,
+        pdfLoadAttempt: 0,
+        metadata: null,
+        metadataStatus: "idle" as const,
+        requestId: 1,
+      };
+    };
+
+    beforeEach(() => {
+      useViewerStore.setState({
+        tabs: [
+          textTab("a", "/docs/a.txt", "p1"),
+          textTab("b", "/docs/b.txt", "p2"),
+          textTab("c", "/docs/c.txt", "p3"),
+        ],
+        panes: [
+          { id: "p1", activeTabId: "a" },
+          { id: "p2", activeTabId: "b" },
+          { id: "p3", activeTabId: "c" },
+        ],
+        focusedPaneId: "p2",
+      });
+    });
+
+    it("shows every pane side by side with its own tabs and a handle between each pair", () => {
+      render(<PreviewPane />);
+
+      for (const index of [1, 2, 3]) {
+        expect(screen.getByRole("tablist", { name: `Open documents, pane ${index} of 3` })).toBeInTheDocument();
+      }
+      expect(screen.getAllByTestId("code-viewer")).toHaveLength(3);
+      for (const id of ["p1", "p2", "p3"]) {
+        expect(document.getElementById(`viewer-tabpanel-${id}`)).not.toBeNull();
+      }
+      expect(screen.getAllByRole("separator").map((element) => element.getAttribute("aria-label"))).toEqual([
+        "Resize panes 1 and 2",
+        "Resize panes 2 and 3",
+      ]);
+    });
+
+    it("makes only the focused pane's document the active one, and a click moves the focus", () => {
+      render(<PreviewPane />);
+
+      expect(api.setActiveDocument).toHaveBeenCalledWith("/docs/b.txt", null);
+      expect(api.setActiveDocument).not.toHaveBeenCalledWith("/docs/a.txt", null);
+      expect(api.setActiveDocument).not.toHaveBeenCalledWith("/docs/c.txt", null);
+
+      fireEvent.pointerDown(document.getElementById("viewer-tabpanel-p3")!);
+
+      expect(useViewerStore.getState().focusedPaneId).toBe("p3");
+      expect(activeViewerTab(useViewerStore.getState())?.path).toBe("/docs/c.txt");
+      expect(api.setActiveDocument).toHaveBeenLastCalledWith("/docs/c.txt", null);
+    });
+
+    it("resizes only the two panes a handle sits between", () => {
+      render(<PreviewPane />);
+      const [first, second] = screen.getAllByRole("separator");
+
+      fireEvent.keyDown(second, { key: "ArrowRight" });
+      expect(second).toHaveAttribute("aria-valuenow", "52");
+      // Pane 1 keeps its width; pane 2 grew, so it now has the larger share.
+      expect(first).toHaveAttribute("aria-valuenow", "49");
+      fireEvent.keyDown(second, { key: "ArrowRight", shiftKey: true });
+      expect(second).toHaveAttribute("aria-valuenow", "62");
+      fireEvent.doubleClick(second);
+      expect(second).toHaveAttribute("aria-valuenow", "50");
+    });
+
+    it("keeps a pane's document mounted while other panes close around it", () => {
+      render(<PreviewPane />);
+      const firstViewer = within(document.getElementById("viewer-tabpanel-p1")!).getByTestId("code-viewer");
+
+      act(() => useViewerStore.getState().closePane("p2"));
+      expect(within(document.getElementById("viewer-tabpanel-p1")!).getByTestId("code-viewer")).toBe(firstViewer);
+
+      act(() => useViewerStore.getState().joinPanes());
+      expect(screen.queryByRole("separator")).not.toBeInTheDocument();
+      expect(document.getElementById("viewer-tabpanel-p1")).not.toBeNull();
+    });
   });
 });

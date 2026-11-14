@@ -347,7 +347,12 @@ export default function DocumentEditor({
   };
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col">
+    // With the view split there may be two editors; the one last focused is
+    // the one the rest of the app means by "the editor".
+    <div
+      className="relative flex h-full min-h-0 flex-col"
+      onFocusCapture={() => useEditorStore.getState().setActiveEditor(documentPath)}
+    >
       <div className="flex flex-wrap items-center gap-2 border-b border-[var(--border-main)] bg-[var(--bg-header)] px-2 py-1.5 text-[10px]">
         <span className="text-[var(--text-muted)]">Context</span>
         {buffer?.scope.pinned.map((path) => (

@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { isPagedPath, isPdfPath, servesPagesOnDemand } from "../lib/documentFormats";
 import { readerLinks, readerOutline } from "../lib/surrogate";
 import { ArrowLeft, ArrowRight, ExternalLink, Check, Copy, Link2, Code, Eye, FileText, Cloud, Share2, Edit3 } from "react-feather";
@@ -22,7 +31,8 @@ import {
   type SelectionActionsSlot,
 } from "@leonrjg/wilkes-reader";
 import { readTextViewMode, readerPositionStore, saveTextViewMode } from "../stores/readerPositions";
-import { activeViewerTab, useViewerStore } from "../stores/useViewerStore";
+import { paneActiveTab, useViewerStore } from "../stores/useViewerStore";
+import { useBrowserStore } from "../stores/useBrowserStore";
 import { useBookmarksStore } from "../stores/useBookmarksStore";
 import { useChatStore } from "../stores/useChatStore";
 import { api, isTauri } from "../services";
@@ -121,8 +131,125 @@ interface PreviewPaneProps {
   standalone?: boolean;
 }
 
+/** Narrowest a pane may be dragged, in pixels. */
+const MIN_PANE_WIDTH = 160;
+/** A keyboard step of the resize handle, as a share of the two panes it sits between. */
+const KEY_RESIZE_STEP = 0.02;
+
+/** The document viewer: its panes of tabs side by side, as many as the tabs
+ *  have been split into. Each pane is keyed by its id, so a pane keeps the
+ *  document it has mounted while other panes open and close beside it. */
 export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
-  const activeTab = useViewerStore(activeViewerTab);
+  const panes = useViewerStore((state) => state.panes);
+  const focusPane = useViewerStore((state) => state.focusPane);
+  // Each pane's share of the width, relative to the others. Only a handle
+  // between two panes changes them, and only theirs.
+  const [weights, setWeights] = useState<Record<string, number>>({});
+  const paneElements = useRef(new Map<string, HTMLDivElement>());
+  const weightOf = (id: string) => weights[id] ?? 1;
+
+  const resizePair = (left: string, right: string, leftShare: number) => {
+    const total = weightOf(left) + weightOf(right);
+    setWeights((current) => ({ ...current, [left]: total * leftShare, [right]: total * (1 - leftShare) }));
+  };
+
+  const startResize = (left: string, right: string) => (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    const leftElement = paneElements.current.get(left);
+    const rightElement = paneElements.current.get(right);
+    if (!leftElement || !rightElement) return;
+    event.preventDefault();
+    const handle = event.currentTarget;
+    const pointerId = event.pointerId;
+    const start = leftElement.getBoundingClientRect().left;
+    const span = leftElement.getBoundingClientRect().width + rightElement.getBoundingClientRect().width;
+    handle.setPointerCapture(pointerId);
+    // A docked browser pane would take the pointer as the drag crossed it.
+    useBrowserStore.getState().setHeld(true);
+    document.body.style.cursor = "col-resize";
+    const move = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId || span <= 0) return;
+      const leftWidth = Math.min(span - MIN_PANE_WIDTH, Math.max(MIN_PANE_WIDTH, moveEvent.clientX - start));
+      resizePair(left, right, leftWidth / span);
+    };
+    const finish = (endEvent: PointerEvent) => {
+      if (endEvent.pointerId !== pointerId) return;
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", finish);
+      handle.removeEventListener("pointercancel", finish);
+      useBrowserStore.getState().setHeld(false);
+      document.body.style.cursor = "";
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", finish);
+    handle.addEventListener("pointercancel", finish);
+  };
+
+  const resizeWithKeys = (left: string, right: string) => (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const share = weightOf(left) / (weightOf(left) + weightOf(right));
+    const step = event.shiftKey ? KEY_RESIZE_STEP * 5 : KEY_RESIZE_STEP;
+    if (event.key === "ArrowLeft") resizePair(left, right, Math.max(0.1, share - step));
+    else if (event.key === "ArrowRight") resizePair(left, right, Math.min(0.9, share + step));
+    else return;
+    event.preventDefault();
+  };
+
+  if (panes.length === 0) return <ViewerPaneView standalone={standalone} paneId={null} />;
+
+  return (
+    <div className="flex h-full min-h-0 min-w-0">
+      {panes.map((pane, index) => {
+        const next = panes[index + 1];
+        const share = next ? weightOf(pane.id) / (weightOf(pane.id) + weightOf(next.id)) : 0;
+        return (
+          <Fragment key={pane.id}>
+            <div
+              ref={(element) => {
+                if (element) paneElements.current.set(pane.id, element);
+                else paneElements.current.delete(pane.id);
+              }}
+              // Whatever is clicked or tabbed into in a pane makes it the
+              // focused one, before the click itself is handled: back and
+              // forward act on the focused pane's tab.
+              onPointerDownCapture={() => focusPane(pane.id)}
+              onFocusCapture={() => focusPane(pane.id)}
+              className="h-full min-h-0 min-w-0"
+              style={{ flex: `${weightOf(pane.id)} 1 0%` }}
+            >
+              <ViewerPaneView standalone={standalone} paneId={pane.id} />
+            </div>
+            {next && (
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                aria-label={`Resize panes ${index + 1} and ${index + 2}`}
+                aria-valuemin={10}
+                aria-valuemax={90}
+                aria-valuenow={Math.round(share * 100)}
+                tabIndex={0}
+                onPointerDown={startResize(pane.id, next.id)}
+                onKeyDown={resizeWithKeys(pane.id, next.id)}
+                onDoubleClick={() => resizePair(pane.id, next.id, 0.5)}
+                className="w-1 flex-shrink-0 cursor-col-resize bg-[var(--border-main)] transition-colors hover:bg-[var(--accent-blue)] focus-visible:bg-[var(--accent-blue)] focus-visible:outline-none"
+              />
+            )}
+          </Fragment>
+        );
+      })}
+    </div>
+  );
+}
+
+interface ViewerPaneViewProps {
+  standalone: boolean;
+  /** Null when no document is open, and so there are no panes. */
+  paneId: string | null;
+}
+
+function ViewerPaneView({ standalone, paneId }: ViewerPaneViewProps) {
+  const activeTab = useViewerStore((state) => (paneId ? paneActiveTab(state, paneId) : null));
+  // Only the focused pane's document is the application's active document.
+  const focused = useViewerStore((state) => paneId !== null && state.focusedPaneId === paneId);
   const goBack = useViewerStore((state) => state.goBack);
   const goForward = useViewerStore((state) => state.goForward);
   const openFile = useViewerStore((state) => state.openFile);
@@ -276,7 +403,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   // Publish that application state directly for external MCP, then separately
   // mirror it into the private chat context when the desktop chat is present.
   useEffect(() => {
-    if (standalone) return;
+    if (standalone || !focused) return;
     if (!selectedMatch) {
       api.setActiveDocument?.(null).catch((error) =>
         console.error("mcp: failed to clear active document", error),
@@ -289,10 +416,10 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
       console.error("mcp: failed to update active document", error),
     );
     if (isTauri) setChatReaderDoc(selectedMatch.path, page);
-  }, [selectedMatch, setChatReaderDoc, standalone]);
+  }, [selectedMatch, setChatReaderDoc, standalone, focused]);
 
   const handleChatPageChange = (page: number) => {
-    if (standalone) return;
+    if (standalone || !focused) return;
     if (selectedMatch) {
       api.setActiveDocument?.(selectedMatch.path, page).catch((error) =>
         console.error("mcp: failed to update active document page", error),
@@ -324,10 +451,9 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
     }
   }, [selectedMatch?.path, selectedMatch?.origin]);
 
-  if (!activeTab || !selectedMatch) {
+  if (!activeTab || !selectedMatch || !paneId) {
     return (
       <div className="flex h-full flex-col bg-[var(--bg-app)] text-[var(--text-dim)]">
-        <ViewerTabs standalone={standalone} />
         <div className="flex flex-1 flex-col items-center justify-center">
           <img
             src="/logo.transparent.png"
@@ -551,7 +677,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
 
   return (
     <div className="flex flex-col h-full min-h-0 overflow-hidden">
-      <ViewerTabs standalone={standalone} />
+      <ViewerTabs standalone={standalone} paneId={paneId} />
       {/* Header */}
       <div className="px-3 py-2 border-b border-[var(--border-main)] flex items-center gap-3 flex-shrink-0 bg-[var(--bg-header)]">
         <div className="flex items-center gap-1">
@@ -751,7 +877,7 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
 
       {/* Content */}
       <div
-        id="viewer-tabpanel"
+        id={`viewer-tabpanel-${paneId}`}
         role="tabpanel"
         aria-labelledby={`viewer-tab-${activeTab.id}`}
         className="flex-1 min-h-0 overflow-hidden bg-[var(--bg-app)]"

@@ -28,6 +28,8 @@ const MAX_PERSISTED_HISTORY_PER_TAB = 100;
 export interface ViewerTab {
   id: string;
   path: string;
+  /** The pane the tab sits in. */
+  paneId: string;
   match: MatchRef;
   history: MatchRef[];
   historyIndex: number;
@@ -40,21 +42,38 @@ export interface ViewerTab {
   requestId: number;
 }
 
+/** One of the viewer's side-by-side panes of tabs. */
+export interface ViewerPane {
+  id: string;
+  /** The tab the pane shows. */
+  activeTabId: string | null;
+}
+
 interface PersistedViewerTab {
   path: string;
   history: MatchRef[];
   historyIndex: number;
+  /** Index of the tab's pane. Absent from sessions saved before panes, which
+   *  had one. */
+  pane?: number;
 }
 
 interface PersistedViewerState {
   tabs: PersistedViewerTab[];
+  /** The focused pane's tab. */
   activePath: string | null;
+  /** Each pane's tab, left to right. Absent from sessions saved before panes. */
+  paneActivePaths?: (string | null)[];
+  focusedPane?: number;
 }
 
 interface ViewerStore {
   mode: "workspace" | "standalone";
   tabs: ViewerTab[];
-  activeTabId: string | null;
+  /** Left to right. Every pane holds at least one tab; none exist with no tabs. */
+  panes: ViewerPane[];
+  /** The pane whose tab is the document being worked with. */
+  focusedPaneId: string | null;
   sessionHydrated: boolean;
 
   restoreSession: () => Promise<void>;
@@ -74,6 +93,93 @@ interface ViewerStore {
   goBack: () => void;
   goForward: () => void;
   clear: () => void;
+  /** Make a pane the focused one, so its tab is the active document. */
+  focusPane: (paneId: string) => void;
+  /** Move a tab into a new pane just right of its own. */
+  splitTab: (id: string) => void;
+  /** Move a tab into another existing pane. */
+  moveTabToPane: (id: string, paneId: string) => void;
+  /** Close every tab in a pane, and with them the pane. */
+  closePane: (paneId: string) => void;
+  /** Bring every tab back into the leftmost pane. */
+  joinPanes: () => void;
+}
+
+type PaneLayout = Pick<ViewerStore, "tabs" | "panes" | "focusedPaneId">;
+
+const EMPTY_LAYOUT: PaneLayout = { tabs: [], panes: [], focusedPaneId: null };
+
+/** Restore the pane invariants after tabs have been opened, closed or moved:
+ *  a pane with no tabs is gone, a tab without a pane joins the leftmost one,
+ *  each pane shows one of its own tabs, and the focus is on a pane that exists
+ *  -- where the focused pane went away, the one that took its place, else the
+ *  one left of it. `previous` is the pane order before the change. */
+function settlePanes(
+  tabs: ViewerTab[],
+  panes: ViewerPane[],
+  focusedPaneId: string | null,
+  previous: ViewerPane[],
+): PaneLayout {
+  if (tabs.length === 0) return EMPTY_LAYOUT;
+  let candidates = panes;
+  if (candidates.length === 0) candidates = [{ id: randomId(), activeTabId: null }];
+  const known = new Set(candidates.map((pane) => pane.id));
+  const homeless = tabs.some((tab) => !known.has(tab.paneId));
+  if (homeless) {
+    const first = candidates[0].id;
+    tabs = tabs.map((tab) => (known.has(tab.paneId) ? tab : { ...tab, paneId: first }));
+  }
+  const settled = candidates
+    .filter((pane) => tabs.some((tab) => tab.paneId === pane.id))
+    .map((pane) =>
+      tabs.some((tab) => tab.id === pane.activeTabId && tab.paneId === pane.id)
+        ? pane
+        : { ...pane, activeTabId: tabs.find((tab) => tab.paneId === pane.id)!.id },
+    );
+  let focused = settled.find((pane) => pane.id === focusedPaneId)?.id ?? null;
+  if (!focused) {
+    const at = Math.max(0, previous.findIndex((pane) => pane.id === focusedPaneId));
+    focused = (settled[Math.min(at, settled.length - 1)] ?? settled[0]).id;
+  }
+  return { tabs, panes: settled, focusedPaneId: focused };
+}
+
+/** The neighbour that takes a tab's place in its pane when it leaves: the
+ *  next tab, else the previous one. */
+function paneNeighbour(tabs: ViewerTab[], leaving: ViewerTab): string | null {
+  const siblings = tabs.filter((tab) => tab.paneId === leaving.paneId);
+  const index = siblings.findIndex((tab) => tab.id === leaving.id);
+  return siblings[index + 1]?.id ?? siblings[index - 1]?.id ?? null;
+}
+
+function withPaneActive(panes: ViewerPane[], paneId: string, activeTabId: string | null): ViewerPane[] {
+  return panes.map((pane) => (pane.id === paneId ? { ...pane, activeTabId } : pane));
+}
+
+/** Take a tab out of its pane, handing its place to its neighbour. */
+function leavePane(state: PaneLayout, leaving: ViewerTab): ViewerPane[] {
+  const pane = state.panes.find((candidate) => candidate.id === leaving.paneId);
+  return pane?.activeTabId === leaving.id
+    ? withPaneActive(state.panes, leaving.paneId, paneNeighbour(state.tabs, leaving))
+    : state.panes;
+}
+
+/** Every pane's tab is on screen, so every one is loaded. */
+function loadVisibleTabs(): void {
+  for (const pane of useViewerStore.getState().panes) {
+    if (pane.activeTabId) ensureTabLoaded(pane.activeTabId);
+  }
+}
+
+/** The tab a pane shows. */
+export function paneActiveTab(state: Pick<ViewerStore, "tabs" | "panes">, paneId: string): ViewerTab | null {
+  const id = state.panes.find((pane) => pane.id === paneId)?.activeTabId;
+  return state.tabs.find((tab) => tab.id === id) ?? null;
+}
+
+/** The tabs a pane holds, in order. */
+export function paneTabs(state: Pick<ViewerStore, "tabs">, paneId: string): ViewerTab[] {
+  return state.tabs.filter((tab) => tab.paneId === paneId);
 }
 
 function directFileMatch(path: string): MatchRef {
@@ -301,11 +407,18 @@ function isMatchRef(value: unknown, path: string): value is MatchRef {
   return isNonNegativeInteger(start) && isNonNegativeInteger(end) && end >= start;
 }
 
-function restorePersistedState(value: unknown): Pick<ViewerStore, "tabs" | "activeTabId"> {
+function restorePersistedState(value: unknown): PaneLayout {
   if (!isRecord(value) || !Array.isArray(value.tabs)) {
-    return { tabs: [], activeTabId: null };
+    return EMPTY_LAYOUT;
   }
 
+  // Panes are saved by position; their ids are this session's.
+  const paneIds: string[] = [];
+  const paneIdAt = (index: unknown): string => {
+    const at = isNonNegativeInteger(index) ? index : 0;
+    while (paneIds.length <= at) paneIds.push(randomId());
+    return paneIds[at];
+  };
   const seenPaths = new Set<string>();
   const tabs: ViewerTab[] = [];
   for (const candidate of value.tabs) {
@@ -325,6 +438,7 @@ function restorePersistedState(value: unknown): Pick<ViewerStore, "tabs" | "acti
     tabs.push({
       id: randomId(),
       path,
+      paneId: paneIdAt(candidate.pane),
       match: history[historyIndex],
       history,
       historyIndex,
@@ -338,9 +452,20 @@ function restorePersistedState(value: unknown): Pick<ViewerStore, "tabs" | "acti
     });
   }
 
-  const activePath = typeof value.activePath === "string" ? value.activePath : null;
-  const activeTab = tabs.find((tab) => tab.path === activePath) ?? tabs[0] ?? null;
-  return { tabs, activeTabId: activeTab?.id ?? null };
+  const idAt = (path: unknown) =>
+    typeof path === "string" ? tabs.find((tab) => tab.path === path)?.id ?? null : null;
+  const savedActives = Array.isArray(value.paneActivePaths) ? value.paneActivePaths : [];
+  const panes = paneIds.map((id, index) => ({ id, activeTabId: idAt(savedActives[index]) }));
+  const focusedIndex = isNonNegativeInteger(value.focusedPane) ? value.focusedPane : 0;
+  const focusedPaneId = paneIds[focusedIndex] ?? paneIds[0] ?? null;
+  // The focused pane's tab is also saved on its own, which is all a session
+  // from before panes has.
+  const activeId = idAt(value.activePath);
+  const activeTab = tabs.find((tab) => tab.id === activeId);
+  const focusedPanes = activeTab
+    ? panes.map((pane) => (pane.id === activeTab.paneId ? { ...pane, activeTabId: activeTab.id } : pane))
+    : panes;
+  return settlePanes(tabs, focusedPanes, activeTab?.paneId ?? focusedPaneId, focusedPanes);
 }
 
 function remapPath(path: string, oldPath: string, newPath: string): string {
@@ -351,7 +476,7 @@ function remapPath(path: string, oldPath: string, newPath: string): string {
   return path;
 }
 
-function persistedTab(tab: ViewerTab): PersistedViewerTab {
+function persistedTab(tab: ViewerTab, panes: ViewerPane[]): PersistedViewerTab {
   const maxStart = Math.max(0, tab.history.length - MAX_PERSISTED_HISTORY_PER_TAB);
   const centeredStart = tab.historyIndex - Math.floor(MAX_PERSISTED_HISTORY_PER_TAB / 2);
   const start = Math.min(Math.max(centeredStart, 0), maxStart);
@@ -360,6 +485,7 @@ function persistedTab(tab: ViewerTab): PersistedViewerTab {
     path: tab.path,
     history,
     historyIndex: tab.historyIndex - start,
+    pane: Math.max(0, panes.findIndex((pane) => pane.id === tab.paneId)),
   };
 }
 
@@ -399,8 +525,7 @@ export const useViewerStore = create<ViewerStore>()(
   persist(
     (set, get) => ({
       mode: "workspace",
-      tabs: [],
-      activeTabId: null,
+      ...EMPTY_LAYOUT,
       sessionHydrated: false,
 
       restoreSession: async () => {
@@ -411,8 +536,7 @@ export const useViewerStore = create<ViewerStore>()(
         restorePromise = (async () => {
           await useViewerStore.persist.rehydrate();
           useViewerStore.setState({ sessionHydrated: true });
-          const activeTabId = useViewerStore.getState().activeTabId;
-          if (activeTabId) ensureTabLoaded(activeTabId);
+          loadVisibleTabs();
         })().finally(() => {
           restorePromise = null;
         });
@@ -424,8 +548,7 @@ export const useViewerStore = create<ViewerStore>()(
         setReaderPositionPersistence(false);
         set({
           mode: "standalone",
-          tabs: [],
-          activeTabId: null,
+          ...EMPTY_LAYOUT,
           sessionHydrated: true,
         });
       },
@@ -446,8 +569,7 @@ export const useViewerStore = create<ViewerStore>()(
           mode: "workspace",
           sessionHydrated: true,
         });
-        const activeTabId = useViewerStore.getState().activeTabId;
-        if (activeTabId) ensureTabLoaded(activeTabId);
+        loadVisibleTabs();
       },
 
       forgetWorkspace: (workspaceId) => {
@@ -462,15 +584,13 @@ export const useViewerStore = create<ViewerStore>()(
       openMatch: (match) => {
         const existing = get().tabs.find((tab) => tab.path === match.path);
         if (existing) {
-          if (sameMatch(existing.match, match)) {
-            set({ activeTabId: existing.id });
-            ensureTabLoaded(existing.id);
-            return;
-          }
+          // A path is open in one tab only: a document already open in another
+          // pane is shown there, and that pane takes the focus.
+          get().activateTab(existing.id);
+          if (sameMatch(existing.match, match)) return;
 
           const requestId = existing.requestId + 1;
           set((state) => ({
-            activeTabId: existing.id,
             tabs: replaceTab(state.tabs, existing.id, (tab) => {
               const history = [...tab.history.slice(0, tab.historyIndex + 1), match];
               return {
@@ -490,9 +610,11 @@ export const useViewerStore = create<ViewerStore>()(
         }
 
         const id = randomId();
+        const paneId = get().focusedPaneId ?? randomId();
         const tab: ViewerTab = {
           id,
           path: match.path,
+          paneId,
           match,
           history: [match],
           historyIndex: 0,
@@ -504,7 +626,12 @@ export const useViewerStore = create<ViewerStore>()(
           metadataStatus: "idle",
           requestId: 0,
         };
-        set((state) => ({ tabs: [...state.tabs, tab], activeTabId: id }));
+        set((state) => {
+          const panes = state.panes.some((pane) => pane.id === paneId)
+            ? withPaneActive(state.panes, paneId, id)
+            : [...state.panes, { id: paneId, activeTabId: id }];
+          return settlePanes([...state.tabs, tab], panes, paneId, state.panes);
+        });
         ensureTabLoaded(id);
       },
 
@@ -515,8 +642,9 @@ export const useViewerStore = create<ViewerStore>()(
         get().openMatch(origin ? { path, origin } : directFileMatch(path)),
 
       activateTab: (id) => {
-        if (!get().tabs.some((tab) => tab.id === id)) return;
-        set({ activeTabId: id });
+        const tab = get().tabs.find((candidate) => candidate.id === id);
+        if (!tab) return;
+        set((state) => settlePanes(state.tabs, withPaneActive(state.panes, tab.paneId, id), tab.paneId, state.panes));
         ensureTabLoaded(id);
       },
 
@@ -542,39 +670,29 @@ export const useViewerStore = create<ViewerStore>()(
 
       closeTab: (id) => {
         set((state) => {
-          const index = state.tabs.findIndex((tab) => tab.id === id);
-          if (index < 0) return state;
-          const tabs = state.tabs.filter((tab) => tab.id !== id);
-          if (state.activeTabId !== id) return { tabs };
-          return {
-            tabs,
-            activeTabId: tabs[index]?.id ?? tabs[index - 1]?.id ?? null,
-          };
+          const closing = state.tabs.find((tab) => tab.id === id);
+          if (!closing) return state;
+          return settlePanes(
+            state.tabs.filter((tab) => tab.id !== id),
+            leavePane(state, closing),
+            state.focusedPaneId,
+            state.panes,
+          );
         });
-        const activeTabId = get().activeTabId;
-        if (activeTabId) ensureTabLoaded(activeTabId);
+        loadVisibleTabs();
       },
 
+      // A path is open in one tab at most.
       closePath: (path) => {
-        set((state) => {
-          const tabs = state.tabs.filter((tab) => tab.path !== path);
-          if (tabs.length === state.tabs.length) return state;
-          const activeIndex = state.tabs.findIndex((tab) => tab.id === state.activeTabId);
-          const activeTab = state.tabs[activeIndex];
-          if (activeTab?.path !== path) return { tabs };
-          const nextActive =
-            state.tabs.slice(activeIndex + 1).find((tab) => tab.path !== path) ??
-            state.tabs.slice(0, activeIndex).reverse().find((tab) => tab.path !== path) ??
-            null;
-          return { tabs, activeTabId: nextActive?.id ?? null };
-        });
-        const activeTabId = get().activeTabId;
-        if (activeTabId) ensureTabLoaded(activeTabId);
+        const tab = get().tabs.find((candidate) => candidate.path === path);
+        if (tab) get().closeTab(tab.id);
       },
 
       remapPathPrefix: (oldPath, newPath) => {
-        const activeTabId = get().activeTabId;
-        const activePath = get().tabs.find((tab) => tab.id === activeTabId)?.path;
+        const visible = get().panes.map((pane) => ({
+          id: pane.activeTabId,
+          path: get().tabs.find((tab) => tab.id === pane.activeTabId)?.path,
+        }));
         set((state) => ({
           tabs: state.tabs.map((tab) => {
             const path = remapPath(tab.path, oldPath, newPath);
@@ -598,28 +716,90 @@ export const useViewerStore = create<ViewerStore>()(
             };
           }),
         }));
-        if (activeTabId && activePath && remapPath(activePath, oldPath, newPath) !== activePath) {
-          ensureTabLoaded(activeTabId);
+        for (const { id, path } of visible) {
+          if (id && path && remapPath(path, oldPath, newPath) !== path) ensureTabLoaded(id);
         }
       },
 
       goBack: () => {
-        const state = get();
-        const tab = state.tabs.find((candidate) => candidate.id === state.activeTabId);
+        const tab = activeViewerTab(get());
         if (tab && tab.historyIndex > 0) {
           navigateToHistoryIndex(tab.id, tab.historyIndex - 1);
         }
       },
 
       goForward: () => {
-        const state = get();
-        const tab = state.tabs.find((candidate) => candidate.id === state.activeTabId);
+        const tab = activeViewerTab(get());
         if (tab && tab.historyIndex < tab.history.length - 1) {
           navigateToHistoryIndex(tab.id, tab.historyIndex + 1);
         }
       },
 
-      clear: () => set({ tabs: [], activeTabId: null }),
+      clear: () => set(EMPTY_LAYOUT),
+
+      focusPane: (paneId) => {
+        if (!get().panes.some((pane) => pane.id === paneId)) return;
+        set({ focusedPaneId: paneId });
+      },
+
+      splitTab: (id) => {
+        set((state) => {
+          const moving = state.tabs.find((tab) => tab.id === id);
+          if (!moving) return state;
+          const fresh: ViewerPane = { id: randomId(), activeTabId: id };
+          const panes = leavePane(state, moving);
+          const at = panes.findIndex((pane) => pane.id === moving.paneId);
+          return settlePanes(
+            replaceTab(state.tabs, id, (tab) => ({ ...tab, paneId: fresh.id })),
+            [...panes.slice(0, at + 1), fresh, ...panes.slice(at + 1)],
+            fresh.id,
+            state.panes,
+          );
+        });
+        loadVisibleTabs();
+      },
+
+      moveTabToPane: (id, paneId) => {
+        set((state) => {
+          const moving = state.tabs.find((tab) => tab.id === id);
+          if (!moving || moving.paneId === paneId || !state.panes.some((pane) => pane.id === paneId)) {
+            return state;
+          }
+          return settlePanes(
+            replaceTab(state.tabs, id, (tab) => ({ ...tab, paneId })),
+            withPaneActive(leavePane(state, moving), paneId, id),
+            paneId,
+            state.panes,
+          );
+        });
+        loadVisibleTabs();
+      },
+
+      closePane: (paneId) => {
+        set((state) => settlePanes(
+          state.tabs.filter((tab) => tab.paneId !== paneId),
+          state.panes,
+          state.focusedPaneId,
+          state.panes,
+        ));
+        loadVisibleTabs();
+      },
+
+      joinPanes: () => {
+        set((state) => {
+          const first = state.panes[0];
+          if (!first) return state;
+          // The tab being worked with stays the one shown.
+          const shown = activeViewerTab(state)?.id ?? first.activeTabId;
+          return settlePanes(
+            state.tabs.map((tab) => ({ ...tab, paneId: first.id })),
+            [{ id: first.id, activeTabId: shown }],
+            first.id,
+            state.panes,
+          );
+        });
+        loadVisibleTabs();
+      },
     }),
     {
       name: VIEWER_SESSION_STORAGE_KEY,
@@ -627,9 +807,12 @@ export const useViewerStore = create<ViewerStore>()(
       storage: createJSONStorage(() => viewerSessionStorage),
       skipHydration: true,
       partialize: (state): PersistedViewerState => ({
-        tabs: state.tabs.map(persistedTab),
-        activePath:
-          state.tabs.find((tab) => tab.id === state.activeTabId)?.path ?? null,
+        tabs: state.tabs.map((tab) => persistedTab(tab, state.panes)),
+        activePath: activeViewerTab(state)?.path ?? null,
+        paneActivePaths: state.panes.map(
+          (pane) => state.tabs.find((tab) => tab.id === pane.activeTabId)?.path ?? null,
+        ),
+        focusedPane: Math.max(0, state.panes.findIndex((pane) => pane.id === state.focusedPaneId)),
       }),
       migrate: () => ({ tabs: [], activePath: null }),
       merge: (persistedState, currentState) => ({
@@ -640,6 +823,7 @@ export const useViewerStore = create<ViewerStore>()(
   ),
 );
 
-export function activeViewerTab(state: Pick<ViewerStore, "tabs" | "activeTabId">) {
-  return state.tabs.find((tab) => tab.id === state.activeTabId) ?? null;
+/** The focused pane's tab: the document being worked with. */
+export function activeViewerTab(state: PaneLayout): ViewerTab | null {
+  return state.focusedPaneId ? paneActiveTab(state, state.focusedPaneId) : null;
 }
