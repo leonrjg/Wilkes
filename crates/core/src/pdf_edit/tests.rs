@@ -411,6 +411,42 @@ fn words_drawn_by_a_form_are_taken_out_with_the_rest() {
     assert!(red < 100, "the form's rule is gone");
 }
 
+#[test]
+fn a_form_the_page_lists_and_does_not_draw_is_not_copied() {
+    let directory = tempfile::tempdir().unwrap();
+    // Some producers give every page one list of every page's content. A page
+    // that draws one form of two must not take a copy of the other with it.
+    let words = |text: &str| format!("BT /F1 12 Tf 80 400 Td ({text}) Tj ET");
+    let source = fixture_over(
+        directory.path(),
+        b"/Fm1 Do\n",
+        &[
+            ("Fm1", words("drawn here").as_str()),
+            ("Fm2", words("another page entirely").as_str()),
+        ],
+    );
+    let destination = directory.path().join("edited.pdf");
+    write_edited_pdf(&source, &line_two_as_paper(), &destination).unwrap();
+
+    let saved = PdfDocument::open(destination.to_str().unwrap()).unwrap();
+    // Forms are told from the page's own content by the `Td` only they use.
+    let contains =
+        |content: &[u8], text: &[u8]| content.windows(text.len()).any(|window| window == text);
+    let forms: Vec<Vec<u8>> = (1..saved.count_objects().unwrap() as i32)
+        .filter_map(|number| saved.new_indirect(number, 0).ok()?.read_stream().ok())
+        .filter(|content| contains(content, b"80 400 Td"))
+        .collect();
+    // One copy was made without its words: of the form the page draws.
+    let wordless = forms
+        .iter()
+        .filter(|content| !contains(content, b"Tj"))
+        .count();
+    assert_eq!(wordless, 1);
+    assert!(forms
+        .iter()
+        .any(|content| contains(content, b"another page entirely")));
+}
+
 /// The fixture with a link over each of page 1's second and third lines.
 fn fixture_with_links(directory: &Path) -> PathBuf {
     let plain = fixture(directory, 1);

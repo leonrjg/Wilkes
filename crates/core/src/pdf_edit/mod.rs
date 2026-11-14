@@ -164,8 +164,11 @@ pub fn write_edited_pdf(
     let mut options = PdfWriteOptions::default();
     // Collect what the rewritten pages no longer reference: the original
     // content streams, and the scratch pages the redactions were done on.
+    // No further: the next level also looks for objects that are copies of
+    // one another by comparing each with every other, which takes seconds on
+    // a book and finds nothing this writer made.
     options
-        .set_garbage_level(3)
+        .set_garbage_level(2)
         .set_compress(true)
         .set_compress_fonts(true);
     doc.save_with_options(destination_str, options)
@@ -421,7 +424,7 @@ fn paper_form(doc: &mut PdfDocument, original: &Original) -> anyhow::Result<PdfO
     form.dict_put("BBox", media_box)?;
     form.dict_put(
         "Resources",
-        textless_resources(doc, &original.resources, 0)?,
+        textless_resources(doc, &original.resources, &original.contents, 0)?,
     )?;
     let mut form = doc.add_object(&form)?;
     form.write_stream_buffer(&Buffer::from_bytes(&strip::without_text(
@@ -430,17 +433,20 @@ fn paper_form(doc: &mut PdfDocument, original: &Original) -> anyhow::Result<PdfO
     Ok(form)
 }
 
-/// `resources` with every form in it replaced by one without text, and so on
-/// down through the forms those draw. The same object when nothing in it
-/// shows text.
+/// `resources` with every form that `content` draws replaced by one without
+/// text, and so on down through the forms those draw. The same object when
+/// nothing drawn shows text. A form the resources list and the content does
+/// not draw is left alone: it is not part of this page.
 fn textless_resources(
     doc: &mut PdfDocument,
     resources: &PdfObject,
+    content: &[u8],
     depth: u8,
 ) -> anyhow::Result<PdfObject> {
     let Some(xobjects) = resources.get_dict("XObject")? else {
         return resources.try_clone().map_err(Into::into);
     };
+    let drawn = strip::drawn(content)?;
     let mut replaced: Vec<(PdfObject, PdfObject)> = Vec::new();
     for index in 0..xobjects.dict_len()? as i32 {
         let (Some(key), Some(xobject)) =
@@ -452,7 +458,7 @@ fn textless_resources(
             Some(subtype) => subtype.as_name()? == b"Form",
             None => false,
         };
-        if !is_form {
+        if !is_form || !drawn.contains(key.as_name()?) {
             continue;
         }
         if depth >= MAX_FORM_DEPTH {
@@ -462,7 +468,7 @@ fn textless_resources(
         let stripped = strip::without_text(&content)?;
         let inner = xobject.get_dict("Resources")?;
         let inner_stripped = match &inner {
-            Some(inner) => Some(textless_resources(doc, inner, depth + 1)?),
+            Some(inner) => Some(textless_resources(doc, inner, &content, depth + 1)?),
             None => None,
         };
         let same_resources = match (&inner, &inner_stripped) {

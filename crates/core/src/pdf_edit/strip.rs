@@ -11,6 +11,8 @@
 //! where each operation starts and ends, and the ones that show text are left
 //! out of the copy.
 
+use std::collections::BTreeSet;
+
 use anyhow::bail;
 
 /// The operators that put glyphs on the page. With these gone the rest of a
@@ -20,9 +22,51 @@ const SHOWS_TEXT: [&[u8]; 4] = [b"Tj", b"TJ", b"'", b"\""];
 /// `content` without the operations that show text.
 pub(super) fn without_text(content: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(content.len());
+    let end = each_operation(content, |operation| {
+        if SHOWS_TEXT.contains(&operation.operator) {
+            // Keep the separation the operation gave its neighbours.
+            out.push(b'\n');
+        } else {
+            out.extend_from_slice(&content[operation.start..operation.end]);
+        }
+    })?;
+    out.extend_from_slice(&content[end..]);
+    Ok(out)
+}
+
+/// The names of the XObjects `content` draws. A page's resources can list far
+/// more than the page uses -- some producers give every page the same list,
+/// with every other page's content in it.
+pub(super) fn drawn(content: &[u8]) -> anyhow::Result<BTreeSet<Vec<u8>>> {
+    let mut names = BTreeSet::new();
+    each_operation(content, |operation| {
+        if let (b"Do", Some(name)) = (operation.operator, operation.name) {
+            names.insert(decoded_name(name));
+        }
+    })?;
+    Ok(names)
+}
+
+/// One operation of a content stream: its operands and its operator.
+struct Operation<'a> {
+    /// Where it starts, straight after the operator before it, and ends.
+    start: usize,
+    end: usize,
+    operator: &'a [u8],
+    /// The last name among its operands, as written, without its solidus.
+    name: Option<&'a [u8]>,
+}
+
+/// Calls `visit` with each operation of `content` in turn, and answers where
+/// the last one ended. The stream is read only far enough to know where each
+/// operation starts and ends.
+fn each_operation<'a>(
+    content: &'a [u8],
+    mut visit: impl FnMut(Operation<'a>),
+) -> anyhow::Result<usize> {
     let mut at = 0;
-    // Where the operation being read started: after the last operator.
-    let mut operation = 0;
+    let mut start = 0;
+    let mut name = None;
     while at < content.len() {
         let byte = content[at];
         match byte {
@@ -32,7 +76,11 @@ pub(super) fn without_text(content: &[u8]) -> anyhow::Result<Vec<u8>> {
             b'<' => at = hex_string_end(content, at)?,
             b'>' if content.get(at + 1) == Some(&b'>') => at += 2,
             b'[' | b']' | b'{' | b'}' | b'>' => at += 1,
-            b'/' => at = token_end(content, at + 1),
+            b'/' => {
+                let end = token_end(content, at + 1);
+                name = Some(&content[(at + 1).min(end)..end]);
+                at = end;
+            }
             _ if is_space(byte) => at += 1,
             _ => {
                 let end = token_end(content, at);
@@ -45,18 +93,41 @@ pub(super) fn without_text(content: &[u8]) -> anyhow::Result<Vec<u8>> {
                     // An inline image: its data is bytes, not tokens.
                     at = inline_image_end(content, at)?;
                 }
-                if !SHOWS_TEXT.contains(&token) {
-                    out.extend_from_slice(&content[operation..at]);
-                } else {
-                    // Keep the separation the operation gave its neighbours.
-                    out.push(b'\n');
-                }
-                operation = at;
+                visit(Operation {
+                    start,
+                    end: at,
+                    operator: token,
+                    name: name.take(),
+                });
+                start = at;
             }
         }
     }
-    out.extend_from_slice(&content[operation..]);
-    Ok(out)
+    Ok(start)
+}
+
+/// A name as it is written in a content stream, with its `#xx` escapes read.
+fn decoded_name(written: &[u8]) -> Vec<u8> {
+    let mut name = Vec::with_capacity(written.len());
+    let mut at = 0;
+    while at < written.len() {
+        let escaped = (written[at] == b'#')
+            .then(|| written.get(at + 1..at + 3))
+            .flatten()
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| u8::from_str_radix(digits, 16).ok());
+        match escaped {
+            Some(byte) => {
+                name.push(byte);
+                at += 3;
+            }
+            None => {
+                name.push(written[at]);
+                at += 1;
+            }
+        }
+    }
+    name
 }
 
 fn is_space(byte: u8) -> bool {
@@ -171,6 +242,13 @@ mod tests {
             assert!(!out.contains(gone), "{gone} is still in {out:?}");
         }
         assert!(out.contains("/Im1 Do"));
+    }
+
+    #[test]
+    fn the_objects_a_content_draws_are_named() {
+        let names = drawn(b"q /Fm1 Do Q /Im#202 Do BT /F1 9 Tf (/Fm9 Do) Tj ET /GS1 gs").unwrap();
+        let names: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+        assert_eq!(names, [b"Fm1".as_slice(), b"Im 2".as_slice()]);
     }
 
     #[test]
