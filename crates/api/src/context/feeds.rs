@@ -173,7 +173,12 @@ fn request_headers() -> [(&'static str, String); 1] {
 fn http_message(error: &ProviderHttpError) -> String {
     match error.status {
         Some(status) => format!("HTTP {status}"),
-        None => error.message.lines().next().unwrap_or("request failed").to_string(),
+        None => error
+            .message
+            .lines()
+            .next()
+            .unwrap_or("request failed")
+            .to_string(),
     }
 }
 
@@ -296,7 +301,12 @@ impl AppContext {
     fn emit_feeds_changed(&self, feed_ids: Vec<String>) {
         let inbox = self
             .feeds_store()
-            .and_then(|store| store.lock().unwrap_or_else(|p| p.into_inner()).inbox_total())
+            .and_then(|store| {
+                store
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .inbox_total()
+            })
             .unwrap_or_else(|error| {
                 warn!("feeds: cannot count the inbox: {error:#}");
                 0
@@ -358,7 +368,10 @@ impl AppContext {
             .filter(|name| !name.is_empty())
             .or(title)
             .ok_or_else(|| anyhow::anyhow!("the feed names itself nothing; give it a name"))?;
-        let folder = match new.folder.map(|folder| folder.trim().trim_matches('/').to_string()) {
+        let folder = match new
+            .folder
+            .map(|folder| folder.trim().trim_matches('/').to_string())
+        {
             Some(folder) if !folder.is_empty() => folder,
             _ => format!("Feeds/{}", folder_component(&name)),
         };
@@ -422,7 +435,8 @@ impl AppContext {
             let mut paths = Vec::new();
             let mut offset = 0;
             loop {
-                let page = store.feed_items(Some(FeedItemStatus::Imported), Some(id), offset, 500)?;
+                let page =
+                    store.feed_items(Some(FeedItemStatus::Imported), Some(id), offset, 500)?;
                 if page.is_empty() {
                     break;
                 }
@@ -431,7 +445,11 @@ impl AppContext {
             }
             paths
         };
-        let Some(feed) = store.lock().unwrap_or_else(|p| p.into_inner()).remove_feed(id)? else {
+        let Some(feed) = store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove_feed(id)?
+        else {
             anyhow::bail!("no feed with id {id}");
         };
         if delete_files {
@@ -555,9 +573,14 @@ impl AppContext {
     }
 
     /// The library root a feed writes under: one of the library's own.
-    fn feed_root(&self, settings: &wilkes_core::types::Settings, root: &Path) -> anyhow::Result<PathBuf> {
-        let canonical = std::fs::canonicalize(root)
-            .map_err(|error| anyhow::anyhow!("library root {} is unavailable: {error}", root.display()))?;
+    fn feed_root(
+        &self,
+        settings: &wilkes_core::types::Settings,
+        root: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        let canonical = std::fs::canonicalize(root).map_err(|error| {
+            anyhow::anyhow!("library root {} is unavailable: {error}", root.display())
+        })?;
         let (roots, _) = super::library_roots(settings);
         anyhow::ensure!(
             roots.iter().any(|listed| canonical.starts_with(listed)),
@@ -591,8 +614,9 @@ impl AppContext {
             );
         };
         let body = self.fetch(&feed_url, cancel).await?;
-        let document = read_feed(&body)
-            .map_err(|error| anyhow::anyhow!("the feed {feed_url} that {url} advertises: {error}"))?;
+        let document = read_feed(&body).map_err(|error| {
+            anyhow::anyhow!("the feed {feed_url} that {url} advertises: {error}")
+        })?;
         Ok((feed_url, document.title))
     }
 
@@ -649,7 +673,9 @@ fn item_dois(item: &FeedItemRecord) -> Vec<String> {
         dois.push(doi.clone());
     }
     if let Some(id) = &item.arxiv_id {
-        if let Some(doi) = wilkes_core::metadata::doi::normalize_doi(&format!("10.48550/arXiv.{id}")) {
+        if let Some(doi) =
+            wilkes_core::metadata::doi::normalize_doi(&format!("10.48550/arXiv.{id}"))
+        {
             dois.push(doi);
         }
     }
@@ -828,7 +854,10 @@ impl AppContext {
             let store = Arc::clone(&store);
             let feed_id = feed.id.clone();
             match blocking(cancel, move || {
-                store.lock().unwrap_or_else(|p| p.into_inner()).feed_item_keys(&feed_id)
+                store
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .feed_item_keys(&feed_id)
             })
             .await?
             {
@@ -859,10 +888,11 @@ impl AppContext {
                 let store = Arc::clone(&store);
                 let feed_id = feed.id.clone();
                 let _ = blocking(cancel, move || {
-                    store
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .feed_failed(&feed_id, &message, retry_after_ms)
+                    store.lock().unwrap_or_else(|p| p.into_inner()).feed_failed(
+                        &feed_id,
+                        &message,
+                        retry_after_ms,
+                    )
                 })
                 .await?;
                 return Ok(());
@@ -890,7 +920,10 @@ impl AppContext {
             FeedSource::Listing { .. } => missed,
         };
         if may_have_missed {
-            info!("feeds: every item {} returned was new; older ones may have been missed", feed.name);
+            info!(
+                "feeds: every item {} returned was new; older ones may have been missed",
+                feed.name
+            );
         }
 
         let records: Vec<FeedItemRecord> = new
@@ -918,7 +951,10 @@ impl AppContext {
                 last_error: None,
             })
             .collect();
-        let undated = records.iter().filter(|item| item.published.is_none()).count();
+        let undated = records
+            .iter()
+            .filter(|item| item.published.is_none())
+            .count();
         if undated > 0 {
             info!(
                 "feeds: {} gave {undated} item(s) no real date; they are shown by when they were first seen",
@@ -1090,14 +1126,19 @@ impl AppContext {
             Ok(store) => store,
             Err(error) => return Ok(Err(error)),
         };
-        let feed = match store.lock().unwrap_or_else(|p| p.into_inner()).feed(&item.feed_id) {
+        let feed = match store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .feed(&item.feed_id)
+        {
             Ok(Some(feed)) => feed,
             Ok(None) => return Ok(Err(anyhow::anyhow!("its feed was removed"))),
             Err(error) => return Ok(Err(error)),
         };
         let outcome = match &feed.source {
             FeedSource::Listing { provider, .. } => {
-                self.import_provider_item(&feed, provider, item, cancel).await?
+                self.import_provider_item(&feed, provider, item, cancel)
+                    .await?
             }
             FeedSource::Syndication { .. } => {
                 self.import_post(&feed, item, allow_missing_images, cancel)
@@ -1171,7 +1212,11 @@ impl AppContext {
             Ok(acquired) => acquired,
             Err(error) => return Ok(Err(anyhow::anyhow!("{error}"))),
         };
-        let paths: Vec<PathBuf> = acquired.files.iter().map(|file| PathBuf::from(&file.path)).collect();
+        let paths: Vec<PathBuf> = acquired
+            .files
+            .iter()
+            .map(|file| PathBuf::from(&file.path))
+            .collect();
         let imported = crate::commands::files::import_files_into_root(
             paths,
             feed.root.clone(),
@@ -1283,7 +1328,10 @@ impl AppContext {
             fetched: Utc::now(),
             item_id: item.id.clone(),
         };
-        let html = document::render(&provenance, &document::embed_pictures(&article.html, &pictures));
+        let html = document::render(
+            &provenance,
+            &document::embed_pictures(&article.html, &pictures),
+        );
         if settings.max_file_size > 0 && html.len() as u64 > settings.max_file_size {
             return Ok(Err(anyhow::anyhow!(
                 "the post with its pictures is {:.1} MB, over the {:.1} MB limit above which files are not indexed",
@@ -1301,7 +1349,10 @@ impl AppContext {
         if feed.root.join(&feed.folder).join(&name).exists() {
             name = document::disambiguated(&name, &item.id);
         }
-        let staging = self.data_dir.join("uploads").join("feeds").join(&item.id);
+        // Beside uploads, never in it: the server serves uploads as its
+        // library, and a file staged there would be in the library before it
+        // was imported into it.
+        let staging = self.data_dir.join("feed-staging").join(&item.id);
         let written = async {
             tokio::fs::create_dir_all(&staging).await?;
             let path = staging.join(&name);
@@ -1408,7 +1459,9 @@ fn listed_entry(feed_name: &str, entry: SourceEntry) -> Option<Listed> {
         year: entry
             .published
             .map(|date| i64::from(chrono::Datelike::year(&date))),
-        publication_date: entry.published.map(|date| date.format("%Y-%m-%d").to_string()),
+        publication_date: entry
+            .published
+            .map(|date| date.format("%Y-%m-%d").to_string()),
         venue: Some(feed_name.to_string()),
         citation_count: None,
         is_open_access: false,
@@ -1480,7 +1533,6 @@ fn listed_work(provider: &str, work: LiteratureSearchResult) -> Listed {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1530,11 +1582,16 @@ mod tests {
         let in_flight = Arc::new(AtomicUsize::new(0));
         let most_in_flight = Arc::new(AtomicUsize::new(0));
         {
-            let (routes, log, most_in_flight) =
-                (Arc::clone(&routes), Arc::clone(&log), Arc::clone(&most_in_flight));
+            let (routes, log, most_in_flight) = (
+                Arc::clone(&routes),
+                Arc::clone(&log),
+                Arc::clone(&most_in_flight),
+            );
             tokio::spawn(async move {
                 loop {
-                    let Ok((mut socket, _)) = listener.accept().await else { break };
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        break;
+                    };
                     let (routes, log, in_flight, most_in_flight) = (
                         Arc::clone(&routes),
                         Arc::clone(&log),
@@ -1686,7 +1743,13 @@ mod tests {
     }
 
     fn reload(ctx: &AppContext, id: &str) -> FeedRecord {
-        ctx.feeds_store().unwrap().lock().unwrap().feed(id).unwrap().unwrap()
+        ctx.feeds_store()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .feed(id)
+            .unwrap()
+            .unwrap()
     }
 
     fn items(ctx: &AppContext, status: FeedItemStatus) -> Vec<FeedItemRecord> {
@@ -1704,7 +1767,9 @@ mod tests {
     async fn a_first_refresh_inboxes_the_ten_newest_and_a_second_adds_nothing() {
         let library = tempfile::tempdir().unwrap();
         let server = serve().await;
-        let entries: Vec<_> = (0..53).map(|i| (format!("/posts/{i}/"), Some(day(i * 30)))).collect();
+        let entries: Vec<_> = (0..53)
+            .map(|i| (format!("/posts/{i}/"), Some(day(i * 30))))
+            .collect();
         server.set("/feed", rss(&server, &entries));
         let (_dir, ctx) = context(library.path()).await;
         let feed = feed_record(&ctx, library.path(), server.url("/feed"), false);
@@ -1715,7 +1780,9 @@ mod tests {
         assert_eq!(inbox.len(), 10);
         assert_eq!(items(&ctx, FeedItemStatus::Seen).len(), 43);
         let newest: HashSet<String> = (43..53).map(|i| format!("/posts/{i}/")).collect();
-        assert!(inbox.iter().all(|item| newest.iter().any(|path| item.link.contains(path.as_str()))));
+        assert!(inbox
+            .iter()
+            .all(|item| newest.iter().any(|path| item.link.contains(path.as_str()))));
         let feed = reload(&ctx, &feed.id);
         assert!(feed.last_success_at_ms.is_some() && !feed.may_have_missed);
 
@@ -1737,16 +1804,22 @@ mod tests {
         let cancel = CancellationToken::new();
         ctx.refresh_feed(&feed, &cancel).await.unwrap();
 
-        let thirty: Vec<_> = (1..=30).map(|i| (format!("/p/{i}/"), Some(day(i)))).collect();
+        let thirty: Vec<_> = (1..=30)
+            .map(|i| (format!("/p/{i}/"), Some(day(i))))
+            .collect();
         server.set("/feed", rss(&server, &thirty));
-        ctx.refresh_feed(&reload(&ctx, &feed.id), &cancel).await.unwrap();
+        ctx.refresh_feed(&reload(&ctx, &feed.id), &cancel)
+            .await
+            .unwrap();
         assert!(reload(&ctx, &feed.id).may_have_missed);
         assert_eq!(items(&ctx, FeedItemStatus::Inbox).len(), 31);
 
         let mut next = thirty.clone();
         next.push(("/p/31/".into(), Some(day(31))));
         server.set("/feed", rss(&server, &next));
-        ctx.refresh_feed(&reload(&ctx, &feed.id), &cancel).await.unwrap();
+        ctx.refresh_feed(&reload(&ctx, &feed.id), &cancel)
+            .await
+            .unwrap();
         assert!(!reload(&ctx, &feed.id).may_have_missed);
     }
 
@@ -1759,7 +1832,13 @@ mod tests {
         let server = serve().await;
         server.set(
             "/feed",
-            rss(&server, &[("/paid".into(), Some(day(2))), ("/free".into(), Some(day(1)))]),
+            rss(
+                &server,
+                &[
+                    ("/paid".into(), Some(day(2))),
+                    ("/free".into(), Some(day(1))),
+                ],
+            ),
         );
         server.set("/paid", article_page(&server, true));
         server.set("/free", article_page(&server, false));
@@ -1767,14 +1846,20 @@ mod tests {
         let (_dir, ctx) = context(library.path()).await;
         let feed = feed_record(&ctx, library.path(), server.url("/feed"), true);
 
-        ctx.refresh_feed(&feed, &CancellationToken::new()).await.unwrap();
+        ctx.refresh_feed(&feed, &CancellationToken::new())
+            .await
+            .unwrap();
         let inbox = items(&ctx, FeedItemStatus::Inbox);
         assert_eq!(inbox.len(), 1);
         assert!(inbox[0].preview_only && inbox[0].link.ends_with("/paid?utm_source=rss"));
         let imported = items(&ctx, FeedItemStatus::Imported);
         assert_eq!(imported.len(), 1);
         let path = imported[0].imported_path.clone().unwrap();
-        assert!(path.starts_with(std::fs::canonicalize(library.path()).unwrap().join("Feeds/Blog")));
+        assert!(path.starts_with(
+            std::fs::canonicalize(library.path())
+                .unwrap()
+                .join("Feeds/Blog")
+        ));
         assert_eq!(
             path.file_name().unwrap().to_string_lossy(),
             "2024-01-02 Post free.html"
@@ -1785,7 +1870,12 @@ mod tests {
         assert!(!html.contains("Footer") && !html.contains("Home"));
         // A manual import of the preview is refused.
         assert!(ctx
-            .feed_item_set_status(&inbox[0].id, FeedItemAction::Import { allow_missing_images: false })
+            .feed_item_set_status(
+                &inbox[0].id,
+                FeedItemAction::Import {
+                    allow_missing_images: false
+                }
+            )
             .await
             .is_err());
     }
@@ -1802,23 +1892,42 @@ mod tests {
         server.set("/img.png", Reply::Status(404));
         let (_dir, ctx) = context(library.path()).await;
         let feed = feed_record(&ctx, library.path(), server.url("/feed"), true);
-        ctx.refresh_feed(&feed, &CancellationToken::new()).await.unwrap();
+        ctx.refresh_feed(&feed, &CancellationToken::new())
+            .await
+            .unwrap();
 
         let item = items(&ctx, FeedItemStatus::Inbox).remove(0);
         let error = item.last_error.clone().unwrap();
-        assert!(error.contains("/img.png") && error.contains("404"), "{error}");
+        assert!(
+            error.contains("/img.png") && error.contains("404"),
+            "{error}"
+        );
 
-        ctx.update_settings(serde_json::json!({ "max_file_size": 300 })).await.unwrap();
+        ctx.update_settings(serde_json::json!({ "max_file_size": 300 }))
+            .await
+            .unwrap();
         let error = ctx
-            .feed_item_set_status(&item.id, FeedItemAction::Import { allow_missing_images: true })
+            .feed_item_set_status(
+                &item.id,
+                FeedItemAction::Import {
+                    allow_missing_images: true,
+                },
+            )
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("limit"), "{error}");
 
-        ctx.update_settings(serde_json::json!({ "max_file_size": 52_428_800u64 })).await.unwrap();
+        ctx.update_settings(serde_json::json!({ "max_file_size": 52_428_800u64 }))
+            .await
+            .unwrap();
         let imported = ctx
-            .feed_item_set_status(&item.id, FeedItemAction::Import { allow_missing_images: true })
+            .feed_item_set_status(
+                &item.id,
+                FeedItemAction::Import {
+                    allow_missing_images: true,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(imported.status, FeedItemStatus::Imported);
@@ -1839,10 +1948,17 @@ mod tests {
         let client = http_client();
         let mut tasks = Vec::new();
         for path in ["/a", "/b", "/c"] {
-            let (gate, cancel, client, url) =
-                (Arc::clone(&gate), cancel.clone(), client.clone(), server.url(path));
+            let (gate, cancel, client, url) = (
+                Arc::clone(&gate),
+                cancel.clone(),
+                client.clone(),
+                server.url(path),
+            );
             tasks.push(tokio::spawn(async move {
-                gate.run(&cancel, client.get_bytes(url, &[])).await.unwrap().unwrap()
+                gate.run(&cancel, client.get_bytes(url, &[]))
+                    .await
+                    .unwrap()
+                    .unwrap()
             }));
         }
         for task in tasks {
@@ -1875,7 +1991,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let stopped = Instant::now();
         ctx.feeds_refresh_cancel();
-        assert!(stopped.elapsed() < Duration::from_millis(50), "cancel must return at once");
+        assert!(
+            stopped.elapsed() < Duration::from_millis(50),
+            "cancel must return at once"
+        );
         let outcome = tokio::time::timeout(Duration::from_secs(3), refresh)
             .await
             .expect("the refresh must end within three seconds")
@@ -1900,11 +2019,16 @@ mod tests {
                 b"<html><head><link rel=\"alternate\" type=\"application/rss+xml\" href=\"/feed\"></head></html>".to_vec(),
             ),
         );
-        server.set("/nofeed", Reply::Ok("text/html", b"<html><body>hi</body></html>".to_vec()));
+        server.set(
+            "/nofeed",
+            Reply::Ok("text/html", b"<html><body>hi</body></html>".to_vec()),
+        );
         let (_dir, ctx) = context(library.path()).await;
         let feed = ctx
             .feed_add(NewFeed {
-                source: FeedSource::Syndication { url: server.url("/blog") },
+                source: FeedSource::Syndication {
+                    url: server.url("/blog"),
+                },
                 name: None,
                 root: library.path().to_path_buf(),
                 folder: None,
@@ -1912,13 +2036,20 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(feed.source, FeedSource::Syndication { url: server.url("/feed") });
+        assert_eq!(
+            feed.source,
+            FeedSource::Syndication {
+                url: server.url("/feed")
+            }
+        );
         assert_eq!(feed.name, "Blog");
         assert_eq!(feed.folder, "Feeds/Blog");
 
         let error = ctx
             .feed_add(NewFeed {
-                source: FeedSource::Syndication { url: server.url("/nofeed") },
+                source: FeedSource::Syndication {
+                    url: server.url("/nofeed"),
+                },
                 name: None,
                 root: library.path().to_path_buf(),
                 folder: None,
@@ -1932,7 +2063,9 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         assert!(ctx
             .feed_add(NewFeed {
-                source: FeedSource::Syndication { url: server.url("/feed") },
+                source: FeedSource::Syndication {
+                    url: server.url("/feed")
+                },
                 name: None,
                 root: elsewhere.path().to_path_buf(),
                 folder: None,
@@ -1956,10 +2089,16 @@ mod tests {
         assert_eq!(listed.link_key, "https://doi.org/10.48550/arxiv.2401.01234");
         assert_eq!(listed.arxiv_id.as_deref(), Some("2401.01234"));
         assert_eq!(
-            listed.published.map(|date| date.date_naive().to_string()).as_deref(),
+            listed
+                .published
+                .map(|date| date.date_naive().to_string())
+                .as_deref(),
             Some("2025-03-04")
         );
         work.doi = None;
-        assert_eq!(listed_work("openalex", work).link_key, "provider:openalex/W1");
+        assert_eq!(
+            listed_work("openalex", work).link_key,
+            "provider:openalex/W1"
+        );
     }
 }

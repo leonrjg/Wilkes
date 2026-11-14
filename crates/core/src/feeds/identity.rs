@@ -116,24 +116,34 @@ pub struct Platform {
 
 /// The platforms the survey's pages came from that need anything said about
 /// them. A page from anywhere else is extracted as it is.
-pub const PLATFORMS: &[Platform] = &[Platform {
-    name: "Substack",
-    recognised_by: "substackcdn.com",
-    // In the post data embedded in the page: `"everyone"` on a free post.
-    paywall: Some(r#""post":{"audience":"only_subscribers""#),
-    remove: &[
-        ".subscription-widget-wrap",
-        ".subscription-widget-wrap-editor",
-        ".subscribe-widget",
-        ".button-wrapper",
-        ".share-dialog",
-        ".post-ufi",
-        ".paywall",
-        ".captioned-button-wrap",
-        "[data-component-name=\"SubscribeWidgetToDOM\"]",
-        "[data-component-name=\"ButtonCreateButton\"]",
-    ],
-}];
+pub const PLATFORMS: &[Platform] = &[
+    Platform {
+        // Measured: on a short link-blog post the extraction took the sidebar
+        // too (tag counts, the monthly briefing, the sponsor box).
+        name: "Simon Willison's Weblog",
+        recognised_by: "https://simonwillison.net/atom/everything/",
+        paywall: None,
+        remove: &["#secondary", "#sponsored-banner", ".recent-articles", "#ft"],
+    },
+    Platform {
+        name: "Substack",
+        recognised_by: "substackcdn.com",
+        // In the post data embedded in the page: `"everyone"` on a free post.
+        paywall: Some(r#""post":{"audience":"only_subscribers""#),
+        remove: &[
+            ".subscription-widget-wrap",
+            ".subscription-widget-wrap-editor",
+            ".subscribe-widget",
+            ".button-wrapper",
+            ".share-dialog",
+            ".post-ufi",
+            ".paywall",
+            ".captioned-button-wrap",
+            "[data-component-name=\"SubscribeWidgetToDOM\"]",
+            "[data-component-name=\"ButtonCreateButton\"]",
+        ],
+    },
+];
 
 /// The platform a page was published on, if it is one Wilkes knows.
 pub fn platform(page_source: &str) -> Option<&'static Platform> {
@@ -165,7 +175,10 @@ mod tests {
         ] {
             assert_eq!(link_key(variant).as_deref(), Some(key.as_str()), "{variant}");
         }
-        assert_eq!(key, "https://garymarcus.substack.com/p/report-from-the-vatican");
+        assert_eq!(
+            key,
+            "https://garymarcus.substack.com/p/report-from-the-vatican"
+        );
     }
 
     #[test]
@@ -232,6 +245,8 @@ mod tests {
         assert!(is_preview_only(paid));
         assert!(!is_preview_only(free));
         // The same marker on a page from no known platform is not a paywall.
-        assert!(!is_preview_only(r#"{"post":{"audience":"only_subscribers"}}"#));
+        assert!(!is_preview_only(
+            r#"{"post":{"audience":"only_subscribers"}}"#
+        ));
     }
 }

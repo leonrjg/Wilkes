@@ -59,7 +59,8 @@ pub fn extract(page_source: &str, page_url: &str) -> Result<Article, ArticleErro
         dom_smoothie::ReadabilityError::GrabFailed => ArticleError::NoArticle,
         other => ArticleError::Unreadable(other.to_string()),
     })?;
-    let base = url::Url::parse(page_url).map_err(|error| ArticleError::Unreadable(error.to_string()))?;
+    let base =
+        url::Url::parse(page_url).map_err(|error| ArticleError::Unreadable(error.to_string()))?;
     let (html, pictures) = clean(&article.content, &base);
     // Readability's own floor for a passage that counts as content: anything
     // shorter is a page's furniture that happened to score highest.
@@ -218,12 +219,31 @@ mod tests {
         let article = extract(&page(&body), "https://example.org/2026/post/").unwrap();
         assert!(article.html.contains("Paragraph 7"));
         assert!(article.html.contains("A figure"));
-        for absent in ["Archive", "Copyright footer", "First!", "evil()", "Subscribe", "srcset", "style="] {
-            assert!(!article.html.contains(absent), "{absent} kept: {}", article.html);
+        for absent in [
+            "Archive",
+            "Copyright footer",
+            "First!",
+            "evil()",
+            "Subscribe",
+            "srcset",
+            "style=",
+        ] {
+            assert!(
+                !article.html.contains(absent),
+                "{absent} kept: {}",
+                article.html
+            );
         }
-        assert!(article.html.contains("href=\"https://example.org/linked/3\""));
-        assert_eq!(article.pictures, vec!["https://example.org/img/a-1456.png".to_string()]);
-        assert!(article.html.contains("src=\"https://example.org/img/a-1456.png\""));
+        assert!(article
+            .html
+            .contains("href=\"https://example.org/linked/3\""));
+        assert_eq!(
+            article.pictures,
+            vec!["https://example.org/img/a-1456.png".to_string()]
+        );
+        assert!(article
+            .html
+            .contains("src=\"https://example.org/img/a-1456.png\""));
         assert!(article.published.is_some());
     }
 
@@ -273,15 +293,48 @@ mod tests {
         assert_eq!(widest_candidate("a.png 1x, a@2x.png 2x"), None);
     }
 
+    /// Simon Willison's short link-blog posts: the post is a paragraph, and
+    /// the sidebar beside it scored as part of the article.
+    #[test]
+    fn a_short_post_keeps_no_sidebar() {
+        let source = r#"<html><head><link rel="alternate" type="application/atom+xml" href="https://simonwillison.net/atom/everything/"></head><body>
+<div id="sponsored-banner">Sponsored by: a company</div>
+<div id="wrapper"><div id="primary">
+<div class="entry"><h2>A short post</h2><p>A link post says, in one paragraph of real length, why the linked page is worth reading and what in it is new, which is enough to be an article.</p><p>And a second paragraph adds a quote from the page itself that a reader would want to keep.</p></div>
+<div class="recent-articles"><h2>Recent articles</h2><ul><li><a href="/a">An older article title</a></li></ul></div>
+</div>
+<div id="secondary"><div class="metabox"><p>Monthly briefing</p><p>Sponsor me for $10/month and get a curated email digest of the month's most important developments.</p><p>tags 2,024 claude 328 vibe-coding 104</p></div></div>
+</div><div id="ft">Colophon</div></body></html>"#;
+        let article = extract(source, "https://simonwillison.net/2026/Nov/11/post/").unwrap();
+        for absent in [
+            "Monthly briefing",
+            "Sponsor me",
+            "Recent articles",
+            "Sponsored by",
+            "Colophon",
+        ] {
+            assert!(
+                !article.html.contains(absent),
+                "{absent} kept: {}",
+                article.html
+            );
+        }
+        assert!(article
+            .html
+            .contains("why the linked page is worth reading"));
+    }
+
     #[test]
     fn a_platforms_boxes_inside_the_article_are_removed() {
         let body = format!(
             "{}<div class=\"subscription-widget-wrap\"><p>Subscribe to keep reading this newsletter every week</p></div>",
             paragraphs()
         );
-        let source = page(&body).replace("<head>", "<head><link rel=\"preconnect\" href=\"https://substackcdn.com\">");
+        let source = page(&body).replace(
+            "<head>",
+            "<head><link rel=\"preconnect\" href=\"https://substackcdn.com\">",
+        );
         let article = extract(&source, "https://example.substack.com/p/post").unwrap();
         assert!(!article.html.contains("keep reading"), "{}", article.html);
     }
 }
-

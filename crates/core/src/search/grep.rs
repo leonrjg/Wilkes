@@ -629,6 +629,48 @@ mod tests {
         assert!(!matcher.is_match("Hello".as_bytes()).unwrap());
     }
 
+    /// An HTML file is searched in what the viewer shows: a word split by an
+    /// inline tag is one word, markup and pictures match nothing, and a match
+    /// is reported at the file bytes and line the viewer highlights.
+    #[test]
+    fn html_is_searched_in_its_visible_text_and_reported_at_file_bytes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("post.html");
+        let source = "<html><head><title>class title</title></head>\n<body>\n<p class=\"lead\">An un<em>believ</em>able caf&eacute; story.</p>\n<img src=\"data:image/png;base64,dW5iZWxpZXZhYmxl\" alt=\"class\">\n</body></html>\n";
+        fs::write(&path, source).unwrap();
+        let matcher = |pattern: &str| {
+            GrepSearchProvider::build_matcher(&SearchQuery {
+                pattern: pattern.to_string(),
+                is_regex: false,
+                case_sensitive: false,
+                root: dir.path().to_path_buf(),
+                max_results: 0,
+                respect_gitignore: false,
+                max_file_size: 0,
+                context_lines: 0,
+                mode: crate::types::SearchMode::Grep,
+                scope: Default::default(),
+                supported_extensions: vec!["html".into()],
+                collection_id: None,
+                tag_ids: Vec::new(),
+            })
+            .unwrap()
+        };
+
+        let found = search_html_file(&path, &matcher("unbelievable café")).unwrap();
+        assert_eq!(found.len(), 1);
+        let range = found[0].text_range.clone().unwrap();
+        assert_eq!(&source[range.start..range.end], "un<em>believ</em>able caf&eacute;");
+        assert_eq!(found[0].matched_text, "unbelievable café");
+        assert!(matches!(found[0].origin, SourceOrigin::TextFile { line: 3, .. }));
+        assert_eq!(found[0].context_after, " story.");
+
+        // Attributes, the title and the picture's bytes are not text.
+        for hidden in ["class", "lead", "base64", "title"] {
+            assert!(search_html_file(&path, &matcher(hidden)).unwrap().is_empty(), "{hidden}");
+        }
+    }
+
     #[test]
     fn test_context_extraction() {
         let text = "The quick brown fox jumps over the lazy dog";

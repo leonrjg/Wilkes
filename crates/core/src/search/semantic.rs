@@ -369,15 +369,19 @@ impl SearchProvider for SemanticSearchProvider {
         // An HTML file's passages are cut from its visible text; the viewer
         // highlights bytes of the file. Each such file is read once per search
         // to map one onto the other.
-        let mut html_readings: HashMap<std::path::PathBuf, Option<crate::text_projection::TextProjection>> =
-            HashMap::new();
+        let mut html_readings: HashMap<
+            std::path::PathBuf,
+            Option<crate::text_projection::TextProjection>,
+        > = HashMap::new();
         for chunk in results {
             let Some(document) = documents_by_path.get(&chunk.file_path) else {
                 continue;
             };
 
             let text_range = match &chunk.origin {
-                SourceOrigin::TextFile { .. } if crate::extract::html::is_html(&chunk.file_path) => {
+                SourceOrigin::TextFile { .. }
+                    if crate::extract::html::is_html(&chunk.file_path) =>
+                {
                     html_readings
                         .entry(chunk.file_path.clone())
                         .or_insert_with(|| match std::fs::read_to_string(&chunk.file_path) {

@@ -192,6 +192,9 @@ mod tests {
             advertised_feed(page, "https://example.org/2026/post/").as_deref(),
             Some("https://example.org/atom/everything/")
         );
-        assert_eq!(advertised_feed("<html></html>", "https://example.org/"), None);
+        assert_eq!(
+            advertised_feed("<html></html>", "https://example.org/"),
+            None
+        );
     }
 }

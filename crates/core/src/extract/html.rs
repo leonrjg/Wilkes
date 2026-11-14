@@ -45,8 +45,8 @@ pub(crate) const STRIPPED: &[&str] = &[
 /// Of [`STRIPPED`], the void elements: they have no closing tag, so removing
 /// one removes the tag alone.
 const VOID: &[&str] = &[
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
-    "source", "track", "wbr",
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
 ];
 
 /// Elements whose content the parser reads as raw text: the first closing tag
@@ -58,9 +58,9 @@ const RAW_TEXT: &[&str] = &[
 /// Elements that sit inside a line of text. A tag of one of these separates
 /// nothing: `un<em>believ</em>able` is one word on screen and one word here.
 const INLINE: &[&str] = &[
-    "a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "del", "dfn", "em", "font", "i",
-    "ins", "kbd", "mark", "q", "s", "samp", "small", "span", "strike", "strong", "sub", "sup",
-    "time", "tt", "u", "var", "wbr",
+    "a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "del", "dfn", "em", "font", "i", "ins",
+    "kbd", "mark", "q", "s", "samp", "small", "span", "strike", "strong", "sub", "sup", "time",
+    "tt", "u", "var", "wbr",
 ];
 
 /// Elements that end a line of text where they open or close.
@@ -127,6 +127,9 @@ pub struct Masked {
     blanks: Vec<(ByteRange, Blank)>,
     /// Each `h1`–`h6`: its level and the file range between its tags.
     headings: Vec<(u32, ByteRange)>,
+    /// Each decoded entity's bytes in the file, in order: a character read
+    /// from one stands for the whole entity, never for part of it.
+    entities: Vec<ByteRange>,
     /// The text of the first `<title>`, as written.
     title: Option<ByteRange>,
 }
@@ -142,6 +145,7 @@ pub fn mask(source: &str) -> Masked {
     let mut headings = Vec::new();
     let mut open_headings: Vec<(u32, usize)> = Vec::new();
     let mut title = None;
+    let mut entities = Vec::new();
     let n = bytes.len();
     let mut i = 0usize;
 
@@ -209,6 +213,7 @@ pub fn mask(source: &str) -> Masked {
                     if i + decoded_len < end {
                         push_blank(&mut out, &mut blanks, i + decoded_len, end, Blank::Join);
                     }
+                    entities.push(ByteRange { start: i, end });
                     i = end;
                 }
                 None => i += 1,
@@ -227,6 +232,7 @@ pub fn mask(source: &str) -> Masked {
         blanks,
         headings,
         title,
+        entities,
     }
 }
 
@@ -241,6 +247,7 @@ pub(crate) fn visible_projection(masked: &Masked) -> TextProjection {
     let text = masked.text.as_str();
     let mut projection = TextProjection::with_capacity(text.len() / 8);
     let mut blanks = masked.blanks.iter().peekable();
+    let mut entities = masked.entities.iter().peekable();
     // The pending run: where it started, where it ends, and the strongest
     // break inside it.
     let mut run: Option<(usize, usize, Blank)> = None;
@@ -283,7 +290,14 @@ pub(crate) fn visible_projection(masked: &Masked) -> TextProjection {
             }
             None => {
                 flush(&mut projection, &mut run);
-                projection.push_scalar(c, ByteRange { start: offset, end });
+                while entities.peek().is_some_and(|range| range.end <= offset) {
+                    entities.next();
+                }
+                let raw = match entities.peek() {
+                    Some(entity) if entity.start <= offset => (*entity).clone(),
+                    _ => ByteRange { start: offset, end },
+                };
+                projection.push_scalar(c, raw);
             }
         }
     }
@@ -516,7 +530,8 @@ fn closing_tag(source: &str, name: &str, from: usize) -> Option<(usize, usize)> 
     while let Some(at) = find(bytes, b"<", i) {
         let closing = bytes.get(at + 1) == Some(&b'/');
         let name_at = if closing { at + 2 } else { at + 1 };
-        if bytes.get(name_at).is_some_and(u8::is_ascii_alphabetic) && tag_name(bytes, name_at) == name
+        if bytes.get(name_at).is_some_and(u8::is_ascii_alphabetic)
+            && tag_name(bytes, name_at) == name
         {
             let end = tag_end(bytes, name_at);
             if closing {
@@ -605,7 +620,10 @@ mod tests {
     fn inline_tags_and_entities_join_their_neighbours() {
         assert_eq!(visible("<p>un<em>believ</em>able</p>"), "unbelievable");
         assert_eq!(visible("<p>don&rsquo;t</p>"), "don\u{2019}t");
-        assert_eq!(visible("<p>a <a href=\"x\">link</a>ed word</p>"), "a linked word");
+        assert_eq!(
+            visible("<p>a <a href=\"x\">link</a>ed word</p>"),
+            "a linked word"
+        );
         assert_eq!(visible("<p>one</p><p>two</p>"), "one\ntwo");
         assert_eq!(visible("<td>a</td><td>b</td>"), "a b");
         assert_eq!(visible("  <p>\n  lead  </p>  "), "lead");
@@ -621,7 +639,10 @@ mod tests {
         assert_eq!(visible("<p>keep</p><form><p>gone</p></form>"), "keep");
         // An unclosed raw-text element runs to the end, as the parser reads it.
         assert_eq!(visible("before<script>after"), "before");
-        assert_eq!(visible("<meta charset=utf-8><p>after meta</p>"), "after meta");
+        assert_eq!(
+            visible("<meta charset=utf-8><p>after meta</p>"),
+            "after meta"
+        );
     }
 
     #[test]
@@ -694,7 +715,9 @@ mod tests {
 
         let content = ExtractedContent {
             text: reading,
-            source_map: SourceMap { segments: Vec::new() },
+            source_map: SourceMap {
+                segments: Vec::new(),
+            },
             metadata: FileMetadata {
                 path: "post.html".into(),
                 size_bytes: source.len() as u64,
@@ -710,7 +733,10 @@ mod tests {
         assert!(last.text.chars().count() <= 2000);
         for chunk in rest {
             let length = chunk.text.chars().count();
-            assert!((1500..=2000).contains(&length), "a chunk of {length} characters");
+            assert!(
+                (1500..=2000).contains(&length),
+                "a chunk of {length} characters"
+            );
         }
     }
 
@@ -733,4 +759,3 @@ mod tests {
         assert_eq!(visible("&#x1F600;"), "\u{1F600}");
     }
 }
-

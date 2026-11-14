@@ -146,7 +146,12 @@ pub fn file_name(date: DateTime<Utc>, title: Option<&str>, fallback: &str) -> St
         .collect();
     let mut name = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     if name.chars().count() > 80 {
-        name = name.chars().take(80).collect::<String>().trim_end().to_string();
+        name = name
+            .chars()
+            .take(80)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
     }
     let name = name.trim_matches('.').trim().to_string();
     let name = if name.is_empty() {
@@ -180,7 +185,10 @@ mod tests {
             link: "https://garymarcus.substack.com/p/report-from-the-vatican".into(),
             published: Utc.with_ymd_and_hms(2026, 10, 31, 15, 17, 33).single(),
             feed: "Gary Marcus".into(),
-            fetched: Utc.with_ymd_and_hms(2026, 11, 14, 15, 2, 11).single().unwrap(),
+            fetched: Utc
+                .with_ymd_and_hms(2026, 11, 14, 15, 2, 11)
+                .single()
+                .unwrap(),
             item_id: "5f0c2d9e-8a41".into(),
         }
     }
@@ -197,7 +205,10 @@ mod tests {
         // The visible text a search reads starts with the header.
         let masked = crate::extract::html::mask(&html);
         let visible = crate::extract::html::visible_projection(&masked).into_text();
-        assert!(visible.starts_with("Report from <the> Vatican\nGary Marcus"), "{visible}");
+        assert!(
+            visible.starts_with("Report from <the> Vatican\nGary Marcus"),
+            "{visible}"
+        );
     }
 
     #[test]
@@ -218,7 +229,10 @@ mod tests {
     fn pictures_go_inside_and_a_missing_one_is_removed() {
         let png = b"\x89PNG\r\n\x1a\nrest".to_vec();
         assert_eq!(picture_mime(&png), Some("image/png"));
-        assert_eq!(picture_mime(b"<?xml version=\"1.0\"?><svg></svg>"), Some("image/svg+xml"));
+        assert_eq!(
+            picture_mime(b"<?xml version=\"1.0\"?><svg></svg>"),
+            Some("image/svg+xml")
+        );
         assert_eq!(picture_mime(b"<html>not a picture</html>"), None);
         let mut pictures = HashMap::new();
         pictures.insert(
@@ -232,13 +246,19 @@ mod tests {
             "<p>x</p><img src=\"https://example.org/a.png\"><img src=\"https://example.org/gone.png\">",
             &pictures,
         );
-        assert!(html.contains("src=\"data:image/png;base64,iVBORw0KGgpyZXN0\""), "{html}");
+        assert!(
+            html.contains("src=\"data:image/png;base64,iVBORw0KGgpyZXN0\""),
+            "{html}"
+        );
         assert!(!html.contains("gone.png"));
     }
 
     #[test]
     fn names_are_dated_cut_and_cleaned() {
-        let date = Utc.with_ymd_and_hms(2026, 10, 31, 0, 0, 0).single().unwrap();
+        let date = Utc
+            .with_ymd_and_hms(2026, 10, 31, 0, 0, 0)
+            .single()
+            .unwrap();
         assert_eq!(
             file_name(date, Some("What/is: AI? <really>"), "item"),
             "2026-10-31 What is AI really.html"

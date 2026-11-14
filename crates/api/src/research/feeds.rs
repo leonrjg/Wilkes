@@ -437,7 +437,13 @@ mod tests {
         }
     }
 
-    fn item(id: &str, feed_id: &str, key: &str, published: Option<&str>, seen: i64) -> FeedItemRecord {
+    fn item(
+        id: &str,
+        feed_id: &str,
+        key: &str,
+        published: Option<&str>,
+        seen: i64,
+    ) -> FeedItemRecord {
         FeedItemRecord {
             id: id.into(),
             feed_id: feed_id.into(),
@@ -485,7 +491,8 @@ mod tests {
         }
         let conn = rusqlite::Connection::open(dir.path().join("research.db")).unwrap();
         conn.pragma_update(None, "user_version", 5).unwrap();
-        conn.execute_batch("DROP TABLE feed_items; DROP TABLE feeds;").unwrap();
+        conn.execute_batch("DROP TABLE feed_items; DROP TABLE feeds;")
+            .unwrap();
         drop(conn);
 
         let store = ResearchStore::open(dir.path(), &dir.path().join("none.json")).unwrap();
@@ -496,7 +503,9 @@ mod tests {
         assert_eq!(version, 6);
         assert_eq!(store.list_saved_works().unwrap().len(), 1);
         assert_eq!(
-            store.saved_work_dois(&["10.1/abc".into(), "10.1/zzz".into()]).unwrap(),
+            store
+                .saved_work_dois(&["10.1/abc".into(), "10.1/zzz".into()])
+                .unwrap(),
             HashSet::from(["10.1/abc".to_string()])
         );
         assert!(store.feeds().unwrap().is_empty());
@@ -543,13 +552,25 @@ mod tests {
         store.insert_feed(&feed("f")).unwrap();
         // 2026-11-01 and 2026-11-03 as first-seen times, in ms.
         store
-            .insert_feed_item(&item("old", "f", "k1", Some("2026-10-01T00:00:00Z"), 1_793_491_200_000))
+            .insert_feed_item(&item(
+                "old",
+                "f",
+                "k1",
+                Some("2026-10-01T00:00:00Z"),
+                1_793_491_200_000,
+            ))
             .unwrap();
         store
             .insert_feed_item(&item("undated", "f", "k2", None, 1_793_664_000_000))
             .unwrap();
         store
-            .insert_feed_item(&item("new", "f", "k3", Some("2026-11-02T00:00:00Z"), 1_793_491_200_000))
+            .insert_feed_item(&item(
+                "new",
+                "f",
+                "k3",
+                Some("2026-11-02T00:00:00Z"),
+                1_793_491_200_000,
+            ))
             .unwrap();
         let order: Vec<String> = store
             .feed_items(Some(FeedItemStatus::Inbox), None, 0, 10)
@@ -559,8 +580,16 @@ mod tests {
             .collect();
         assert_eq!(order, vec!["undated", "new", "old"]);
 
-        store.set_feed_item_status("new", FeedItemStatus::Dismissed).unwrap();
-        assert_eq!(store.feed_items(Some(FeedItemStatus::Inbox), Some("f"), 0, 10).unwrap().len(), 2);
+        store
+            .set_feed_item_status("new", FeedItemStatus::Dismissed)
+            .unwrap();
+        assert_eq!(
+            store
+                .feed_items(Some(FeedItemStatus::Inbox), Some("f"), 0, 10)
+                .unwrap()
+                .len(),
+            2
+        );
         assert_eq!(store.feed_item_keys("f").unwrap().len(), 3);
     }
 }
