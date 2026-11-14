@@ -370,7 +370,9 @@ export default function PreviewPane({ standalone = false }: PreviewPaneProps) {
   const saveEditedCopy = async () => {
     setSavingEdits(true);
     try {
-      const edits = pdfReaderRef.current?.exportEdits() ?? null;
+      // The reader first lays out every page the edits reach, which in a long
+      // document is more than it has shown.
+      const edits = (await pdfReaderRef.current?.exportEdits()) ?? null;
       if (!edits) {
         addToast("Nothing has been changed", { type: "info" });
         return;
