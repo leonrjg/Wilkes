@@ -173,7 +173,7 @@ describe("readerPositions", () => {
 });
 
 describe("unsaved PDF edits", () => {
-  const draft = { version: 1 as const, edits: [{ paragraph: { page: 2 }, runs: [] }] } as any;
+  const draft = { version: 2 as const, edits: [{ paragraph: { page: 2 }, runs: [] }] } as any;
 
   beforeEach(() => {
     localStorage.clear();

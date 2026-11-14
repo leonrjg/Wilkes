@@ -203,8 +203,11 @@ export const PDF_EDIT_DRAFTS_STORAGE_KEY = "wilkes.pdf-edit-drafts";
 const draftsKey = (workspaceId: string) => `${PDF_EDIT_DRAFTS_STORAGE_KEY}.${workspaceId}`;
 let drafts: Map<string, PdfEditDraft> | null = null;
 
+/** Whether a stored value has a draft's shape. Which versions can still be
+ *  read is the reader's to say, when it takes the draft up: this store keeps
+ *  what it was given. */
 function isDraft(value: unknown): value is PdfEditDraft {
-  return isRecord(value) && value.version === 1 && Array.isArray(value.edits);
+  return isRecord(value) && typeof value.version === "number" && Array.isArray(value.edits);
 }
 
 function loadDrafts(): Map<string, PdfEditDraft> {
