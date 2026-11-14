@@ -83,6 +83,7 @@ import type {
   FeedsChanged,
   FeedUpdate,
   NewFeed,
+  OfferedFeed,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type { SearchApi, WebSourceApi } from "./api";
@@ -981,6 +982,16 @@ export class HttpSearchApi implements SearchApi {
     const res = await fetch("/api/feeds");
     if (!res.ok) throw await responseError(res, "feedsList");
     return res.json() as Promise<Feed[]>;
+  }
+
+  async feedDiscover(address: string): Promise<OfferedFeed[]> {
+    const res = await fetch("/api/feeds/discover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address }),
+    });
+    if (!res.ok) throw await responseError(res, "feedDiscover");
+    return res.json() as Promise<OfferedFeed[]>;
   }
 
   async feedAdd(feed: NewFeed): Promise<Feed> {
