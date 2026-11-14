@@ -16,5 +16,6 @@ pub mod network;
 pub mod path;
 mod program;
 pub mod search;
+pub mod text_index;
 pub mod types;
 pub mod worker;

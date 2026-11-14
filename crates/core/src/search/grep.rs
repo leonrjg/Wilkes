@@ -1,5 +1,5 @@
-use crate::embed::index::SemanticIndex;
 use crate::extract::ExtractorRegistry;
+use crate::text_index::DocumentTextIndex;
 use crate::types::{
     ByteRange, FileMatches, FileType, Match, SearchCapabilities, SearchDocument, SearchQuery,
     SourceMap, SourceOrigin,
@@ -17,8 +17,20 @@ use super::{
     SearchOutcome, SearchProvider, SearchResultTx,
 };
 
-/// Shared handle to the live semantic index, as held by the API layer.
-type IndexHandle = Arc<Mutex<Option<SemanticIndex>>>;
+/// Where exact search may read a paged document's text from instead of
+/// extracting it.
+#[derive(Clone, Default)]
+pub enum StoredText {
+    /// Every paged document is extracted live (the setting is off).
+    #[default]
+    Disabled,
+    /// The setting is on but the document text index could not be opened, so
+    /// every paged document is extracted live and counted as such.
+    Unavailable,
+    /// Read from the document text index; documents it cannot serve are
+    /// extracted live.
+    Available(Arc<DocumentTextIndex>),
+}
 
 #[derive(Default)]
 struct GrepDiagnostics {
@@ -28,22 +40,22 @@ struct GrepDiagnostics {
 }
 
 pub struct GrepSearchProvider {
-    /// When set, PDF matches are found against text the index already holds
-    /// instead of re-extracting the file. Files the index does not hold (or that
-    /// changed on disk) fall back to live extraction. `None` disables this and
-    /// makes every PDF extract live, i.e. the setting is off.
-    index: Option<IndexHandle>,
+    /// Where paged documents' text is read from. Documents the store does not
+    /// hold (or that changed on disk) are extracted live.
+    stored_text: StoredText,
 }
 
 impl GrepSearchProvider {
     pub fn new() -> Self {
-        Self { index: None }
+        Self {
+            stored_text: StoredText::Disabled,
+        }
     }
 
-    /// Enable index-backed exact search: PDF matches are read from the semantic
-    /// index when it holds the file's current text, otherwise extracted live.
-    pub fn with_index(mut self, index: Option<IndexHandle>) -> Self {
-        self.index = index;
+    /// Read paged documents' text from the document text index when it holds
+    /// the file's current text, extracting live otherwise.
+    pub fn with_stored_text(mut self, stored_text: StoredText) -> Self {
+        self.stored_text = stored_text;
         self
     }
 
@@ -76,7 +88,7 @@ impl SearchProvider for GrepSearchProvider {
         let errors = Mutex::new(Vec::new());
         let files_scanned = AtomicUsize::new(0);
         let diagnostics = GrepDiagnostics::default();
-        let index = self.index.as_ref();
+        let stored_text = &self.stored_text;
         let field_matches_by_document = documents
             .iter()
             .map(|document| document_field_matches(&matcher, document))
@@ -121,7 +133,7 @@ impl SearchProvider for GrepSearchProvider {
                     extractors,
                     &matcher,
                     pdf_literal_matcher.as_ref(),
-                    index,
+                    stored_text,
                     &diagnostics,
                 ) {
                     Ok(matches) => matches,
@@ -227,47 +239,55 @@ fn search_document_content(
     extractors: &ExtractorRegistry,
     matcher: &RegexMatcher,
     pdf_literal_matcher: Option<&RegexMatcher>,
-    index: Option<&IndexHandle>,
+    stored_text: &StoredText,
     diagnostics: &GrepDiagnostics,
 ) -> anyhow::Result<Vec<Match>> {
     let path = document.path.as_path();
     match &document.file_type {
-        // Plain text is memory-mapped and already fast; it also carries exact
-        // line/column origins that the chunk-granular index cannot reproduce, so
-        // it never uses the index regardless of the setting.
+        // Plain text is memory-mapped and already fast, with exact line/column
+        // origins; the text index does not hold it.
         FileType::PlainText => search_text_file(path, matcher, query.context_lines as u64),
         FileType::Paged => {
-            // Prefer text the index already holds. A genuine index fault is
-            // logged and demoted to live extraction rather than failing the
-            // file; "not indexed / stale / pre-v4" simply returns None.
-            let from_index = match index {
-                Some(handle) => indexed_pdf_matches(handle, path, matcher, pdf_literal_matcher)
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            "index-backed grep failed for {}, extracting live: {e:#}",
-                            path.display()
-                        );
-                        IndexedPdfSearch::DocumentUnavailable
-                    }),
-                None => IndexedPdfSearch::Disabled,
-            };
-            match from_index {
-                IndexedPdfSearch::Served(matches) => {
-                    diagnostics
-                        .indexed_pdf_reads
-                        .fetch_add(1, Ordering::Relaxed);
-                    Ok(matches)
-                }
-                IndexedPdfSearch::IndexUnavailable => {
+            let store = match stored_text {
+                StoredText::Available(store) => store,
+                StoredText::Unavailable => {
                     diagnostics
                         .live_pdf_fallbacks
                         .fetch_add(1, Ordering::Relaxed);
                     diagnostics
                         .index_unavailable_fallbacks
                         .fetch_add(1, Ordering::Relaxed);
-                    live_pdf_matches(path, extractors, matcher, pdf_literal_matcher)
+                    return live_pdf_matches(path, extractors, matcher, pdf_literal_matcher);
                 }
-                IndexedPdfSearch::Disabled | IndexedPdfSearch::DocumentUnavailable => {
+                StoredText::Disabled => {
+                    diagnostics
+                        .live_pdf_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                    return live_pdf_matches(path, extractors, matcher, pdf_literal_matcher);
+                }
+            };
+            // A store fault is logged and demoted to live extraction rather
+            // than failing the file; "not held / stale" is simply `None`.
+            let stored = store.document_for_path(path).unwrap_or_else(|e| {
+                tracing::warn!(
+                    "stored text unreadable for {}, extracting live: {e:#}",
+                    path.display()
+                );
+                None
+            });
+            match stored {
+                Some(document) => {
+                    diagnostics
+                        .indexed_pdf_reads
+                        .fetch_add(1, Ordering::Relaxed);
+                    search_text_and_map(
+                        &document.text,
+                        &document.source_map,
+                        matcher,
+                        pdf_literal_matcher,
+                    )
+                }
+                None => {
                     diagnostics
                         .live_pdf_fallbacks
                         .fetch_add(1, Ordering::Relaxed);
@@ -355,8 +375,8 @@ fn search_text_file(
 
 // ── Extracted content search (PDF / future formats) ──────────────────────────
 
-/// Extract a PDF live and search it. Used when the index is disabled, or does
-/// not yet hold this file's current text.
+/// Extract a PDF live and search it. Used when stored text is disabled, or the
+/// store does not hold this file's current text.
 fn live_pdf_matches(
     path: &Path,
     extractors: &ExtractorRegistry,
@@ -373,44 +393,6 @@ fn live_pdf_matches(
         matcher,
         pdf_literal_matcher,
     )
-}
-
-/// Search a PDF's text as held by the semantic index. Returns `None` when the
-/// index cannot serve this file (not loaded, not indexed, changed on disk, or
-/// indexed before schema v4), leaving the caller to extract it live.
-enum IndexedPdfSearch {
-    Served(Vec<Match>),
-    Disabled,
-    IndexUnavailable,
-    DocumentUnavailable,
-}
-
-fn indexed_pdf_matches(
-    index: &IndexHandle,
-    path: &Path,
-    matcher: &RegexMatcher,
-    pdf_literal_matcher: Option<&RegexMatcher>,
-) -> anyhow::Result<IndexedPdfSearch> {
-    // Hold the index lock only long enough to copy out the stored text; run the
-    // regex afterwards so we do not block indexing for the scan itself.
-    let document = {
-        let guard = index
-            .lock()
-            .map_err(|_| anyhow::anyhow!("semantic index lock poisoned"))?;
-        let Some(idx) = guard.as_ref() else {
-            return Ok(IndexedPdfSearch::IndexUnavailable);
-        };
-        idx.indexed_document_for_path(path)?
-    };
-    let Some((text, source_map)) = document else {
-        return Ok(IndexedPdfSearch::DocumentUnavailable);
-    };
-    Ok(IndexedPdfSearch::Served(search_text_and_map(
-        &text,
-        &source_map,
-        matcher,
-        pdf_literal_matcher,
-    )?))
 }
 
 /// Search already-extracted PDF text and resolve every result against the raw
@@ -1050,40 +1032,44 @@ mod tests {
     }
 
     #[test]
-    fn index_backed_grep_serves_matches_without_extraction() {
-        use crate::embed::index::chunk::Chunk;
-        use crate::embed::index::db::{PreparedFile, SemanticIndex};
-        use crate::types::{EmbeddingEngine, SourceOrigin};
+    fn stored_text_serves_matches_without_extraction() {
+        use crate::metadata::cache::FileIdentity;
+        use crate::text_index::{DocumentTextIndex, TextSource};
+        use crate::types::{BoundingBox, SourceOrigin, SourceSegment, TextProvenance};
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
         let root = dir.path();
         let pdf = root.join("paper.pdf");
-        // Real bytes so the file's on-disk identity matches what we index; the
-        // content is irrelevant because matches are served from the index.
+        // Real bytes so the file's on-disk identity matches what is stored; the
+        // content is irrelevant because matches are served from the store.
         fs::write(&pdf, "%PDF-1.7 opaque bytes").unwrap();
 
-        let mut idx =
-            SemanticIndex::create(root, "m", 3, EmbeddingEngine::Candle, Some(root)).unwrap();
-        idx.write_file(PreparedFile {
-            retained: Default::default(),
-            path: pdf.clone(),
-            full_text: "alpha something gamma".to_string(),
-            chunks: vec![(
-                Chunk {
-                    file_path: pdf.clone(),
-                    text: "alpha something gamma".to_string(),
-                    byte_range: ByteRange { start: 0, end: 21 },
-                    origin: SourceOrigin::PdfPage {
-                        page: 1,
-                        bbox: None,
-                    },
+        let store = DocumentTextIndex::open(&root.join("data")).unwrap();
+        let word = |start: usize, end: usize, x: f32| SourceSegment {
+            text_range: ByteRange { start, end },
+            origin: SourceOrigin::PdfPage {
+                page: 1,
+                bbox: Some(BoundingBox {
+                    x,
+                    y: 700.0,
+                    width: 30.0,
+                    height: 12.0,
+                }),
+            },
+            provenance: TextProvenance::Native,
+        };
+        store
+            .write_text(
+                &pdf,
+                FileIdentity::for_path(&pdf).unwrap(),
+                &TextSource::current_native(),
+                "alpha something gamma",
+                &crate::types::SourceMap {
+                    segments: vec![word(0, 5, 72.0), word(6, 15, 110.0), word(16, 21, 150.0)],
                 },
-                vec![1.0, 0.0, 0.0],
-            )],
-        })
-        .unwrap();
-        let handle = Arc::new(Mutex::new(Some(idx)));
+            )
+            .unwrap();
 
         let query = SearchQuery {
             pattern: "something".to_string(),
@@ -1107,7 +1093,8 @@ mod tests {
         let mut extractors = ExtractorRegistry::new();
         extractors.register(Box::new(FailingExtractor));
 
-        let provider = GrepSearchProvider::new().with_index(Some(handle));
+        let provider =
+            GrepSearchProvider::new().with_stored_text(StoredText::Available(Arc::new(store)));
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
         let search = std::thread::spawn(move || {
             let documents = test_documents(&query);
@@ -1127,10 +1114,20 @@ mod tests {
         assert_eq!(results[0].matches[0].matched_text, "something");
         let range = results[0].matches[0].text_range.as_ref().unwrap();
         assert_eq!((range.start, range.end), (6, 15));
-        match &results[0].matches[0].origin {
-            SourceOrigin::PdfPage { page, .. } => assert_eq!(*page, 1),
-            other => panic!("expected pdf page origin, got {other:?}"),
-        }
+        // The stored map is word-granular, so the match resolves to its word's
+        // box, as a live read would.
+        assert_eq!(
+            results[0].matches[0].origin,
+            SourceOrigin::PdfPage {
+                page: 1,
+                bbox: Some(BoundingBox {
+                    x: 110.0,
+                    y: 700.0,
+                    width: 30.0,
+                    height: 12.0,
+                }),
+            }
+        );
         assert_eq!(outcome.indexed_pdf_reads, 1);
         assert_eq!(outcome.live_pdf_fallbacks, 0);
         assert_eq!(outcome.index_unavailable_fallbacks, 0);

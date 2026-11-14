@@ -8,7 +8,7 @@ use wilkes_core::embed::index::SemanticIndex;
 use wilkes_core::embed::Embedder;
 use wilkes_core::generate::Generator;
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
-use wilkes_core::search::grep::GrepSearchProvider;
+use wilkes_core::search::grep::{GrepSearchProvider, StoredText};
 use wilkes_core::search::hybrid::HybridSearchProvider;
 use wilkes_core::search::semantic::SemanticSearchProvider;
 use wilkes_core::search::{SearchOutcome, SearchProvider};
@@ -219,9 +219,9 @@ impl SearchHandle {
 
 /// Spawn a search and return a `SearchHandle` whose `rx` streams `FileMatches`.
 ///
-/// For `SearchMode::Grep`: `embedder` is ignored. When `grep_use_index` is
-/// enabled, `index` supplies stored PDF text and individual unavailable files
-/// are read live for the glyphs they typeset — see
+/// For `SearchMode::Grep`: `embedder` and `index` are ignored. `stored_text`
+/// supplies paged documents' text from the document text index, and files it
+/// cannot serve are read live for the glyphs they typeset — see
 /// [`wilkes_core::extract::native_text_registry`] for why a search's own read
 /// never enriches.
 /// For `SearchMode::Semantic`: both must be `Some`, otherwise the search returns
@@ -237,7 +237,7 @@ pub fn start_search(
     log: Option<SearchLogTracker>,
     retrieval: RetrievalSettings,
     generator: Option<Arc<dyn Generator>>,
-    grep_use_index: bool,
+    stored_text: StoredText,
 ) -> SearchHandle {
     let (tx, rx) = mpsc::channel::<FileMatches>(64);
 
@@ -250,13 +250,9 @@ pub fn start_search(
         // it must not be a read that reaches a model.
         let registry = wilkes_core::extract::native_text_registry();
 
-        // When enabled, let the exact lane read PDF text the index already holds
-        // instead of re-extracting each file. `None` keeps every PDF on the
-        // live-extraction path.
-        let exact_lane = || {
-            let grep_index = if grep_use_index { index.clone() } else { None };
-            GrepSearchProvider::new().with_index(grep_index)
-        };
+        // The exact lane reads paged documents' text from the document text
+        // index where it can, instead of re-extracting each file.
+        let exact_lane = || GrepSearchProvider::new().with_stored_text(stored_text.clone());
         let semantic_lane = |embedder: Option<Arc<dyn Embedder>>| {
             let (embedder, idx) = (embedder?, index.clone()?);
             Some(
@@ -423,7 +419,7 @@ mod tests {
             None,
             RetrievalSettings::default(),
             None,
-            false,
+            StoredText::Disabled,
         );
         let mut matches = Vec::new();
         while let Some(m) = handle.rx.recv().await {
@@ -468,7 +464,7 @@ mod tests {
             None,
             RetrievalSettings::default(),
             None,
-            false,
+            StoredText::Disabled,
         );
         let errors = handle.finish().await;
         assert_eq!(errors.len(), 1);
@@ -513,7 +509,7 @@ mod tests {
             None,
             RetrievalSettings::default(),
             None,
-            false,
+            StoredText::Disabled,
         );
         let mut matches = Vec::new();
         while let Some(m) = handle.rx.recv().await {
@@ -564,7 +560,7 @@ mod tests {
             None,
             RetrievalSettings::default(),
             None,
-            false,
+            StoredText::Disabled,
         );
 
         let stats = handle
@@ -629,7 +625,7 @@ mod tests {
             None,
             RetrievalSettings::default(),
             None,
-            false,
+            StoredText::Disabled,
         );
 
         let (stats, complete) = handle
@@ -675,7 +671,7 @@ mod tests {
             None,
             RetrievalSettings::default(),
             None,
-            false,
+            StoredText::Disabled,
         );
 
         let (stats, complete) = handle
@@ -718,7 +714,7 @@ mod tests {
             None,
             RetrievalSettings::default(),
             None,
-            false,
+            StoredText::Disabled,
         );
 
         let stats = handle.run(|_| async { true }).await;
@@ -796,7 +792,7 @@ mod tests {
             None,
             RetrievalSettings::default(),
             None,
-            false,
+            StoredText::Disabled,
         );
 
         let stats = handle
@@ -841,7 +837,7 @@ mod tests {
             None,
             RetrievalSettings::default(),
             None,
-            false,
+            StoredText::Disabled,
         );
         let errors = handle.finish().await;
         assert_eq!(errors.len(), 1);

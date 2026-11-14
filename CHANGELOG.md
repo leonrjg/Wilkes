@@ -27,6 +27,7 @@
 ### Changed
 
 - **API change:** `POST /api/catalogue/acquire` and the desktop `catalogue_acquire` command are removed. A result with a direct file, from a catalogue or any other provider, is added with `POST /api/literature/acquire` (desktop `literature_acquire`), so its provider decides what the file is called. Byte progress still arrives on `catalogue-download-progress`.
+- Exact search no longer extracts PDFs and other paged documents on every search when they are not embedded. Wilkes keeps their text in a store of its own beside the semantic index (`document_text.db` in the workspace's data directory), filled in the background when a folder joins the library and kept current from then on: on startup, as files change in the open folder, and after an index build. Embedded documents are copied from the semantic index, with any text recognized in their images; the rest are read once for the text they typeset, using half the machine's cores. Deleting or rebuilding the semantic index leaves this store in place. Settings › Search › Exact search › "Use index for exact search" turns the store and its upkeep on and off, and is on by default.
 - The Python worker's dependencies are pinned and locked per environment, so every install gets the same versions. `semantic-text-splitter`, `sqlite-vec` and PyMuPDF, which it never used, are gone.
 
 ### Fixed

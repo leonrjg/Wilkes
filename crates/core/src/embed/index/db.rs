@@ -146,6 +146,21 @@ fn recover_interrupted_index_replacement(data_dir: &Path) -> anyhow::Result<()> 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
 const SCHEMA_VERSION: i64 = 12;
 
+/// The `files f` rows whose stored text can be served: text is present, and
+/// empty only for a document that produced no passages. Empty text alongside
+/// passages is a legacy row and holds nothing.
+const SERVABLE_RENDITION: &str = "f.full_text IS NOT NULL
+    AND (f.full_text <> '' OR NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id))";
+
+/// When a file's servable rendition was written, and the on-disk identity it
+/// was written for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenditionStamp {
+    pub size_bytes: i64,
+    pub modified_at_ms: i64,
+    pub indexed_at_ms: i64,
+}
+
 fn configure_connection(conn: &Connection, path: &Path) -> anyhow::Result<()> {
     conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
         .with_context(|| format!("Failed to configure busy timeout for {}", path.display()))?;
@@ -6536,9 +6551,9 @@ impl SemanticIndex {
     /// Fill `full_text` for rows that carry chunks but no stored text — legacy
     /// rows indexed before schema v4 that have neither changed on disk nor been
     /// rebuilt since, so no existing path (fresh build, build-time reuse, or the
-    /// incremental watcher) has ever backfilled them. Until filled they force
-    /// exact (grep) search to re-extract the file live on every query — exactly
-    /// the cost the column exists to remove.
+    /// incremental watcher) has ever backfilled them. Until filled, every
+    /// reader of a rendition's text (summaries, completion context, superseded
+    /// areas, the document text index's copy) finds nothing for them.
     ///
     /// **Reads with [`native_text_registry`](crate::extract::native_text_registry),
     /// and takes no registry so that no caller can hand it another one.** This
@@ -6546,9 +6561,8 @@ impl SemanticIndex {
     /// once, with nothing on screen: it is the last place in the application
     /// that should be starting recognition workers, and it was doing so once
     /// per legacy PDF. What it stores is therefore the page's own glyphs —
-    /// which is exactly the reading these rows are served by today, since the
-    /// live grep fallback they force reads the same way. Filling them changes
-    /// what a query costs, not what it finds.
+    /// the same reading those readers fall back to for these rows today.
+    /// Filling them changes what a read costs, not what it finds.
     ///
     /// Only text is written; chunks and embeddings are left untouched. Extraction
     /// runs without holding the index lock — only the initial read of the stale
@@ -6660,12 +6674,60 @@ impl SemanticIndex {
         filled
     }
 
-    /// Return a file's stored extracted text plus a chunk-granular `SourceMap`,
-    /// for exact (grep) search that reads from the index instead of
-    /// re-extracting. Returns `None` — so the caller falls back to live
-    /// extraction — when the file is absent, has no stored `full_text` (indexed
-    /// before schema v4), or has changed on disk since it was indexed (stale
-    /// text must never be served as a match).
+    /// When each file's rendition with servable text was written, by stored
+    /// key. A rendition is servable when it holds `full_text` — empty text
+    /// counts only for a document that produced no passages, the same rule
+    /// [`Self::indexed_document_for_path`] applies. On-disk identity is
+    /// returned, not checked: the caller compares it with the file it has.
+    ///
+    /// The document text index reads this to find renditions worth copying
+    /// without opening any of their text.
+    pub fn rendition_stamps(&self) -> anyhow::Result<HashMap<PathBuf, RenditionStamp>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT f.file_path, f.size_bytes, f.modified_at_ms, f.indexed_at_ms
+               FROM files f WHERE {SERVABLE_RENDITION}"
+        ))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    PathBuf::from(row.get::<_, String>(0)?),
+                    RenditionStamp {
+                        size_bytes: row.get(1)?,
+                        modified_at_ms: row.get(2)?,
+                        indexed_at_ms: row.get(3)?,
+                    },
+                ))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        Ok(rows)
+    }
+
+    /// [`Self::rendition_stamps`] for one path.
+    pub fn rendition_stamp(&self, path: &Path) -> anyhow::Result<Option<RenditionStamp>> {
+        let key = Self::canonical_path(path);
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT f.size_bytes, f.modified_at_ms, f.indexed_at_ms
+                       FROM files f WHERE f.file_path = ?1 AND {SERVABLE_RENDITION}"
+                ),
+                params![key.to_string_lossy()],
+                |row| {
+                    Ok(RenditionStamp {
+                        size_bytes: row.get(0)?,
+                        modified_at_ms: row.get(1)?,
+                        indexed_at_ms: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Return a file's stored extracted text plus a chunk-granular `SourceMap`.
+    /// Returns `None` when the file is absent, has no stored `full_text`
+    /// (indexed before schema v4), or has changed on disk since it was indexed
+    /// (stale text must never be served).
     pub fn indexed_document_for_path(
         &self,
         path: &Path,
