@@ -54,8 +54,11 @@ const previewTheme = () => EditorView.theme({
     fontFamily: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif',
     lineHeight: "1.65",
   },
-  ".cm-md-heading": { fontWeight: "700", color: "var(--text-main)" },
-  ".cm-md-heading, .cm-md-heading *": { textDecoration: "none" },
+  // The syntax highlighter colours and underlines the spans inside a line;
+  // rendered constructs take the document's own colours instead, so the
+  // rules reach those spans.
+  ".cm-md-heading": { fontWeight: "700" },
+  ".cm-md-heading, .cm-md-heading *": { color: "var(--text-main)", textDecoration: "none" },
   ".cm-md-h1": { fontSize: "1.75em", lineHeight: "1.4" },
   ".cm-md-h2": { fontSize: "1.45em", lineHeight: "1.4" },
   ".cm-md-h3": { fontSize: "1.25em" },
@@ -71,7 +74,7 @@ const previewTheme = () => EditorView.theme({
     borderRadius: "4px",
     padding: "1px 4px",
   },
-  ".cm-md-link": { color: "var(--accent-blue)", textDecoration: "underline", textUnderlineOffset: "2px" },
+  ".cm-md-link, .cm-md-link *": { color: "var(--accent-blue)", textDecoration: "underline", textUnderlineOffset: "2px" },
   ".cm-line.cm-md-quote": {
     borderLeft: "3px solid var(--border-strong)",
     paddingLeft: "12px",
@@ -88,6 +91,7 @@ const previewTheme = () => EditorView.theme({
   ".cm-line.cm-md-codeblock-last": { borderBottomLeftRadius: "6px", borderBottomRightRadius: "6px", paddingBottom: "4px" },
   ".cm-md-code-label": { fontSize: "0.8em", color: "var(--text-dim)", fontFamily: MONO },
   ".cm-line.cm-md-table-source, .cm-line.cm-md-math-source, .cm-md-math-source": { fontFamily: MONO, fontSize: "0.88em" },
+  ".cm-md-table-source *": { textDecoration: "none" },
   ".cm-md-table-wrap": { overflowX: "auto", padding: "6px 0", cursor: "text" },
   ".cm-md-table": { borderCollapse: "collapse", fontSize: "0.95em" },
   ".cm-md-table th, .cm-md-table td": {
@@ -111,7 +115,7 @@ const previewTheme = () => EditorView.theme({
     borderTop: "1px solid var(--border-strong)",
   },
   ".cm-md-bullet": { color: "var(--text-muted)", display: "inline-block", minWidth: "0.9em" },
-  ".cm-md-list-number": { color: "var(--text-muted)" },
+  ".cm-md-list-number, .cm-md-list-number *": { color: "var(--text-muted)" },
   ".cm-md-checkbox": { margin: "0 6px 0 0", verticalAlign: "middle", cursor: "pointer" },
   ".cm-md-task-done": { color: "var(--text-dim)", textDecoration: "line-through" },
   ".cm-md-mermaid": {
