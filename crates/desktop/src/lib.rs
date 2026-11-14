@@ -2222,6 +2222,86 @@ async fn literature_acquire(
         .map_err(|error| error.to_string())
 }
 
+// ── Feeds ────────────────────────────────────────────────────────────────────
+
+/// Every feed with its status, flags and inbox count.
+#[tauri::command]
+async fn feeds_list(app: AppHandle) -> Result<Vec<wilkes_api::research::FeedRecord>, String> {
+    app_context(&app)
+        .feeds_list()
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Add a feed and refresh it. "Follow this" calls it with the listing on screen.
+#[tauri::command]
+async fn feed_add(
+    app: AppHandle,
+    feed: wilkes_api::context::feeds::NewFeed,
+) -> Result<wilkes_api::research::FeedRecord, String> {
+    app_context(&app)
+        .feed_add(feed)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+async fn feed_update(
+    app: AppHandle,
+    id: String,
+    update: wilkes_api::context::feeds::FeedUpdate,
+) -> Result<wilkes_api::research::FeedRecord, String> {
+    app_context(&app)
+        .feed_update(&id, update)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Remove a feed and its items; `delete_files` deletes what it imported too.
+#[tauri::command]
+async fn feed_remove(app: AppHandle, id: String, delete_files: bool) -> Result<(), String> {
+    app_context(&app)
+        .feed_remove(&id, delete_files)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+async fn feeds_refresh(app: AppHandle) -> Result<(), String> {
+    app_context(&app)
+        .feeds_refresh()
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+async fn feeds_refresh_cancel(app: AppHandle) -> Result<(), String> {
+    app_context(&app).feeds_refresh_cancel();
+    Ok(())
+}
+
+/// Items by status and feed, newest first, paged.
+#[tauri::command]
+async fn feed_items(
+    app: AppHandle,
+    query: wilkes_api::context::feeds::FeedItemsQuery,
+) -> Result<wilkes_api::context::feeds::FeedItemsPage, String> {
+    app_context(&app)
+        .feed_items(query)
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Import or dismiss one item.
+#[tauri::command]
+async fn feed_item_set_status(
+    app: AppHandle,
+    id: String,
+    action: wilkes_api::context::feeds::FeedItemAction,
+) -> Result<wilkes_api::research::FeedItemRecord, String> {
+    app_context(&app)
+        .feed_item_set_status(&id, action)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
 /// One provider's listing by filter and sort. A request its manifest does not
 /// allow comes back inside the answer, beside the provider's name.
 #[tauri::command]
@@ -2748,6 +2828,14 @@ pub fn run() {
             literature_search,
             literature_acquire,
             literature_browse,
+            feeds_list,
+            feed_add,
+            feed_update,
+            feed_remove,
+            feeds_refresh,
+            feeds_refresh_cancel,
+            feed_items,
+            feed_item_set_status,
             literature_filter_suggest,
             literature_compose,
             literature_compose_cancel,

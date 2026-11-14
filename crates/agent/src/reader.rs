@@ -24,6 +24,10 @@ fn is_paged_document(path: &Path) -> bool {
     wilkes_core::extract::document::format::PagedFormat::for_path(path).is_some()
 }
 
+fn is_html(path: &Path) -> bool {
+    wilkes_core::extract::html::is_html(path)
+}
+
 /// The page's own glyphs, never the enriched reading.
 ///
 /// A chat tool call is not an indexing job. `get_document_text` and
@@ -107,6 +111,10 @@ pub fn read_text_range(
             Some((start, end)) => page_range_text(&content, start, end),
             None => content.text,
         }
+    } else if is_html(path) {
+        // The text the viewer shows: a model asked to read a page is not
+        // asking for its markup, nor for the pictures written inside it.
+        extract(path)?.text
     } else {
         std::fs::read_to_string(path)?
     };
@@ -142,6 +150,8 @@ pub fn read_active_excerpt(
             Some(page) => page_text_strict(&content, page).unwrap_or_default(),
             None => content.text,
         }
+    } else if is_html(path) {
+        extract(path)?.text
     } else {
         std::fs::read_to_string(path)?
     };
@@ -233,6 +243,27 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use wilkes_core::types::{ByteRange, FileMetadata, SourceMap, SourceOrigin, SourceSegment};
+
+    /// A model reading an HTML page reads what the viewer shows: no markup,
+    /// and none of the pictures written inside the file.
+    #[test]
+    fn an_html_file_is_read_as_its_visible_text() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("post.html");
+        std::fs::write(
+            &path,
+            "<html><head><title>T</title><style>p{}</style></head><body><p>First <em>para</em>graph.</p><img src=\"data:image/png;base64,QUFB\"><p>Second.</p></body></html>",
+        )
+        .unwrap();
+        assert_eq!(
+            read_text_range(&path, None, None, None).unwrap(),
+            "First paragraph.\nSecond."
+        );
+        assert_eq!(
+            read_active_excerpt(&path, None, 1000).unwrap().text,
+            "First paragraph.\nSecond."
+        );
+    }
 
     #[test]
     fn reads_plain_text_file() {

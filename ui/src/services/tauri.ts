@@ -91,6 +91,14 @@ import type {
   RecognizerCatalogue,
   RecognizerInventory,
   NativeOpenRequest,
+  Feed,
+  FeedItem,
+  FeedItemAction,
+  FeedItemsPage,
+  FeedItemsQuery,
+  FeedsChanged,
+  FeedUpdate,
+  NewFeed,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type {
@@ -670,6 +678,42 @@ export class TauriSearchApi implements SearchApi {
     request: BrowseRequest,
   ): Promise<LiteratureProviderAnswer> {
     return invoke<LiteratureProviderAnswer>("literature_browse", { provider, request });
+  }
+
+  async feedsList(): Promise<Feed[]> {
+    return invoke<Feed[]>("feeds_list");
+  }
+
+  async feedAdd(feed: NewFeed): Promise<Feed> {
+    return invoke<Feed>("feed_add", { feed });
+  }
+
+  async feedUpdate(id: string, update: FeedUpdate): Promise<Feed> {
+    return invoke<Feed>("feed_update", { id, update });
+  }
+
+  async feedRemove(id: string, deleteFiles: boolean): Promise<void> {
+    return invoke("feed_remove", { id, deleteFiles });
+  }
+
+  async feedsRefresh(): Promise<void> {
+    return invoke("feeds_refresh");
+  }
+
+  async feedsRefreshCancel(): Promise<void> {
+    return invoke("feeds_refresh_cancel");
+  }
+
+  async feedItems(query: FeedItemsQuery): Promise<FeedItemsPage> {
+    return invoke<FeedItemsPage>("feed_items", { query });
+  }
+
+  async feedItemSetStatus(id: string, action: FeedItemAction): Promise<Omit<FeedItem, "held">> {
+    return invoke<Omit<FeedItem, "held">>("feed_item_set_status", { id, action });
+  }
+
+  async onFeedsChanged(handler: (change: FeedsChanged) => void): Promise<() => void> {
+    return listen<FeedsChanged>("feeds-changed", (e) => handler(e.payload));
   }
 
   async literatureFilterSuggest(

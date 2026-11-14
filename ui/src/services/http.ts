@@ -75,6 +75,14 @@ import type {
   RecognitionEngine,
   RecognizerCatalogue,
   RecognizerInventory,
+  Feed,
+  FeedItem,
+  FeedItemAction,
+  FeedItemsPage,
+  FeedItemsQuery,
+  FeedsChanged,
+  FeedUpdate,
+  NewFeed,
 } from "../lib/types";
 import { randomId } from "../lib/types";
 import type { SearchApi, WebSourceApi } from "./api";
@@ -967,6 +975,78 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw await responseError(res, "literatureBrowse");
     return res.json() as Promise<LiteratureProviderAnswer>;
+  }
+
+  async feedsList(): Promise<Feed[]> {
+    const res = await fetch("/api/feeds");
+    if (!res.ok) throw await responseError(res, "feedsList");
+    return res.json() as Promise<Feed[]>;
+  }
+
+  async feedAdd(feed: NewFeed): Promise<Feed> {
+    const res = await fetch("/api/feeds", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(feed),
+    });
+    if (!res.ok) throw await responseError(res, "feedAdd");
+    return res.json() as Promise<Feed>;
+  }
+
+  async feedUpdate(id: string, update: FeedUpdate): Promise<Feed> {
+    const res = await fetch(`/api/feeds/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(update),
+    });
+    if (!res.ok) throw await responseError(res, "feedUpdate");
+    return res.json() as Promise<Feed>;
+  }
+
+  async feedRemove(id: string, deleteFiles: boolean): Promise<void> {
+    const res = await fetch(
+      `/api/feeds/${encodeURIComponent(id)}?delete_files=${deleteFiles}`,
+      { method: "DELETE" },
+    );
+    if (!res.ok) throw await responseError(res, "feedRemove");
+  }
+
+  async feedsRefresh(): Promise<void> {
+    const res = await fetch("/api/feeds/refresh", { method: "POST" });
+    if (!res.ok) throw await responseError(res, "feedsRefresh");
+  }
+
+  async feedsRefreshCancel(): Promise<void> {
+    const res = await fetch("/api/feeds/refresh/cancel", { method: "POST" });
+    if (!res.ok) throw await responseError(res, "feedsRefreshCancel");
+  }
+
+  async feedItems(query: FeedItemsQuery): Promise<FeedItemsPage> {
+    const params = new URLSearchParams();
+    if (query.status) params.set("status", query.status);
+    if (query.feed_id) params.set("feed_id", query.feed_id);
+    if (query.offset !== undefined) params.set("offset", String(query.offset));
+    if (query.limit !== undefined) params.set("limit", String(query.limit));
+    const res = await fetch(`/api/feeds/items?${params}`);
+    if (!res.ok) throw await responseError(res, "feedItems");
+    return res.json() as Promise<FeedItemsPage>;
+  }
+
+  async feedItemSetStatus(id: string, action: FeedItemAction): Promise<Omit<FeedItem, "held">> {
+    const res = await fetch(`/api/feeds/items/${encodeURIComponent(id)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(action),
+    });
+    if (!res.ok) throw await responseError(res, "feedItemSetStatus");
+    return res.json() as Promise<Omit<FeedItem, "held">>;
+  }
+
+  async onFeedsChanged(handler: (change: FeedsChanged) => void): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("feeds-changed", listener);
+    return () => this.releaseEventSource("feeds-changed", listener);
   }
 
   async literatureFilterSuggest(

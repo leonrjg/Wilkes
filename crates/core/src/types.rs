@@ -2758,6 +2758,10 @@ pub struct Settings {
     pub supported_extensions: Vec<String>,
     #[serde(default)]
     pub max_results: usize,
+    /// Hours between feed refreshes, for every feed. Feeds also refresh when
+    /// Wilkes starts, if the last refresh is older than this.
+    #[serde(default = "default_feeds_refresh_hours")]
+    pub feeds_refresh_hours: u64,
     #[serde(default)]
     pub bookmarks_dock: BookmarkDock,
     #[serde(default)]
@@ -2842,6 +2846,10 @@ where
         ));
     }
     Ok(value)
+}
+
+fn default_feeds_refresh_hours() -> u64 {
+    6
 }
 
 fn default_max_file_size() -> u64 {
@@ -2962,6 +2970,7 @@ impl Default for Settings {
             primary_metadata_source: MetadataSourcePreference::default(),
             supported_extensions: default_supported_extensions(),
             max_results: 50,
+            feeds_refresh_hours: default_feeds_refresh_hours(),
             bookmarks_dock: BookmarkDock::default(),
             file_sort_key: FileSortKey::default(),
             file_sort_direction: FileSortDirection::default(),

@@ -4,6 +4,7 @@ import { confirmDialog } from "../lib/utils/dialog";
 import type { WorkspaceSummary } from "../lib/types";
 import { useBookmarksStore } from "./useBookmarksStore";
 import { useSavedWorksStore } from "./useSavedWorksStore";
+import { useFeedsStore } from "./useFeedsStore";
 import { useChatStore } from "./useChatStore";
 import { useEditorStore } from "./useEditorStore";
 import { useFolderStateStore } from "./useFolderStateStore";
@@ -188,6 +189,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         useBookmarksStore.getState().load(),
         useSavedWorksStore.getState().load(),
         useResearchStore.getState().load(),
+        useFeedsStore.getState().reloadIfLoaded(),
       ]);
     } catch (error) {
       // The response can fail after the backend has committed its atomic
@@ -207,6 +209,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           useBookmarksStore.getState().load(),
           useSavedWorksStore.getState().load(),
           useResearchStore.getState().load(),
+          useFeedsStore.getState().reloadIfLoaded(),
         ]);
       }
       throw error;

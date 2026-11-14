@@ -139,6 +139,7 @@ fn text_that_was_replaced_is_gone_and_what_followed_it_moved() {
         color: [0, 0, 0],
     };
     let export = EditExport {
+        fonts: vec![],
         pages: vec![page(
             1,
             vec![kept(1, 0, 0.0), kept(1, 2, 20.0)],
@@ -172,6 +173,44 @@ fn text_that_was_replaced_is_gone_and_what_followed_it_moved() {
 }
 
 #[test]
+fn text_in_a_font_sent_with_the_edits_is_set_in_that_font() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = fixture(directory.path(), 1);
+    let destination = directory.path().join("edited.pdf");
+    // The document's own font, as the reader sends it: any font file will do.
+    let id = "own:ABCDEF+Sent-Regular".to_string();
+    let file = fonts::load(&system_font()).unwrap().data;
+    let export = EditExport {
+        fonts: vec![ExportFont {
+            id: id.clone(),
+            data: STANDARD.encode(&file),
+        }],
+        pages: vec![page(
+            1,
+            vec![kept(1, 0, 0.0), kept(1, 2, 0.0)],
+            vec![TextChunk {
+                x: LEFT,
+                baseline: 80.0,
+                text: "Set in a sent font".to_string(),
+                font: id,
+                size: 12.0,
+                color: [0, 0, 0],
+            }],
+        )],
+    };
+    write_edited_pdf(&source, &export, &destination).unwrap();
+
+    assert!(has(&lines(&destination, 0), "Set in a sent font"));
+    let saved = std::fs::read(&destination).unwrap();
+    assert!(
+        saved
+            .windows(b"Sent-Regular".len())
+            .any(|window| window == b"Sent-Regular"),
+        "the sent font is not what the text was embedded in"
+    );
+}
+
+#[test]
 fn a_line_pushed_off_a_page_arrives_on_the_next_and_leaves_the_first() {
     let directory = tempfile::tempdir().unwrap();
     let source = fixture(directory.path(), 2);
@@ -188,6 +227,7 @@ fn a_line_pushed_off_a_page_arrives_on_the_next_and_leaves_the_first() {
         graphics_only: false,
     };
     let export = EditExport {
+        fonts: vec![],
         pages: vec![
             page(1, vec![kept(1, 0, 0.0), kept(1, 1, 0.0)], vec![]),
             page(
@@ -236,6 +276,7 @@ fn content_past_the_last_page_gets_a_page_of_its_own() {
         graphics_only: false,
     };
     let export = EditExport {
+        fonts: vec![],
         pages: vec![
             page(1, vec![kept(1, 0, 0.0), kept(1, 1, 0.0)], vec![]),
             page(2, vec![carried], vec![]),
@@ -263,6 +304,7 @@ fn what_a_paragraph_stood_on_is_kept_without_its_words() {
         ..kept(1, 1, dy)
     };
     let export = EditExport {
+        fonts: vec![],
         pages: vec![page(
             1,
             vec![kept(1, 0, 0.0), paper(0.0), paper(20.0), kept(1, 2, 20.0)],
@@ -348,6 +390,7 @@ fn line_two_as_paper() -> EditExport {
         ..kept(1, 1, dy)
     };
     EditExport {
+        fonts: vec![],
         pages: vec![page(
             1,
             vec![kept(1, 0, 0.0), paper(0.0), paper(20.0), kept(1, 2, 20.0)],
@@ -511,6 +554,7 @@ fn a_link_follows_the_line_it_is_on_and_goes_with_text_that_was_replaced() {
 
     // Line two is replaced; line three moves down by 20.
     let export = EditExport {
+        fonts: vec![],
         pages: vec![page(1, vec![kept(1, 0, 0.0), kept(1, 2, 20.0)], vec![])],
     };
     write_edited_pdf(&source, &export, &destination).unwrap();
@@ -537,6 +581,7 @@ fn a_link_goes_to_the_next_page_with_its_line() {
         graphics_only: false,
     };
     let export = EditExport {
+        fonts: vec![],
         pages: vec![
             page(1, vec![kept(1, 0, 0.0), kept(1, 1, 0.0)], vec![]),
             page(2, vec![carried], vec![]),
@@ -630,6 +675,7 @@ fn a_destination_follows_what_it_pointed_at_down_the_page() {
     let source = fixture_with_destinations(directory.path());
     let destination = directory.path().join("edited.pdf");
     let export = EditExport {
+        fonts: vec![],
         pages: vec![page(
             1,
             vec![kept(1, 0, 0.0), kept(1, 1, 0.0), kept(1, 2, 20.0)],
@@ -658,6 +704,7 @@ fn a_destination_follows_what_it_pointed_at_onto_the_next_page() {
         ..kept(1, 2, 0.0)
     };
     let export = EditExport {
+        fonts: vec![],
         pages: vec![
             page(1, vec![kept(1, 0, 0.0), kept(1, 1, 0.0)], vec![]),
             page(
@@ -679,6 +726,7 @@ fn a_page_the_edits_did_not_reach_is_left_as_it_was() {
     let source = fixture(directory.path(), 2);
     let destination = directory.path().join("edited.pdf");
     let export = EditExport {
+        fonts: vec![],
         pages: vec![page(1, vec![kept(1, 0, 0.0)], vec![])],
     };
     write_edited_pdf(&source, &export, &destination).unwrap();
@@ -691,6 +739,7 @@ fn the_source_is_never_the_destination() {
     let source = fixture(directory.path(), 1);
     let before = std::fs::read(&source).unwrap();
     let export = EditExport {
+        fonts: vec![],
         pages: vec![page(1, vec![kept(1, 0, 0.0)], vec![])],
     };
     let error = write_edited_pdf(&source, &export, &source).unwrap_err();
@@ -704,11 +753,13 @@ fn an_export_that_names_a_page_the_document_lacks_is_refused() {
     let source = fixture(directory.path(), 1);
     let destination = directory.path().join("edited.pdf");
     let export = EditExport {
+        fonts: vec![],
         pages: vec![page(1, vec![kept(4, 0, 0.0)], vec![])],
     };
     assert!(write_edited_pdf(&source, &export, &destination).is_err());
     // Appending page 3 to a one-page document would leave a hole at page 2.
     let export = EditExport {
+        fonts: vec![],
         pages: vec![page(3, vec![kept(1, 0, 0.0)], vec![])],
     };
     assert!(write_edited_pdf(&source, &export, &destination).is_err());

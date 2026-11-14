@@ -336,6 +336,28 @@ export interface SearchApi {
     provider: string,
     request: import("../lib/types").BrowseRequest,
   ): Promise<import("../lib/types").LiteratureProviderAnswer>;
+  /** Every feed, with its status and inbox count. */
+  feedsList(): Promise<import("../lib/types").Feed[]>;
+  /** Adds a feed and refreshes it. A page address is replaced by the feed the
+   *  page advertises; a listing is followed newest first. */
+  feedAdd(feed: import("../lib/types").NewFeed): Promise<import("../lib/types").Feed>;
+  feedUpdate(id: string, update: import("../lib/types").FeedUpdate): Promise<import("../lib/types").Feed>;
+  /** Removes a feed and its items; `deleteFiles` deletes what it imported. */
+  feedRemove(id: string, deleteFiles: boolean): Promise<void>;
+  /** Refreshes every feed now. */
+  feedsRefresh(): Promise<void>;
+  /** Stops the refresh in progress, and any import in flight. */
+  feedsRefreshCancel(): Promise<void>;
+  feedItems(query: import("../lib/types").FeedItemsQuery): Promise<import("../lib/types").FeedItemsPage>;
+  /** Imports or dismisses one item; rejects with why an import failed. */
+  feedItemSetStatus(
+    id: string,
+    action: import("../lib/types").FeedItemAction,
+  ): Promise<Omit<import("../lib/types").FeedItem, "held">>;
+  /** Which feeds changed, and how many items wait in the inbox. */
+  onFeedsChanged(
+    handler: (change: import("../lib/types").FeedsChanged) => void,
+  ): Promise<() => void>;
   /** What a provider suggests for one of its filters as the user types. Only
    *  a filter whose control is `suggest` can be asked, and not for fewer than
    *  two characters; either rejects. */

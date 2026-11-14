@@ -1,4 +1,5 @@
 pub mod document;
+pub mod html;
 pub mod image;
 pub mod outline;
 
@@ -86,6 +87,7 @@ pub fn production_registry() -> ExtractorRegistry {
         Some(analyzer) => Box::new(document::DocumentExtractor::with_image_analyzer(analyzer)),
         None => Box::new(document::DocumentExtractor::new()),
     });
+    registry.register(Box::new(html::HtmlExtractor));
     registry
 }
 
@@ -132,6 +134,7 @@ pub fn production_registry() -> ExtractorRegistry {
 pub fn native_text_registry() -> ExtractorRegistry {
     let mut registry = ExtractorRegistry::new();
     registry.register(Box::new(document::DocumentExtractor::new()));
+    registry.register(Box::new(html::HtmlExtractor));
     registry
 }
 
@@ -491,9 +494,14 @@ mod tests {
         assert_eq!(recipe("comic.cbz"), "cbz-mupdf-v1");
         assert_eq!(recipe("book.fb2"), "fb2-mupdf-v1+layout-450x600x11");
 
+        // HTML is read as the text the viewer shows, under its own recipe:
+        // every HTML file indexed before it is re-extracted once.
+        assert_eq!(recipe("page.html"), "html-visible-v1");
+        assert_eq!(recipe("page.htm"), "html-visible-v1");
+
         // Everything the registry does not claim keeps the identity every
         // text file in every index already has.
-        for name in ["notes.txt", "readme.md", "page.html", "data.xml", "run.log"] {
+        for name in ["notes.txt", "readme.md", "data.xml", "run.log"] {
             assert_eq!(recipe(name), "plain-text-v1", "{name}");
         }
     }
@@ -501,19 +509,18 @@ mod tests {
     /// The registry's admission and the recipe's must be the same list. They
     /// were two lists before, matched against extensions in two places.
     #[test]
-    fn the_registry_admits_exactly_the_paged_formats() {
+    fn the_registry_admits_exactly_the_paged_formats_and_html() {
         let registry = native_text_registry();
         for name in [
-            "a.pdf", "b.epub", "c.mobi", "d.prc", "e.pdb", "f.azw3", "g.fb2",
+            "a.pdf", "b.epub", "c.mobi", "d.prc", "e.pdb", "f.azw3", "g.fb2", "h.html", "i.htm",
+            "j.xhtml",
         ] {
             assert!(
                 registry.find(Path::new(name), None).is_some(),
                 "{name} should be read by the backend"
             );
         }
-        for name in [
-            "a.txt", "b.md", "c.html", "d.xml", "e.log", "f.zip", "g.docx",
-        ] {
+        for name in ["a.txt", "b.md", "d.xml", "e.log", "f.zip", "g.docx"] {
             assert!(
                 registry.find(Path::new(name), None).is_none(),
                 "{name} must stay plain text"
