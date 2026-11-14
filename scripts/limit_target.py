@@ -157,24 +157,25 @@ def limit(target: Path, limit_bytes: int, dry_run: bool) -> bool:
         print(f"  {verb} everything but the caches in {profile.relative_to(target)} "
               f"({gb(rest[profile])})")
 
-    for cache in sorted(caches, key=lambda cache: cache.stat().st_mtime):
-        if total <= limit_bytes:
-            break
-        last_compiled = cache.stat().st_mtime
+    oldest_first = sorted(caches, key=lambda cache: cache.stat().st_mtime, reverse=True)
+    while total > limit_bytes and oldest_first:
+        while total > limit_bytes and oldest_first:
+            cache = oldest_first.pop()
+            last_compiled = cache.stat().st_mtime
+            if not dry_run:
+                shutil.rmtree(cache)
+            total -= caches[cache]
+            print(f"  {verb} incremental cache {cache.relative_to(target)} "
+                  f"({gb(caches[cache])}, last compiled {age(last_compiled)})")
         if not dry_run:
-            shutil.rmtree(cache)
-        total -= caches[cache]
-        print(f"  {verb} incremental cache {cache.relative_to(target)} "
-              f"({gb(caches[cache])}, last compiled {age(last_compiled)})")
+            # Measured again rather than trusted, and evicted further if it
+            # comes up short: a cache shares hard links with the objects rustc
+            # leaves in deps/, so removing it gives back less than its own size.
+            total = disk_usage(target)
 
     for fd in locks.values():
         os.close(fd)
 
-    if not dry_run:
-        # Measured again rather than trusted: the running total subtracts each
-        # eviction's own size, which overstates what a hard link shared with
-        # something still standing gives back.
-        total = disk_usage(target)
     if total > limit_bytes:
         print(f"{target}: still {gb(total)} after evicting everything no running build holds",
               file=sys.stderr)
