@@ -20,16 +20,22 @@
 //! real -- and what is left becomes a Form XObject. The output page then draws
 //! each such XObject once, shifted and clipped to its areas, and sets the new
 //! text over the gaps. Figures, formulas, rules and shadings travel through
-//! untouched, in the operators the file already had.
+//! untouched, in the operators the file already had. What an edited paragraph
+//! stood on is drawn from a second kind of copy: the page with the operators
+//! that show text cut out of it ([`strip`]), so a photograph under the old
+//! words is still there under the new ones.
 //!
 //! Pages the edits did not reach are not touched at all.
 
 mod content;
+mod destinations;
 pub mod fonts;
 mod geometry;
+mod strip;
+mod subset;
 
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context};
@@ -146,17 +152,22 @@ pub fn write_edited_pdf(
     // where the page it is on had it.
     let annotations = relocated_annotations(&doc, export, &originals, source_pages)?;
 
-    let mut fonts = FontTable::default();
+    let fonts = FontTable::embed(&mut doc, export)?;
+    let mut papers: HashMap<u32, PdfObject> = HashMap::new();
     for page in &export.pages {
-        write_page(&mut doc, page, &originals, &mut fonts)
+        write_page(&mut doc, page, &originals, &fonts, &mut papers)
             .with_context(|| format!("writing page {}", page.page))?;
     }
     attach_annotations(&mut doc, export, annotations)?;
+    destinations::relocate(&mut doc, export)?;
 
     let mut options = PdfWriteOptions::default();
     // Collect what the rewritten pages no longer reference: the original
     // content streams, and the scratch pages the redactions were done on.
-    options.set_garbage_level(3).set_compress(true);
+    options
+        .set_garbage_level(3)
+        .set_compress(true)
+        .set_compress_fonts(true);
     doc.save_with_options(destination_str, options)
         .with_context(|| format!("saving {}", destination.display()))?;
     debug!(
@@ -327,7 +338,9 @@ fn write_page(
     doc: &mut PdfDocument,
     page: &ExportPage,
     originals: &HashMap<u32, Original>,
-    fonts: &mut FontTable,
+    fonts: &FontTable,
+    // Each source page without its text, made the first time one is wanted.
+    papers: &mut HashMap<u32, PdfObject>,
 ) -> anyhow::Result<()> {
     let index = page.page as i32 - 1;
     let mut object = doc.find_page(index)?;
@@ -340,8 +353,20 @@ fn write_page(
             .get(&group.source)
             .ok_or_else(|| anyhow!("source page {} was not read", group.source))?;
         let kept: Vec<Area> = group.strips.iter().map(|strip| strip.rect).collect();
-        let form = cut_form(doc, original, &kept, group.graphics_only)
-            .with_context(|| format!("cutting areas out of page {}", group.source))?;
+        let form =
+            if group.graphics_only {
+                match papers.entry(group.source) {
+                    Entry::Occupied(paper) => paper.get().try_clone()?,
+                    Entry::Vacant(unmade) => unmade
+                        .insert(paper_form(doc, original).with_context(|| {
+                            format!("taking the text out of page {}", group.source)
+                        })?)
+                        .try_clone()?,
+                }
+            } else {
+                cut_form(doc, original, &kept)
+                    .with_context(|| format!("cutting areas out of page {}", group.source))?
+            };
         let name = format!("Wk{number}");
         xobjects.dict_put(name.as_str(), form)?;
 
@@ -357,7 +382,7 @@ fn write_page(
 
     let mut font_resources = doc.new_dict()?;
     for chunk in &page.text {
-        let font = fonts.get(doc, &chunk.font)?;
+        let font = fonts.get(&chunk.font)?;
         if font_resources.get_dict(font.name.as_str())?.is_none() {
             font_resources.dict_put(font.name.as_str(), font.object.try_clone()?)?;
         }
@@ -375,25 +400,139 @@ fn write_page(
     Ok(())
 }
 
+/// How deep forms inside forms are followed when text is taken out of a page.
+/// Real documents nest two or three; a file that refers to itself would
+/// otherwise never end.
+const MAX_FORM_DEPTH: u8 = 12;
+
+/// A source page with its text taken out and everything else as it was, as a
+/// Form XObject in the page's own user space.
+fn paper_form(doc: &mut PdfDocument, original: &Original) -> anyhow::Result<PdfObject> {
+    let media_box = original
+        .boxes
+        .iter()
+        .find(|(key, _)| *key == "MediaBox")
+        .ok_or_else(|| anyhow!("a page has no MediaBox"))?
+        .1
+        .try_clone()?;
+    let mut form = doc.new_dict()?;
+    form.dict_put("Type", PdfObject::new_name("XObject")?)?;
+    form.dict_put("Subtype", PdfObject::new_name("Form")?)?;
+    form.dict_put("BBox", media_box)?;
+    form.dict_put(
+        "Resources",
+        textless_resources(doc, &original.resources, 0)?,
+    )?;
+    let mut form = doc.add_object(&form)?;
+    form.write_stream_buffer(&Buffer::from_bytes(&strip::without_text(
+        &original.contents,
+    )?)?)?;
+    Ok(form)
+}
+
+/// `resources` with every form in it replaced by one without text, and so on
+/// down through the forms those draw. The same object when nothing in it
+/// shows text.
+fn textless_resources(
+    doc: &mut PdfDocument,
+    resources: &PdfObject,
+    depth: u8,
+) -> anyhow::Result<PdfObject> {
+    let Some(xobjects) = resources.get_dict("XObject")? else {
+        return resources.try_clone().map_err(Into::into);
+    };
+    let mut replaced: Vec<(PdfObject, PdfObject)> = Vec::new();
+    for index in 0..xobjects.dict_len()? as i32 {
+        let (Some(key), Some(xobject)) =
+            (xobjects.get_dict_key(index)?, xobjects.get_dict_val(index)?)
+        else {
+            continue;
+        };
+        let is_form = match xobject.get_dict("Subtype")? {
+            Some(subtype) => subtype.as_name()? == b"Form",
+            None => false,
+        };
+        if !is_form {
+            continue;
+        }
+        if depth >= MAX_FORM_DEPTH {
+            bail!("the page's forms are nested more than {MAX_FORM_DEPTH} deep");
+        }
+        let content = xobject.read_stream()?;
+        let stripped = strip::without_text(&content)?;
+        let inner = xobject.get_dict("Resources")?;
+        let inner_stripped = match &inner {
+            Some(inner) => Some(textless_resources(doc, inner, depth + 1)?),
+            None => None,
+        };
+        let same_resources = match (&inner, &inner_stripped) {
+            (Some(was), Some(now)) => same_object(was, now)?,
+            _ => true,
+        };
+        if stripped == content && same_resources {
+            continue;
+        }
+        let mut copy = shallow_copy(doc, &xobject, &["Length", "Filter", "DecodeParms"])?;
+        if let Some(inner_stripped) = inner_stripped {
+            copy.dict_put("Resources", inner_stripped)?;
+        }
+        let mut copy = doc.add_object(&copy)?;
+        copy.write_stream_buffer(&Buffer::from_bytes(&stripped)?)?;
+        replaced.push((key, copy));
+    }
+    if replaced.is_empty() {
+        return resources.try_clone().map_err(Into::into);
+    }
+    let mut new_xobjects = shallow_copy(doc, &xobjects, &[])?;
+    for (key, form) in replaced {
+        new_xobjects.dict_put(key, form)?;
+    }
+    let mut new_resources = shallow_copy(doc, resources, &[])?;
+    new_resources.dict_put("XObject", new_xobjects)?;
+    doc.add_object(&new_resources).map_err(Into::into)
+}
+
+/// A new dictionary with the entries of another, less the keys named.
+fn shallow_copy(
+    doc: &PdfDocument,
+    dict: &PdfObject,
+    without: &[&str],
+) -> anyhow::Result<PdfObject> {
+    let mut copy = doc.new_dict()?;
+    for index in 0..dict.dict_len()? as i32 {
+        let (Some(key), Some(value)) = (dict.get_dict_key(index)?, dict.get_dict_val(index)?)
+        else {
+            continue;
+        };
+        if without
+            .iter()
+            .any(|name| key.as_name().ok() == Some(name.as_bytes()))
+        {
+            continue;
+        }
+        copy.dict_put(key, value)?;
+    }
+    Ok(copy)
+}
+
+/// Whether two handles are to the same indirect object.
+fn same_object(a: &PdfObject, b: &PdfObject) -> anyhow::Result<bool> {
+    Ok(a.is_indirect()? && b.is_indirect()? && a.as_indirect()? == b.as_indirect()?)
+}
+
 /// A source page with everything but `kept` taken out, as a Form XObject in
-/// the page's own user space. With `graphics_only`, the text inside `kept`
-/// is taken out as well: redaction removes text and leaves what is drawn.
+/// the page's own user space.
 fn cut_form(
     doc: &mut PdfDocument,
     original: &Original,
     kept: &[Area],
-    graphics_only: bool,
 ) -> anyhow::Result<PdfObject> {
     let page_area = original.page_area();
-    let redactions = if graphics_only {
-        vec![page_area]
-    } else {
-        let safe: Vec<Area> = kept
-            .iter()
-            .map(|area| area.expanded(KEEP_MARGIN_X, KEEP_MARGIN_Y))
-            .collect();
-        geometry::complement(page_area, &safe)
-    };
+    let safe: Vec<Area> = kept
+        .iter()
+        .map(|area| area.expanded(KEEP_MARGIN_X, KEEP_MARGIN_Y))
+        .collect();
+    let redactions = geometry::complement(page_area, &safe);
 
     // A scratch page with its own copy of the content: redaction rewrites a
     // page's stream in place, and the source's must stay as it is for every
@@ -602,8 +741,8 @@ fn number_array(doc: &PdfDocument, values: &[f32]) -> anyhow::Result<PdfObject> 
     Ok(array)
 }
 
-/// The fonts already added to the document being written.
-#[derive(Default)]
+/// The fonts the new text is set in, as embedded in the document being
+/// written.
 struct FontTable {
     fonts: HashMap<String, EmbeddedFont>,
 }
@@ -612,51 +751,84 @@ struct EmbeddedFont {
     /// Its name in a page's `/Font` resources.
     name: String,
     object: PdfObject,
+    /// The whole font, which is what knows the glyph for a character.
     font: Font,
 }
 
 impl FontTable {
-    fn get(&mut self, doc: &mut PdfDocument, id: &str) -> anyhow::Result<&EmbeddedFont> {
-        if !self.fonts.contains_key(id) {
+    /// Embed every font the export's text uses, each cut down to the glyphs
+    /// that text shows. All of them at once and before any page is written,
+    /// because what a font has to hold is everything every page asks of it.
+    fn embed(doc: &mut PdfDocument, export: &EditExport) -> anyhow::Result<Self> {
+        let mut text_in: Vec<(&str, String)> = Vec::new();
+        for chunk in export.pages.iter().flat_map(|page| &page.text) {
+            match text_in.iter_mut().find(|(id, _)| *id == chunk.font) {
+                Some((_, text)) => text.push_str(&chunk.text),
+                None => text_in.push((&chunk.font, chunk.text.clone())),
+            }
+        }
+
+        let mut fonts = HashMap::new();
+        for (number, (id, text)) in text_in.into_iter().enumerate() {
             let resolved = fonts::load(id)?;
             let font = Font::from_bytes(id, &resolved.data)
                 .with_context(|| format!("MuPDF could not read font {id}"))?;
-            let object = doc.add_font(&font)?;
-            let name = format!("WkF{}", self.fonts.len());
-            self.fonts
-                .insert(id.to_string(), EmbeddedFont { name, object, font });
+            let glyphs: BTreeSet<u16> = glyph_ids(&font, &text).into_iter().collect();
+            let cut = subset::subset(&resolved.data, &glyphs)
+                .with_context(|| format!("cutting font {id} down to what is used"))?;
+            debug!(
+                "pdf_edit: font {id}: {} glyph(s) used, {} of {} bytes embedded",
+                glyphs.len(),
+                cut.len(),
+                resolved.data.len()
+            );
+            let embedded = Font::from_bytes(id, &cut)
+                .with_context(|| format!("MuPDF could not read the subset of font {id}"))?;
+            let object = doc.add_font(&embedded)?;
+            let name = format!("WkF{number}");
+            fonts.insert(id.to_string(), EmbeddedFont { name, object, font });
         }
-        Ok(&self.fonts[id])
+        Ok(Self { fonts })
+    }
+
+    fn get(&self, id: &str) -> anyhow::Result<&EmbeddedFont> {
+        self.fonts
+            .get(id)
+            .ok_or_else(|| anyhow!("font {id} was not embedded"))
     }
 }
 
-impl EmbeddedFont {
-    /// The text as this font's glyph ids, which is how a font added this way
-    /// is addressed.
-    fn glyphs(&self, text: &str) -> Vec<u16> {
-        text.chars()
-            .map(|character| {
-                let glyph = match self.font.encode_character(character as i32) {
-                    Ok(glyph) => glyph,
-                    Err(error) => {
-                        warn!(
-                            "pdf_edit: font {} could not be asked for {character:?}: {error}",
-                            self.font.name()
-                        );
-                        0
-                    }
-                };
-                if glyph == 0 && !character.is_whitespace() {
-                    // Glyph 0 is the font's own "missing" box, which is at
-                    // least an honest account of what happened.
+/// Text as a font's glyph ids, which is how a font added this way is
+/// addressed.
+fn glyph_ids(font: &Font, text: &str) -> Vec<u16> {
+    text.chars()
+        .map(|character| {
+            let glyph = match font.encode_character(character as i32) {
+                Ok(glyph) => glyph,
+                Err(error) => {
                     warn!(
-                        "pdf_edit: font {} has no glyph for {character:?}",
-                        self.font.name()
+                        "pdf_edit: font {} could not be asked for {character:?}: {error}",
+                        font.name()
                     );
+                    0
                 }
-                glyph as u16
-            })
-            .collect()
+            };
+            if glyph == 0 && !character.is_whitespace() {
+                // Glyph 0 is the font's own "missing" box, which is at
+                // least an honest account of what happened.
+                warn!(
+                    "pdf_edit: font {} has no glyph for {character:?}",
+                    font.name()
+                );
+            }
+            glyph as u16
+        })
+        .collect()
+}
+
+impl EmbeddedFont {
+    fn glyphs(&self, text: &str) -> Vec<u16> {
+        glyph_ids(&self.font, text)
     }
 }
 

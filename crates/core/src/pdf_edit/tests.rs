@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use mupdf::pdf::PdfDocument;
-use mupdf::{Buffer, Document, Font, SimpleFontEncoding, Size, TextPageFlags};
+use mupdf::{Buffer, Document, Font, Matrix, SimpleFontEncoding, Size, TextPageFlags};
 
 use super::fonts::{self, FontRequest, GenericFamily};
 use super::*;
@@ -280,6 +280,137 @@ fn what_a_paragraph_stood_on_is_kept_without_its_words() {
     assert!(has(&edited, "P1 line three gamma"));
 }
 
+/// The colour of one point of a page, in page space.
+fn colour_at(path: &Path, page: i32, x: f32, y: f32) -> [u8; 3] {
+    let doc = Document::open(path.to_str().unwrap()).unwrap();
+    let pixmap = doc
+        .load_page(page)
+        .unwrap()
+        .to_pixmap(
+            &Matrix::IDENTITY,
+            &mupdf::Colorspace::device_rgb(),
+            false,
+            false,
+        )
+        .unwrap();
+    let at = y as usize * pixmap.stride() as usize + x as usize * usize::from(pixmap.n());
+    let samples = pixmap.samples();
+    [samples[at], samples[at + 1], samples[at + 2]]
+}
+
+/// The fixture with `before` drawn under page 1's text and `forms` among its
+/// XObjects.
+fn fixture_over(directory: &Path, before: &[u8], forms: &[(&str, &str)]) -> PathBuf {
+    let plain = fixture(directory, 1);
+    let mut doc = PdfDocument::open(plain.to_str().unwrap()).unwrap();
+    let mut object = doc.find_page(0).unwrap();
+    let mut content = before.to_vec();
+    content.extend(
+        object
+            .get_dict("Contents")
+            .unwrap()
+            .unwrap()
+            .read_stream()
+            .unwrap(),
+    );
+    let mut contents = doc.add_object(&doc.new_dict().unwrap()).unwrap();
+    contents
+        .write_stream_buffer(&Buffer::from_bytes(&content).unwrap())
+        .unwrap();
+    object.dict_put("Contents", contents).unwrap();
+
+    let mut resources = object.get_dict("Resources").unwrap().unwrap();
+    let mut xobjects = doc.new_dict().unwrap();
+    for (name, stream) in forms {
+        let dict = doc
+            .new_object_from_str(&format!(
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 {WIDTH} {HEIGHT}] \
+                 /Resources << /Font {} >> >>",
+                "<< /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >>"
+            ))
+            .unwrap();
+        let mut form = doc.add_object(&dict).unwrap();
+        form.write_stream_buffer(&Buffer::from_bytes(stream.as_bytes()).unwrap())
+            .unwrap();
+        xobjects.dict_put(*name, form).unwrap();
+    }
+    resources.dict_put("XObject", xobjects).unwrap();
+
+    let path = directory.join("over.pdf");
+    doc.save(path.to_str().unwrap()).unwrap();
+    path
+}
+
+/// An export that redraws line two of page 1 as paper only, twice.
+fn line_two_as_paper() -> EditExport {
+    let paper = |dy: f32| Strip {
+        graphics_only: true,
+        ..kept(1, 1, dy)
+    };
+    EditExport {
+        pages: vec![page(
+            1,
+            vec![kept(1, 0, 0.0), paper(0.0), paper(20.0), kept(1, 2, 20.0)],
+            vec![],
+        )],
+    }
+}
+
+#[test]
+fn an_image_under_a_paragraph_is_still_there_without_its_words() {
+    let directory = tempfile::tempdir().unwrap();
+    // One red pixel, stretched over the whole of line two.
+    let area = line_area(1);
+    let mut image = format!(
+        "q {} 0 0 {} {} {} cm BI /W 1 /H 1 /BPC 8 /CS /RGB ID ",
+        area.width,
+        area.height,
+        area.x,
+        HEIGHT - area.bottom()
+    )
+    .into_bytes();
+    image.extend_from_slice(&[200, 0, 0]);
+    image.extend_from_slice(b" EI Q\n");
+    let source = fixture_over(directory.path(), &image, &[]);
+    let destination = directory.path().join("edited.pdf");
+    write_edited_pdf(&source, &line_two_as_paper(), &destination).unwrap();
+
+    assert!(!has(&lines(&destination, 0), "two beta"));
+    // Where the line was, and where the paragraph's added line is: both stand
+    // on the image, away from where any letter was.
+    for dy in [0.0, 20.0] {
+        let [red, green, _] = colour_at(&destination, 0, area.right() - 4.0, area.y + 6.0 + dy);
+        assert!(red > 150 && green < 60, "no image at +{dy}: {red} {green}");
+    }
+}
+
+#[test]
+fn words_drawn_by_a_form_are_taken_out_with_the_rest() {
+    let directory = tempfile::tempdir().unwrap();
+    // Line two's place also holds words that a form draws, with a rule.
+    let area = line_area(1);
+    let form = format!(
+        "BT /F1 12 Tf {} {} Td (inside a form) Tj ET {} {} 60 1 re f",
+        LEFT + 110.0,
+        HEIGHT - BASELINES[1],
+        LEFT,
+        HEIGHT - area.bottom()
+    );
+    let source = fixture_over(directory.path(), b"/Fm1 Do\n", &[("Fm1", form.as_str())]);
+    assert!(has(&lines(&source, 0), "inside a form"));
+    let destination = directory.path().join("edited.pdf");
+    write_edited_pdf(&source, &line_two_as_paper(), &destination).unwrap();
+
+    let edited = lines(&destination, 0);
+    assert!(
+        !has(&edited, "inside a form"),
+        "the form kept its words: {edited:?}"
+    );
+    // The rule the form draws is not text, and stays.
+    let [red, ..] = colour_at(&destination, 0, LEFT + 30.0, area.bottom() - 0.5);
+    assert!(red < 100, "the form's rule is gone");
+}
+
 /// The fixture with a link over each of page 1's second and third lines.
 fn fixture_with_links(directory: &Path) -> PathBuf {
     let plain = fixture(directory, 1);
@@ -388,6 +519,122 @@ fn a_link_goes_to_the_next_page_with_its_line() {
     assert_eq!(carried.len(), 1);
     assert_eq!(carried[0].0, "https://example.org/2");
     assert!((carried[0].1 - line_area(0).y).abs() < 0.01, "{carried:?}");
+}
+
+/// A two-page fixture with an outline entry and a named destination that
+/// both point at the top of page 1's third line.
+fn fixture_with_destinations(directory: &Path) -> PathBuf {
+    let plain = fixture(directory, 2);
+    let mut doc = PdfDocument::open(plain.to_str().unwrap()).unwrap();
+    let page = doc.find_page(0).unwrap().as_indirect().unwrap();
+    let top = HEIGHT - line_area(2).y;
+    let entry = doc
+        .add_object(
+            &doc.new_object_from_str(&format!(
+                "<< /Title (Line three) /Dest [{page} 0 R /XYZ {LEFT} {top} null] >>"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    let mut outlines = doc.new_dict().unwrap();
+    outlines
+        .dict_put("First", entry.try_clone().unwrap())
+        .unwrap();
+    outlines.dict_put("Last", entry).unwrap();
+    let outlines = doc.add_object(&outlines).unwrap();
+    let names = doc
+        .new_object_from_str(&format!(
+            "<< /Dests << /Names [(three) << /D [{page} 0 R /FitH {top}] >>] >> >>"
+        ))
+        .unwrap();
+    let mut catalog = doc.catalog().unwrap();
+    catalog.dict_put("Outlines", outlines).unwrap();
+    catalog.dict_put("Names", names).unwrap();
+    let path = directory.join("destinations.pdf");
+    doc.save(path.to_str().unwrap()).unwrap();
+    path
+}
+
+/// The page (0-based) and top an outline's first entry and the named
+/// destination `three` point at, in user space.
+fn destinations(path: &Path) -> [(i32, f32); 2] {
+    let doc = PdfDocument::open(path.to_str().unwrap()).unwrap();
+    let page_of = |reference: PdfObject| {
+        let number = reference.as_indirect().unwrap();
+        (0..doc.page_count().unwrap())
+            .find(|index| doc.find_page(*index).unwrap().as_indirect().unwrap() == number)
+            .unwrap()
+    };
+    let catalog = doc.catalog().unwrap();
+    let get = |object: &PdfObject, key: &str| object.get_dict(key).unwrap().unwrap();
+    let outline = get(&get(&get(&catalog, "Outlines"), "First"), "Dest");
+    let named = get(
+        &get(&get(&catalog, "Names"), "Dests")
+            .get_dict("Names")
+            .unwrap()
+            .unwrap()
+            .get_array(1)
+            .unwrap()
+            .unwrap(),
+        "D",
+    );
+    let at = |array: &PdfObject, index: i32| array.get_array(index).unwrap().unwrap();
+    [
+        (
+            page_of(at(&outline, 0)),
+            at(&outline, 3).as_float().unwrap(),
+        ),
+        (page_of(at(&named, 0)), at(&named, 2).as_float().unwrap()),
+    ]
+}
+
+#[test]
+fn a_destination_follows_what_it_pointed_at_down_the_page() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = fixture_with_destinations(directory.path());
+    let destination = directory.path().join("edited.pdf");
+    let export = EditExport {
+        pages: vec![page(
+            1,
+            vec![kept(1, 0, 0.0), kept(1, 1, 0.0), kept(1, 2, 20.0)],
+            vec![],
+        )],
+    };
+    write_edited_pdf(&source, &export, &destination).unwrap();
+
+    let was = HEIGHT - line_area(2).y;
+    assert_eq!(destinations(&source), [(0, was), (0, was)]);
+    // Twenty lower on the page is twenty less in a space that counts upward.
+    assert_eq!(
+        destinations(&destination),
+        [(0, was - 20.0), (0, was - 20.0)]
+    );
+}
+
+#[test]
+fn a_destination_follows_what_it_pointed_at_onto_the_next_page() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = fixture_with_destinations(directory.path());
+    let destination = directory.path().join("edited.pdf");
+    // Line three of page 1 is now the first line of page 2.
+    let moved = Strip {
+        y: line_area(0).y,
+        ..kept(1, 2, 0.0)
+    };
+    let export = EditExport {
+        pages: vec![
+            page(1, vec![kept(1, 0, 0.0), kept(1, 1, 0.0)], vec![]),
+            page(
+                2,
+                vec![moved, kept(2, 0, 20.0), kept(2, 1, 20.0), kept(2, 2, 20.0)],
+                vec![],
+            ),
+        ],
+    };
+    write_edited_pdf(&source, &export, &destination).unwrap();
+
+    let top = HEIGHT - line_area(0).y;
+    assert_eq!(destinations(&destination), [(1, top), (1, top)]);
 }
 
 #[test]
