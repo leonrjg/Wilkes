@@ -68,6 +68,11 @@ use wilkes_core::worker::{python_env_inventory, remove_python_envs, PythonEnvInv
 
 use crate::commands::search::{start_search, SearchHandle};
 use wilkes_core::consumer::{ConsumerError, ConsumerErrorCode};
+use wilkes_core::search::grep::StoredText;
+use wilkes_core::text_index::upkeep::{
+    apply_changes, reconcile_library, ChangedDocuments, LibraryDocuments, UpkeepReport,
+};
+use wilkes_core::text_index::DocumentTextIndex;
 use wilkes_core::{consumer_bail, consumer_ensure};
 
 use crate::commands::settings::{get_scoped_settings, update_scoped_settings};
@@ -589,7 +594,32 @@ struct SemanticRuntime {
     indexing: IndexingConfig,
 }
 
-fn library_roots(settings: &Settings) -> (Vec<PathBuf>, Vec<String>) {
+/// What the document text index has been asked to catch up on.
+#[derive(Default)]
+struct TextIndexRequests {
+    /// Compare with the whole library. Subsumes any batches.
+    library: bool,
+    batches: Vec<DirectoryChangeBatch>,
+}
+
+impl TextIndexRequests {
+    fn is_empty(&self) -> bool {
+        !self.library && self.batches.is_empty()
+    }
+}
+
+/// The document text index's single writer: queued requests, whether the
+/// runner is running, and the cancel flag of the pass in progress.
+#[derive(Default)]
+struct TextIndexUpkeep {
+    requests: PLMutex<TextIndexRequests>,
+    running: AtomicBool,
+    cancel: PLMutex<Arc<AtomicBool>>,
+}
+
+/// The library's roots as configured, before any of them is checked: the open
+/// directory, the favorites and the recent directories.
+fn configured_library_roots(settings: &Settings) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(root) = settings.last_directory.clone() {
         roots.push(root);
@@ -604,6 +634,11 @@ fn library_roots(settings: &Settings) -> (Vec<PathBuf>, Vec<String>) {
             roots.push(root);
         }
     }
+    roots
+}
+
+fn library_roots(settings: &Settings) -> (Vec<PathBuf>, Vec<String>) {
+    let roots = configured_library_roots(settings);
     let mut errors = Vec::new();
     let mut canonical: Vec<PathBuf> = Vec::new();
     for root in roots {
@@ -1651,6 +1686,11 @@ pub struct AppContext {
     /// publishes by replacing the index file.
     job_journal: PLMutex<Option<Arc<Mutex<IndexJobJournal>>>>,
     research_store: PLMutex<Option<Arc<Mutex<ResearchStore>>>>,
+    /// The text of every library document, for exact search; opened on first
+    /// use. Its own database, kept whether or not anything is embedded — see
+    /// [`wilkes_core::text_index`].
+    text_index: PLMutex<Option<Arc<DocumentTextIndex>>>,
+    text_index_upkeep: TextIndexUpkeep,
     directory_watcher: PLMutex<Option<DirectoryWatcher>>,
     embed_task: PLMutex<Option<EmbedTaskHandle>>,
     embed_cancel_in_progress: AtomicBool,
@@ -1781,6 +1821,8 @@ impl AppContext {
             metadata_cache: PLMutex::new(None),
             job_journal: PLMutex::new(None),
             research_store: PLMutex::new(None),
+            text_index: PLMutex::new(None),
+            text_index_upkeep: TextIndexUpkeep::default(),
             directory_watcher: PLMutex::new(None),
             embed_task: PLMutex::new(None),
             embed_cancel_in_progress: AtomicBool::new(false),
@@ -5238,6 +5280,194 @@ impl AppContext {
         }
     }
 
+    /// Lazily open (once) the document text index. `None` when it cannot be
+    /// opened; exact search then extracts live and counts the files it did.
+    fn text_index(&self) -> Option<Arc<DocumentTextIndex>> {
+        let mut guard = self.text_index.lock();
+        if let Some(store) = guard.as_ref() {
+            return Some(Arc::clone(store));
+        }
+        match DocumentTextIndex::open(&self.data_dir) {
+            Ok(store) => {
+                let store = Arc::new(store);
+                *guard = Some(Arc::clone(&store));
+                Some(store)
+            }
+            Err(e) => {
+                error!("document text index open failed: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Where exact search reads paged documents' text from.
+    fn stored_text(&self, settings: &Settings) -> StoredText {
+        if !settings.grep_use_index {
+            return StoredText::Disabled;
+        }
+        match self.text_index() {
+            Some(store) => StoredText::Available(store),
+            None => StoredText::Unavailable,
+        }
+    }
+
+    /// Ask for the document text index to be compared with the whole library.
+    fn request_text_index_reconcile(self: &Arc<Self>) {
+        self.request_text_index_upkeep(|requests| requests.library = true);
+    }
+
+    /// Ask for one watcher batch to be applied to the document text index.
+    fn request_text_index_batch(self: &Arc<Self>, batch: DirectoryChangeBatch) {
+        self.request_text_index_upkeep(|requests| requests.batches.push(batch));
+    }
+
+    /// Queue upkeep, and start the runner unless one is running: there is
+    /// never more than one writer of the store, and requests that arrive while
+    /// it works are merged and taken on its next turn.
+    fn request_text_index_upkeep(self: &Arc<Self>, add: impl FnOnce(&mut TextIndexRequests)) {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        add(&mut self.text_index_upkeep.requests.lock());
+        if self.text_index_upkeep.running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let ctx = Arc::clone(self);
+        tokio::spawn(async move { ctx.run_text_index_upkeep().await });
+    }
+
+    /// Stop the pass in progress and drop what was queued. Returns at once;
+    /// a document being read when the flag is raised finishes in the
+    /// background, and nothing after it starts.
+    fn cancel_text_index_upkeep(&self) {
+        *self.text_index_upkeep.requests.lock() = TextIndexRequests::default();
+        self.text_index_upkeep
+            .cancel
+            .lock()
+            .store(true, Ordering::Relaxed);
+    }
+
+    async fn run_text_index_upkeep(self: Arc<Self>) {
+        loop {
+            let requests = std::mem::take(&mut *self.text_index_upkeep.requests.lock());
+            if requests.is_empty() {
+                self.text_index_upkeep
+                    .running
+                    .store(false, Ordering::Release);
+                // A request that arrived between the take and the store saw
+                // the runner still running and left its work here.
+                if self.text_index_upkeep.requests.lock().is_empty()
+                    || self.text_index_upkeep.running.swap(true, Ordering::AcqRel)
+                {
+                    return;
+                }
+                continue;
+            }
+            self.text_index_upkeep_pass(requests).await;
+        }
+    }
+
+    async fn text_index_upkeep_pass(self: &Arc<Self>, requests: TextIndexRequests) {
+        let settings = self.get_settings().await;
+        if !settings.grep_use_index || self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(store) = self.text_index() else {
+            return;
+        };
+        if requests.library {
+            // Renditions are copied from the semantic index rather than read
+            // again, so a library pass opens it if one exists on disk.
+            self.activate_index_from_disk().await;
+        }
+        // A fresh flag per pass, so a cancel stops this pass and no later one.
+        let cancel = Arc::new(AtomicBool::new(false));
+        *self.text_index_upkeep.cancel.lock() = Arc::clone(&cancel);
+        let semantic = Arc::clone(&*self.index.lock());
+        // Half the machine: the reading is background work, and the user may
+        // be searching or reading while it runs.
+        let threads = std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).max(1))
+            .unwrap_or(1);
+        let started = std::time::Instant::now();
+
+        let report = if requests.library {
+            // A library pass covers whatever the batches named.
+            let mut paths = Vec::new();
+            let mut unlisted_roots = Vec::new();
+            let (roots, _) = library_roots(&settings);
+            for configured in configured_library_roots(&settings) {
+                let available = std::fs::canonicalize(&configured)
+                    .is_ok_and(|root| roots.iter().any(|listed| root.starts_with(listed)));
+                if !available {
+                    unlisted_roots.push(configured);
+                }
+            }
+            for root in roots {
+                match crate::commands::files::list_files_with_ignore(
+                    root.clone(),
+                    settings.supported_extensions.clone(),
+                    settings.max_file_size,
+                    settings.respect_gitignore,
+                )
+                .await
+                {
+                    Ok(listed) => paths.extend(
+                        listed
+                            .files
+                            .into_iter()
+                            .filter(|entry| entry.file_type == FileType::Paged)
+                            .map(|entry| entry.path),
+                    ),
+                    Err(e) => {
+                        error!("text index: list {}: {e:#}", root.display());
+                        unlisted_roots.push(root);
+                    }
+                }
+            }
+            let library = LibraryDocuments {
+                paths,
+                unlisted_roots,
+            };
+            tokio::task::spawn_blocking(move || {
+                reconcile_library(&store, Some(&semantic), &library, threads, &cancel)
+            })
+            .await
+        } else {
+            let extensions = settings.supported_extensions.clone();
+            let max_file_size = settings.max_file_size;
+            tokio::task::spawn_blocking(move || {
+                let mut total = UpkeepReport::default();
+                for batch in &requests.batches {
+                    let changes = ChangedDocuments::from_batch(batch, &extensions, max_file_size);
+                    let report =
+                        apply_changes(&store, Some(&semantic), &changes, threads, &cancel)?;
+                    total.copied += report.copied;
+                    total.extracted += report.extracted;
+                    total.failed += report.failed;
+                    total.renamed += report.renamed;
+                    total.removed += report.removed;
+                    total.cancelled |= report.cancelled;
+                    if total.cancelled {
+                        break;
+                    }
+                }
+                Ok(total)
+            })
+            .await
+        };
+
+        match report {
+            Ok(Ok(report)) if report.changed_anything() || report.cancelled => info!(
+                "text index: {report:?} in {} ms",
+                started.elapsed().as_millis()
+            ),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => error!("text index upkeep failed: {e:#}"),
+            Err(e) => error!("text index upkeep panicked: {e}"),
+        }
+    }
+
     /// Extract document metadata for the given paths off the request path,
     /// upsert it into the cache, and emit `file-metadata-updated` so the UI can
     /// fill in and re-sort. A file whose content matches a stale cache row
@@ -5931,11 +6161,24 @@ impl AppContext {
             ctx.emit_file_list_changed(&batch.root);
             let ctx = Arc::clone(&ctx);
             runtime.spawn(async move {
-                ctx.process_directory_change_for_semantic(batch).await;
+                Arc::clone(&ctx)
+                    .process_directory_change_for_semantic(batch.clone())
+                    .await;
+                // After the semantic index has taken the batch, so a document
+                // it just indexed again is copied rather than read twice.
+                ctx.request_text_index_batch(batch);
             });
         }) {
             Ok(watcher) => *self.directory_watcher.lock() = Some(watcher),
             Err(err) => error!("directory watcher start failed: {err:#}"),
+        }
+    }
+
+    /// A root that joined the library has documents the text index has never
+    /// read, and one that left has rows nothing will search.
+    fn on_library_roots_maybe_changed(self: &Arc<Self>, before: &Settings, after: &Settings) {
+        if configured_library_roots(before) != configured_library_roots(after) {
+            self.request_text_index_reconcile();
         }
     }
 
@@ -6402,6 +6645,7 @@ impl AppContext {
             (before, updated)
         };
         self.on_directory_setting_maybe_changed(&before, &updated);
+        self.on_library_roots_maybe_changed(&before, &updated);
         Ok(())
     }
 
@@ -6429,6 +6673,7 @@ impl AppContext {
             (before, updated)
         };
         self.on_directory_setting_maybe_changed(&before, &updated);
+        self.on_library_roots_maybe_changed(&before, &updated);
         self.on_zotero_settings_maybe_changed(&before, &updated);
         self.on_literature_provider_settings_maybe_changed(&before, &updated);
         self.on_search_runtime_settings_maybe_changed(&before, &updated);
@@ -6463,15 +6708,23 @@ impl AppContext {
         }
 
         let semantic_just_enabled = after.search_prefer_semantic && !before.search_prefer_semantic;
-        let exact_just_enabled = after.grep_use_index && !before.grep_use_index;
-        if semantic_just_enabled || (exact_just_enabled && !self.is_index_loaded()) {
+        if semantic_just_enabled {
             // Reload can install/probe the embedder or open the index, so do it
-            // off the settings write path. Exact-only activation never touches
-            // the embedding model.
+            // off the settings write path.
             let ctx = Arc::clone(self);
             tokio::spawn(async move {
                 ctx.activate_required_search_runtime_from_disk().await;
+                // A newly restored index may hold renditions to copy.
+                ctx.request_text_index_reconcile();
             });
+        }
+
+        // The document text index exists for exact search, so this setting
+        // owns its upkeep.
+        if after.grep_use_index && !before.grep_use_index {
+            self.request_text_index_reconcile();
+        } else if !after.grep_use_index && before.grep_use_index {
+            self.cancel_text_index_upkeep();
         }
     }
 
@@ -6534,8 +6787,8 @@ impl AppContext {
     /// Whether to open it is not a search question. The reading surfaces read
     /// the retained extraction out of this same index — a PDF preview's
     /// superseded areas, the reading regions behind them, figures — and they
-    /// are consumers of it whatever `search_prefer_semantic` and
-    /// `grep_use_index` say; index-backed exact search is one more consumer,
+    /// are consumers of it whatever `search_prefer_semantic` says; the
+    /// document text index copies its renditions, and is one more consumer,
     /// not the owner. So the only gate here is whether an index is open
     /// already, and this is the single opener for the no-embedder case.
     ///
@@ -7241,9 +7494,6 @@ impl AppContext {
         initiated_by: &str,
     ) -> Result<SearchHandle, String> {
         let settings = self.settings().await;
-        if query.mode.uses_exact_matching() && settings.grep_use_index && !self.is_index_loaded() {
-            self.activate_index_from_disk().await;
-        }
         let (resolved_library_roots, library_root_errors) = library_roots(&settings);
         query = Self::prepare_search_query(
             query,
@@ -7330,10 +7580,7 @@ impl AppContext {
                 semantic_indexing = Some(runtime.indexing);
                 (Some(runtime.embedder), Some(runtime.index))
             }
-            SearchMode::Grep => {
-                let index = settings.grep_use_index.then(|| self.index.lock().clone());
-                (None, index)
-            }
+            SearchMode::Grep => (None, None),
             // The combined mode's exact lane needs nothing, so an unavailable
             // semantic lane reduces the search rather than failing it. This is
             // the one place that knows *why* it is unavailable, so it is the
@@ -7355,8 +7602,7 @@ impl AppContext {
                         catalog_errors.push(format!(
                             "Combined search found exact matches only — related passages need the semantic index: {reason}"
                         ));
-                        let index = settings.grep_use_index.then(|| self.index.lock().clone());
-                        (None, index)
+                        (None, None)
                     }
                 }
             }
@@ -7393,7 +7639,7 @@ impl AppContext {
             log,
             retrieval,
             generator,
-            settings.grep_use_index,
+            self.stored_text(&settings),
         )
         .with_catalog_elapsed_ms(catalog_elapsed_ms)
         .with_metadata(self.metadata_cache(), primary_metadata_source))
@@ -8462,6 +8708,8 @@ impl AppContext {
         })
         .await;
 
+        // The build's renditions are text the document text index can copy.
+        self.request_text_index_reconcile();
         self.events
             .emit("embed-done", serde_json::json!({ "operation": "Build" }));
         Ok(())
@@ -8864,6 +9112,7 @@ impl AppContext {
             return;
         }
         self.stop_directory_watcher();
+        self.cancel_text_index_upkeep();
         self.cancel_all_completions();
         self.cancel_embed().await;
         self.await_winddown().await;
@@ -9395,9 +9644,10 @@ impl AppContext {
     }
 
     /// Converge `full_text` right after a restored-from-disk index is installed.
-    /// Legacy rows that carry chunks but no stored text force exact search to
-    /// re-extract them live on every query; fill them once, in the background,
-    /// off the index lock. Self-limiting: a cheap no-op query once nothing is
+    /// Legacy rows that carry chunks but no stored text leave the readers of a
+    /// rendition's text (summaries, completion context, superseded areas, the
+    /// document text index's copy) with nothing; fill them once, in the
+    /// background, off the index lock. Self-limiting: a cheap no-op query once nothing is
     /// stale, so it is safe to run on every load (startup and runtime toggle).
     ///
     /// Safe to run unattended because it runs no inference: the backfill reads
@@ -9475,6 +9725,9 @@ impl AppContext {
         // embedder is needed, not whether the reading store is opened. An index
         // on disk is opened for the reading surfaces regardless.
         self.activate_required_search_runtime_from_disk().await;
+        // After the index, so renditions it holds are copied, not read again.
+        // Also what catches the documents that changed while Wilkes was closed.
+        self.request_text_index_reconcile();
     }
 }
 
@@ -9932,7 +10185,12 @@ mod tests {
             ]
         );
 
-        vectors.extend(queued.into_iter().map(|(hash, _)| hash).zip([vec![1.0], vec![2.0]]));
+        vectors.extend(
+            queued
+                .into_iter()
+                .map(|(hash, _)| hash)
+                .zip([vec![1.0], vec![2.0]]),
+        );
         let mut chunks: Vec<((), Vec<f32>)> = texts.iter().map(|_| ((), Vec::new())).collect();
         fill_chunk_vectors(&mut chunks, &hashes, &vectors).unwrap();
         let filled: Vec<Vec<f32>> = chunks.into_iter().map(|(_, v)| v).collect();
@@ -9946,7 +10204,10 @@ mod tests {
         vectors.insert(hashes[0].clone(), vec![1.0]);
         let mut chunks: Vec<((), Vec<f32>)> = vec![((), Vec::new()), ((), Vec::new())];
         let error = fill_chunk_vectors(&mut chunks, &hashes, &vectors).unwrap_err();
-        assert_eq!(error.code(), Some(ConsumerErrorCode::DocumentIndexIncomplete));
+        assert_eq!(
+            error.code(),
+            Some(ConsumerErrorCode::DocumentIndexIncomplete)
+        );
     }
 
     #[test]
@@ -10023,8 +10284,6 @@ mod tests {
     use tokio::sync::mpsc;
     use tracing::subscriber;
     use tracing_subscriber::prelude::*;
-    use wilkes_core::embed::index::chunk::Chunk;
-    use wilkes_core::embed::index::db::PreparedFile;
     use wilkes_core::embed::MockEmbedder;
     use wilkes_core::generate::mock::MockGenerator;
     use wilkes_core::types::EmbeddingEngine;
@@ -13424,7 +13683,13 @@ title = "title[0]"
         };
 
         let empty = ctx
-            .resolve_chunks(refs(1), Some(NeighborWindow { before: 0, after: 0 }))
+            .resolve_chunks(
+                refs(1),
+                Some(NeighborWindow {
+                    before: 0,
+                    after: 0,
+                }),
+            )
             .await
             .unwrap_err();
         assert!(empty.message().contains("omit `neighbors`"), "{empty}");
@@ -13529,8 +13794,9 @@ title = "title[0]"
         assert!(ctx.directory_watcher.lock().is_some());
     }
 
-    /// Turning index-backed exact search on opens the index with no embedder;
-    /// turning it back off releases nothing, because the toggle owns the
+    /// Turning index-backed exact search on opens the semantic index with no
+    /// embedder — the document text index's upkeep copies its renditions;
+    /// turning it back off releases nothing, because the toggle owns no
     /// embedder and the reading surfaces still read the index.
     #[tokio::test]
     async fn exact_index_toggle_loads_index_without_embedder_and_keeps_it() {
@@ -13951,10 +14217,7 @@ exit 0
         );
 
         let (tx, rx) = mpsc::channel(1);
-        let forwarder = tokio::spawn(AppContext::run_event_forwarder(
-            Arc::clone(&ctx.events),
-            rx,
-        ));
+        let forwarder = tokio::spawn(AppContext::run_event_forwarder(Arc::clone(&ctx.events), rx));
 
         tx.send(ManagerEvent::WorkerStarting).await.unwrap();
         tx.send(ManagerEvent::ReindexingDone).await.unwrap();
@@ -14612,12 +14875,12 @@ exit 0
     }
 
     #[tokio::test]
-    async fn exact_search_setting_routes_the_shared_index_and_reports_fallbacks() {
+    async fn exact_search_setting_routes_the_text_index_and_reports_fallbacks() {
         let dir = tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let pdf = root.join("paper.pdf");
         // Intentionally not a valid PDF: successful matching proves the app
-        // boundary supplied indexed text instead of silently extracting live.
+        // boundary supplied stored text instead of silently extracting live.
         std::fs::write(&pdf, "%PDF-1.7 opaque bytes").unwrap();
 
         let emitter = Arc::new(MockEmitter {
@@ -14646,34 +14909,25 @@ exit 0
         .await
         .unwrap();
 
-        let mut index = SemanticIndex::create(
-            &ctx.data_dir,
-            "test-model",
-            3,
-            EmbeddingEngine::Candle,
-            Some(&root),
-        )
-        .unwrap();
-        index
-            .write_file(PreparedFile {
-                retained: Default::default(),
-                path: pdf.clone(),
-                full_text: "alpha beta gamma".to_string(),
-                chunks: vec![(
-                    Chunk {
-                        file_path: pdf.clone(),
-                        text: "alpha beta gamma".to_string(),
-                        byte_range: ByteRange { start: 0, end: 16 },
+        ctx.text_index()
+            .unwrap()
+            .write_text(
+                &pdf,
+                FileIdentity::for_path(&pdf).unwrap(),
+                &wilkes_core::text_index::TextSource::current_native(),
+                "alpha beta gamma",
+                &wilkes_core::types::SourceMap {
+                    segments: vec![wilkes_core::types::SourceSegment {
+                        text_range: ByteRange { start: 0, end: 16 },
                         origin: SourceOrigin::PdfPage {
                             page: 1,
                             bbox: None,
                         },
-                    },
-                    vec![1.0, 0.0, 0.0],
-                )],
-            })
+                        provenance: Default::default(),
+                    }],
+                },
+            )
             .unwrap();
-        *ctx.index.lock() = Arc::new(Mutex::new(Some(index)));
 
         let query = SearchQuery {
             pattern: "beta".to_string(),
@@ -14733,8 +14987,17 @@ exit 0
         )
         .await
         .unwrap();
-        *ctx.index.lock() = Arc::new(Mutex::new(None));
-        std::fs::remove_file(ctx.data_dir.join("semantic_index.db")).unwrap();
+        // A store that cannot be opened: every document is read live, and
+        // the search says why.
+        *ctx.text_index.lock() = None;
+        for name in [
+            "document_text.db",
+            "document_text.db-wal",
+            "document_text.db-shm",
+        ] {
+            let _ = std::fs::remove_file(ctx.data_dir.join(name));
+        }
+        std::fs::create_dir(ctx.data_dir.join("document_text.db")).unwrap();
         let unavailable_stats = ctx
             .clone()
             .start_search(query)
@@ -14746,6 +15009,136 @@ exit 0
         assert_eq!(unavailable_stats.live_pdf_fallbacks, 1);
         assert_eq!(unavailable_stats.index_unavailable_fallbacks, 1);
         assert_eq!(unavailable_stats.errors.len(), 1);
+    }
+
+    /// A one-page PDF that typesets `text` in Helvetica.
+    fn write_text_pdf(path: &Path, text: &str) {
+        let stream = format!("BT\n/F1 12 Tf\n50 80 Td\n({text}) Tj\nET\n");
+        let objects = [
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_string(),
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n".to_string(),
+            format!(
+                "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+                stream.len(),
+                stream
+            ),
+            "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"
+                .to_string(),
+        ];
+        let mut pdf = "%PDF-1.4\n".to_string();
+        let mut offsets = Vec::new();
+        for object in &objects {
+            offsets.push(pdf.len());
+            pdf.push_str(object);
+        }
+        let xref_offset = pdf.len();
+        pdf.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            offsets.len() + 1
+        ));
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        std::fs::write(path, pdf).unwrap();
+    }
+
+    /// The reason the document text index exists: a root nobody embedded is
+    /// read once, in the background, as soon as it joins the library, and
+    /// exact search over it then reads no PDF at all.
+    #[tokio::test]
+    async fn an_unembedded_root_is_read_once_and_exact_search_is_served_from_its_text() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let pdf = root.join("book.pdf");
+        write_text_pdf(&pdf, "A needle in the library");
+
+        let emitter = Arc::new(MockEmitter {
+            events: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (ctx, _rx, _loop) = AppContext::new(
+            data_dir.clone(),
+            data_dir.join("settings.json"),
+            WorkerPaths {
+                python_override: None,
+                python_package_dir: PathBuf::from("pkg"),
+                requirements_path: PathBuf::from("r"),
+                uv_bin: PathBuf::from("v"),
+                worker_bin: PathBuf::from("w"),
+                data_dir: PathBuf::from("data"),
+            },
+            emitter,
+        );
+        ctx.update_settings(serde_json::json!({ "last_directory": root }))
+            .await
+            .unwrap();
+        assert!(!ctx.is_index_loaded(), "nothing here is embedded");
+
+        let store = ctx.text_index().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while store.document_for_path(&pdf).unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the new root was never read into the text index"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let query = SearchQuery {
+            pattern: "needle".to_string(),
+            is_regex: false,
+            case_sensitive: false,
+            root: root.clone(),
+            max_results: 10,
+            respect_gitignore: true,
+            max_file_size: 0,
+            context_lines: 0,
+            mode: SearchMode::Grep,
+            scope: SearchScope::All,
+            supported_extensions: Vec::new(),
+            collection_id: None,
+            tag_ids: Vec::new(),
+        };
+        let mut results = Vec::new();
+        let stats = ctx
+            .clone()
+            .start_search(query)
+            .await
+            .unwrap()
+            .run(|result| {
+                results.push(result);
+                async { true }
+            })
+            .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].matches[0].matched_text, "needle");
+        assert!(matches!(
+            results[0].matches[0].origin,
+            SourceOrigin::PdfPage {
+                page: 1,
+                bbox: Some(_)
+            }
+        ));
+        assert_eq!(stats.indexed_pdf_reads, 1);
+        assert_eq!(stats.live_pdf_fallbacks, 0);
+        assert!(stats.errors.is_empty(), "{:?}", stats.errors);
+
+        // Turning the setting off stops the upkeep and the reads alike.
+        ctx.update_settings(serde_json::json!({ "grep_use_index": false }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ctx.stored_text(&ctx.get_settings().await),
+            StoredText::Disabled
+        ));
     }
 
     #[test]

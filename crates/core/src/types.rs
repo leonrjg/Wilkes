@@ -2731,11 +2731,12 @@ pub struct Settings {
     pub dark_mode_dimming: u8,
     #[serde(default)]
     pub search_prefer_semantic: bool,
-    /// When enabled, exact (grep) search reads a PDF's text from the semantic
-    /// index instead of re-extracting it, falling back to live extraction only
-    /// for files the index does not yet hold. On by default: re-extracting a
-    /// document the index already holds is the same text at a much higher
-    /// price, and the fallback means an unindexed corpus behaves as before.
+    /// When enabled, Wilkes keeps the text of every paged document in the
+    /// library in the document text index (`wilkes_core::text_index`), whether
+    /// or not it is embedded, and exact (grep) search reads it from there
+    /// instead of re-extracting the file, falling back to live extraction only
+    /// for files the store does not yet hold. On by default: re-extracting a
+    /// document on every search is the same text at a much higher price.
     #[serde(default = "default_grep_use_index")]
     pub grep_use_index: bool,
     #[serde(default)]

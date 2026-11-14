@@ -915,7 +915,7 @@ export default function SettingsModal({
                         />
                         <span className="flex flex-col">
                           <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Use index for exact search</span>
-                          <span className="text-[10px] text-[var(--text-dim)] italic">Search cached text when available.</span>
+                          <span className="text-[10px] text-[var(--text-dim)] italic">Keep every document's text in the background, embedded or not, so exact search does not re-read PDFs.</span>
                         </span>
                       </label>
                     </div>

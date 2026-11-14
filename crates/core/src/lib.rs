@@ -17,5 +17,6 @@ pub mod path;
 pub mod pdf_edit;
 mod program;
 pub mod search;
+pub mod text_index;
 pub mod types;
 pub mod worker;
