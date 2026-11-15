@@ -328,7 +328,9 @@ function FeedRow({
       <p className="text-[var(--text-dim)]">
         {status} · into{" "}
         {readOnly ? (
-          <span title={`${feed.root}/${feed.folder}`}>{feed.folder}</span>
+          <Tooltip content={`${feed.root}/${feed.folder}`}>
+            <span>{feed.folder}</span>
+          </Tooltip>
         ) : (
           <Tooltip content={`${feed.root}/${feed.folder} — change where new posts go`}>
             <button

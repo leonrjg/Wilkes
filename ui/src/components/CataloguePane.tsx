@@ -535,38 +535,39 @@ function ComposeToggle({ active, onToggle }: { active: boolean; onToggle: () => 
   const cancel = useCatalogueSearch((s) => s.cancelCompose);
   const label = composing ? "Stop composing filters" : "Compose filters from what you type";
   return (
-    <button
-      type="button"
-      onClick={composing ? cancel : onToggle}
-      aria-label={label}
-      aria-pressed={composing ? undefined : active}
-      title={
-        composing
-          ? label
-          : "Describe what you want in a sentence, and the filters are set for you"
+    <Tooltip
+      content={
+        composing ? label : "Describe what you want in a sentence, and the filters are set for you"
       }
-      className={`inline-flex shrink-0 rounded p-1 transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] ${
-        active ? "bg-[var(--accent-blue-muted)] text-[var(--accent-blue)]" : "text-[var(--text-dim)]"
-      }`}
     >
-      {composing ? <Square size={11} /> : (
-        <svg
-          width={11}
-          height={11}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={2}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <path d="M9 4L11 10L17 12L11 14L9 20L7 14L1 12L7 10Z" />
-          <path d="M20 2v6m-3-3h6m-3 12v4m-2-2h4" />
-        </svg>
-      )}
-    </button>
+      <button
+        type="button"
+        onClick={composing ? cancel : onToggle}
+        aria-label={label}
+        aria-pressed={composing ? undefined : active}
+        className={`inline-flex shrink-0 rounded p-1 transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] ${
+          active ? "bg-[var(--accent-blue-muted)] text-[var(--accent-blue)]" : "text-[var(--text-dim)]"
+        }`}
+      >
+        {composing ? <Square size={11} /> : (
+          <svg
+            width={11}
+            height={11}
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={2}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+            focusable="false"
+          >
+            <path d="M9 4L11 10L17 12L11 14L9 20L7 14L1 12L7 10Z" />
+            <path d="M20 2v6m-3-3h6m-3 12v4m-2-2h4" />
+          </svg>
+        )}
+      </button>
+    </Tooltip>
   );
 }
 
@@ -643,25 +644,26 @@ function FiltersButton() {
   const count = totalRefinements({ refinements, providerOptions: options, providers: selected });
   if (browseProviderIds(options).length === 0) return null;
   return (
-    <button
-      type="button"
-      onClick={() => setOpen(!open)}
-      aria-expanded={open}
-      aria-label={count > 0 ? `Filters, ${count} set` : "Filters"}
-      title="Filter and sort a provider's works, with or without a keyword"
-      className={`flex shrink-0 items-center gap-1 rounded border px-2 text-[10px] font-bold uppercase tracking-wider transition-colors ${
-        open || count > 0
-          ? "border-[var(--border-strong)] bg-[var(--bg-active)] text-[var(--text-main)]"
-          : "border-[var(--border-main)] bg-[var(--bg-app)] text-[var(--text-dim)] hover:text-[var(--text-main)]"
-      }`}
-    >
-      <Sliders size={11} />
-      {count > 0 && (
-        <span className="rounded-full bg-[var(--accent-blue)] px-1 text-[9px] leading-[14px] text-white">
-          {count}
-        </span>
-      )}
-    </button>
+    <Tooltip content="Filter and sort a provider's works, with or without a keyword">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        aria-expanded={open}
+        aria-label={count > 0 ? `Filters, ${count} set` : "Filters"}
+        className={`flex shrink-0 items-center gap-1 rounded border px-2 text-[10px] font-bold uppercase tracking-wider transition-colors ${
+          open || count > 0
+            ? "border-[var(--border-strong)] bg-[var(--bg-active)] text-[var(--text-main)]"
+            : "border-[var(--border-main)] bg-[var(--bg-app)] text-[var(--text-dim)] hover:text-[var(--text-main)]"
+        }`}
+      >
+        <Sliders size={11} />
+        {count > 0 && (
+          <span className="rounded-full bg-[var(--accent-blue)] px-1 text-[9px] leading-[14px] text-white">
+            {count}
+          </span>
+        )}
+      </button>
+    </Tooltip>
   );
 }
 
@@ -1172,20 +1174,20 @@ function ChosenValues({ name, values, labels, onChange, onApply }: FilterControl
   return (
     <span className="flex flex-wrap gap-1">
       {values.map((value) => (
-        <button
-          key={value}
-          type="button"
-          onClick={() => {
-            onChange(values.filter((kept) => kept !== value));
-            onApply();
-          }}
-          aria-label={`Remove ${labels[value] ?? value} from ${name}`}
-          title={labels[value] ?? value}
-          className="flex max-w-full items-center gap-1 rounded-full border border-[var(--border-strong)] bg-[var(--bg-active)] px-2 py-0.5 text-[10px] text-[var(--text-main)] transition-colors hover:border-red-400"
-        >
-          <span className="truncate">{labels[value] ?? value}</span>
-          <X size={9} className="shrink-0" />
-        </button>
+        <Tooltip key={value} content={labels[value] ?? value}>
+          <button
+            type="button"
+            onClick={() => {
+              onChange(values.filter((kept) => kept !== value));
+              onApply();
+            }}
+            aria-label={`Remove ${labels[value] ?? value} from ${name}`}
+            className="flex max-w-full items-center gap-1 rounded-full border border-[var(--border-strong)] bg-[var(--bg-active)] px-2 py-0.5 text-[10px] text-[var(--text-main)] transition-colors hover:border-red-400"
+          >
+            <span className="truncate">{labels[value] ?? value}</span>
+            <X size={9} className="shrink-0" />
+          </button>
+        </Tooltip>
       ))}
     </span>
   );
@@ -1324,17 +1326,17 @@ function ActiveFilters({
   return (
     <div className="flex flex-wrap items-center gap-1" aria-label="Active filters">
       {chips.map((chip) => (
-        <button
-          key={chip.key}
-          type="button"
-          onClick={chip.clear}
-          aria-label={`Remove ${chip.text}`}
-          title={chip.text}
-          className="flex max-w-full items-center gap-1 rounded-full border border-[var(--border-strong)] bg-[var(--bg-active)] px-2 py-0.5 text-[10px] text-[var(--text-main)] transition-colors hover:border-red-400"
-        >
-          <span className="truncate">{chip.text}</span>
-          <X size={9} className="shrink-0" />
-        </button>
+        <Tooltip key={chip.key} content={chip.text}>
+          <button
+            type="button"
+            onClick={chip.clear}
+            aria-label={`Remove ${chip.text}`}
+            className="flex max-w-full items-center gap-1 rounded-full border border-[var(--border-strong)] bg-[var(--bg-active)] px-2 py-0.5 text-[10px] text-[var(--text-main)] transition-colors hover:border-red-400"
+          >
+            <span className="truncate">{chip.text}</span>
+            <X size={9} className="shrink-0" />
+          </button>
+        </Tooltip>
       ))}
       {chips.length > 1 && (
         <button

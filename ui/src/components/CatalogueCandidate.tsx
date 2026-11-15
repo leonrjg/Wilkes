@@ -25,14 +25,6 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/** What a learning catalogue calls the kind of thing a result is. A kind this
- *  build has no name for is shown as the source spelled it. */
-const KIND_LABELS: Record<string, string> = {
-  course: "Course",
-  reference: "Reference",
-  post: "Post",
-};
-
 /**
  * A row's facts, as one run of text rather than a row of chips.
  *
@@ -48,12 +40,9 @@ function MetaLine({ parts }: { parts: (string | null | undefined | false)[] }) {
   if (shown.length === 0) return null;
   const text = shown.join(" · ");
   return (
-    <p
-      title={text}
-      className="line-clamp-2 text-[10px] leading-snug text-[var(--text-dim)]"
-    >
-      {text}
-    </p>
+    <Tooltip content={text} size="wide">
+      <p className="line-clamp-2 text-[10px] leading-snug text-[var(--text-dim)]">{text}</p>
+    </Tooltip>
   );
 }
 
@@ -61,12 +50,11 @@ function MetaLine({ parts }: { parts: (string | null | undefined | false)[] }) {
  *  of in a pane this wide. Two lines, and the rest on hover. */
 function RowTitle({ title }: { title: string }) {
   return (
-    <span
-      title={title}
-      className="line-clamp-2 text-[11px] font-medium leading-snug text-[var(--text-main)]"
-    >
-      {title}
-    </span>
+    <Tooltip content={title} size="wide">
+      <span className="line-clamp-2 text-[11px] font-medium leading-snug text-[var(--text-main)]">
+        {title}
+      </span>
+    </Tooltip>
   );
 }
 
@@ -220,19 +208,7 @@ export default function CatalogueCandidate({
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">
         <div className="flex items-start justify-between gap-2">
           <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-            <div className="flex min-w-0 flex-1 items-start gap-1.5">
-              <RowTitle title={title} />
-              {/* Only where the source says what kind of thing it returned. A
-                  bibliographic index names none, and a badge reading "Paper" over
-                  its monographs, standards and theses would be wrong for some of
-                  its rows. A textbook gets none either: it is what this pane
-                  mostly holds, so the badge only said what went without saying. */}
-              {work.kind !== null && work.kind !== "textbook" && (
-                <span className="mt-px shrink-0 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1 text-[9px] uppercase tracking-wider text-[var(--text-dim)]">
-                  {KIND_LABELS[work.kind] ?? work.kind}
-                </span>
-              )}
-            </div>
+            <RowTitle title={title} />
             {/* What a person chooses by comes first — when, how cited, whether it
                 can be had — because the line is clamped at two lines and a long
                 author list used to push the citations and the access out of view. A

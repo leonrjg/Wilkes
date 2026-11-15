@@ -108,14 +108,11 @@ describe("CatalogueCandidate", () => {
     useWorkspaceStore.setState({ workspaces: [], activeWorkspaceId: null } as never);
   });
 
-  /// Grain and licence are what the thing is and what may be done with it. A
-  /// row that hid either would be inviting a click it cannot describe.
-  /// The grain keeps its own chip — it is what the thing *is*. The rest are
-  /// one run of text rather than a chip each, because a chip cannot be broken
-  /// across lines and three of them took three lines in a pane this narrow.
-  it("shows the kind, the subject and the licence", () => {
-    render(<CatalogueCandidate provider="libretexts" work={{ ...HIT, kind: "course" }} />);
-    expect(screen.getByText("Course")).toBeTruthy();
+  /// The facts are one run of text rather than a chip each, because a chip
+  /// cannot be broken across lines and three of them took three lines in a
+  /// pane this narrow.
+  it("shows the subject and the licence", () => {
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
     expect(screen.getByText(/CC-BY/)).toBeTruthy();
     // Under its provider's heading the row does not repeat whose it is, and an
     // open catalogue's licence says more than "open access" would.
@@ -208,22 +205,22 @@ describe("CatalogueCandidate", () => {
     expect(screen.queryByText(HIT.summary as string)).toBeNull();
   });
 
-  /// A textbook is what the pane mostly lists, so it is not badged as one.
-  it("shows no badge for a textbook", () => {
-    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
-    expect(screen.queryByText(/^textbook$/i)).toBeNull();
+  /// No row is badged with its kind: a heading already says what a provider
+  /// lists, and the badge repeated it down the pane.
+  it("shows no kind badge", () => {
+    render(<CatalogueCandidate provider="libretexts" work={{ ...HIT, kind: "course" }} />);
+    expect(screen.queryByText(/^course$/i)).toBeNull();
   });
 
-  /// A source that names no kind gets no badge: "Paper" over a provider's
-  /// monographs and standards would be wrong for some of its rows.
-  it("shows no kind for a result whose source named none", () => {
+  /// A source that names no kind is not called open access by its licence
+  /// alone; the row says so itself.
+  it("says open access for a result whose source named no kind", () => {
     render(
       <CatalogueCandidate
         provider="openalex"
         work={{ ...HIT, kind: null, year: 2021, citation_count: 3 }}
       />,
     );
-    expect(screen.queryByText("Course")).toBeNull();
     expect(screen.getByText(/^2021 · 3 citations · Open access/)).toBeTruthy();
   });
 
@@ -337,7 +334,6 @@ describe("CatalogueCandidate", () => {
   it("offers a course the same Add as anything else", () => {
     render(<CatalogueCandidate provider="mit_ocw" work={COURSE} />);
     expect(screen.getByLabelText(/Add Water Quality Control to library/)).toBeTruthy();
-    expect(screen.getByText("Course")).toBeTruthy();
     expect(screen.queryByText(/Add course/)).toBeNull();
     expect(screen.queryByText(/A course, not a file/i)).toBeNull();
   });

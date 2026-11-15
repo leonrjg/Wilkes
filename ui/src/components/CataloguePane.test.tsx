@@ -447,19 +447,16 @@ describe("CataloguePane", () => {
   });
 
   /// A result carries the facts its source knows and the row shows those: a
-  /// catalogue's record has a kind, a subject and a blurb, and no year or
+  /// catalogue's record has a subject and a blurb, and no year or
   /// citation count to show a blank for.
   it("shows a catalogue's result by what a catalogue knows about it", async () => {
     withCatalogue();
     render(<CataloguePane pane={pane()} />);
     submit("python lists");
     await screen.findByText("Python 3.12");
-    expect(screen.getByText("Reference")).toBeTruthy();
     expect(screen.getByText("The language reference and standard library.")).toBeTruthy();
-    expect(screen.getByTitle("Programming · PSF · PSF")).toBeTruthy();
+    expect(screen.getByText("Programming · PSF · PSF")).toBeTruthy();
     expect(screen.getByText(/No downloadable copy/)).toBeTruthy();
-    // The index's row beside it names no kind, because its source named none.
-    expect(screen.queryByText("Paper")).toBeNull();
   });
 
   /// A catalogue that cannot answer says why under its own name, like any
@@ -810,7 +807,7 @@ describe("CataloguePane", () => {
     );
     render(<CataloguePane pane={pane()} />);
     submit("python lists");
-    const facts = await screen.findByTitle(/^2021 · 12 citations · Open access · Ada Lovelace/);
+    const facts = await screen.findByText(/^2021 · 12 citations · Open access · Ada Lovelace/);
     expect(facts).toBeTruthy();
   });
 
@@ -823,7 +820,6 @@ describe("CataloguePane", () => {
     submit("python lists");
     await screen.findByText("Persistent Lists Revisited");
     expect(screen.queryByText(/citation/)).toBeNull();
-    expect(screen.queryByTitle(/0 citations/)).toBeNull();
   });
 
   // ── Filters ──────────────────────────────────────────────────────────────
