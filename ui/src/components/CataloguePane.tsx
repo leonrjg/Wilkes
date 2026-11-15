@@ -1541,7 +1541,6 @@ function ProviderResults({
             entry={entry}
             paged={info?.capabilities.paged_search === true}
             grain={info?.mirror?.grain ?? null}
-            followable={info?.capabilities.browse?.keyword === true}
           />
         );
       })}
@@ -1550,22 +1549,19 @@ function ProviderResults({
 }
 
 /** One provider's answer to the keyword, with its next page one press away
- *  where the provider can be read on. */
+ *  where the provider can be read on. Any answer can be followed: through the
+ *  provider's listing where it takes a keyword, through its search otherwise. */
 function ProviderEntry({
   answer,
   entry,
   paged,
   grain,
-  followable,
 }: {
   answer: LiteratureAnswer;
   entry: LiteratureProviderAnswer;
   paged: boolean;
   /** What a learning catalogue holds; null for any other provider. */
   grain: CatalogueGrain | null;
-  /** Whether the provider's listing takes a keyword, so this answer can be
-   *  followed as one. */
-  followable: boolean;
 }) {
   const { readOnly } = useCatalogueAdd();
   const moreLoading = useCatalogueSearch((s) => s.literatureMore);
@@ -1587,7 +1583,7 @@ function ProviderEntry({
               .join(" · ")}
           </span>
         )}
-        {followable && !readOnly && (
+        {!readOnly && (
           <FollowButton provider={entry.provider} name={entry.name} request={{ query: answer.query }} />
         )}
       </h4>

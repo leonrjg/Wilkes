@@ -732,6 +732,18 @@ describe("CataloguePane", () => {
   });
 
   /// A provider whose manifest names no page would answer its first again.
+  /// A keyword alone needs no listing: a provider that only searches is
+  /// followed through its search.
+  it("offers to follow a keyword answer from a provider with no listing", async () => {
+    literature.mockResolvedValue({
+      query: "python lists",
+      providers: [{ provider: "semantic_scholar", name: "Semantic Scholar", results: [], error: null }],
+    });
+    render(<CataloguePane pane={pane()} />);
+    submit("python lists");
+    expect(await screen.findByRole("button", { name: "Follow Semantic Scholar" })).toBeTruthy();
+  });
+
   it("lists a work once when two pages both return it", async () => {
     literature
       .mockResolvedValueOnce(answerOf("openalex", "OpenAlex", hits(10)))

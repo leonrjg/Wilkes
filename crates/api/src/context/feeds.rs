@@ -382,7 +382,11 @@ impl AppContext {
                 .find(|known| known.provider == provider)
                 .ok_or_else(|| anyhow::anyhow!("no literature provider named {provider}"))?;
                 let name = info.name.clone();
-                if let Some(newest) = newest_sort(&info)? {
+                if let ListingRoute::Browse {
+                    newest: Some(newest),
+                    ..
+                } = listing_route(&info, &request)?
+                {
                     request.sort = Some(newest);
                 }
                 request.page = None;
@@ -702,27 +706,99 @@ impl AppContext {
     }
 }
 
-/// The provider's newest-first sort, when it has one. A followed listing is
-/// read in it, so what is new comes first and a refresh can stop at what it
-/// has seen; a listing in any other order — or a provider with no sort, such
-/// as a page of links — is kept in the order it was followed in and read
-/// whole at every refresh, what is new being whatever it had not listed
-/// before.
-fn newest_sort(
+/// How a followed listing is asked at each refresh.
+///
+/// Through the provider's listing (`browse`) when it can answer the request:
+/// in its newest-first sort, when it has one, so what is new comes first and a
+/// refresh can stop at what it has seen. A listing in any other order — or a
+/// provider with no sort, such as a page of links — is kept in the order it
+/// was followed in and read whole at every refresh, what is new being
+/// whatever it had not listed before.
+///
+/// A keyword alone needs no listing: a provider whose listing takes no
+/// keyword, or that has none, is followed through its keyword search, read
+/// whole the same way. Filters and a sort are a listing's alone.
+enum ListingRoute {
+    Browse { newest: Option<String>, paged: bool },
+    Search { paged: bool },
+}
+
+fn listing_route(
     info: &crate::commands::integrations::literature::LiteratureProviderInfo,
-) -> anyhow::Result<Option<String>> {
-    let Some(browse) = info.capabilities.browse.as_ref() else {
-        anyhow::bail!(
-            "{} cannot list works by filter, so there is no listing to follow",
+    request: &BrowseRequest,
+) -> anyhow::Result<ListingRoute> {
+    let keyword = request
+        .query
+        .as_deref()
+        .is_some_and(|query| !query.trim().is_empty());
+    let refined = !request.filters.is_empty() || request.sort.is_some();
+    match info.capabilities.browse.as_ref() {
+        Some(browse) if browse.keyword || !keyword => Ok(ListingRoute::Browse {
+            newest: browse.sort.as_ref().and_then(|sort| {
+                sort.equivalent_to
+                    .iter()
+                    .find(|(_, canonical)| canonical.as_str() == "newest")
+                    .map(|(value, _)| value.clone())
+            }),
+            paged: browse.paged,
+        }),
+        _ if keyword && !refined => Ok(ListingRoute::Search {
+            paged: info.capabilities.paged_search,
+        }),
+        Some(_) => anyhow::bail!(
+            "{}'s listing takes no keyword and its search takes no filters, so a keyword with filters cannot be followed",
             info.name
-        );
-    };
-    Ok(browse.sort.as_ref().and_then(|sort| {
-        sort.equivalent_to
-            .iter()
-            .find(|(_, canonical)| canonical.as_str() == "newest")
-            .map(|(value, _)| value.clone())
-    }))
+        ),
+        None => anyhow::bail!(
+            "{} cannot list works by filter, so only a keyword search of it can be followed",
+            info.name
+        ),
+    }
+}
+
+/// One page of a followed listing, by its route, in the shape a listing
+/// answers in.
+async fn ask_listing(
+    integrations: &wilkes_core::types::IntegrationsSettings,
+    mirror_dir: &Path,
+    route: &ListingRoute,
+    provider: &str,
+    request: BrowseRequest,
+) -> Result<
+    crate::commands::integrations::literature::LiteratureProviderAnswer,
+    crate::commands::integrations::literature::LiteratureRequestError,
+> {
+    use crate::commands::integrations::literature::{self, LiteratureRequestError};
+    match route {
+        ListingRoute::Browse { .. } => {
+            literature::browse(
+                integrations,
+                Some(mirror_dir),
+                provider.to_string(),
+                request,
+            )
+            .await
+        }
+        ListingRoute::Search { .. } => {
+            let query = request.query.unwrap_or_default();
+            let answer = literature::search_all(
+                integrations,
+                Some(mirror_dir),
+                query,
+                request.limit,
+                Some(vec![provider.to_string()]),
+                request.page,
+            )
+            .await?;
+            // Asked of one provider, the answer is that provider's or none: a
+            // provider switched off is left out of a search.
+            answer
+                .providers
+                .into_iter()
+                .next()
+                .ok_or_else(|| LiteratureRequestError(format!("{provider} is switched off")))
+        }
+    }
 }
 
 /// The DOIs an item is known by: its own, and its arXiv id's.
@@ -1130,11 +1206,8 @@ impl AppContext {
                 retry_after: None,
             });
         };
-        let (newest, paged) = match newest_sort(&info) {
-            Ok(newest) => (
-                newest,
-                info.capabilities.browse.as_ref().is_some_and(|b| b.paged),
-            ),
+        let route = match listing_route(&info, request) {
+            Ok(route) => route,
             Err(error) => {
                 return Ok(Listing::Failed {
                     message: error.to_string(),
@@ -1142,11 +1215,16 @@ impl AppContext {
                 })
             }
         };
+        let (newest_first, paged) = match &route {
+            ListingRoute::Browse { newest, paged } => {
+                (newest.is_some() && *newest == request.sort, *paged)
+            }
+            ListingRoute::Search { paged } => (false, *paged),
+        };
         // Newest first, a refresh stops at the first page holding an item it
         // has seen, and a first refresh reads one page: what came before it is
         // not news. In any other order a new item can be on any page, so every
         // refresh reads to the last.
-        let newest_first = newest.is_some() && newest == request.sort;
         let pages = match (paged, newest_first && first_refresh) {
             (false, _) | (true, true) => 1,
             (true, false) => LISTING_MAX_PAGES,
@@ -1162,10 +1240,11 @@ impl AppContext {
                 .gate
                 .run(
                     cancel,
-                    crate::commands::integrations::literature::browse(
+                    ask_listing(
                         &settings.integrations,
-                        Some(&self.catalogue_dir),
-                        provider.to_string(),
+                        &self.catalogue_dir,
+                        &route,
+                        provider,
                         request,
                     ),
                 )
@@ -2578,6 +2657,108 @@ mod tests {
             60
         );
         assert_eq!(requests("/links"), 2);
+    }
+
+    /// A keyword alone needs no listing: a provider that only searches is
+    /// followed through its search, read whole at every refresh.
+    #[tokio::test]
+    async fn a_keyword_of_a_provider_that_only_searches_is_followed_through_its_search() {
+        let library = tempfile::tempdir().unwrap();
+        let server = serve().await;
+        let (_dir, ctx) = context(library.path()).await;
+        let manifest = format!(
+            "manifest_version = 2\nid = \"finder\"\nname = \"Finder\"\n[http]\nbase_url = \"{}\"\n\
+             [capabilities.search]\npath = \"/search/{{page}}?q={{query}}&n={{limit}}\"\nitems = \"data\"\n\
+             [capabilities.search.fields]\nid = \"id\"\ntitle = \"title\"\n",
+            server.url("")
+        );
+        ctx.update_settings(serde_json::json!({ "integrations": { "custom": [
+            {"id": "finder", "enabled": true, "manifest": manifest, "secrets": {}},
+        ]}}))
+        .await
+        .unwrap();
+        let provider = crate::commands::integrations::literature::providers(
+            &ctx.get_settings().await.integrations,
+            Some(&ctx.catalogue_dir),
+        )
+        .into_iter()
+        .find(|info| info.name == "Finder")
+        .unwrap();
+        assert!(provider.capabilities.browse.is_none());
+        let page = |ids: &[String]| {
+            let data: Vec<_> = ids
+                .iter()
+                .map(|id| serde_json::json!({"id": id, "title": id}))
+                .collect();
+            Reply::Ok(
+                "application/json",
+                serde_json::json!({ "data": data }).to_string().into_bytes(),
+            )
+        };
+        let ids = |range: std::ops::Range<usize>| -> Vec<String> {
+            range.map(|i| format!("w{i}")).collect()
+        };
+        server.set("/search/1", page(&ids(0..50)));
+        server.set("/search/2", page(&ids(50..52)));
+
+        let filtered = ctx
+            .feed_add(NewFeed {
+                source: FeedSource::Listing {
+                    provider: provider.provider.clone(),
+                    request: BrowseRequest {
+                        query: Some("beeps".into()),
+                        sort: Some("newest".into()),
+                        ..BrowseRequest::default()
+                    },
+                },
+                name: None,
+                root: library.path().to_path_buf(),
+                folder: None,
+                auto_import: false,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(filtered.contains("only a keyword search"), "{filtered}");
+
+        let feed = ctx
+            .feed_add(NewFeed {
+                source: FeedSource::Listing {
+                    provider: provider.provider.clone(),
+                    request: BrowseRequest {
+                        query: Some("beeps".into()),
+                        ..BrowseRequest::default()
+                    },
+                },
+                name: None,
+                root: library.path().to_path_buf(),
+                folder: None,
+                auto_import: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(feed.name, "Finder: beeps");
+        let started = Instant::now();
+        while reload(&ctx, &feed.id).last_success_at_ms.is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "no refresh came"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(items(&ctx, FeedItemStatus::Inbox).len(), 10);
+        assert_eq!(items(&ctx, FeedItemStatus::Seen).len(), 42);
+
+        let mut second = ids(50..52);
+        second.push("awaited".into());
+        server.set("/search/2", page(&second));
+        ctx.refresh_feed(&reload(&ctx, &feed.id), &CancellationToken::new())
+            .await
+            .unwrap();
+        let inbox = items(&ctx, FeedItemStatus::Inbox);
+        assert_eq!(inbox.len(), 11);
+        assert!(inbox.iter().any(|item| item.link_key.ends_with("/awaited")));
+        assert!(!reload(&ctx, &feed.id).may_have_missed);
     }
 
     #[test]
