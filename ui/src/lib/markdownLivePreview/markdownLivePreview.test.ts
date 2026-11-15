@@ -12,7 +12,7 @@ vi.mock("mermaid", () => ({
 
 import { markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorState } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
+import { EditorView, lineNumbers } from "@codemirror/view";
 import { markdownLivePreview } from ".";
 import { mathSyntax } from "./mathSyntax";
 
@@ -220,6 +220,30 @@ describe("markdown live preview", () => {
     // The blank line holding the caret keeps its height to type on.
     view.dispatch({ selection: { anchor: doc.indexOf("\n\n\n") + 1 } });
     expect(view.contentDOM.querySelectorAll(".cm-line")[1].className).not.toContain("cm-md-gap");
+  });
+
+  it("gives each line number its line's classes, so collapsed lines show none", () => {
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const doc = "# Title\n\nText";
+    const view = new EditorView({
+      state: EditorState.create({
+        doc,
+        selection: { anchor: doc.length },
+        extensions: [
+          lineNumbers(),
+          markdownLivePreview({ documentPath: "/notes/draft.md", dark: false, resolveAsset: vi.fn(), openLink: vi.fn() }),
+        ],
+      }),
+      parent,
+    });
+    views.push(view);
+    const numbers = [...view.dom.querySelectorAll(".cm-lineNumbers .cm-gutterElement")]
+      .filter((element) => /^\d+$/.test(element.textContent ?? ""));
+    const byNumber = (n: string) => numbers.find((element) => element.textContent === n)?.className ?? "";
+    expect(byNumber("1")).toContain("cm-md-h1");
+    expect(byNumber("2")).toContain("cm-md-gap");
+    expect(byNumber("3")).not.toContain("cm-md-gap");
   });
 
   it("keeps a heading's own margins where no blank line parts it from its neighbours", () => {

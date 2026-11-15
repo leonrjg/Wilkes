@@ -1,7 +1,7 @@
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { LanguageSupport, syntaxTree } from "@codemirror/language";
 import { Prec, StateField, type Extension } from "@codemirror/state";
-import { EditorView, keymap, type Command } from "@codemirror/view";
+import { EditorView, gutterLineClass, keymap, type Command } from "@codemirror/view";
 import { getLanguageExtension } from "@leonrjg/wilkes-reader";
 import { buildPreview, type PreviewState } from "./decorations";
 import { mathSyntax } from "./mathSyntax";
@@ -64,6 +64,11 @@ const HEADING_MARGIN_BOTTOM = "0.35rem";
 
 const BORDER = "1px solid var(--border-main)";
 
+/** Height of a line of body text, and of a code line, which the line numbers
+ *  take so they sit level with the text beside them. */
+const TEXT_LINE = "calc(16px * 1.65)";
+const CODE_LINE = "calc(0.92 * 16px * 1.65)";
+
 /** Markdown being edited is laid out the way the reader renders it (the
  *  `.prose` and `.prose-document` rules of wilkes-reader's stylesheet): the
  *  same face, size, measure, headings, block spacing, code and tables, so
@@ -82,6 +87,33 @@ const previewTheme = () => EditorView.theme({
     padding: `${PAGE_PADDING_Y} ${PAGE_PADDING_X}`,
   },
   ".cm-line": { padding: "0" },
+  // Line numbers, when the setting shows them, on the page rather than in a
+  // panel of their own. Each gutter element carries its line's classes (see
+  // `gutterClasses`), so a number takes its line's height and padding and is
+  // left out where a line is only a margin.
+  "&.cm-editor .cm-gutters": {
+    backgroundColor: "var(--bg-app)",
+    color: "var(--text-dim)",
+    borderRight: "none",
+  },
+  // The line's classes bring its type (a heading's weight and size, a
+  // formula's face) with its metrics; the number keeps the gutter's own.
+  ".cm-lineNumbers .cm-gutterElement": {
+    lineHeight: TEXT_LINE,
+    paddingLeft: "12px",
+    fontFamily: MONO,
+    fontSize: "13px",
+    fontWeight: "400",
+    color: "var(--text-dim)",
+  },
+  ".cm-gutterElement.cm-md-gap, .cm-gutterElement.cm-md-fence": { visibility: "hidden" },
+  ".cm-gutterElement.cm-md-space-above": { paddingTop: HEADING_MARGIN_TOP },
+  ".cm-gutterElement.cm-md-item-next": { paddingTop: "0.2rem" },
+  ".cm-gutterElement.cm-md-codeblock": { lineHeight: CODE_LINE },
+  ".cm-gutterElement.cm-md-codeblock-first": { paddingTop: "calc(0.6rem + 1px)" },
+  ".cm-gutterElement.cm-md-h1": { lineHeight: "calc(1.15 * 16px * 1.25)" },
+  ".cm-gutterElement.cm-md-h2": { lineHeight: "calc(1.08 * 16px * 1.25)" },
+  ".cm-gutterElement.cm-md-h3, .cm-gutterElement.cm-md-h4": { lineHeight: "calc(16px * 1.25)" },
   // A run of blank lines is the margin between two blocks (see
   // `blockSpacing`); a line with no height of its own is all margin.
   ".cm-line.cm-md-gap": { lineHeight: "0" },
@@ -236,7 +268,10 @@ export function markdownLivePreview(options: LivePreviewOptions): Extension {
       }
       return value;
     },
-    provide: (self) => EditorView.decorations.from(self, (value) => value.decorations),
+    provide: (self) => [
+      EditorView.decorations.from(self, (value) => value.decorations),
+      gutterLineClass.from(self, (value) => value.gutterClasses),
+    ],
   });
 
   return [

@@ -48,12 +48,14 @@ describe("editor setup", () => {
     expect(view.state.doc.toString()).toBe("one\ntwo\nthree");
   });
 
-  it("draws prose without gutters or an active-line band, whatever the line-number setting", () => {
-    const { setup, view } = mount(true, true);
+  it("draws prose without a fold gutter or an active-line band, and line numbers as set", () => {
+    const { setup, view } = mount(false, true);
     expect(view.dom.querySelector(".cm-gutters")).toBeNull();
     expect(view.dom.querySelector(".cm-activeLine")).toBeNull();
 
     setup.setLineNumbers(view, true);
-    expect(view.dom.querySelector(".cm-lineNumbers")).toBeNull();
+    expect(view.dom.querySelector(".cm-lineNumbers")).not.toBeNull();
+    expect(view.dom.querySelector(".cm-foldGutter")).toBeNull();
+    expect(view.dom.querySelector(".cm-activeLineGutter")).toBeNull();
   });
 });

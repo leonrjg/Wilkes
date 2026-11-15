@@ -1,6 +1,6 @@
 import { syntaxTree } from "@codemirror/language";
-import type { EditorState, Range } from "@codemirror/state";
-import { Decoration, type DecorationSet, type WidgetType } from "@codemirror/view";
+import { RangeSet, type EditorState, type Range } from "@codemirror/state";
+import { Decoration, GutterMarker, type DecorationSet, type WidgetType } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
 import { mathSource } from "./mathSyntax";
 import {
@@ -22,8 +22,22 @@ export interface Span {
   to: number;
 }
 
+/** Gives a line's gutter element the classes of the line itself, so the
+ *  line numbers can follow the heights the preview gives its lines. */
+class LineClassMarker extends GutterMarker {
+  constructor(readonly elementClass: string) {
+    super();
+  }
+
+  eq(other: LineClassMarker) {
+    return other.elementClass === this.elementClass;
+  }
+}
+
 export interface PreviewState {
   decorations: DecorationSet;
+  /** The preview's line classes again, for the gutter elements beside them. */
+  gutterClasses: RangeSet<GutterMarker>;
   /** Line spans replaced by a block widget, for keyboard navigation into them. */
   blocks: readonly Span[];
 }
@@ -201,7 +215,13 @@ export function buildPreview(state: EditorState, host: PreviewHost): PreviewStat
   }));
   const lineActive = (from: number, to: number) => overlaps(selectedLines, from, to);
   const ranges: Range<Decoration>[] = [];
+  const gutterRanges: Range<GutterMarker>[] = [];
   const blocks: Span[] = [];
+  /** Class one line, and its gutter element with it. */
+  const classLine = (position: number, className: string) => {
+    ranges.push(Decoration.line({ class: className }).range(position));
+    gutterRanges.push(new LineClassMarker(className).range(position));
+  };
   /** The headings the reader spaces: first line number to last (a setext
    *  heading's underline is its last line). */
   const spacedHeadings = new Map<number, number>();
@@ -227,9 +247,7 @@ export function buildPreview(state: EditorState, host: PreviewHost): PreviewStat
   };
   const lineClass = (from: number, to: number, className: string) => {
     const last = doc.lineAt(to).number;
-    for (let number = doc.lineAt(from).number; number <= last; number++) {
-      ranges.push(Decoration.line({ class: className }).range(doc.line(number).from));
-    }
+    for (let number = doc.lineAt(from).number; number <= last; number++) classLine(doc.line(number).from, className);
   };
   const lineSpan = (node: SyntaxNode): Span => ({ from: doc.lineAt(node.from).from, to: doc.lineAt(node.to).to });
   // A block widget replaces whole lines, so it is only drawn where the
@@ -437,8 +455,8 @@ export function buildPreview(state: EditorState, host: PreviewHost): PreviewStat
     },
   });
 
-  blockSpacing(state, isBlank, spacedHeadings, verbatimLines, ranges);
-  return { decorations: Decoration.set(ranges, true), blocks };
+  blockSpacing(state, isBlank, spacedHeadings, verbatimLines, classLine);
+  return { decorations: Decoration.set(ranges, true), gutterClasses: RangeSet.of(gutterRanges, true), blocks };
 }
 
 /** The reader's vertical rhythm. A run of blank lines between two blocks is
@@ -452,16 +470,14 @@ function blockSpacing(
   isBlank: (number: number) => boolean,
   spacedHeadings: ReadonlyMap<number, number>,
   verbatimLines: ReadonlySet<number>,
-  ranges: Range<Decoration>[],
+  classLine: (position: number, className: string) => void,
 ) {
   const { doc } = state;
   const caretLines = new Set(
     state.selection.ranges.filter((range) => range.empty).map((range) => doc.lineAt(range.head).number),
   );
   const gap = (number: number) => isBlank(number) && !verbatimLines.has(number);
-  const lineClass = (number: number, className: string) => {
-    ranges.push(Decoration.line({ class: className }).range(doc.line(number).from));
-  };
+  const lineClass = (number: number, className: string) => classLine(doc.line(number).from, className);
 
   for (const [first, last] of spacedHeadings) {
     if (first > 1 && !isBlank(first - 1)) lineClass(first, "cm-md-space-above");

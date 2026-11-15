@@ -211,7 +211,7 @@ describe("DocumentEditor grounded completion", () => {
     expect(setLineNumbers).toHaveBeenLastCalledWith(expect.anything(), true);
   });
 
-  it("lays Markdown out as prose, without the source editor's gutters", () => {
+  it("lays Markdown out as prose, with line numbers as set", () => {
     useSettingsStore.setState({ settings: { editor_line_numbers: true } as Settings });
     useEditorStore.getState().ensureBuffer("/library/draft.md", "# Draft");
     render(

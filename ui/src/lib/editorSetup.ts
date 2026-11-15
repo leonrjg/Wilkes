@@ -28,8 +28,8 @@ export interface EditorSetupOptions {
   /** Show the line-number gutter: the user's setting. */
   lineNumbers: boolean;
   /** The document reads as prose (Markdown in live preview) and is laid out
-   *  like the rendered page: no gutters and no active-line band, so the line
-   *  numbers stay off whatever the setting says. */
+   *  like the rendered page: no fold gutter and no active-line band, in the
+   *  text or beside its number. Line numbers still follow the setting. */
   prose: boolean;
 }
 
@@ -39,8 +39,9 @@ export interface EditorSetup {
   setLineNumbers(view: EditorView, show: boolean): void;
 }
 
-function lineNumberGutter(show: boolean): Extension {
-  return show ? [lineNumbers(), highlightActiveLineGutter()] : [];
+function lineNumberGutter(show: boolean, prose: boolean): Extension {
+  if (!show) return [];
+  return prose ? lineNumbers() : [lineNumbers(), highlightActiveLineGutter()];
 }
 
 /** CodeMirror's `basicSetup`, taken apart as its documentation recommends
@@ -48,10 +49,9 @@ function lineNumberGutter(show: boolean): Extension {
  *  setup per editor: the line numbers live in a compartment of its own. */
 export function editorSetup({ lineNumbers, prose }: EditorSetupOptions): EditorSetup {
   const gutter = new Compartment();
-  const numbers = (show: boolean) => (prose ? [] : lineNumberGutter(show));
   return {
     extension: [
-      gutter.of(numbers(lineNumbers)),
+      gutter.of(lineNumberGutter(lineNumbers, prose)),
       highlightSpecialChars(),
       history(),
       prose ? [] : foldGutter(),
@@ -78,7 +78,7 @@ export function editorSetup({ lineNumbers, prose }: EditorSetupOptions): EditorS
       ]),
     ],
     setLineNumbers(view, show) {
-      view.dispatch({ effects: gutter.reconfigure(numbers(show)) });
+      view.dispatch({ effects: gutter.reconfigure(lineNumberGutter(show, prose)) });
     },
   };
 }
