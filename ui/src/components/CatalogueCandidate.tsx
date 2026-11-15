@@ -1,5 +1,6 @@
-import { useId, useState, type ReactNode } from "react";
-import { Bookmark, Check, Download, ExternalLink } from "react-feather";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { Bookmark, Check, Download, ExternalLink, X } from "react-feather";
 import type {
   CatalogueCourseProgress,
   CatalogueDownloadProgress,
@@ -47,14 +48,181 @@ function MetaLine({ parts }: { parts: (string | null | undefined | false)[] }) {
 }
 
 /** A title long enough to take four lines is a title nobody reads to the end
- *  of in a pane this wide. Two lines, and the rest on hover. */
-function RowTitle({ title }: { title: string }) {
+ *  of in a pane this wide. Two lines, the rest on hover, and everything the
+ *  provider said about the work on a click. */
+function RowTitle({ title, onOpen }: { title: string; onOpen: () => void }) {
   return (
     <Tooltip content={title} size="wide">
-      <span className="line-clamp-2 text-[11px] font-medium leading-snug text-[var(--text-main)]">
-        {title}
-      </span>
+      <button
+        type="button"
+        onClick={onOpen}
+        aria-label={`Details for ${title}`}
+        className="text-left text-[11px] font-medium leading-snug text-[var(--text-main)] hover:underline"
+      >
+        <span className="line-clamp-2">{title}</span>
+      </button>
     </Tooltip>
+  );
+}
+
+/** A fact's link, followed the way every link in the app is. */
+function DetailLink({ href }: { href: string }) {
+  return (
+    <a
+      href={href}
+      rel="noreferrer noopener"
+      onClick={(e) => {
+        e.preventDefault();
+        openLink(href).catch((err) => console.error("Open catalogue link failed:", err));
+      }}
+      className="break-all text-[var(--accent-blue)] hover:underline"
+    >
+      {href}
+    </a>
+  );
+}
+
+/**
+ * Everything a provider said about one result, over the app: the picture at a
+ * size it can be seen, every fact it reported, the summary whole, and where it
+ * links. The row is a line to skim; this is the place to read it. A fact the
+ * provider did not report is left out rather than shown blank.
+ */
+function WorkDetails({
+  provider,
+  work,
+  title,
+  link,
+  doiLink,
+  actions,
+  onClose,
+}: {
+  provider: string;
+  work: LiteratureSearchResult;
+  title: string;
+  link: string | null;
+  doiLink: string | null;
+  /** The row's own buttons, so what can be done from the row can be done here. */
+  actions: ReactNode;
+  onClose: () => void;
+}) {
+  const titleId = useId();
+  const closeButton = useRef<HTMLButtonElement>(null);
+  const [imageFailed, setImageFailed] = useState(false);
+  const source = useCatalogueStore(
+    (s) => s.providerOptions.find((option) => option.provider === provider)?.name ?? provider,
+  );
+  // Once, on opening: the row re-renders while it downloads, and focus
+  // pulled back to Close each time would be taken from whatever was pressed.
+  useEffect(() => {
+    closeButton.current?.focus();
+  }, []);
+
+  const facts: [string, ReactNode][] = [
+    ["Source", source],
+    ["Authors", work.authors],
+    ["Published", work.publication_date ?? (work.year !== null ? `${work.year}` : null)],
+    ["Venue", work.venue],
+    ["Publisher", work.publisher !== work.venue ? work.publisher : null],
+    [
+      "Citations",
+      work.citation_count !== null ? work.citation_count.toLocaleString() : null,
+    ],
+    ["Kind", work.kind],
+    ["Subject", work.subject],
+    ["Language", work.language],
+    ["Pages", work.pages !== null ? work.pages.toLocaleString() : null],
+    ["Format", work.file_format],
+    ["File size", work.file_size],
+    ["Licence", work.license],
+    ["Access", work.open_access_status ?? (work.is_open_access ? "Open access" : null)],
+    ["DOI", doiLink !== null ? <DetailLink href={doiLink} /> : null],
+    ["Page", work.landing_page_url !== null ? <DetailLink href={work.landing_page_url} /> : null],
+    ["File", work.pdf_url !== null ? <DetailLink href={work.pdf_url} /> : null],
+    ["Identifier", work.id],
+  ];
+  const shown = facts.filter(([, value]) => value !== null && value !== "");
+
+  return createPortal(
+    // A portal is outside the row in the page but inside it in React, so what
+    // happens here would otherwise reach whatever the row sits in — a search
+    // result's own handlers, for the strip under one. It stops here, and
+    // Escape is therefore heard here rather than on the window.
+    <div
+      className="fixed inset-0 z-[160] flex items-center justify-center bg-black/50 px-4"
+      onMouseDown={(event) => {
+        event.stopPropagation();
+        if (event.target === event.currentTarget) onClose();
+      }}
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={(event) => event.stopPropagation()}
+      onDoubleClick={(event) => event.stopPropagation()}
+      onContextMenu={(event) => event.stopPropagation()}
+      onKeyDown={(event) => {
+        event.stopPropagation();
+        if (event.key === "Escape") {
+          event.preventDefault();
+          onClose();
+        }
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        // Focusable, so a click on its text keeps Escape working.
+        tabIndex={-1}
+        className="flex max-h-[85vh] w-full max-w-xl flex-col overflow-hidden rounded-lg border border-[var(--border-main)] bg-[var(--bg-app)] shadow-2xl outline-none"
+      >
+        <div className="flex items-start gap-2 border-b border-[var(--border-main)] px-3 py-2">
+          <h2 id={titleId} className="min-w-0 flex-1 text-sm font-semibold leading-snug text-[var(--text-main)]">
+            {title}
+          </h2>
+          <div className="flex shrink-0 items-center gap-1">
+            {actions}
+            <button
+              ref={closeButton}
+              type="button"
+              onClick={onClose}
+              aria-label="Close details"
+              className="flex h-[26px] w-[26px] items-center justify-center rounded text-[var(--text-dim)] transition-colors hover:text-[var(--text-main)]"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        </div>
+        <div className="flex min-h-0 flex-col gap-3 overflow-y-auto p-3">
+          <div className="flex items-start gap-3">
+            {work.image_url && !imageFailed && (
+              <img
+                src={work.image_url}
+                alt={`Image for ${title}`}
+                referrerPolicy="no-referrer"
+                onError={() => setImageFailed(true)}
+                className="max-h-64 w-36 shrink-0 rounded object-contain"
+              />
+            )}
+            <dl className="grid min-w-0 flex-1 grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px] leading-snug">
+              {shown.map(([label, value]) => (
+                <div key={label} className="contents">
+                  <dt className="text-[var(--text-dim)]">{label}</dt>
+                  <dd className="min-w-0 break-words text-[var(--text-main)]">{value}</dd>
+                </div>
+              ))}
+            </dl>
+          </div>
+          {work.summary?.trim() && (
+            <p className="whitespace-pre-wrap break-words text-[11px] leading-relaxed text-[var(--text-muted)]">
+              {work.summary.trim()}
+            </p>
+          )}
+          {link === null && (
+            <p className="text-[10px] text-[var(--text-dim)]">The provider gave no link for this work.</p>
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -200,15 +368,46 @@ export default function CatalogueCandidate({
         ? "Fetch every document this course publishes, with a generated syllabus, into the current directory"
         : "Fetch this document and add it to the current directory";
 
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const closeDetails = () => setDetailsOpen(false);
+  const buttons = (
+    <>
+      {actions === undefined && <SaveButton provider={provider} work={work} title={title} />}
+      {link !== null && <OpenLink link={link} title={title} />}
+      {actions}
+      {actions === undefined && acquirable && (
+        <AddButton
+          title={title}
+          tooltip={added ? "Added to this library" : addTitle}
+          onAdd={() => void add(provider, work)}
+          disabled={!canAdd || adding || added}
+          adding={adding}
+          added={added}
+        />
+      )}
+    </>
+  );
+
   return (
     <div className="flex items-start gap-2 py-1.5">
+      {detailsOpen && (
+        <WorkDetails
+          provider={provider}
+          work={work}
+          title={title}
+          link={link}
+          doiLink={doiLink}
+          actions={buttons}
+          onClose={closeDetails}
+        />
+      )}
       {!compact && work.image_url && (
         <ResultImage key={work.image_url} url={work.image_url} title={title} />
       )}
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">
         <div className="flex items-start justify-between gap-2">
           <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-            <RowTitle title={title} />
+            <RowTitle title={title} onOpen={() => setDetailsOpen(true)} />
             {/* What a person chooses by comes first — when, how cited, whether it
                 can be had — because the line is clamped at two lines and a long
                 author list used to push the citations and the access out of view. A
@@ -235,21 +434,7 @@ export default function CatalogueCandidate({
             />
           </div>
 
-          <div className="flex shrink-0 items-center gap-1">
-            {actions === undefined && <SaveButton provider={provider} work={work} title={title} />}
-            {link !== null && <OpenLink link={link} title={title} />}
-            {actions}
-            {actions === undefined && acquirable && (
-              <AddButton
-                title={title}
-                tooltip={added ? "Added to this library" : addTitle}
-                onAdd={() => void add(provider, work)}
-                disabled={!canAdd || adding || added}
-                adding={adding}
-                added={added}
-              />
-            )}
-          </div>
+          <div className="flex shrink-0 items-center gap-1">{buttons}</div>
         </div>
 
         {!compact && work.summary?.trim() && (

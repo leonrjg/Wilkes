@@ -753,6 +753,51 @@ describe("CataloguePane", () => {
     expect(screen.getAllByText("Searched work 9")).toHaveLength(1);
   });
 
+  /// Kitsu, filtered, answers an offset with the page before it: page 2 is
+  /// page 1 again. The press reads past it to page 3 rather than doing nothing.
+  it("reads past a next page that repeats what is shown", async () => {
+    literature
+      .mockResolvedValueOnce(answerOf("openalex", "OpenAlex", hits(10)))
+      .mockResolvedValueOnce(answerOf("openalex", "OpenAlex", hits(10)))
+      .mockResolvedValueOnce(answerOf("openalex", "OpenAlex", hits(10, 10)));
+    render(<CataloguePane pane={pane()} />);
+    submit("python lists");
+    await screen.findByText("Searched work 9");
+    fireEvent.click(screen.getByRole("button", { name: "Load more from OpenAlex" }));
+    expect(await screen.findByText("Searched work 19")).toBeTruthy();
+    expect(literature).toHaveBeenNthCalledWith(2, "python lists", 10, ["openalex"], 2);
+    expect(literature).toHaveBeenNthCalledWith(3, "python lists", 10, ["openalex"], 3);
+    expect(screen.queryByText(/already shown/)).toBeNull();
+    // The next press goes on from the page that was read.
+    literature.mockResolvedValueOnce(answerOf("openalex", "OpenAlex", hits(10, 20)));
+    fireEvent.click(screen.getByRole("button", { name: "Load more from OpenAlex" }));
+    expect(await screen.findByText("Searched work 29")).toBeTruthy();
+    expect(literature).toHaveBeenNthCalledWith(4, "python lists", 10, ["openalex"], 4);
+  });
+
+  it("says so when the page after a repeated one repeats too, and skips no further", async () => {
+    literature
+      .mockResolvedValueOnce(answerOf("openalex", "OpenAlex", hits(10)))
+      .mockResolvedValueOnce(answerOf("openalex", "OpenAlex", hits(10)))
+      .mockResolvedValueOnce(answerOf("openalex", "OpenAlex", hits(10)));
+    render(<CataloguePane pane={pane()} />);
+    submit("python lists");
+    await screen.findByText("Searched work 9");
+    fireEvent.click(screen.getByRole("button", { name: "Load more from OpenAlex" }));
+    expect(
+      await screen.findByText(
+        "OpenAlex answered pages 2–3 with works already shown, so nothing was added. Load more asks for page 4.",
+      ),
+    ).toBeTruthy();
+    expect(literature).toHaveBeenCalledTimes(3);
+    expect(screen.getAllByText("Searched work 9")).toHaveLength(1);
+    // A page that adds something clears it.
+    literature.mockResolvedValueOnce(answerOf("openalex", "OpenAlex", hits(10, 10)));
+    fireEvent.click(screen.getByRole("button", { name: "Load more from OpenAlex" }));
+    expect(await screen.findByText("Searched work 19")).toBeTruthy();
+    expect(screen.queryByText(/already shown/)).toBeNull();
+  });
+
   it("offers no next page for a provider whose search cannot be read past its first", async () => {
     providers.mockResolvedValue([
       { ...provider("openalex", "OpenAlex", OPENALEX_BROWSE), capabilities: {
@@ -1014,6 +1059,40 @@ describe("CataloguePane", () => {
     expect(screen.getByText("Browsed work 0")).toBeTruthy();
     // A short page is the last one.
     expect(screen.queryByRole("button", { name: "Load more filtered OpenAlex" })).toBeNull();
+  });
+
+  it("reads past a listing page that repeats what is shown", async () => {
+    browse
+      .mockResolvedValueOnce(listing(works(10)))
+      .mockResolvedValueOnce(listing(works(10)))
+      .mockResolvedValueOnce(listing(works(10, 10)));
+    render(<CataloguePane pane={pane()} />);
+    const panel = await openFilters();
+    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
+    await screen.findByText("Browsed work 9");
+    fireEvent.click(screen.getByRole("button", { name: "Load more filtered OpenAlex" }));
+    expect(await screen.findByText("Browsed work 19")).toBeTruthy();
+    expect(browse.mock.calls[1][1]).toMatchObject({ page: 2 });
+    expect(browse.mock.calls[2][1]).toMatchObject({ page: 3 });
+    expect(screen.queryByText(/already shown/)).toBeNull();
+  });
+
+  it("says so when a listing repeats itself twice in a row", async () => {
+    browse
+      .mockResolvedValueOnce(listing(works(10)))
+      .mockResolvedValueOnce(listing(works(10)))
+      .mockResolvedValueOnce(listing(works(10)));
+    render(<CataloguePane pane={pane()} />);
+    const panel = await openFilters();
+    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
+    await screen.findByText("Browsed work 9");
+    fireEvent.click(screen.getByRole("button", { name: "Load more filtered OpenAlex" }));
+    expect(
+      await screen.findByText(
+        "OpenAlex answered pages 2–3 with works already shown, so nothing was added. Load more asks for page 4.",
+      ),
+    ).toBeTruthy();
+    expect(browse).toHaveBeenCalledTimes(3);
   });
 
   it("reads an unpaged listing whole, offering no next page however many it returned", async () => {

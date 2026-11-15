@@ -151,7 +151,17 @@ export interface LiteratureAnswer {
 export interface LiteraturePage {
   page: number;
   exhausted: boolean;
+  /** How many pages in a row, ending with the last one fetched, held works
+   *  but only ones already shown; 0 when the last one added something. A
+   *  provider that serves the wrong page does this — Kitsu, filtered, answers
+   *  an offset with the page before it — so one such page is skipped by
+   *  asking for the next. A second is said rather than dropped: a press that
+   *  adds nothing looks like a press that was not taken. */
+  repeated: number;
 }
+
+/** Repeated pages read past without being asked, per press. */
+const REPEATED_PAGES_SKIPPED = 1;
 
 /** Works per provider per page of a keyword search. Sent explicitly, because
  *  a page shorter than the limit asked for is how the last one is known. */
@@ -181,6 +191,9 @@ export interface BrowseAnswer {
   exhausted: boolean;
   /** How many works match in all, when the provider says. */
   total: number | null;
+  /** Pages in a row that held only works already shown. See
+   *  `LiteraturePage.repeated`. */
+  repeated: number;
 }
 
 /** What one provider is being filtered and sorted by.
@@ -546,6 +559,7 @@ async function searchLiterature(
         pages[entry.provider] = {
           page: 1,
           exhausted: entry.results.length < LITERATURE_LIMIT,
+          repeated: 0,
         };
       }
     }
@@ -745,7 +759,8 @@ function browseRequestFor(
 }
 
 /** Asks for one page. `held` is the answer to extend, or null for a fresh
- *  listing that replaces whatever was shown. */
+ *  listing that replaces whatever was shown. `skipped` is how many pages this
+ *  press has already read past for holding only works already shown. */
 async function runBrowse(
   set: SearchSet,
   requests: Requests,
@@ -753,6 +768,7 @@ async function runBrowse(
   name: string,
   request: BrowseRequest,
   held: BrowseAnswer | null,
+  skipped: number,
 ): Promise<void> {
   const token = (requests.browse[provider] = (requests.browse[provider] ?? 0) + 1);
   const paged =
@@ -771,16 +787,27 @@ async function runBrowse(
       });
       return;
     }
+    const added = unseen(held?.results ?? [], answer.results);
+    const page = request.page ?? 1;
+    // An unpaged listing answers with every record it has, however many.
+    const exhausted = !paged || answer.results.length < (request.limit ?? BROWSE_LIMIT);
+    const repeated = answer.results.length > 0 && added.length === 0;
+    if (repeated) {
+      console.warn(`${name} answered page ${page} of its listing with only works already shown`);
+      if (!exhausted && skipped < REPEATED_PAGES_SKIPPED) {
+        return runBrowse(set, requests, provider, name, { ...request, page: page + 1 }, held, skipped + 1);
+      }
+    }
     patchListing(set, provider, {
       loading: false,
       answer: {
         provider,
         name,
-        results: [...(held?.results ?? []), ...unseen(held?.results ?? [], answer.results)],
-        page: request.page ?? 1,
-        // An unpaged listing answers with every record it has, however many.
-        exhausted: !paged || answer.results.length < (request.limit ?? BROWSE_LIMIT),
+        results: [...(held?.results ?? []), ...added],
+        page,
+        exhausted,
         total: answer.total ?? null,
+        repeated: repeated ? skipped + 1 : 0,
       },
     });
   } catch (e: any) {
@@ -834,6 +861,7 @@ function listProvider(
     info?.name ?? provider,
     browseRequestFor(state.refinements[provider] ?? NO_REFINEMENT, info, keyword),
     null,
+    0,
   );
 }
 
@@ -1055,6 +1083,7 @@ export function createCatalogueSearch(providers: Selection<string>): CatalogueSe
         held.name,
         { ...listing.request, page: held.page + 1 },
         held,
+        0,
       );
     },
 
@@ -1074,8 +1103,10 @@ export function createCatalogueSearch(providers: Selection<string>): CatalogueSe
           ...partial,
           literatureMore: state.literatureMore.filter((id) => id !== provider),
         }));
-      try {
-        const response = await api.literatureSearch(held.query, LITERATURE_LIMIT, [provider], next);
+      // `skipped` is how many pages this press has already read past for
+      // holding only works already shown.
+      const read = async (page: number, skipped: number): Promise<void> => {
+        const response = await api.literatureSearch(held.query, LITERATURE_LIMIT, [provider], page);
         // A new question was asked while this one was out: its answer belongs to
         // the old one.
         if (request !== requests.literature) return settle({});
@@ -1091,23 +1122,31 @@ export function createCatalogueSearch(providers: Selection<string>): CatalogueSe
         const fetched = entry.results;
         const current = get().literature;
         if (current === null || current.query !== held.query) return settle({});
+        const shown = current.providers.find((existing) => existing.provider === provider)?.results ?? [];
+        const added = unseen(shown, fetched);
+        const exhausted = fetched.length < LITERATURE_LIMIT;
+        const repeated = fetched.length > 0 && added.length === 0;
+        if (repeated) {
+          console.warn(`${entry.name} answered page ${page} of "${held.query}" with only works already shown`);
+          if (!exhausted && skipped < REPEATED_PAGES_SKIPPED) return read(page + 1, skipped + 1);
+        }
         settle({
           literature: {
             ...current,
             pages: {
               ...current.pages,
-              [provider]: { page: next, exhausted: fetched.length < LITERATURE_LIMIT },
+              [provider]: { page, exhausted, repeated: repeated ? skipped + 1 : 0 },
             },
             providers: current.providers.map((existing) =>
               existing.provider === provider
-                ? {
-                    ...existing,
-                    results: [...(existing.results ?? []), ...unseen(existing.results ?? [], fetched)],
-                  }
+                ? { ...existing, results: [...(existing.results ?? []), ...added] }
                 : existing,
             ),
           },
         });
+      };
+      try {
+        await read(next, 0);
       } catch (e: any) {
         if (request !== requests.literature) return settle({});
         settle({
