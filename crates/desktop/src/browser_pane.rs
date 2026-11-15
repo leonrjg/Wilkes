@@ -22,7 +22,7 @@
 //! given back a browser's white once its first page is in: that white is also
 //! what shows behind a page that sets no background of its own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -222,6 +222,86 @@ pub(crate) fn pane(window: &Window) -> Result<Webview, String> {
 #[derive(Default)]
 pub struct Downloads(Mutex<HashMap<String, PathBuf>>);
 
+/// The addresses the pane was asked to save to the library, until their
+/// download finishes. Such a download is staged beside the library: a web page
+/// becomes its article, with its pictures inside, as a feed's post does; any
+/// other file goes into the library as it came.
+#[derive(Default)]
+pub struct PageSaves(Mutex<HashSet<String>>);
+
+/// Whether a downloaded file is a web page, by its own first bytes: WebKit's
+/// suggested name for a page need not end in `.html`.
+fn is_web_page(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(1024);
+    std::fs::File::open(path)?
+        .take(1024)
+        .read_to_end(&mut head)?;
+    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+    let head = head.trim_start_matches('\u{feff}').trim_start();
+    // Markup from its first character: a doctype, a comment, the root element.
+    Ok(head.starts_with('<') && (head.starts_with("<!doctype html") || head.contains("<html")))
+}
+
+/// Put a saved page's download where it belongs, once it is in, and say so.
+async fn finish_page_save(
+    app: AppHandle,
+    owner: String,
+    url: String,
+    staged: PathBuf,
+    success: bool,
+) {
+    let staging = staged.parent().map(Path::to_path_buf);
+    let outcome: Result<PathBuf, String> = async {
+        if !success {
+            return Err("The download failed".to_string());
+        }
+        let ctx = crate::app_context(&app);
+        let root = ctx
+            .get_settings()
+            .await
+            .last_directory
+            .filter(|root| root.is_dir())
+            .ok_or_else(|| "No library folder is open to save it in".to_string())?;
+        if is_web_page(&staged).map_err(|e| e.to_string())? {
+            ctx.save_web_page(&url, &staged, &root)
+                .await
+                .map_err(|e| format!("Its article could not be saved: {e:#}"))
+        } else {
+            let name = file_name(&staged);
+            let target = free_path(&root, &name);
+            tokio::fs::rename(&staged, &target)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(target)
+        }
+    }
+    .await;
+    if let Some(staging) = staging {
+        if let Err(e) = tokio::fs::remove_dir_all(&staging).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                error!("browser pane: could not clear {}: {e}", staging.display());
+            }
+        }
+    }
+    match outcome {
+        Ok(path) => emit(
+            &app,
+            &owner,
+            PageEvent::DownloadFinished {
+                url,
+                name: file_name(&path),
+                path: path.display().to_string(),
+                success: true,
+            },
+        ),
+        Err(reason) => {
+            error!("browser pane: saving {url}: {reason}");
+            emit(&app, &owner, PageEvent::DownloadRefused { url, reason });
+        }
+    }
+}
+
 /// `name` in `root`, or `name (2)`, `name (3)`… if it is taken: a download
 /// never replaces a file already in the library.
 fn free_path(root: &Path, name: &str) -> PathBuf {
@@ -266,6 +346,7 @@ pub(crate) fn route_download(app: &AppHandle, owner: &str, event: DownloadEvent<
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
             else {
+                app.state::<PageSaves>().0.lock().unwrap().remove(&url);
                 emit(
                     app,
                     owner,
@@ -279,11 +360,33 @@ pub(crate) fn route_download(app: &AppHandle, owner: &str, event: DownloadEvent<
             let root = match download_root(app) {
                 Ok(root) => root,
                 Err(reason) => {
+                    app.state::<PageSaves>().0.lock().unwrap().remove(&url);
                     emit(app, owner, PageEvent::DownloadRefused { url, reason });
                     return false;
                 }
             };
-            let path = free_path(&root, &name);
+            let saving_page = app.state::<PageSaves>().0.lock().unwrap().contains(&url);
+            let path = if saving_page {
+                let staging = crate::app_context(app)
+                    .data_dir
+                    .join("page-staging")
+                    .join(uuid::Uuid::new_v4().to_string());
+                if let Err(e) = std::fs::create_dir_all(&staging) {
+                    app.state::<PageSaves>().0.lock().unwrap().remove(&url);
+                    emit(
+                        app,
+                        owner,
+                        PageEvent::DownloadRefused {
+                            url,
+                            reason: format!("Could not stage it: {e}"),
+                        },
+                    );
+                    return false;
+                }
+                staging.join(&name)
+            } else {
+                free_path(&root, &name)
+            };
             *destination = path.clone();
             app.state::<Downloads>()
                 .0
@@ -308,6 +411,16 @@ pub(crate) fn route_download(app: &AppHandle, owner: &str, event: DownloadEvent<
                 error!("browser pane: a download finished that was never started: {url}");
                 return true;
             };
+            if app.state::<PageSaves>().0.lock().unwrap().remove(&url) {
+                tauri::async_runtime::spawn(finish_page_save(
+                    app.clone(),
+                    owner.to_string(),
+                    url,
+                    path,
+                    success,
+                ));
+                return true;
+            }
             emit(
                 app,
                 owner,
@@ -502,6 +615,14 @@ const SAVE_PAGE_SCRIPT: &str = r#"(() => {
 #[tauri::command]
 pub async fn browser_pane_save_page(window: Window) -> Result<(), String> {
     let webview = pane(&window)?;
+    let url = webview.url().map_err(|e| e.to_string())?.to_string();
+    window
+        .app_handle()
+        .state::<PageSaves>()
+        .0
+        .lock()
+        .unwrap()
+        .insert(url);
     #[cfg(target_os = "macos")]
     {
         crate::browser_webkit_download::save_page(&webview, window.label());
@@ -539,6 +660,29 @@ pub async fn browser_pane_close(window: Window) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_page_is_told_from_another_file_by_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        // WebKit's name for a page need not say it is one.
+        assert!(is_web_page(&write(
+            "mysterious-beeps",
+            b"\xef\xbb\xbf\n<!DOCTYPE html>\n<html lang=\"en\">"
+        ))
+        .unwrap());
+        assert!(is_web_page(&write(
+            "a.html",
+            b"<!-- generated -->\n<html><body></body></html>"
+        ))
+        .unwrap());
+        assert!(!is_web_page(&write("paper.pdf", b"%PDF-1.7\n%\xe2\xe3")).unwrap());
+        assert!(!is_web_page(&write("notes.txt", b"Some notes about <html> tags")).unwrap());
+    }
 
     #[test]
     fn the_pane_opens_web_addresses_only() {

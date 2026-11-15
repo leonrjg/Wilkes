@@ -81,6 +81,7 @@ use crate::commands::settings::{get_settings, update_settings};
 use crate::research::{CachedBookmarkEmbedding, ResearchStore, SearchLogTracker};
 
 pub mod feeds;
+pub mod web_article;
 
 const BOOKMARK_EMBEDDING_RECIPE_VERSION: i64 = 1;
 

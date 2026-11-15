@@ -18,14 +18,17 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use wilkes_core::feeds::article::{self, SiteTemplate};
-use wilkes_core::feeds::document::{self, Picture, Provenance};
+use wilkes_core::feeds::article::SiteTemplate;
+use wilkes_core::feeds::document::Provenance;
 use wilkes_core::feeds::identity::{self, link_identifiers, link_key, provider_key};
 use wilkes_core::feeds::syndication::{offered_feeds, read_feed};
 use wilkes_core::feeds::{FeedSource, SourceEntry};
-use wilkes_core::network::{ProviderHttpClient, ProviderHttpError};
 use wilkes_core::types::{BrowseRequest, LiteratureAcquisition, LiteratureSearchResult};
 
+use super::web_article::{
+    fetch_pictures, http_client, http_message, page_date, read_article, request_headers,
+    Destination,
+};
 use super::AppContext;
 use crate::research::feeds::FeedItemStatus;
 use crate::research::{FeedItemRecord, FeedRecord};
@@ -177,31 +180,6 @@ fn link_host(link: &str) -> Option<String> {
 
 fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
-}
-
-fn http_client() -> ProviderHttpClient {
-    ProviderHttpClient::new("feeds")
-}
-
-/// Sent with every page, feed and picture request. Some sites refuse a
-/// request that names no client at all.
-fn request_headers() -> [(&'static str, String); 1] {
-    [(
-        "User-Agent",
-        format!("Wilkes/{} (feed reader)", env!("CARGO_PKG_VERSION")),
-    )]
-}
-
-fn http_message(error: &ProviderHttpError) -> String {
-    match error.status {
-        Some(status) => format!("HTTP {status}"),
-        None => error
-            .message
-            .lines()
-            .next()
-            .unwrap_or("request failed")
-            .to_string(),
-    }
 }
 
 // ── API types ─────────────────────────────────────────────────────────────────
@@ -1404,14 +1382,8 @@ impl AppContext {
         allow_missing_images: bool,
         cancel: &CancellationToken,
     ) -> Result<anyhow::Result<Imported>, Cancelled> {
-        let client = http_client();
-        let headers = request_headers();
-        let page = match self
-            .feed_upkeep
-            .gate
-            .run(cancel, client.get_bytes(item.link.clone(), &headers))
-            .await?
-        {
+        let gate = Some(&self.feed_upkeep.gate);
+        let page = match super::web_article::get(gate, item.link.clone(), cancel).await? {
             Ok(page) => String::from_utf8_lossy(&page).into_owned(),
             Err(error) => {
                 return Ok(Err(anyhow::anyhow!(
@@ -1427,18 +1399,9 @@ impl AppContext {
             Ok(template) => template,
             Err(error) => return Ok(Err(error)),
         };
-        let extracted = {
-            let link = item.link.clone();
-            tokio::task::spawn_blocking(move || article::extract(&page, &link, template.as_deref()))
-        };
-        let extracted = tokio::select! {
-            _ = cancel.cancelled() => return Err(Cancelled),
-            joined = extracted => joined,
-        };
-        let article = match extracted {
-            Ok(Ok(article)) => article,
-            Ok(Err(error)) => return Ok(Err(anyhow::anyhow!("{error}"))),
-            Err(error) => return Ok(Err(anyhow::anyhow!("extraction failed: {error}"))),
+        let article = match read_article(page, &item.link, template, cancel).await? {
+            Ok(article) => article,
+            Err(error) => return Ok(Err(error)),
         };
         if let Some(host) = link_host(&item.link) {
             self.feed_upkeep.templates.lock().insert(
@@ -1449,35 +1412,12 @@ impl AppContext {
                 ),
             );
         }
-
-        let mut pictures: HashMap<String, Picture> = HashMap::new();
-        for address in &article.pictures {
-            let fetched = self
-                .feed_upkeep
-                .gate
-                .run(cancel, client.get_bytes(address.clone(), &headers))
-                .await?;
-            let failure = match fetched {
-                Ok(bytes) => match document::picture_mime(&bytes) {
-                    Some(mime) => {
-                        pictures.insert(address.clone(), Picture { mime, bytes });
-                        continue;
-                    }
-                    None => format!("the picture {address} is not PNG, JPEG, GIF, WebP or SVG"),
-                },
-                Err(error) => format!(
-                    "the picture {address} could not be fetched: {}",
-                    http_message(&error)
-                ),
+        let pictures =
+            match fetch_pictures(&article, &item.link, gate, allow_missing_images, cancel).await? {
+                Ok(pictures) => pictures,
+                Err(error) => return Ok(Err(error)),
             };
-            if allow_missing_images {
-                warn!("feeds: {failure}; left out of {}", item.link);
-            } else {
-                return Ok(Err(anyhow::anyhow!(failure)));
-            }
-        }
 
-        let settings = self.get_settings().await;
         // The source's values first; the page fills what the source left
         // empty, and never overrides it.
         let published = item
@@ -1485,72 +1425,35 @@ impl AppContext {
             .as_deref()
             .and_then(|date| DateTime::parse_from_rfc3339(date).ok())
             .map(|date| date.with_timezone(&Utc))
-            .or_else(|| {
-                article
-                    .published
-                    .as_deref()
-                    .and_then(|date| DateTime::parse_from_rfc3339(date).ok())
-                    .map(|date| date.with_timezone(&Utc))
-                    .and_then(|date| identity::publication_date(Some(date), None))
-            });
-        let title = item.work.title.clone().or(article.title.clone());
+            .or_else(|| page_date(&article));
         let provenance = Provenance {
-            title: title.clone(),
+            title: item.work.title.clone().or(article.title.clone()),
             author: item.work.authors.clone().or(article.byline.clone()),
             link: item.link.clone(),
             published,
-            feed: feed.name.clone(),
+            feed: Some(feed.name.clone()),
             fetched: Utc::now(),
-            item_id: item.id.clone(),
+            item_id: Some(item.id.clone()),
         };
-        let html = document::render(
-            &provenance,
-            &document::embed_pictures(&article.html, &pictures),
-        );
-        if settings.max_file_size > 0 && html.len() as u64 > settings.max_file_size {
-            return Ok(Err(anyhow::anyhow!(
-                "the post with its pictures is {:.1} MB, over the {:.1} MB limit above which files are not indexed",
-                html.len() as f64 / 1_048_576.0,
-                settings.max_file_size as f64 / 1_048_576.0
-            )));
-        }
-
         let date = published.unwrap_or_else(|| {
             Utc.timestamp_millis_opt(item.first_seen_at_ms)
                 .single()
                 .unwrap_or_else(Utc::now)
         });
-        let mut name = document::file_name(date, title.as_deref(), "Post");
-        if feed.root.join(&feed.folder).join(&name).exists() {
-            name = document::disambiguated(&name, &item.id);
-        }
-        // Beside uploads, never in it: the server serves uploads as its
-        // library, and a file staged there would be in the library before it
-        // was imported into it.
-        let staging = self.data_dir.join("feed-staging").join(&item.id);
-        let written = async {
-            tokio::fs::create_dir_all(&staging).await?;
-            let path = staging.join(&name);
-            tokio::fs::write(&path, html.as_bytes()).await?;
-            let imported = crate::commands::files::import_files_into_root(
-                vec![path],
-                feed.root.clone(),
-                Some(feed.folder.clone()),
-                settings.supported_extensions.clone(),
-                crate::commands::files::FileImportMode::Move,
+        let written = self
+            .write_web_article(
+                &provenance,
+                &article,
+                &pictures,
+                Destination {
+                    root: &feed.root,
+                    folder: Some(&feed.folder),
+                    date,
+                    tell_apart_by: Some(&item.id),
+                    staging: self.data_dir.join("feed-staging").join(&item.id),
+                },
             )
-            .await?;
-            imported
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("the import step returned no file"))
-        }
-        .await;
-        if let Err(error) = tokio::fs::remove_dir_all(&staging).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                warn!("feeds: could not clear {}: {error}", staging.display());
-            }
-        }
+            .await;
         Ok(written.map(Imported::File))
     }
 
@@ -2155,6 +2058,62 @@ mod tests {
         // `/short` once.
         assert_eq!(fetched("/other"), 2);
         assert_eq!(fetched("/short"), 1);
+    }
+
+    /// A page saved from the browser is kept as a post is: its article, its
+    /// picture inside, where it came from at its top — and no feed.
+    #[tokio::test]
+    async fn a_page_saved_from_the_browser_keeps_its_article_and_its_pictures() {
+        let library = tempfile::tempdir().unwrap();
+        let server = serve().await;
+        server.set("/img.png", png());
+        let (dir, ctx) = context(library.path()).await;
+        let Reply::Ok(_, page) = article_page(&server, "beeps", false) else {
+            unreachable!()
+        };
+        let downloaded = dir.path().join("mysterious-beeps");
+        std::fs::write(&downloaded, page).unwrap();
+        let link = server.url("/2026/Nov/9/mysterious-beeps/");
+
+        let saved = ctx
+            .save_web_page(&link, &downloaded, library.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            saved.parent().unwrap(),
+            std::fs::canonicalize(library.path()).unwrap()
+        );
+        let name = saved.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.ends_with(" Post.html"), "{name}");
+        let html = std::fs::read_to_string(&saved).unwrap();
+        assert!(html.contains("src=\"data:image/png;base64,"), "{html}");
+        assert!(html.contains(&format!("<meta name=\"wilkes:link\" content=\"{link}\">")));
+        assert!(!html.contains("wilkes:feed"));
+        assert!(html.contains("Paragraph 7 of the post beeps"));
+        assert!(!html.contains("Footer"));
+
+        // Saved again, it is told apart from the first.
+        let again = ctx
+            .save_web_page(&link, &downloaded, library.path())
+            .await
+            .unwrap();
+        assert!(
+            again.to_string_lossy().ends_with(" Post (2).html"),
+            "{}",
+            again.display()
+        );
+
+        // A picture that cannot be fetched fails the save, and says which.
+        server.set("/img.png", Reply::Status(404));
+        let error = ctx
+            .save_web_page(&link, &downloaded, library.path())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("/img.png") && error.contains("404"),
+            "{error}"
+        );
     }
 
     /// A paid post's page is a preview: it stays in the inbox, marked, and is

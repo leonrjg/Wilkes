@@ -2593,6 +2593,7 @@ pub fn run() {
         .manage(NativeOpenState::default())
         .manage(browser_pane::DarkFilters::default())
         .manage(browser_pane::Downloads::default())
+        .manage(browser_pane::PageSaves::default())
         .setup(|app| {
             let startup = Arc::new(DesktopStartupState::default());
             app.manage(Arc::clone(&startup));
