@@ -623,8 +623,9 @@ function Failure({ children }: { children: ReactNode }) {
 
 /**
  * Follow what is on screen: a provider's listing, or its answer to a keyword,
- * read newest first at every refresh. What it adds lands in Feeds, and is
- * written under the current directory.
+ * read again at every refresh — newest first where the provider can sort so,
+ * otherwise whole. What it adds lands in Feeds, and is written under the
+ * current directory.
  */
 export function FollowButton({
   provider,
@@ -641,7 +642,7 @@ export function FollowButton({
   const [busy, setBusy] = useState(false);
   if (directory === "") return null;
   return (
-    <Tooltip content={`Be told of what ${name} adds here, newest first, in Feeds`}>
+    <Tooltip content={`Be told in Feeds of what ${name} adds here`}>
       <button
         type="button"
         disabled={busy}

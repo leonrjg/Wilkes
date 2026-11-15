@@ -12,7 +12,7 @@ vi.mock("mermaid", () => ({
 
 import { markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorState } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
+import { EditorView, lineNumbers } from "@codemirror/view";
 import { markdownLivePreview } from ".";
 import { mathSyntax } from "./mathSyntax";
 
@@ -190,7 +190,67 @@ describe("markdown live preview", () => {
     const doc = "```python\nprint(1)\n```\n\nEnd";
     const { view } = mount(doc, doc.length);
     expect(view.contentDOM.querySelectorAll(".cm-md-codeblock")).toHaveLength(3);
-    expect(view.contentDOM.querySelector(".cm-md-code-label")?.textContent).toBe("python");
+    // The fences leave only the block's padding: no text, no language label.
+    expect(view.contentDOM.querySelectorAll(".cm-md-fence")).toHaveLength(2);
     expect(view.contentDOM.textContent).not.toContain("```");
+    expect(view.contentDOM.textContent).not.toContain("python");
+
+    view.dispatch({ selection: { anchor: doc.indexOf("print") } });
+    expect(view.contentDOM.querySelectorAll(".cm-md-fence")).toHaveLength(0);
+    expect(view.contentDOM.textContent).toContain("```python");
+  });
+
+  it("shrinks blank lines between blocks to the reader's margins", () => {
+    const doc = "Intro\n\n\n## Heading\n\nText\n- one\n- two\n\n```\na\n\nb\n```\n\nEnd";
+    const { view } = mount(doc, doc.indexOf("Text"));
+    const lines = [...view.contentDOM.querySelectorAll(".cm-line")];
+    const classes = (number: number) => lines[number - 1].className;
+    // A run before a heading: its first line is the heading's margin, the rest nothing.
+    expect(classes(2)).toContain("cm-md-gap-heading");
+    expect(classes(3)).toContain("cm-md-gap");
+    expect(classes(3)).not.toContain("cm-md-gap-heading");
+    expect(classes(5)).toContain("cm-md-gap-block");
+    // The heading touches nothing; tight list items are parted a little.
+    expect(classes(4)).not.toContain("cm-md-space");
+    expect(classes(8)).toContain("cm-md-item-next");
+    // A blank line inside code is code.
+    expect(classes(12)).not.toContain("cm-md-gap");
+    expect(classes(15)).toContain("cm-md-gap-block");
+
+    // The blank line holding the caret keeps its height to type on.
+    view.dispatch({ selection: { anchor: doc.indexOf("\n\n\n") + 1 } });
+    expect(view.contentDOM.querySelectorAll(".cm-line")[1].className).not.toContain("cm-md-gap");
+  });
+
+  it("gives each line number its line's classes, so collapsed lines show none", () => {
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const doc = "# Title\n\nText";
+    const view = new EditorView({
+      state: EditorState.create({
+        doc,
+        selection: { anchor: doc.length },
+        extensions: [
+          lineNumbers(),
+          markdownLivePreview({ documentPath: "/notes/draft.md", dark: false, resolveAsset: vi.fn(), openLink: vi.fn() }),
+        ],
+      }),
+      parent,
+    });
+    views.push(view);
+    const numbers = [...view.dom.querySelectorAll(".cm-lineNumbers .cm-gutterElement")]
+      .filter((element) => /^\d+$/.test(element.textContent ?? ""));
+    const byNumber = (n: string) => numbers.find((element) => element.textContent === n)?.className ?? "";
+    expect(byNumber("1")).toContain("cm-md-h1");
+    expect(byNumber("2")).toContain("cm-md-gap");
+    expect(byNumber("3")).not.toContain("cm-md-gap");
+  });
+
+  it("keeps a heading's own margins where no blank line parts it from its neighbours", () => {
+    const doc = "Intro\n# Title\nText";
+    const { view } = mount(doc, doc.length);
+    const heading = view.contentDOM.querySelectorAll(".cm-line")[1].className;
+    expect(heading).toContain("cm-md-space-above");
+    expect(heading).toContain("cm-md-space-below");
   });
 });

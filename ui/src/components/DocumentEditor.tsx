@@ -261,7 +261,7 @@ export default function DocumentEditor({
           },
         })
       : getLanguageExtension(language);
-    const setup = editorSetup(showLineNumbersRef.current);
+    const setup = editorSetup({ lineNumbers: showLineNumbersRef.current, prose: language === "markdown" });
     setupRef.current = setup;
     const extensions = [
       setup.extension,
@@ -415,20 +415,12 @@ export default function DocumentEditor({
           {buffer?.dirty ? <Save size={10} /> : <Check size={10} />} {saving ? "Saving…" : "Save"}
         </button>
       </div>
-      {!semanticReady && (
-        <div className="border-b border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-          Build the semantic index in Settings → Semantic to enable grounded completions.
-        </div>
-      )}
-      {semanticReady && !generationReady && (
-        <div className="border-b border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-          Select and enable a model in Settings → Generation to enable grounded completions.
-        </div>
-      )}
       <div
         ref={containerRef}
+        // Markdown takes the page's own background from the live preview, as
+        // the rendered reader does, rather than the source editor's.
         className={`plain-text-editor min-h-0 flex-1 overflow-auto text-sm ${
-          isDark ? "plain-text-editor--dark" : ""
+          isDark && language !== "markdown" ? "plain-text-editor--dark" : ""
         }`}
       />
       {shown && (

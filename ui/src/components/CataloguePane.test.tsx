@@ -161,6 +161,7 @@ const OPENALEX_BROWSE: BrowseControls = {
   keyword: true,
   keyword_required: false,
   total: true,
+  paged: true,
   sort: {
     default: "cited_by_count:desc",
     keyword_default: "relevance_score:desc",
@@ -1005,6 +1006,26 @@ describe("CataloguePane", () => {
     expect(screen.getByText("Browsed work 0")).toBeTruthy();
     // A short page is the last one.
     expect(screen.queryByRole("button", { name: "Load more filtered OpenAlex" })).toBeNull();
+  });
+
+  it("reads an unpaged listing whole, offering no next page however many it returned", async () => {
+    providers.mockResolvedValue([provider("openalex", "OpenAlex", { ...OPENALEX_BROWSE, paged: false })]);
+    browse.mockResolvedValueOnce(listing(works(25)));
+    render(<CataloguePane pane={pane()} />);
+    const panel = await openFilters();
+    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
+    expect(await screen.findByText("Browsed work 24")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Load more filtered OpenAlex" })).toBeNull();
+  });
+
+  /// Waiting for something to be published is following a listing with
+  /// nothing in it, so following needs no answer, let alone results.
+  it("can follow a listing before it has answered", async () => {
+    browse.mockReturnValue(new Promise(() => {}));
+    render(<CataloguePane pane={pane()} />);
+    const panel = await openFilters();
+    fireEvent.change(within(panel).getByLabelText("Type"), { target: { value: "article" } });
+    expect(await screen.findByRole("button", { name: "Follow OpenAlex" })).toBeTruthy();
   });
 
   it("says what a provider refused, under its name, and keeps what was already read", async () => {

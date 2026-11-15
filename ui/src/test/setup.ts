@@ -84,6 +84,7 @@ vi.mock("@codemirror/view", () => {
   MockView.scrollIntoView = vi.fn();
   MockView.updateListener = { of: vi.fn() };
   class MockWidgetType {}
+  class MockGutterMarker {}
   return {
     EditorView: MockView,
     Decoration: {
@@ -93,6 +94,8 @@ vi.mock("@codemirror/view", () => {
       widget: vi.fn().mockReturnValue({ range: vi.fn().mockReturnValue({}) }),
     },
     WidgetType: MockWidgetType,
+    GutterMarker: MockGutterMarker,
+    gutterLineClass: { from: vi.fn() },
     keymap: { of: vi.fn() },
   };
 });
@@ -106,6 +109,7 @@ vi.mock("@codemirror/state", () => ({
     })),
     readOnly: { of: vi.fn() },
   },
+  RangeSet: { of: vi.fn() },
   RangeSetBuilder: vi.fn().mockImplementation(() => ({
     add: vi.fn(),
     finish: vi.fn(),

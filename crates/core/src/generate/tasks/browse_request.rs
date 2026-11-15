@@ -615,6 +615,7 @@ mod tests {
             keyword: true,
             keyword_required: false,
             total: true,
+            paged: true,
             sort: Some(SortControl {
                 equivalent_to: BTreeMap::new(),
                 default: "cited_by_count:desc".into(),
@@ -751,6 +752,7 @@ mod tests {
             keyword: true,
             keyword_required: false,
             total: false,
+            paged: true,
             sort: None,
             modes: Vec::new(),
             filters: vec![filter("year_from", "From", "integer")],
@@ -777,6 +779,7 @@ mod tests {
             keyword: false,
             keyword_required: false,
             total: false,
+            paged: true,
             sort: None,
             modes: Vec::new(),
             filters: Vec::new(),

@@ -197,17 +197,26 @@ describe("DocumentEditor grounded completion", () => {
 
   it("follows the line-number setting without remounting the editor", () => {
     useSettingsStore.setState({ settings: { editor_line_numbers: false } as Settings });
-    useEditorStore.getState().ensureBuffer("/library/draft.md", "# Draft");
+    useEditorStore.getState().ensureBuffer("/library/draft.txt", "notes");
     render(
-      <DocumentEditor content="# Draft" language="markdown" documentPath="/library/draft.md" semanticReady generationReady />,
+      <DocumentEditor content="notes" language="plaintext" documentPath="/library/draft.txt" semanticReady generationReady />,
     );
     expect(editorSetup).toHaveBeenCalledOnce();
-    expect(editorSetup).toHaveBeenCalledWith(false);
+    expect(editorSetup).toHaveBeenCalledWith({ lineNumbers: false, prose: false });
 
     act(() => {
       useSettingsStore.setState({ settings: { editor_line_numbers: true } as Settings });
     });
     expect(editorSetup).toHaveBeenCalledOnce();
     expect(setLineNumbers).toHaveBeenLastCalledWith(expect.anything(), true);
+  });
+
+  it("lays Markdown out as prose, with line numbers as set", () => {
+    useSettingsStore.setState({ settings: { editor_line_numbers: true } as Settings });
+    useEditorStore.getState().ensureBuffer("/library/draft.md", "# Draft");
+    render(
+      <DocumentEditor content="# Draft" language="markdown" documentPath="/library/draft.md" semanticReady generationReady />,
+    );
+    expect(editorSetup).toHaveBeenCalledWith({ lineNumbers: true, prose: true });
   });
 });

@@ -1,12 +1,8 @@
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { LanguageSupport, syntaxTree } from "@codemirror/language";
 import { Prec, StateField, type Extension } from "@codemirror/state";
-import { EditorView, keymap, type Command } from "@codemirror/view";
+import { EditorView, gutterLineClass, keymap, type Command } from "@codemirror/view";
 import { getLanguageExtension } from "@leonrjg/wilkes-reader";
-import "@fontsource/open-sans/400.css";
-import "@fontsource/open-sans/400-italic.css";
-import "@fontsource/open-sans/700.css";
-import "@fontsource/open-sans/700-italic.css";
 import { buildPreview, type PreviewState } from "./decorations";
 import { mathSyntax } from "./mathSyntax";
 import { classifyReference } from "./references";
@@ -51,61 +47,142 @@ function codeLanguage(info: string) {
   return extension instanceof LanguageSupport ? extension.language : null;
 }
 
-const MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace';
+/** The reader's monospace stack, for inline code and code blocks. */
+const MONO = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace';
 
+/** The reader's page around `.prose .prose-document`: `px-6 py-5` padding
+ *  and a 90rem measure. `.cm-content` is border-box, so the measure is
+ *  widened by the padding. */
+const PAGE_PADDING_X = "24px";
+const PAGE_PADDING_Y = "20px";
+const MEASURE = `calc(90rem + 2 * ${PAGE_PADDING_X})`;
+
+/** Margins the reader puts around a block and around a heading. */
+const BLOCK_MARGIN = "0.55rem";
+const HEADING_MARGIN_TOP = "0.7rem";
+const HEADING_MARGIN_BOTTOM = "0.35rem";
+
+const BORDER = "1px solid var(--border-main)";
+
+/** Height of a line of body text, and of a code line, which the line numbers
+ *  take so they sit level with the text beside them. */
+const TEXT_LINE = "calc(16px * 1.65)";
+const CODE_LINE = "calc(0.92 * 16px * 1.65)";
+
+/** Markdown being edited is laid out the way the reader renders it (the
+ *  `.prose` and `.prose-document` rules of wilkes-reader's stylesheet): the
+ *  same face, size, measure, headings, block spacing, code and tables, so
+ *  switching between reading and editing moves nothing but the source the
+ *  caret reveals. */
 const previewTheme = () => EditorView.theme({
-  // MarkText's prose settings: Open Sans at 16px with a 1.6 line height.
+  // Over the source editor's dark background, the page's own, as the reader.
+  "&.cm-editor": { backgroundColor: "var(--bg-app)" },
   ".cm-content": {
-    fontFamily: '"Open Sans", sans-serif',
+    fontFamily: "var(--default-font-family)",
     fontSize: "16px",
-    lineHeight: "1.6",
+    lineHeight: "1.65",
+    color: "var(--text-main)",
+    maxWidth: MEASURE,
+    margin: "0 auto",
+    padding: `${PAGE_PADDING_Y} ${PAGE_PADDING_X}`,
   },
+  ".cm-line": { padding: "0" },
+  // Line numbers, when the setting shows them, on the page rather than in a
+  // panel of their own. Each gutter element carries its line's classes (see
+  // `gutterClasses`), so a number takes its line's height and padding and is
+  // left out where a line is only a margin.
+  "&.cm-editor .cm-gutters": {
+    backgroundColor: "var(--bg-app)",
+    color: "var(--text-dim)",
+    borderRight: "none",
+  },
+  // The line's classes bring its type (a heading's weight and size, a
+  // formula's face) with its metrics; the number keeps the gutter's own.
+  ".cm-lineNumbers .cm-gutterElement": {
+    lineHeight: TEXT_LINE,
+    paddingLeft: "12px",
+    fontFamily: MONO,
+    fontSize: "13px",
+    fontWeight: "400",
+    color: "var(--text-dim)",
+  },
+  ".cm-gutterElement.cm-md-gap, .cm-gutterElement.cm-md-fence": { visibility: "hidden" },
+  ".cm-gutterElement.cm-md-space-above": { paddingTop: HEADING_MARGIN_TOP },
+  ".cm-gutterElement.cm-md-item-next": { paddingTop: "0.2rem" },
+  ".cm-gutterElement.cm-md-codeblock": { lineHeight: CODE_LINE },
+  ".cm-gutterElement.cm-md-codeblock-first": { paddingTop: "calc(0.6rem + 1px)" },
+  ".cm-gutterElement.cm-md-h1": { lineHeight: "calc(1.15 * 16px * 1.25)" },
+  ".cm-gutterElement.cm-md-h2": { lineHeight: "calc(1.08 * 16px * 1.25)" },
+  ".cm-gutterElement.cm-md-h3, .cm-gutterElement.cm-md-h4": { lineHeight: "calc(16px * 1.25)" },
+  // A run of blank lines is the margin between two blocks (see
+  // `blockSpacing`); a line with no height of its own is all margin.
+  ".cm-line.cm-md-gap": { lineHeight: "0" },
+  ".cm-line.cm-md-gap-block": { paddingTop: BLOCK_MARGIN },
+  ".cm-line.cm-md-gap-heading": { paddingTop: HEADING_MARGIN_TOP },
+  ".cm-line.cm-md-space-above": { paddingTop: HEADING_MARGIN_TOP },
+  ".cm-line.cm-md-space-below": { paddingBottom: HEADING_MARGIN_BOTTOM },
   // The syntax highlighter colours and underlines the spans inside a line;
   // rendered constructs take the document's own colours instead, so the
   // rules reach those spans.
-  ".cm-md-heading": { fontWeight: "700" },
   ".cm-md-heading, .cm-md-heading *": { color: "var(--text-main)", textDecoration: "none" },
-  ".cm-md-h1": { fontSize: "1.75em", lineHeight: "1.4" },
-  ".cm-md-h2": { fontSize: "1.45em", lineHeight: "1.4" },
-  ".cm-md-h3": { fontSize: "1.25em" },
-  ".cm-md-h4": { fontSize: "1.1em" },
-  ".cm-md-h6": { color: "var(--text-muted)" },
+  ".cm-md-h1, .cm-md-h2, .cm-md-h3, .cm-md-h4": { fontWeight: "650", lineHeight: "1.25" },
+  ".cm-md-h1": { fontSize: "1.15em" },
+  ".cm-md-h2": { fontSize: "1.08em" },
   ".cm-md-em": { fontStyle: "italic" },
   ".cm-md-strong": { fontWeight: "700" },
   ".cm-md-strike": { textDecoration: "line-through" },
   ".cm-md-inline-code": {
     fontFamily: MONO,
-    fontSize: "0.88em",
+    fontSize: "0.92em",
     backgroundColor: "var(--bg-active)",
+    border: BORDER,
     borderRadius: "4px",
-    padding: "1px 4px",
+    padding: "0.05rem 0.25rem",
   },
   ".cm-md-link, .cm-md-link *": { color: "var(--accent-blue)", textDecoration: "underline", textUnderlineOffset: "2px" },
   ".cm-line.cm-md-quote": {
     borderLeft: "3px solid var(--border-strong)",
-    paddingLeft: "12px",
+    paddingLeft: "0.75rem",
     color: "var(--text-muted)",
   },
+  ".cm-line.cm-md-item-next": { paddingTop: "0.2rem" },
   ".cm-line.cm-md-codeblock": {
     fontFamily: MONO,
-    fontSize: "0.88em",
+    fontSize: "0.92em",
     backgroundColor: "var(--bg-active)",
-    paddingLeft: "12px",
-    paddingRight: "12px",
+    borderLeft: BORDER,
+    borderRight: BORDER,
+    paddingLeft: "0.7rem",
+    paddingRight: "0.7rem",
   },
-  ".cm-line.cm-md-codeblock-first": { borderTopLeftRadius: "6px", borderTopRightRadius: "6px", paddingTop: "4px" },
-  ".cm-line.cm-md-codeblock-last": { borderBottomLeftRadius: "6px", borderBottomRightRadius: "6px", paddingBottom: "4px" },
-  ".cm-md-code-label": { fontSize: "0.8em", color: "var(--text-dim)", fontFamily: MONO },
+  ".cm-line.cm-md-codeblock-first": {
+    borderTop: BORDER,
+    borderTopLeftRadius: "6px",
+    borderTopRightRadius: "6px",
+    paddingTop: "0.6rem",
+  },
+  ".cm-line.cm-md-codeblock-last": {
+    borderBottom: BORDER,
+    borderBottomLeftRadius: "6px",
+    borderBottomRightRadius: "6px",
+    paddingBottom: "0.6rem",
+  },
+  // A hidden fence is only the block's padding. CodeMirror's widget buffers
+  // around the hidden text are 1em tall, so the em goes too.
+  ".cm-line.cm-md-fence": { lineHeight: "0", fontSize: "0" },
   ".cm-line.cm-md-table-source, .cm-line.cm-md-math-source, .cm-md-math-source": { fontFamily: MONO, fontSize: "0.88em" },
   ".cm-md-table-source *": { textDecoration: "none" },
-  ".cm-md-table-wrap": { overflowX: "auto", padding: "6px 0", cursor: "text" },
-  ".cm-md-table": { borderCollapse: "collapse", fontSize: "0.95em" },
+  ".cm-md-table-wrap": { overflowX: "auto", cursor: "text" },
+  ".cm-md-table": { borderCollapse: "collapse", width: "100%", tableLayout: "auto" },
   ".cm-md-table th, .cm-md-table td": {
-    border: "1px solid var(--border-main)",
-    padding: "4px 10px",
-    verticalAlign: "top",
+    border: BORDER,
+    padding: "0.25rem 0.45rem",
+    minWidth: "7rem",
+    overflowWrap: "break-word",
+    textAlign: "center",
+    verticalAlign: "middle",
   },
-  ".cm-md-table th": { backgroundColor: "var(--bg-header)", fontWeight: "600" },
+  ".cm-md-table th": { backgroundColor: "var(--bg-active)", fontWeight: "650" },
   ".cm-md-math-block": { padding: "6px 0", overflowX: "auto", cursor: "text" },
   ".cm-md-math-block .katex-display": { margin: "0" },
   ".cm-md-math-preview": { opacity: "0.8", borderTop: "1px dashed var(--border-main)", cursor: "default" },
@@ -120,8 +197,9 @@ const previewTheme = () => EditorView.theme({
     verticalAlign: "middle",
     borderTop: "1px solid var(--border-strong)",
   },
-  ".cm-md-bullet": { color: "var(--text-muted)", display: "inline-block", minWidth: "0.9em" },
-  ".cm-md-list-number, .cm-md-list-number *": { color: "var(--text-muted)" },
+  // List markers in the text's own colour, as the reader's.
+  ".cm-md-bullet": { display: "inline-block", minWidth: "0.9em" },
+  ".cm-md-list-number, .cm-md-list-number *": { color: "var(--text-main)" },
   ".cm-md-checkbox": { margin: "0 6px 0 0", verticalAlign: "middle", cursor: "pointer" },
   ".cm-md-task-done": { color: "var(--text-dim)", textDecoration: "line-through" },
   ".cm-md-mermaid": {
@@ -190,7 +268,10 @@ export function markdownLivePreview(options: LivePreviewOptions): Extension {
       }
       return value;
     },
-    provide: (self) => EditorView.decorations.from(self, (value) => value.decorations),
+    provide: (self) => [
+      EditorView.decorations.from(self, (value) => value.decorations),
+      gutterLineClass.from(self, (value) => value.gutterClasses),
+    ],
   });
 
   return [

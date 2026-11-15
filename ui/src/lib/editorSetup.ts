@@ -24,27 +24,37 @@ import {
   rectangularSelection,
 } from "@codemirror/view";
 
+export interface EditorSetupOptions {
+  /** Show the line-number gutter: the user's setting. */
+  lineNumbers: boolean;
+  /** The document reads as prose (Markdown in live preview) and is laid out
+   *  like the rendered page: no fold gutter and no active-line band, in the
+   *  text or beside its number. Line numbers still follow the setting. */
+  prose: boolean;
+}
+
 export interface EditorSetup {
   extension: Extension;
   /** Show or hide the line-number gutter of the editor this setup belongs to. */
   setLineNumbers(view: EditorView, show: boolean): void;
 }
 
-function lineNumberGutter(show: boolean): Extension {
-  return show ? [lineNumbers(), highlightActiveLineGutter()] : [];
+function lineNumberGutter(show: boolean, prose: boolean): Extension {
+  if (!show) return [];
+  return prose ? lineNumbers() : [lineNumbers(), highlightActiveLineGutter()];
 }
 
 /** CodeMirror's `basicSetup`, taken apart as its documentation recommends
  *  for a configurable editor, so the line numbers can be switched off. One
  *  setup per editor: the line numbers live in a compartment of its own. */
-export function editorSetup(showLineNumbers: boolean): EditorSetup {
+export function editorSetup({ lineNumbers, prose }: EditorSetupOptions): EditorSetup {
   const gutter = new Compartment();
   return {
     extension: [
-      gutter.of(lineNumberGutter(showLineNumbers)),
+      gutter.of(lineNumberGutter(lineNumbers, prose)),
       highlightSpecialChars(),
       history(),
-      foldGutter(),
+      prose ? [] : foldGutter(),
       drawSelection(),
       dropCursor(),
       EditorState.allowMultipleSelections.of(true),
@@ -55,7 +65,7 @@ export function editorSetup(showLineNumbers: boolean): EditorSetup {
       autocompletion(),
       rectangularSelection(),
       crosshairCursor(),
-      highlightActiveLine(),
+      prose ? [] : highlightActiveLine(),
       highlightSelectionMatches(),
       keymap.of([
         ...closeBracketsKeymap,
@@ -68,7 +78,7 @@ export function editorSetup(showLineNumbers: boolean): EditorSetup {
       ]),
     ],
     setLineNumbers(view, show) {
-      view.dispatch({ effects: gutter.reconfigure(lineNumberGutter(show)) });
+      view.dispatch({ effects: gutter.reconfigure(lineNumberGutter(show, prose)) });
     },
   };
 }
