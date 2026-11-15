@@ -439,7 +439,10 @@ pub struct BrowseCapability {
     /// its query string `{query}` (the keyword), `{sort}`, the name of any
     /// filter, and `{filters}` for every filter it does not name. A query
     /// parameter none of whose placeholders has a value is left off the
-    /// request. A path without `{query}` is a listing that takes no keyword.
+    /// request. `{sort}`, `{filters}` or a filter's name standing by itself as
+    /// a parameter (`&{filters}`) is written as parameters: each clause, or
+    /// the sort option, is one, named by what precedes its first `=`. A path
+    /// without `{query}` is a listing that takes no keyword.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// A program whose output is the listing, in place of `path`. Its
@@ -525,8 +528,9 @@ pub struct ModeSpec {
     /// The values go in one clause, joined by this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join: Option<String>,
-    /// The clause is written once per value; the filter separator joins them.
-    /// Only for a filter written to `{filters}`.
+    /// The clause is written once per value; the filter separator joins them,
+    /// or each is a parameter of its own where the path writes parameters.
+    /// Not for a filter the path writes by name as a value.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub repeat: bool,
     /// How each value is written before it is combined. Carries `{value}`.
@@ -840,6 +844,27 @@ impl BrowseCapability {
         self.request().names(placeholder)
     }
 
+    /// Whether `placeholder` is a query parameter of `path` by itself
+    /// (`&{filters}`), so that what is written there is parameters, not a
+    /// value: each clause becomes its own `key=value`, split at its first `=`.
+    /// A program's arguments have no such place.
+    pub fn spreads(&self, placeholder: &str) -> bool {
+        let Some(path) = &self.path else {
+            return false;
+        };
+        let alone = format!("{{{placeholder}}}");
+        query_parts(path).1.contains(&alone.as_str())
+    }
+
+    /// The placeholder a filter's clauses are written to: its own name when
+    /// the request names it, `{filters}` otherwise.
+    pub fn place<'a>(&self, filter: &'a str) -> &'a str {
+        match self.names(filter) {
+            true => filter,
+            false => BROWSE_FILTERS,
+        }
+    }
+
     /// Whether the listing can be read past its first page.
     pub fn paged(&self) -> bool {
         self.names("page") || self.names("offset")
@@ -853,10 +878,12 @@ impl BrowseCapability {
     /// filter syntax is made of, where that filter is written.
     pub fn reserved(&self, filter: &str) -> Reserved {
         let mut reserved = Reserved {
-            // The separator is syntax only among the clauses it separates.
-            within: match self.names(filter) {
-                true => Vec::new(),
-                false => vec![self.filter_separator.clone()],
+            // The separator is syntax only among the clauses it separates,
+            // and a clause that is a parameter of its own is separated by
+            // nothing a value could carry: the engine encodes it.
+            within: match self.place(filter) == BROWSE_FILTERS && !self.spreads(BROWSE_FILTERS) {
+                true => vec![self.filter_separator.clone()],
+                false => Vec::new(),
             },
             leading: Vec::new(),
         };
@@ -1694,6 +1721,40 @@ language  = { label = "Language", clause = "{value}", modes = ["any"], options =
 reviews   = { label = "Reviews only", clause = "reviews_only" }
 "#;
 
+const AUTHORING_REPEATED_KEYS_EXAMPLE: &str = r#"manifest_version = 2
+id = "example-repeated-keys"
+name = "Example service that repeats a key per value"
+
+[http]
+base_url = "https://api.stories.test"
+
+[capabilities.search]
+path = "/stories?title={query}&limit={limit}&offset={offset}"
+items = "data"
+
+[capabilities.search.fields]
+id = "id"
+title = "attributes.title"
+
+# Browse: {filters} and {sort} stand by themselves, so each clause and the sort
+# option is a query parameter of its own, named by what precedes its first "=".
+# Two statuses and a sort send "status[]=ongoing&status[]=hiatus&order[year]=desc".
+[capabilities.browse]
+path = "/stories?title={query}&{filters}&{sort}&limit={limit}&offset={offset}"
+total = "total"
+
+[capabilities.browse.sort]
+default = "order[followedCount]=desc"
+options = [["order[followedCount]=desc", "Most followed"], ["order[year]=desc", "Newest"], ["order[year]=asc", "Oldest"]]
+
+[capabilities.browse.modes]
+any = { label = "Any of", repeat = true }
+
+[capabilities.browse.filters]
+status = { label = "Status", clause = "status[]={value}", modes = ["any"], options = [["ongoing", "Ongoing"], ["hiatus", "Hiatus"], ["completed", "Completed"]] }
+year   = { label = "Year", clause = "year={value}", value = "integer" }
+"#;
+
 const AUTHORING_RUN_EXAMPLE: &str = r#"manifest_version = 2
 id = "example-cli"
 name = "Example archive with a command-line client"
@@ -1887,10 +1948,16 @@ query_required = true                 # optional; the listing cannot be asked wi
 filter_separator = ","                # optional, defaults to ","; joins the clauses written to {filters}
 total = "expression"                  # optional; JMESPath over the response yielding how many records match in all
 # No {query} means the listing takes no keyword. {sort} stands exactly when [capabilities.browse.sort] does. Every
-# filter is named in the path or goes to {filters}, whose parameter holds nothing else. A parameter may be a bare
-# word: "&{flag}" with clause = "onlyOpen" sends "&onlyOpen" when the filter is on.
+# filter is named in the path or goes to {filters}, whose parameter holds nothing else. {query}, {limit}, {page}
+# and {offset} always sit in a value ("q={query}").
+# {sort}, {filters} or a filter's name standing by itself ("&{filters}") is written as parameters, not a value:
+# each clause, or the chosen sort option, is a parameter of its own, named by what precedes its first "=" and with
+# {value} after it. So a service that repeats a key per value writes "/list?{filters}&{sort}" with clause =
+# "status[]={value}", a mode with repeat = true, and sort options such as "order[year]=desc", and sends
+# "status[]=ongoing&status[]=hiatus&order[year]=desc" (each name and value encoded). filter_separator is unused
+# there. A clause with no "=" is a bare word: "&{flag}" with clause = "onlyOpen" sends "&onlyOpen" when it is on.
 
-[capabilities.browse.sort]            # optional; written to {sort}
+[capabilities.browse.sort]            # optional; written to {sort}; with "&{sort}" each option is "name=value"
 default = "value-of-the-default-option"
 keyword_default = "value-used-instead-when-a-keyword-is-given"   # optional
 options = [["value", "Label"], ["value2", "Label 2"]]
@@ -1903,7 +1970,7 @@ hint = "expression"                   # optional; a second line that tells two e
 
 [capabilities.browse.modes]           # optional; the ways several values of one filter combine, in the order offered
 any = { label = "Any of", join = "|" }                         # join: the values go in one clause, joined by this
-all = { label = "All of", repeat = true }                      # repeat: the clause is written once per value; only for filters in {filters}
+all = { label = "All of", repeat = true }                      # repeat: the clause is written once per value; not for a filter named in a value
 none = { label = "None of", repeat = true, value = "!{value}" } # value: how each value is written first
 
 [capabilities.browse.filters]         # one line per filter, shown in this order; a name is a-z, 0-9, _
@@ -2018,6 +2085,8 @@ JMESPath selects keys (`a.b`), indices (`a[0]`, `a[-1]`), projections (`a[*].b`)
     prompt.push_str(AUTHORING_FULL_EXAMPLE);
     prompt.push_str("\nValid example with a parameter per filter and a required keyword:\n\n");
     prompt.push_str(AUTHORING_PARAMETERS_EXAMPLE);
+    prompt.push_str("\nValid example with a query parameter of its own per value:\n\n");
+    prompt.push_str(AUTHORING_REPEATED_KEYS_EXAMPLE);
     prompt.push_str("\nValid example whose files are written by a command-line program:\n\n");
     prompt.push_str(AUTHORING_RUN_EXAMPLE);
     prompt.push_str(
@@ -2791,13 +2860,25 @@ fn browse_problems(browse: &BrowseCapability, http: bool) -> Vec<String> {
                 }
             }
             for parameter in &parameters {
-                let value = parameter
-                    .split_once('=')
-                    .map_or(*parameter, |(_, value)| value);
-                if parameter.contains(&joined) && value != joined {
-                    problems.push(format!(
-                        "browse.path: '{parameter}' must be a parameter whose whole value is {joined}"
-                    ));
+                // By itself, a placeholder is written as parameters: only
+                // what the manifest writes the names of can stand there.
+                if let [name] = placeholders(parameter).as_slice() {
+                    if *parameter == format!("{{{name}}}")
+                        && (BROWSE_PAGING_PLACEHOLDERS.contains(name) || *name == BROWSE_QUERY)
+                    {
+                        problems.push(format!(
+                            "browse.path: '{parameter}' cannot be a parameter by itself; give it a name, as '{name}={parameter}'"
+                        ));
+                        continue;
+                    }
+                }
+                if parameter.contains(&joined) && *parameter != joined {
+                    let value = parameter.split_once('=').map(|(_, value)| value);
+                    if value != Some(joined.as_str()) {
+                        problems.push(format!(
+                            "browse.path: '{parameter}' must be {joined} by itself or a parameter whose whole value is {joined}"
+                        ));
+                    }
                 }
             }
         }
@@ -2888,6 +2969,14 @@ fn browse_problems(browse: &BrowseCapability, http: bool) -> Vec<String> {
             }
         }
         problems.extend(option_problems("browse.sort", &sort.options));
+        if browse.spreads(BROWSE_SORT) {
+            for (value, _) in &sort.options {
+                problems.extend(spread_problems(
+                    &format!("browse.sort option '{value}'"),
+                    value,
+                ));
+            }
+        }
     }
 
     if browse.filter_separator.is_empty() {
@@ -3047,6 +3136,9 @@ fn browse_problems(browse: &BrowseCapability, http: bool) -> Vec<String> {
         } else {
             problems.extend(clause_problems(&label, "clause", &spec.clause, takes_value));
         }
+        if browse.spreads(browse.place(name)) {
+            problems.extend(spread_problems(&format!("{label}.clause"), &spec.clause));
+        }
 
         if let Some(options) = &spec.options {
             if options.is_empty() {
@@ -3095,11 +3187,15 @@ fn browse_problems(browse: &BrowseCapability, http: bool) -> Vec<String> {
             if spec.modes[..index].contains(mode) {
                 problems.push(format!("{label}.modes repeats '{mode}'"));
             }
-            // Written by name, a filter is one value in one parameter: there
-            // is no separator there for a repeated clause to be joined by.
-            if browse.names(name) && browse.modes.get(mode).is_some_and(|mode| mode.repeat) {
+            // Written by name as a value, a filter is one value in one
+            // parameter: there is no separator there for a repeated clause to
+            // be joined by. By itself, each clause is a parameter of its own.
+            if browse.names(name)
+                && !browse.spreads(name)
+                && browse.modes.get(mode).is_some_and(|mode| mode.repeat)
+            {
                 problems.push(format!(
-                    "{label}.modes names '{mode}', which repeats the clause; a filter browse.path writes by name takes only modes that join"
+                    "{label}.modes names '{mode}', which repeats the clause; a filter browse.path writes by name as a value takes only modes that join"
                 ));
             }
         }
@@ -3135,6 +3231,24 @@ fn clause_problems(label: &str, field: &str, clause: &str, takes_value: bool) ->
         problems.push(format!("{label}.{field} must contain {{value}}"));
     }
     problems
+}
+
+/// What is wrong with `text` as a query parameter of its own: the name before
+/// its first `=` is written by the manifest, never by a value, so a value
+/// cannot move where the name ends.
+fn spread_problems(label: &str, text: &str) -> Vec<String> {
+    let name = text.split_once('=').map_or(text, |(name, _)| name);
+    if name.is_empty() {
+        vec![format!(
+            "{label} is a query parameter of its own and must name it before '='"
+        )]
+    } else if name.contains("{value}") {
+        vec![format!(
+            "{label} is a query parameter of its own, so {{value}} goes after its first '=', as 'name={{value}}'"
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 fn lookup_problems(lookup: &LookupCapability, http: bool) -> Vec<String> {
@@ -4060,7 +4174,7 @@ url = "{id}"
                 AUTHORING_FULL_EXAMPLE,
                 "&filter={filters}",
                 "&filter=type:article,{filters}",
-                "must be a parameter whose whole value is {filters}",
+                "a parameter whose whole value is {filters}",
             ),
             (
                 AUTHORING_FULL_EXAMPLE,
@@ -4103,6 +4217,42 @@ url = "{id}"
                 r#"any = { label = "Any of", join = "|" }"#,
                 r#"any = { label = "Any of", repeat = true }"#,
                 "takes only modes that join",
+            ),
+            (
+                AUTHORING_REPEATED_KEYS_EXAMPLE,
+                "/stories?title={query}&",
+                "/stories?{query}&",
+                "'{query}' cannot be a parameter by itself",
+            ),
+            (
+                AUTHORING_REPEATED_KEYS_EXAMPLE,
+                "&limit={limit}&offset={offset}\"\ntotal",
+                "&{limit}&offset={offset}\"\ntotal",
+                "'{limit}' cannot be a parameter by itself",
+            ),
+            (
+                AUTHORING_REPEATED_KEYS_EXAMPLE,
+                "&{filters}&",
+                "&x{filters}&",
+                "must be {filters} by itself or a parameter whose whole value is {filters}",
+            ),
+            (
+                AUTHORING_REPEATED_KEYS_EXAMPLE,
+                r#"clause = "status[]={value}""#,
+                r#"clause = "{value}""#,
+                "browse.filters.status.clause is a query parameter of its own, so {value} goes after its first '='",
+            ),
+            (
+                AUTHORING_REPEATED_KEYS_EXAMPLE,
+                r#"clause = "year={value}""#,
+                r#"clause = "=y{value}""#,
+                "browse.filters.year.clause is a query parameter of its own and must name it before '='",
+            ),
+            (
+                AUTHORING_REPEATED_KEYS_EXAMPLE,
+                r#"["order[year]=asc", "Oldest"]"#,
+                r#"["=asc", "Oldest"]"#,
+                "browse.sort option '=asc' is a query parameter of its own and must name it before '='",
             ),
         ] {
             assert!(source.contains(from), "{from}");
@@ -4489,6 +4639,7 @@ url = "{pdf_url}""#,
         Manifest::parse(AUTHORING_HTML_EXAMPLE).unwrap();
         Manifest::parse(AUTHORING_FULL_EXAMPLE).unwrap();
         Manifest::parse(AUTHORING_PARAMETERS_EXAMPLE).unwrap();
+        Manifest::parse(AUTHORING_REPEATED_KEYS_EXAMPLE).unwrap();
         let run = Manifest::parse(AUTHORING_RUN_EXAMPLE).unwrap();
         assert_eq!(run.programs(), vec!["archive-get"]);
         let cli = Manifest::parse(AUTHORING_CLI_EXAMPLE).unwrap();

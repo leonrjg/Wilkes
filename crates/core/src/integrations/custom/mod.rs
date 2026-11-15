@@ -1686,6 +1686,10 @@ fn browse_parameters(
             joined.extend(clauses);
             continue;
         }
+        if browse.spreads(name) {
+            written.extend(clauses.into_iter().map(|clause| (name.clone(), clause)));
+            continue;
+        }
         match clauses.as_slice() {
             [] => {}
             [one] => written.push((name.clone(), one.clone())),
@@ -1693,7 +1697,13 @@ fn browse_parameters(
             _ => return Err(format!("filter '{name}' is written as one value")),
         }
     }
-    if !joined.is_empty() {
+    if browse.spreads(BROWSE_FILTERS) {
+        written.extend(
+            joined
+                .into_iter()
+                .map(|clause| (BROWSE_FILTERS.to_string(), clause)),
+        );
+    } else if !joined.is_empty() {
         written.push((
             BROWSE_FILTERS.to_string(),
             joined.join(&browse.filter_separator),
@@ -1807,6 +1817,11 @@ fn filter_clauses(
 /// written with the others empty, which is how a range in one parameter reads
 /// when only one end is given (`year=2016-`). Values are percent-encoded here,
 /// as in [`substitute`].
+///
+/// A parameter that is a placeholder by itself (`&{filters}`) is written as
+/// parameters: each value written to that placeholder is one, its name and
+/// value split at its first `=` and each encoded, so `contentRating[]=safe`
+/// stays a parameter named `contentRating[]` rather than becoming a word.
 fn browse_path(template: &str, limit: usize, page: usize, written: &[(String, String)]) -> String {
     let paging = [
         ("limit", limit.to_string()),
@@ -1843,6 +1858,22 @@ fn browse_path(template: &str, limit: usize, page: usize, written: &[(String, St
         out
     };
 
+    let spread = |name: &str| {
+        written
+            .iter()
+            .filter(|(known, _)| known == name)
+            .map(|(_, clause)| match clause.split_once('=') {
+                Some((key, value)) => format!(
+                    "{}={}",
+                    urlencoding::encode(key),
+                    urlencoding::encode(value)
+                ),
+                None => urlencoding::encode(clause).into_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join("&")
+    };
+
     let (before_query, parameters) = query_parts(template);
     let kept: Vec<String> = parameters
         .into_iter()
@@ -1850,7 +1881,10 @@ fn browse_path(template: &str, limit: usize, page: usize, written: &[(String, St
             let names = placeholders(parameter);
             names.is_empty() || names.iter().any(|name| value_of(name).is_some())
         })
-        .map(fill)
+        .map(|parameter| match placeholders(parameter).as_slice() {
+            [name] if parameter == format!("{{{name}}}") => spread(name),
+            _ => fill(parameter),
+        })
         .collect();
     let mut path = fill(before_query);
     if !kept.is_empty() {
@@ -4315,6 +4349,127 @@ doi = "doi"
             browse_path("/list/{page}?q={query}&fixed=1", 10, 2, &[]),
             "/list/2?fixed=1"
         );
+    }
+
+    /// A placeholder standing by itself is written as parameters: each value
+    /// is one, its name and value encoded apart, so the `&` and `=` between
+    /// them stay syntax and the brackets in a name reach the service as such.
+    #[test]
+    fn a_placeholder_by_itself_writes_a_parameter_per_clause() {
+        let written = [
+            ("filters", "contentRating[]=safe"),
+            ("filters", "contentRating[]=suggestive"),
+            ("filters", "includedTags[]=a b&c"),
+            ("sort", "order[followedCount]=desc"),
+            ("flag", "hasAvailableChapters"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+        assert_eq!(
+            browse_path(
+                "/manga?{filters}&{sort}&{flag}&limit={limit}",
+                10,
+                1,
+                &written
+            ),
+            "/manga?contentRating%5B%5D=safe&contentRating%5B%5D=suggestive\
+             &includedTags%5B%5D=a%20b%26c&order%5BfollowedCount%5D=desc\
+             &hasAvailableChapters&limit=10"
+        );
+        assert_eq!(
+            browse_path("/manga?{filters}&{sort}&limit={limit}", 10, 1, &[]),
+            "/manga?limit=10"
+        );
+    }
+
+    const REPEATED_KEYS_MANIFEST: &str = r#"manifest_version = 2
+id = "repeated-keys"
+name = "Repeated keys"
+
+[http]
+base_url = "BASE_URL"
+
+[capabilities.search]
+path = "/manga?title={query}&limit={limit}&offset={offset}"
+items = "data"
+
+[capabilities.search.fields]
+id = "id"
+title = "title"
+
+[capabilities.browse]
+path = "/manga?title={query}&{filters}&{sort}&{demographic}&limit={limit}&offset={offset}"
+total = "total"
+
+[capabilities.browse.sort]
+default = "order[followedCount]=desc"
+options = [["order[followedCount]=desc", "Most followed"], ["order[year]=asc", "Oldest"]]
+
+[capabilities.browse.modes]
+any = { label = "Any of", repeat = true }
+
+[capabilities.browse.filters]
+rating      = { label = "Rating", clause = "contentRating[]={value}", modes = ["any"], options = [["safe", "Safe"], ["suggestive", "Suggestive"]] }
+year        = { label = "Year", clause = "year={value}", value = "integer" }
+demographic = { label = "Demographic", clause = "publicationDemographic[]={value}", modes = ["any"], options = [["seinen", "Seinen"], ["josei", "Josei"]] }
+author      = { label = "Author", clause = "author={value}", value = "text" }
+"#;
+
+    /// The filter separator joins clauses in one value; where each clause is
+    /// a parameter of its own it separates nothing, so a value may carry it.
+    #[test]
+    fn a_value_written_as_its_own_parameter_may_carry_the_separator() {
+        let browse = Manifest::parse(&REPEATED_KEYS_MANIFEST.replace("BASE_URL", "https://x.test"))
+            .unwrap()
+            .capabilities
+            .browse
+            .unwrap();
+        let written =
+            browse_parameters(&browse, &browse_request(&[("author", "Smith, J.")]), None).unwrap();
+        assert_eq!(
+            browse_path(browse.path.as_deref().unwrap(), 10, 1, &written),
+            "/manga?author=Smith%2C%20J.&order%5BfollowedCount%5D=desc&limit=10&offset=0"
+        );
+    }
+
+    /// Where the path writes parameters, a repeating mode sends the key once
+    /// per value — for the filters it names as well as for `{filters}` — and
+    /// the sort option is a parameter of its own.
+    #[tokio::test]
+    async fn a_listing_whose_path_writes_parameters_repeats_the_key_per_value() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/manga")
+            .match_query(Matcher::Exact(
+                "contentRating%5B%5D=safe&contentRating%5B%5D=suggestive&year=2016\
+                 &order%5Byear%5D=asc\
+                 &publicationDemographic%5B%5D=seinen&publicationDemographic%5B%5D=josei\
+                 &limit=5&offset=5"
+                    .into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"total": 7, "data": [{"id": "m1", "title": "One"}]}"#)
+            .create_async()
+            .await;
+
+        let mut request = many("rating", &["safe", "suggestive"], None);
+        request.filters.insert(
+            "demographic".into(),
+            FilterValue::Many(vec!["seinen".into(), "josei".into()]),
+        );
+        request
+            .filters
+            .insert("year".into(), FilterValue::One("2016".into()));
+        request.sort = Some("order[year]=asc".into());
+        request.page = Some(2);
+        request.limit = Some(5);
+        let page = source(REPEATED_KEYS_MANIFEST, &server.url(), &[])
+            .browse(&request)
+            .await
+            .unwrap();
+
+        assert_eq!(page.total, Some(7));
+        assert_eq!(page.results.len(), 1);
+        mock.assert_async().await;
     }
 
     #[tokio::test]
