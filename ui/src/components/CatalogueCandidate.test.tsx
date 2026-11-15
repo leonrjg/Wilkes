@@ -114,8 +114,8 @@ describe("CatalogueCandidate", () => {
   /// one run of text rather than a chip each, because a chip cannot be broken
   /// across lines and three of them took three lines in a pane this narrow.
   it("shows the kind, the subject and the licence", () => {
-    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
-    expect(screen.getByText("Textbook")).toBeTruthy();
+    render(<CatalogueCandidate provider="libretexts" work={{ ...HIT, kind: "course" }} />);
+    expect(screen.getByText("Course")).toBeTruthy();
     expect(screen.getByText(/CC-BY/)).toBeTruthy();
     // Under its provider's heading the row does not repeat whose it is, and an
     // open catalogue's licence says more than "open access" would.
@@ -208,6 +208,12 @@ describe("CatalogueCandidate", () => {
     expect(screen.queryByText(HIT.summary as string)).toBeNull();
   });
 
+  /// A textbook is what the pane mostly lists, so it is not badged as one.
+  it("shows no badge for a textbook", () => {
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
+    expect(screen.queryByText(/^textbook$/i)).toBeNull();
+  });
+
   /// A source that names no kind gets no badge: "Paper" over a provider's
   /// monographs and standards would be wrong for some of its rows.
   it("shows no kind for a result whose source named none", () => {
@@ -217,7 +223,7 @@ describe("CatalogueCandidate", () => {
         work={{ ...HIT, kind: null, year: 2021, citation_count: 3 }}
       />,
     );
-    expect(screen.queryByText("Textbook")).toBeNull();
+    expect(screen.queryByText("Course")).toBeNull();
     expect(screen.getByText(/^2021 · 3 citations · Open access/)).toBeTruthy();
   });
 

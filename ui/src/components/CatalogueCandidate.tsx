@@ -28,7 +28,6 @@ function formatBytes(bytes: number): string {
 /** What a learning catalogue calls the kind of thing a result is. A kind this
  *  build has no name for is shown as the source spelled it. */
 const KIND_LABELS: Record<string, string> = {
-  textbook: "Textbook",
   course: "Course",
   reference: "Reference",
   post: "Post",
@@ -226,8 +225,9 @@ export default function CatalogueCandidate({
               {/* Only where the source says what kind of thing it returned. A
                   bibliographic index names none, and a badge reading "Paper" over
                   its monographs, standards and theses would be wrong for some of
-                  its rows. */}
-              {work.kind !== null && (
+                  its rows. A textbook gets none either: it is what this pane
+                  mostly holds, so the badge only said what went without saying. */}
+              {work.kind !== null && work.kind !== "textbook" && (
                 <span className="mt-px shrink-0 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1 text-[9px] uppercase tracking-wider text-[var(--text-dim)]">
                   {KIND_LABELS[work.kind] ?? work.kind}
                 </span>
@@ -267,7 +267,6 @@ export default function CatalogueCandidate({
               <AddButton
                 title={title}
                 tooltip={added ? "Added to this library" : addTitle}
-                label="Add"
                 onAdd={() => void add(provider, work)}
                 disabled={!canAdd || adding || added}
                 adding={adding}
@@ -519,7 +518,6 @@ function OpenLink({ link, title }: { link: string; title: string }) {
 function AddButton({
   title,
   tooltip,
-  label,
   onAdd,
   disabled,
   adding,
@@ -527,7 +525,6 @@ function AddButton({
 }: {
   title: string;
   tooltip: string;
-  label: string;
   onAdd: () => void;
   disabled: boolean;
   adding: boolean;
@@ -540,7 +537,7 @@ function AddButton({
         onClick={onAdd}
         disabled={disabled}
         aria-label={`Add ${title} to library`}
-        className="flex h-[26px] items-center gap-1 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-2 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)] transition-colors hover:bg-[var(--bg-active)] disabled:opacity-50"
+        className="flex h-[26px] min-w-[26px] items-center justify-center gap-1 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1.5 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)] transition-colors hover:bg-[var(--bg-active)] disabled:opacity-50"
       >
         {added ? (
           <>
@@ -554,9 +551,7 @@ function AddButton({
             className="h-[11px] w-[11px] animate-spin rounded-full border border-current border-t-transparent"
           />
         ) : (
-          <>
-            <Download size={11} /> {label}
-          </>
+          <Download size={11} />
         )}
       </button>
     </Tooltip>
