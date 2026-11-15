@@ -464,6 +464,32 @@ function Note({ children }: { children: ReactNode }) {
   );
 }
 
+/** Why the last press added nothing: the provider answered the pages asked
+ *  for with works already shown, the one skipped past and the one after it.
+ *  Without it the press looks ignored, and the next one — which asks for the
+ *  page after — looks like the one that worked. */
+function RepeatedPage({
+  name,
+  page,
+  count,
+  more,
+}: {
+  name: string;
+  /** The last page asked for. */
+  page: number;
+  /** How many pages in a row, ending with `page`, repeated what was shown. */
+  count: number;
+  more: boolean;
+}) {
+  const pages = count === 1 ? `page ${page}` : `pages ${page - count + 1}–${page}`;
+  return (
+    <p role="status" className="pt-1 text-[10px] leading-snug text-[var(--text-muted)]">
+      {name} answered {pages} with works already shown, so nothing was added.
+      {more && ` Load more asks for page ${page + 1}.`}
+    </p>
+  );
+}
+
 /**
  * Which sources are asked, above what they answered.
  *
@@ -1467,6 +1493,9 @@ function ListingBody({ provider, name }: { provider: string; name: string }) {
             ))}
           </div>
         ))}
+      {answer !== null && answer.repeated > 0 && !loading && (
+        <RepeatedPage name={name} page={answer.page} count={answer.repeated} more={!answer.exhausted} />
+      )}
       {answer !== null && !answer.exhausted && (
         <button
           type="button"
@@ -1608,6 +1637,14 @@ function ProviderEntry({
         <p className="py-1 text-[10px] leading-snug text-red-400">
           {entry.name} could not read the next page: {moreError[entry.provider]}
         </p>
+      )}
+      {(answer.pages[entry.provider]?.repeated ?? 0) > 0 && !moreLoading.includes(entry.provider) && (
+        <RepeatedPage
+          name={entry.name}
+          page={answer.pages[entry.provider].page}
+          count={answer.pages[entry.provider].repeated}
+          more={!answer.pages[entry.provider].exhausted}
+        />
       )}
       {entry.results !== null &&
         entry.results.length > 0 &&
