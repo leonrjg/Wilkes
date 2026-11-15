@@ -43,7 +43,8 @@ const FIRST_REFRESH_INBOX: usize = 10;
 const AUTO_IMPORT_CAP: usize = 20;
 /// A listing is read this many results to a page...
 const LISTING_PAGE_SIZE: usize = 50;
-/// ...for at most this many pages, until a page holds an item already seen.
+/// ...for at most this many pages: newest first, until a page holds an item
+/// already seen; in any other order, until its last page.
 const LISTING_MAX_PAGES: usize = 5;
 /// The least time between the end of one request and the start of the next.
 const REQUEST_SPACING: Duration = Duration::from_secs(1);
@@ -299,7 +300,8 @@ struct Listed {
 enum Listing {
     Items {
         items: Vec<Listed>,
-        /// Set when the listing could not reach an item already seen.
+        /// Set when the listing was not read as far as it needed: to an item
+        /// already seen, newest first; to its last page, in any other order.
         missed: bool,
     },
     Failed {
@@ -380,7 +382,9 @@ impl AppContext {
                 .find(|known| known.provider == provider)
                 .ok_or_else(|| anyhow::anyhow!("no literature provider named {provider}"))?;
                 let name = info.name.clone();
-                request.sort = newest_first(&info)?;
+                if let Some(newest) = newest_sort(&info)? {
+                    request.sort = Some(newest);
+                }
                 request.page = None;
                 request.limit = None;
                 let title = request
@@ -698,12 +702,13 @@ impl AppContext {
     }
 }
 
-/// The sort a followed listing is read in: the provider's newest-first, so
-/// what is new comes first and a refresh can stop at what it has seen. A
-/// listing with no sort at all — a page of links read through a custom
-/// manifest — is read in its own order. A provider that sorts but cannot
-/// sort newest first cannot be followed.
-fn newest_first(
+/// The provider's newest-first sort, when it has one. A followed listing is
+/// read in it, so what is new comes first and a refresh can stop at what it
+/// has seen; a listing in any other order — or a provider with no sort, such
+/// as a page of links — is kept in the order it was followed in and read
+/// whole at every refresh, what is new being whatever it had not listed
+/// before.
+fn newest_sort(
     info: &crate::commands::integrations::literature::LiteratureProviderInfo,
 ) -> anyhow::Result<Option<String>> {
     let Some(browse) = info.capabilities.browse.as_ref() else {
@@ -712,19 +717,12 @@ fn newest_first(
             info.name
         );
     };
-    let Some(sort) = browse.sort.as_ref() else {
-        return Ok(None);
-    };
-    sort.equivalent_to
-        .iter()
-        .find(|(_, canonical)| canonical.as_str() == "newest")
-        .map(|(value, _)| Some(value.clone()))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} cannot list its works newest first, so a refresh could not tell what is new",
-                info.name
-            )
-        })
+    Ok(browse.sort.as_ref().and_then(|sort| {
+        sort.equivalent_to
+            .iter()
+            .find(|(_, canonical)| canonical.as_str() == "newest")
+            .map(|(value, _)| value.clone())
+    }))
 }
 
 /// The DOIs an item is known by: its own, and its arXiv id's.
@@ -1120,8 +1118,41 @@ impl AppContext {
         cancel: &CancellationToken,
     ) -> Result<Listing, Cancelled> {
         let settings = self.get_settings().await;
-        let pages = if first_refresh { 1 } else { LISTING_MAX_PAGES };
+        let info = crate::commands::integrations::literature::providers(
+            &settings.integrations,
+            Some(&self.catalogue_dir),
+        )
+        .into_iter()
+        .find(|known| known.provider == provider);
+        let Some(info) = info else {
+            return Ok(Listing::Failed {
+                message: format!("no literature provider named {provider}"),
+                retry_after: None,
+            });
+        };
+        let (newest, paged) = match newest_sort(&info) {
+            Ok(newest) => (
+                newest,
+                info.capabilities.browse.as_ref().is_some_and(|b| b.paged),
+            ),
+            Err(error) => {
+                return Ok(Listing::Failed {
+                    message: error.to_string(),
+                    retry_after: None,
+                })
+            }
+        };
+        // Newest first, a refresh stops at the first page holding an item it
+        // has seen, and a first refresh reads one page: what came before it is
+        // not news. In any other order a new item can be on any page, so every
+        // refresh reads to the last.
+        let newest_first = newest.is_some() && newest == request.sort;
+        let pages = match (paged, newest_first && first_refresh) {
+            (false, _) | (true, true) => 1,
+            (true, false) => LISTING_MAX_PAGES,
+        };
         let mut items = Vec::new();
+        let mut listed = HashSet::new();
         for page in 1..=pages {
             let mut request = request.clone();
             request.page = Some(page);
@@ -1157,12 +1188,17 @@ impl AppContext {
             let results = answer.results.unwrap_or_default();
             let count = results.len();
             let mut reached_known = false;
+            let mut grew = false;
             for work in results {
                 let item = listed_work(provider, work);
                 reached_known |= known.contains(&item.link_key);
+                grew |= listed.insert(item.link_key.clone());
                 items.push(item);
             }
-            if reached_known || count < LISTING_PAGE_SIZE {
+            // A page that lists nothing the earlier ones did not is a service
+            // repeating itself, not a listing going on.
+            let last = !paged || count < LISTING_PAGE_SIZE || !grew;
+            if last || (newest_first && reached_known) {
                 return Ok(Listing::Items {
                     items,
                     missed: false,
@@ -1171,7 +1207,7 @@ impl AppContext {
         }
         Ok(Listing::Items {
             items,
-            missed: !first_refresh,
+            missed: pages > 1,
         })
     }
 
@@ -2400,6 +2436,148 @@ mod tests {
             .await
             .is_err());
         ctx.shutdown().await;
+    }
+
+    /// A provider listing works in no newest-first order — a page of links,
+    /// a listing sorted by relevance — can be followed: every refresh reads
+    /// it to its last page, so a work that appears on any page is new, and an
+    /// unpaged one is read in one request, whole.
+    #[tokio::test]
+    async fn a_listing_in_no_newest_order_is_read_whole_and_finds_what_appears_anywhere() {
+        let library = tempfile::tempdir().unwrap();
+        let server = serve().await;
+        let (_dir, ctx) = context(library.path()).await;
+        let manifest = |id: &str, path: &str| {
+            format!(
+                "manifest_version = 2\nid = \"{id}\"\nname = \"{id}\"\n[http]\nbase_url = \"{}\"\n\
+                 [capabilities.search]\npath = \"/search?q={{query}}\"\nitems = \"data\"\n\
+                 [capabilities.search.fields]\nid = \"id\"\ntitle = \"title\"\n\
+                 [capabilities.browse]\npath = \"{path}\"\n\
+                 [capabilities.browse.sort]\ndefault = \"title\"\noptions = [[\"title\", \"Title\"]]\n",
+                server.url("")
+            )
+        };
+        ctx.update_settings(serde_json::json!({ "integrations": { "custom": [
+            {"id": "paged", "enabled": true, "manifest": manifest("paged", "/list/{page}?limit={limit}&order={sort}"), "secrets": {}},
+            {"id": "links", "enabled": true, "manifest": manifest("links", "/links?order={sort}"), "secrets": {}},
+        ]}}))
+        .await
+        .unwrap();
+        let providers = crate::commands::integrations::literature::providers(
+            &ctx.get_settings().await.integrations,
+            Some(&ctx.catalogue_dir),
+        );
+        let id = |name: &str| {
+            providers
+                .iter()
+                .find(|info| info.name == name)
+                .unwrap()
+                .provider
+                .clone()
+        };
+        let page = |range: std::ops::Range<usize>, extra: &[&str]| {
+            let mut data: Vec<_> = range
+                .map(|i| serde_json::json!({"id": format!("w{i}"), "title": format!("Work {i}")}))
+                .collect();
+            data.extend(
+                extra
+                    .iter()
+                    .map(|id| serde_json::json!({"id": id, "title": id})),
+            );
+            Reply::Ok(
+                "application/json",
+                serde_json::json!({ "data": data }).to_string().into_bytes(),
+            )
+        };
+        let requests = |path: &str| {
+            server
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(asked, _, _)| asked.starts_with(path))
+                .count()
+        };
+        // Adding a feed refreshes it: wait for that refresh to be done.
+        let first_refresh = |id: String| {
+            let ctx = Arc::clone(&ctx);
+            async move {
+                let started = Instant::now();
+                while reload(&ctx, &id).last_success_at_ms.is_none() {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(20),
+                        "no refresh came"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+        let cancel = CancellationToken::new();
+
+        server.set("/list/1", page(0..50, &[]));
+        server.set("/list/2", page(50..60, &[]));
+        let feed = ctx
+            .feed_add(NewFeed {
+                source: FeedSource::Listing {
+                    provider: id("paged"),
+                    request: BrowseRequest {
+                        sort: Some("title".into()),
+                        ..BrowseRequest::default()
+                    },
+                },
+                name: None,
+                root: library.path().to_path_buf(),
+                folder: None,
+                auto_import: false,
+            })
+            .await
+            .unwrap();
+        first_refresh(feed.id.clone()).await;
+        assert_eq!(items(&ctx, FeedItemStatus::Inbox).len(), 10);
+        assert_eq!(items(&ctx, FeedItemStatus::Seen).len(), 50);
+        assert_eq!(requests("/list/"), 2);
+
+        // Listed by title, the new work sorts onto the second page.
+        server.set("/list/2", page(50..60, &["awaited"]));
+        ctx.refresh_feed(&reload(&ctx, &feed.id), &cancel)
+            .await
+            .unwrap();
+        let inbox = items(&ctx, FeedItemStatus::Inbox);
+        assert_eq!(inbox.len(), 11);
+        assert!(inbox.iter().any(|item| item.link_key.ends_with("/awaited")));
+        assert!(!reload(&ctx, &feed.id).may_have_missed);
+        assert_eq!(requests("/list/"), 4);
+
+        server.set("/links", page(0..70, &[]));
+        let links = ctx
+            .feed_add(NewFeed {
+                source: FeedSource::Listing {
+                    provider: id("links"),
+                    request: BrowseRequest::default(),
+                },
+                name: None,
+                root: library.path().to_path_buf(),
+                folder: None,
+                auto_import: false,
+            })
+            .await
+            .unwrap();
+        first_refresh(links.id.clone()).await;
+        server.set("/links", page(0..70, &["posted"]));
+        ctx.refresh_feed(&reload(&ctx, &links.id), &cancel)
+            .await
+            .unwrap();
+        assert!(items(&ctx, FeedItemStatus::Inbox)
+            .iter()
+            .any(|item| item.feed_id == links.id && item.link_key.ends_with("/posted")));
+        assert_eq!(
+            items(&ctx, FeedItemStatus::Seen)
+                .iter()
+                .filter(|item| item.feed_id == links.id)
+                .count(),
+            60
+        );
+        assert_eq!(requests("/links"), 2);
     }
 
     #[test]

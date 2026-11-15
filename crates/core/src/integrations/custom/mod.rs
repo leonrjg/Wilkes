@@ -782,6 +782,10 @@ impl CustomSource {
             .ok_or_else(|| anyhow::anyhow!("{name} cannot search"))?;
         let limit = request.limit.unwrap_or(10).clamp(1, MAX_LIMIT);
         let page = request.page.unwrap_or(1).max(1);
+        anyhow::ensure!(
+            page == 1 || browse.paged(),
+            "{name} listing has one page: its request names neither {{page}} nor {{offset}}"
+        );
         let query = request
             .query
             .as_deref()
@@ -805,8 +809,11 @@ impl CustomSource {
                 self.output(run, &values, Unset::LeftOff).await?
             }
         };
+        // As for search: an unpaged response is the only chance to read its
+        // records, so none is cut at the limit.
+        let record_limit = browse.paged().then_some(limit);
         let projection =
-            self.project_response(search, &body, query.unwrap_or(""), limit, Some(limit))?;
+            self.project_response(search, &body, query.unwrap_or(""), limit, record_limit)?;
         self.warn_unmapped(&projection);
         let total = match &browse.total {
             Some(expression) => self.total_in(expression, &body)?,
@@ -2852,6 +2859,55 @@ path = "/works?page={page}&limit={limit}"
         );
         search_mock.assert_async().await;
         browse_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn an_unpaged_listing_is_read_whole_and_has_no_second_page() {
+        let manifest = r#"manifest_version = 2
+id = "links"
+name = "Links"
+[http]
+base_url = "BASE_URL"
+[capabilities.search]
+path = "/search?q={query}"
+items = "data"
+[capabilities.search.fields]
+id = "id"
+title = "title"
+[capabilities.browse]
+path = "/all"
+"#;
+        let records: Vec<_> = (0..15)
+            .map(|index| serde_json::json!({"id": index.to_string(), "title": format!("T{index}")}))
+            .collect();
+        let mut server = mockito::Server::new_async().await;
+        let listing = server
+            .mock("GET", "/all")
+            .with_body(serde_json::json!({ "data": records }).to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let remote = source(manifest, &server.url(), &[]);
+        assert!(!remote.capabilities().browse.unwrap().paged);
+        let first = remote
+            .browse(&BrowseRequest {
+                limit: Some(10),
+                ..BrowseRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.results.len(), 15);
+        let second = remote
+            .browse(&BrowseRequest {
+                limit: Some(10),
+                page: Some(2),
+                ..BrowseRequest::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(second.contains("has one page"), "{second}");
+        listing.assert_async().await;
     }
 
     #[test]

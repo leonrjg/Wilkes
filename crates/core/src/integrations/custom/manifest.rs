@@ -751,6 +751,9 @@ pub struct BrowseControls {
     pub keyword_required: bool,
     /// Whether a listing says how many records match in all.
     pub total: bool,
+    /// Whether a listing can be read past its first page. One that cannot
+    /// answers its first page with every record it has.
+    pub paged: bool,
     pub sort: Option<SortControl>,
     /// The combination modes, in the order they are offered.
     pub modes: Vec<ControlOption>,
@@ -799,6 +802,7 @@ impl BrowseCapability {
             keyword: self.names("query"),
             keyword_required: self.query_required,
             total: self.total.is_some(),
+            paged: self.paged(),
             sort: self.sort.as_ref().map(|sort| SortControl {
                 equivalent_to: sort.equivalent_to.clone(),
                 default: sort.default.clone(),
@@ -834,6 +838,11 @@ impl BrowseCapability {
     /// Whether the request says where `placeholder` is written.
     pub fn names(&self, placeholder: &str) -> bool {
         self.request().names(placeholder)
+    }
+
+    /// Whether the listing can be read past its first page.
+    pub fn paged(&self) -> bool {
+        self.names("page") || self.names("offset")
     }
 
     pub fn request(&self) -> RequestRef<'_> {

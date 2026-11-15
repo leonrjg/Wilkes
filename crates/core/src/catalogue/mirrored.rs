@@ -135,6 +135,7 @@ impl MirroredSource {
             keyword: true,
             keyword_required: false,
             total: true,
+            paged: true,
             sort: Some(SortControl {
                 equivalent_to: [(BY_RELEVANCE.to_string(), "most_relevant".to_string())]
                     .into_iter()

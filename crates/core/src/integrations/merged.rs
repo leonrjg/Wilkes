@@ -44,6 +44,7 @@ pub fn merge(declared: &[(&str, &str, &BrowseControls)]) -> MergedControls {
             keyword_required: !declared.is_empty()
                 && declared.iter().all(|(_, _, c)| c.keyword_required),
             total: false,
+            paged: false,
             sort: None,
             modes: Vec::new(),
             filters: Vec::new(),
@@ -75,6 +76,7 @@ pub fn merge(declared: &[(&str, &str, &BrowseControls)]) -> MergedControls {
         };
         merged.controls.keyword |= controls.keyword;
         merged.controls.total |= controls.total;
+        merged.controls.paged |= controls.paged;
         for mode in &controls.modes {
             if !merged.controls.modes.iter().any(|m| m.value == mode.value) {
                 merged.controls.modes.push(mode.clone());
@@ -318,6 +320,7 @@ mod tests {
             keyword: false,
             keyword_required: false,
             total: false,
+            paged: true,
             sort: None,
             modes: Vec::new(),
             filters,

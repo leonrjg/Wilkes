@@ -1197,6 +1197,9 @@ export interface BrowseControls {
   keyword_required: boolean;
   /** Whether a listing says how many records match in all. */
   total: boolean;
+  /** Whether a listing can be read past its first page. One that cannot
+   *  answers its first page with every record it has. */
+  paged: boolean;
   sort: {
     equivalent_to?: Record<string, string>;
     default: string;

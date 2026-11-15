@@ -176,12 +176,11 @@ export interface BrowseAnswer {
   results: LiteratureSearchResult[];
   /** The last page fetched, 1-based. */
   page: number;
-  /** The last page was short, so there is no next one. */
+  /** The last page was short, or the listing has no pages past its first,
+   *  so there is no next one. */
   exhausted: boolean;
   /** How many works match in all, when the provider says. */
   total: number | null;
-  /** The request this answer belongs to, so the next page asks the same one. */
-  request: BrowseRequest;
 }
 
 /** What one provider is being filtered and sorted by.
@@ -201,10 +200,13 @@ export interface Refinement {
   sort: string | null;
 }
 
-/** A provider's listing: what it returned so far, whether a page is on its
- *  way, and why the last request failed. A failed *next page* leaves the pages
- *  already read where they are. */
+/** A provider's listing: what was asked, what it returned so far, whether a
+ *  page is on its way, and why the last request failed. A failed *next page*
+ *  leaves the pages already read where they are. The request is held from the
+ *  moment it is asked, so the next page asks the same one and the listing can
+ *  be followed before anything has come back. */
 export interface Listing {
+  request: BrowseRequest | null;
   answer: BrowseAnswer | null;
   loading: boolean;
   error: string | null;
@@ -664,7 +666,7 @@ export function browseProviderIds(options: LiteratureProviderInfo[]): string[] {
 }
 
 export const NO_REFINEMENT: Refinement = { filters: {}, modes: {}, labels: {}, sort: null };
-const IDLE_LISTING: Listing = { answer: null, loading: false, error: null };
+const IDLE_LISTING: Listing = { request: null, answer: null, loading: false, error: null };
 
 /** How many refinements one provider has set: its filters, plus a chosen
  *  sort. A filter with several values is one. */
@@ -753,7 +755,9 @@ async function runBrowse(
   held: BrowseAnswer | null,
 ): Promise<void> {
   const token = (requests.browse[provider] = (requests.browse[provider] ?? 0) + 1);
-  patchListing(set, provider, { loading: true, error: null });
+  const paged =
+    providerOptions().find((option) => option.provider === provider)?.capabilities.browse?.paged === true;
+  patchListing(set, provider, { request, loading: true, error: null });
   try {
     const answer = await api.literatureBrowse(provider, request);
     if (token !== requests.browse[provider]) return;
@@ -774,9 +778,9 @@ async function runBrowse(
         name,
         results: [...(held?.results ?? []), ...unseen(held?.results ?? [], answer.results)],
         page: request.page ?? 1,
-        exhausted: answer.results.length < (request.limit ?? BROWSE_LIMIT),
+        // An unpaged listing answers with every record it has, however many.
+        exhausted: !paged || answer.results.length < (request.limit ?? BROWSE_LIMIT),
         total: answer.total ?? null,
-        request,
       },
     });
   } catch (e: any) {
@@ -1041,14 +1045,15 @@ export function createCatalogueSearch(providers: Selection<string>): CatalogueSe
     },
 
     browseMore: async (provider) => {
-      const held = get().listings[provider]?.answer ?? null;
-      if (held === null || held.exhausted) return;
+      const listing = get().listings[provider];
+      const held = listing?.answer ?? null;
+      if (held === null || held.exhausted || listing.request === null) return;
       await runBrowse(
         set,
         requests,
         held.provider,
         held.name,
-        { ...held.request, page: held.page + 1 },
+        { ...listing.request, page: held.page + 1 },
         held,
       );
     },

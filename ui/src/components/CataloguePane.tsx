@@ -1426,6 +1426,7 @@ function ListingBody({ provider, name }: { provider: string; name: string }) {
   const { readOnly } = useCatalogueAdd();
   const listing = useCatalogueSearch((s) => s.listings[provider]);
   const more = useCatalogueSearch((s) => s.browseMore);
+  const request = listing?.request ?? null;
   const answer = listing?.answer ?? null;
   const loading = listing?.loading ?? false;
   const error = listing?.error ?? null;
@@ -1444,9 +1445,9 @@ function ListingBody({ provider, name }: { provider: string; name: string }) {
                 : ""
             }`}
         </span>
-        {answer !== null && !readOnly && (
-          <FollowButton provider={provider} name={name} request={answer.request} />
-        )}
+        {/* Followable as soon as it is asked: a listing waited on for
+            something not yet published has nothing to show. */}
+        {request !== null && !readOnly && <FollowButton provider={provider} name={name} request={request} />}
       </h4>
       {answer === null && loading && <Spinner />}
       {error !== null && !loading && (
@@ -1586,7 +1587,7 @@ function ProviderEntry({
               .join(" · ")}
           </span>
         )}
-        {followable && !readOnly && entry.error === null && (
+        {followable && !readOnly && (
           <FollowButton provider={entry.provider} name={entry.name} request={{ query: answer.query }} />
         )}
       </h4>
