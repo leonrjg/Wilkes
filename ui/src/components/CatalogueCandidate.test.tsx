@@ -120,6 +120,120 @@ describe("CatalogueCandidate", () => {
     expect(screen.getByText(HIT.summary as string)).toBeTruthy();
   });
 
+  it("shows everything the provider said about a work when its title is clicked", () => {
+    const work: LiteratureSearchResult = {
+      ...HIT,
+      doi: "10.1000/xyz",
+      image_url: "https://example.invalid/cover.jpg",
+      publication_date: "2019-04-02",
+      venue: "Some Journal",
+      publisher: "Some Press",
+      citation_count: 1234,
+      language: "en",
+      file_format: "PDF",
+      file_size: "3 MB",
+      summary: "First paragraph.\n\nSecond paragraph, which the row clamps away.",
+    };
+    render(<CatalogueCandidate provider="libretexts" work={work} />);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: `Details for ${HIT.title}` }));
+    const dialog = screen.getByRole("dialog", { name: HIT.title as string });
+    const fact = (label: string) => within(dialog).getByText(label).nextElementSibling?.textContent;
+    expect(within(dialog).getByRole("img", { name: `Image for ${HIT.title}` }).getAttribute("src")).toBe(
+      "https://example.invalid/cover.jpg",
+    );
+    expect(fact("Authors")).toBe("Someone");
+    expect(fact("Published")).toBe("2019-04-02");
+    expect(fact("Venue")).toBe("Some Journal");
+    expect(fact("Publisher")).toBe("Some Press");
+    expect(fact("Citations")).toBe((1234).toLocaleString());
+    expect(fact("Subject")).toBe("Mathematics");
+    expect(fact("Kind")).toBe("textbook");
+    expect(fact("Language")).toBe("en");
+    expect(fact("Pages")).toBe("412");
+    expect(fact("Format")).toBe("PDF");
+    expect(fact("File size")).toBe("3 MB");
+    expect(fact("Licence")).toBe("CC-BY");
+    expect(fact("Access")).toBe("Open access");
+    expect(fact("DOI")).toBe("https://doi.org/10.1000/xyz");
+    expect(fact("Page")).toBe("https://example.invalid/book");
+    expect(fact("File")).toBe("https://example.invalid/book.pdf");
+    expect(fact("Identifier")).toBe("42");
+    // The summary whole, not clamped.
+    expect(
+      within(dialog).getByText(work.summary as string, { normalizer: (text) => text }).className,
+    ).not.toContain("line-clamp");
+    // What can be done from the row can be done here.
+    expect(within(dialog).getByRole("button", { name: `Save ${HIT.title}` })).toBeTruthy();
+    expect(within(dialog).getByRole("button", { name: `Add ${HIT.title} to library` })).toBeTruthy();
+    // Focus starts on Close, so Escape and Enter work at once.
+    expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Close details" }));
+  });
+
+  it("leaves out what the provider did not report", () => {
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
+    fireEvent.click(screen.getByRole("button", { name: `Details for ${HIT.title}` }));
+    const dialog = screen.getByRole("dialog");
+    for (const label of ["Venue", "Citations", "Language", "DOI", "Published"]) {
+      expect(within(dialog).queryByText(label)).toBeNull();
+    }
+    expect(within(dialog).queryByRole("img")).toBeNull();
+  });
+
+  it("closes on Escape, on Close, and on a press outside it", () => {
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
+    const open = () => fireEvent.click(screen.getByRole("button", { name: `Details for ${HIT.title}` }));
+
+    open();
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    open();
+    fireEvent.click(screen.getByRole("button", { name: "Close details" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    open();
+    // A press inside it is not a press outside it.
+    fireEvent.mouseDown(screen.getByRole("dialog"));
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    fireEvent.mouseDown(screen.getByRole("dialog").parentElement as HTMLElement);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  /// The dialog is a portal: outside the row in the page, inside it in React.
+  /// What is pressed in it must not reach what the row sits in — a search
+  /// result's own handlers, for the strip under one.
+  it("keeps what happens in the dialog from reaching what the row sits in", () => {
+    const clicked = vi.fn();
+    const keyed = vi.fn();
+    render(
+      <div onClick={clicked} onKeyDown={keyed}>
+        <CatalogueCandidate provider="libretexts" work={HIT} />
+      </div>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: `Details for ${HIT.title}` }));
+    clicked.mockClear();
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Authors"));
+    fireEvent.keyDown(dialog, { key: "ArrowDown" });
+    expect(clicked).not.toHaveBeenCalled();
+    expect(keyed).not.toHaveBeenCalled();
+  });
+
+  it("saves from the dialog as from the row", async () => {
+    (api.saveWork as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: "saved-1",
+      provider: "libretexts",
+      work: HIT,
+      saved_at_ms: 1,
+      acquired_path: null,
+    });
+    render(<CatalogueCandidate provider="libretexts" work={HIT} />);
+    fireEvent.click(screen.getByRole("button", { name: `Details for ${HIT.title}` }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: `Save ${HIT.title}` }));
+    await waitFor(() => expect(api.saveWork).toHaveBeenCalled());
+  });
+
   it("expands and collapses the full description independently for each result", () => {
     const description = "First paragraph.\n\n" + "A longer synopsis with more detail. ".repeat(30);
     render(<>
