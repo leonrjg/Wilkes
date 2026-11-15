@@ -825,7 +825,7 @@ export default function SettingsModal({
                       />
                       <span className="flex flex-col">
                         <span className="text-xs text-[var(--text-main)] group-hover:text-[var(--text-main)] transition-colors">Show line numbers in the editor</span>
-                        <span className="text-[10px] text-[var(--text-dim)] italic">The gutter beside documents opened for editing</span>
+                        <span className="text-[10px] text-[var(--text-dim)] italic">The gutter beside documents opened for editing. Markdown has none: it edits laid out as it reads</span>
                       </span>
                     </label>
                   </section>

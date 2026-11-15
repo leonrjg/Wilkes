@@ -6,7 +6,6 @@ import { mathSource } from "./mathSyntax";
 import {
   BulletWidget,
   CheckboxWidget,
-  CodeLabelWidget,
   ImageWidget,
   MathWidget,
   MermaidWidget,
@@ -183,6 +182,13 @@ function inside(node: SyntaxNode, name: string): boolean {
   return false;
 }
 
+/** Headings the reader sets apart with margins of their own; `h5` and `h6`
+ *  read as body text there. */
+const SPACED_HEADING = /^(?:ATX|Setext)Heading[1-4]$/;
+
+/** Constructs whose blank lines are content, not the space between blocks. */
+const VERBATIM_BLOCKS = new Set(["FencedCode", "CodeBlock", "BlockMath"]);
+
 /** Compute every decoration of the live preview from the syntax tree and the
  *  selection. Syntax shows as source wherever the selection is, line-wise for
  *  inline markup and construct-wise for blocks drawn as widgets. */
@@ -196,6 +202,12 @@ export function buildPreview(state: EditorState, host: PreviewHost): PreviewStat
   const lineActive = (from: number, to: number) => overlaps(selectedLines, from, to);
   const ranges: Range<Decoration>[] = [];
   const blocks: Span[] = [];
+  /** The headings the reader spaces: first line number to last (a setext
+   *  heading's underline is its last line). */
+  const spacedHeadings = new Map<number, number>();
+  /** Line numbers inside verbatim blocks. */
+  const verbatimLines = new Set<number>();
+  const isBlank = (number: number) => /^\s*$/.test(doc.line(number).text);
 
   const slice = (node: { from: number; to: number }) => state.sliceDoc(node.from, node.to);
   const spaceAfter = (position: number) => (doc.sliceString(position, position + 1) === " " ? position + 1 : position);
@@ -240,6 +252,11 @@ export function buildPreview(state: EditorState, host: PreviewHost): PreviewStat
     enter: (ref) => {
       const node = ref.node;
       const name = ref.name;
+      if (SPACED_HEADING.test(name)) spacedHeadings.set(doc.lineAt(node.from).number, doc.lineAt(node.to).number);
+      if (VERBATIM_BLOCKS.has(name)) {
+        const last = doc.lineAt(node.to).number;
+        for (let number = doc.lineAt(node.from).number; number <= last; number++) verbatimLines.add(number);
+      }
       const heading = /^ATXHeading(\d)$/.exec(name);
       if (heading) {
         lineClass(node.from, node.from, `cm-md-heading cm-md-h${heading[1]}`);
@@ -256,7 +273,10 @@ export function buildPreview(state: EditorState, host: PreviewHost): PreviewStat
         const underline = node.getChild("HeaderMark");
         const textEnd = underline ? Math.max(node.from, doc.lineAt(underline.from).from - 1) : node.to;
         lineClass(node.from, textEnd, `cm-md-heading cm-md-h${setext[1]}`);
-        if (underline && !lineActive(node.from, node.to)) hide(underline.from, underline.to);
+        if (underline && !lineActive(node.from, node.to)) {
+          hide(underline.from, underline.to);
+          lineClass(underline.from, underline.from, "cm-md-gap");
+        }
         return;
       }
       switch (name) {
@@ -311,6 +331,15 @@ export function buildPreview(state: EditorState, host: PreviewHost): PreviewStat
           }
           return false;
         }
+        case "ListItem": {
+          // The reader parts tight list items by a little; a loose list's
+          // blank lines already part them.
+          const line = doc.lineAt(node.from).number;
+          if (node.prevSibling?.name === "ListItem" && line > 1 && !isBlank(line - 1)) {
+            lineClass(node.from, node.from, "cm-md-item-next");
+          }
+          return;
+        }
         case "Blockquote":
           lineClass(node.from, node.to, "cm-md-quote");
           return;
@@ -355,13 +384,21 @@ export function buildPreview(state: EditorState, host: PreviewHost): PreviewStat
           lineClass(node.from, node.from, "cm-md-codeblock-first");
           lineClass(node.to, node.to, "cm-md-codeblock-last");
           if (!active) {
-            replaceWith(node.from, openLine.to, new CodeLabelWidget(language));
-            if (close && closeLine && closeLine.number > openLine.number) hide(close.from, closeLine.to);
+            // Off the cursor the fences leave only the block's padding, as
+            // the reader draws it.
+            hide(node.from, openLine.to);
+            lineClass(node.from, node.from, "cm-md-fence");
+            if (close && closeLine && closeLine.number > openLine.number) {
+              hide(close.from, closeLine.to);
+              lineClass(close.from, close.from, "cm-md-fence");
+            }
           }
           return false;
         }
         case "CodeBlock":
           lineClass(node.from, node.to, "cm-md-codeblock");
+          lineClass(node.from, node.from, "cm-md-codeblock-first");
+          lineClass(node.to, node.to, "cm-md-codeblock-last");
           return false;
         case "Table": {
           const span = lineSpan(node);
@@ -400,5 +437,52 @@ export function buildPreview(state: EditorState, host: PreviewHost): PreviewStat
     },
   });
 
+  blockSpacing(state, isBlank, spacedHeadings, verbatimLines, ranges);
   return { decorations: Decoration.set(ranges, true), blocks };
+}
+
+/** The reader's vertical rhythm. A run of blank lines between two blocks is
+ *  the margin the reader puts between them, not a line of text: it shrinks to
+ *  that margin (taller before a heading, whose top margin is larger) and any
+ *  further blank lines in the run to nothing. A blank line holding the caret
+ *  keeps its full height, so there is a line to type on. A heading that
+ *  touches a neighbour without a blank line keeps its own margin on that side. */
+function blockSpacing(
+  state: EditorState,
+  isBlank: (number: number) => boolean,
+  spacedHeadings: ReadonlyMap<number, number>,
+  verbatimLines: ReadonlySet<number>,
+  ranges: Range<Decoration>[],
+) {
+  const { doc } = state;
+  const caretLines = new Set(
+    state.selection.ranges.filter((range) => range.empty).map((range) => doc.lineAt(range.head).number),
+  );
+  const gap = (number: number) => isBlank(number) && !verbatimLines.has(number);
+  const lineClass = (number: number, className: string) => {
+    ranges.push(Decoration.line({ class: className }).range(doc.line(number).from));
+  };
+
+  for (const [first, last] of spacedHeadings) {
+    if (first > 1 && !isBlank(first - 1)) lineClass(first, "cm-md-space-above");
+    if (last < doc.lines && !isBlank(last + 1)) lineClass(first, "cm-md-space-below");
+  }
+
+  let number = 1;
+  while (number <= doc.lines) {
+    if (!gap(number)) {
+      number++;
+      continue;
+    }
+    let end = number;
+    while (end < doc.lines && gap(end + 1)) end++;
+    // Before the first block and after the last there is no margin at all.
+    const between = number > 1 && end < doc.lines;
+    const size = spacedHeadings.has(end + 1) ? "cm-md-gap-heading" : "cm-md-gap-block";
+    for (let line = number; line <= end; line++) {
+      if (caretLines.has(line)) continue;
+      lineClass(line, between && line === number ? `cm-md-gap ${size}` : "cm-md-gap");
+    }
+    number = end + 1;
+  }
 }

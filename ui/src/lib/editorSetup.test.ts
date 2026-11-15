@@ -15,8 +15,8 @@ afterEach(() => {
   for (const view of views.splice(0)) view.destroy();
 });
 
-function mount(showLineNumbers: boolean) {
-  const setup = editorSetup(showLineNumbers);
+function mount(lineNumbers: boolean, prose = false) {
+  const setup = editorSetup({ lineNumbers, prose });
   const view = new EditorView({
     state: EditorState.create({ doc: "one\ntwo\nthree", extensions: setup.extension }),
     parent: document.body,
@@ -46,5 +46,14 @@ describe("editor setup", () => {
 
     undo(view);
     expect(view.state.doc.toString()).toBe("one\ntwo\nthree");
+  });
+
+  it("draws prose without gutters or an active-line band, whatever the line-number setting", () => {
+    const { setup, view } = mount(true, true);
+    expect(view.dom.querySelector(".cm-gutters")).toBeNull();
+    expect(view.dom.querySelector(".cm-activeLine")).toBeNull();
+
+    setup.setLineNumbers(view, true);
+    expect(view.dom.querySelector(".cm-lineNumbers")).toBeNull();
   });
 });

@@ -261,7 +261,7 @@ export default function DocumentEditor({
           },
         })
       : getLanguageExtension(language);
-    const setup = editorSetup(showLineNumbersRef.current);
+    const setup = editorSetup({ lineNumbers: showLineNumbersRef.current, prose: language === "markdown" });
     setupRef.current = setup;
     const extensions = [
       setup.extension,
@@ -427,8 +427,10 @@ export default function DocumentEditor({
       )}
       <div
         ref={containerRef}
+        // Markdown takes the page's own background from the live preview, as
+        // the rendered reader does, rather than the source editor's.
         className={`plain-text-editor min-h-0 flex-1 overflow-auto text-sm ${
-          isDark ? "plain-text-editor--dark" : ""
+          isDark && language !== "markdown" ? "plain-text-editor--dark" : ""
         }`}
       />
       {shown && (

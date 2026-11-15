@@ -297,23 +297,6 @@ export class RuleWidget extends WidgetType {
   }
 }
 
-export class CodeLabelWidget extends WidgetType {
-  constructor(readonly language: string) {
-    super();
-  }
-
-  eq(other: CodeLabelWidget) {
-    return other.language === this.language;
-  }
-
-  toDOM() {
-    const label = document.createElement("span");
-    label.className = "cm-md-code-label";
-    label.textContent = this.language;
-    return label;
-  }
-}
-
 type Mermaid = (typeof import("mermaid"))["default"];
 let mermaidModule: Promise<Mermaid> | null = null;
 let mermaidQueue: Promise<unknown> = Promise.resolve();
