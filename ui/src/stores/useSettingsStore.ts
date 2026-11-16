@@ -42,10 +42,18 @@ function projectColorScheme(colorScheme: ColorScheme): ColorScheme {
  *  the pages in its browser pane, its title bar, native dialogs -- shows the
  *  appearance the app does. "System" hands the window back to the OS. The
  *  choice and not the resolved scheme, or a window held at "dark" would keep
- *  the OS from ever telling "System" it had changed. */
-function projectWindowTheme(theme: Theme) {
+ *  the OS from ever telling "System" it had changed.
+ *
+ *  The window's background is the resolved `--bg-app`, read after the scheme
+ *  is on <html>. The title bar shows it, and the shell paints it only once,
+ *  before the page loads; from then on this is the only thing that repaints
+ *  it, so it must follow every change of scheme, System's included. */
+function projectWindowAppearance(theme: Theme) {
   const windowTheme = theme === "System" ? null : theme === "Dark" ? "dark" : "light";
-  api.setWindowTheme?.(windowTheme).catch((e) => console.error("Could not set the window's appearance:", e));
+  const background = getComputedStyle(window.document.documentElement).getPropertyValue("--bg-app").trim();
+  api
+    .setWindowAppearance?.(windowTheme, background)
+    .catch((e) => console.error("Could not set the window's appearance:", e));
 }
 
 /** Project the saved preference without keeping a second copy of it. */
@@ -137,8 +145,8 @@ export const useSettingsStore = create<SettingsStore>()(
         media.addEventListener("change", systemThemeListener);
       }
 
-      projectWindowTheme(theme);
       set({ colorScheme: projectColorScheme(resolveColorScheme(theme)) });
+      projectWindowAppearance(theme);
     };
 
     return {

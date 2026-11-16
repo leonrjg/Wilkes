@@ -158,8 +158,9 @@ export interface SearchApi {
   switchWorkspace(workspaceId: string): Promise<WorkspaceState>;
   deleteWorkspace(workspaceId: string): Promise<WorkspaceState>;
   /** Desktop-only: the native window's appearance, which every webview in it
-   *  follows; null follows the OS. */
-  setWindowTheme?(theme: "light" | "dark" | null): Promise<void>;
+   *  follows (null follows the OS), and the colour it paints where the page
+   *  does not reach -- its title bar -- as a `#rrggbb` hex. */
+  setWindowAppearance?(theme: "light" | "dark" | null, background: string): Promise<void>;
   /** Desktop-only docked browser: a native webview this window keeps over a
    *  page rectangle. Opens `url` in it, creating it at `bounds` if needed,
    *  in `background` until its first page is in. */

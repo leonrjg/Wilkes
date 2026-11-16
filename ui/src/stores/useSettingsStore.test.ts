@@ -8,7 +8,7 @@ vi.mock("../services", () => ({
     getSettings: vi.fn(),
     updateSettings: vi.fn(),
     listFiles: vi.fn(),
-    setWindowTheme: vi.fn(() => Promise.resolve()),
+    setWindowAppearance: vi.fn(() => Promise.resolve()),
   },
 }));
 
@@ -433,10 +433,42 @@ describe("useSettingsStore", () => {
 
   it("holds the native window to the chosen appearance, and hands System back to the OS", () => {
     useSettingsStore.getState().applySettingsPatch({ theme: "Dark" });
-    expect(api.setWindowTheme).toHaveBeenLastCalledWith("dark");
+    expect(api.setWindowAppearance).toHaveBeenLastCalledWith("dark", expect.any(String));
     useSettingsStore.getState().applySettingsPatch({ theme: "Light" });
-    expect(api.setWindowTheme).toHaveBeenLastCalledWith("light");
+    expect(api.setWindowAppearance).toHaveBeenLastCalledWith("light", expect.any(String));
     useSettingsStore.getState().applySettingsPatch({ theme: "System" });
-    expect(api.setWindowTheme).toHaveBeenLastCalledWith(null);
+    expect(api.setWindowAppearance).toHaveBeenLastCalledWith(null, expect.any(String));
+  });
+
+  it("repaints the window background (the title bar) when System follows the OS to another scheme", () => {
+    const palette = document.createElement("style");
+    palette.textContent = ":root { --bg-app: #ffffff; } .dark { --bg-app: #0a0a0a; }";
+    document.head.appendChild(palette);
+    let osDark = true;
+    let onOsChange: (() => void) | null = null;
+    const matchMedia = vi.mocked(window.matchMedia);
+    const original = matchMedia.getMockImplementation();
+    matchMedia.mockImplementation((query: string) => ({
+      matches: osDark,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn((_: string, listener: () => void) => { onOsChange = listener; }),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    try {
+      useSettingsStore.getState().applySettingsPatch({ theme: "System" });
+      expect(api.setWindowAppearance).toHaveBeenLastCalledWith(null, "#0a0a0a");
+
+      osDark = false;
+      onOsChange!();
+      expect(useSettingsStore.getState().colorScheme).toBe("light");
+      expect(api.setWindowAppearance).toHaveBeenLastCalledWith(null, "#ffffff");
+    } finally {
+      matchMedia.mockImplementation(original!);
+      palette.remove();
+    }
   });
 });

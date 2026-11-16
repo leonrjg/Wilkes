@@ -503,8 +503,10 @@ export class TauriSearchApi implements SearchApi {
     return invoke("reveal_path", { path });
   }
 
-  async setWindowTheme(theme: "light" | "dark" | null): Promise<void> {
-    return getCurrentWindow().setTheme(theme);
+  async setWindowAppearance(theme: "light" | "dark" | null, background: string): Promise<void> {
+    const window = getCurrentWindow();
+    await window.setTheme(theme);
+    await window.setBackgroundColor(background);
   }
 
   async browserPaneShow(url: string, bounds: PaneBounds, background: RgbColor): Promise<void> {

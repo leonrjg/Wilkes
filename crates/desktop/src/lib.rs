@@ -82,7 +82,8 @@ fn native_open_ready(window: tauri::WebviewWindow, app: AppHandle) -> Vec<Native
 /// Paint the main window in the saved appearance before the page has loaded.
 /// The webview is white until its first paint, which flashes in dark mode; the
 /// page's own `<style>` covers the span after that, and the settings store
-/// remains the only thing that decides the theme once the UI is running.
+/// remains the only thing that decides the theme once the UI is running -- it
+/// repaints this background (which the title bar shows) on every change.
 fn paint_window_background(app: &tauri::App, settings_path: &std::path::Path) {
     let Some(window) = app.get_webview_window("main") else {
         error!("window background: no main window to paint");
