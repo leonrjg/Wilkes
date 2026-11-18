@@ -344,12 +344,18 @@ pub async fn download_to_root(
         .await
         .map_err(|error| {
             tracing::warn!(url = %url, "download failed before any bytes: {error}");
-            format!("Download failed: {error}")
+            format!(
+                "Download failed: {}",
+                crate::network::request_error_message(&error)
+            )
         })?
         .error_for_status()
         .map_err(|error| {
             tracing::warn!(url = %url, "download refused by the server: {error}");
-            format!("Download failed: {error}")
+            format!(
+                "Download failed: {}",
+                crate::network::request_error_message(&error)
+            )
         })?;
     let total_bytes = response.content_length();
     if total_bytes.is_some_and(|length| length > max_download_bytes) {
@@ -439,7 +445,10 @@ pub async fn download_to_root(
                     received,
                     "download failed after {received} bytes: {error}"
                 );
-                return Err(format!("Failed to read download: {error}"));
+                return Err(format!(
+                    "Failed to read download: {}",
+                    crate::network::request_error_message(&error)
+                ));
             }
         };
         received += chunk.len() as u64;
@@ -1015,6 +1024,39 @@ mod tests {
             assert!(error.contains(expected), "{script}: {error}");
         }
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    /// What the server refused is reported; where the request went is not.
+    /// A download URL can carry an integration's secret, and the caller
+    /// already has the URL it asked for.
+    #[tokio::test]
+    async fn a_refused_download_does_not_repeat_its_url() {
+        let dir = tempdir().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/paper.pdf")
+            .match_query(mockito::Matcher::Any)
+            .with_status(404)
+            .create_async()
+            .await;
+        let url = format!("{}/paper.pdf?key=s3cret", server.url());
+
+        let error = download_to_root(
+            dir.path(),
+            DownloadParams {
+                url: url.clone(),
+                filename: None,
+            },
+            None,
+            crate::types::DEFAULT_MAX_DOWNLOAD_BYTES,
+        )
+        .await
+        .unwrap_err();
+        mock.assert_async().await;
+        assert!(error.contains("404"), "{error}");
+        assert!(!error.contains(&url), "{error}");
+        assert!(!error.contains("s3cret"), "{error}");
+        assert!(!error.contains(&server.url()), "{error}");
     }
 
     #[tokio::test]

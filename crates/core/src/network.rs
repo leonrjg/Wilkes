@@ -369,7 +369,7 @@ impl ProviderHttpClient {
 /// The actual URL is omitted here. Callers already carry a separately
 /// redacted URL, and a request URL may contain a custom integration's secret
 /// query parameter.
-fn request_error_message(error: &reqwest::Error) -> String {
+pub(crate) fn request_error_message(error: &reqwest::Error) -> String {
     error_chain_message(error, error.url().map(reqwest::Url::as_str))
 }
 
