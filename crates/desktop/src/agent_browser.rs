@@ -32,6 +32,15 @@ use crate::browser_pane::{
 /// How long a page has to load before the agent is told it did not.
 const PAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long a page shown in place of an expected file is given to forward
+/// itself, as a bot check does once it has passed the browser, and how many
+/// times in a row.
+const FORWARD_WAIT: Duration = Duration::from_secs(15);
+const FORWARDS: usize = 3;
+
+/// The type of the document the pane shows.
+const CONTENT_TYPE_SCRIPT: &str = r#"String(document.contentType ?? "")"#;
+
 const NEEDS_USER: &str = "The site answered with a page instead of the file, most likely a sign-in or a check. The agent browser now shows that page: ask the user to open Agent browser from the browser button's menu in Wilkes, deal with it there, and try again.";
 
 /// What the page says about itself, as `READ_SCRIPT` encodes it.
@@ -256,10 +265,52 @@ impl DesktopAgentBrowser {
         url: &Url,
         claim: &ClaimGuard<'_>,
     ) -> Result<(), String> {
-        match self.open(webview, url).await {
-            _ if claim.started() => Ok(()),
-            Ok(()) => save_shown_page(webview),
-            Err(error) => Err(error),
+        self.open(webview, url).await.or_else(|error| {
+            if claim.started() {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })?;
+        if claim.started() {
+            return Ok(());
+        }
+        self.wait_for_forwards(webview, claim).await;
+        if claim.started() {
+            return Ok(());
+        }
+        save_shown_page(webview)
+    }
+
+    /// Give a page shown where a file was asked for the time to move on.
+    ///
+    /// A bot check in front of a file -- Cloudflare's, at the ACM Digital
+    /// Library -- is a page of its own that loads, checks the browser, and
+    /// then forwards to the file. Saved as soon as it loads, it is the check
+    /// that is saved. So while the pane shows a web page, wait for the next
+    /// one, a few times at most; a page that stays -- a sign-in -- is saved
+    /// as it is and reported for the user to deal with.
+    async fn wait_for_forwards(&self, webview: &Webview, claim: &ClaimGuard<'_>) {
+        for _ in 0..FORWARDS {
+            let content_type =
+                match crate::browser_script::evaluate(webview, CONTENT_TYPE_SCRIPT).await {
+                    Ok(content_type) => content_type.to_ascii_lowercase(),
+                    Err(error) => {
+                        tracing::warn!("agent browser: could not tell what the page is: {error}");
+                        return;
+                    }
+                };
+            if !content_type.contains("html") {
+                return;
+            }
+            let forwarded = self.expect_load();
+            match tokio::time::timeout(FORWARD_WAIT, forwarded).await {
+                Ok(Ok(())) if claim.started() => return,
+                Ok(Ok(())) => {
+                    tracing::info!("agent browser: the page forwarded itself; looking again");
+                }
+                Ok(Err(_)) | Err(_) => return,
+            }
         }
     }
 }
