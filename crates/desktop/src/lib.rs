@@ -33,6 +33,8 @@ mod browser_find;
 mod browser_hover;
 mod browser_pane;
 mod browser_script;
+#[cfg(not(target_os = "macos"))]
+mod browser_status;
 #[cfg(target_os = "macos")]
 mod browser_webkit_download;
 mod chat;

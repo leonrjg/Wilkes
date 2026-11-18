@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -32,14 +32,34 @@ use crate::browser_pane::{
 /// How long a page has to load before the agent is told it did not.
 const PAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long a page shown in place of an expected file is given to forward
-/// itself, as a bot check does once it has passed the browser, and how many
-/// times in a row.
-const FORWARD_WAIT: Duration = Duration::from_secs(15);
-const FORWARDS: usize = 3;
+/// How long a page answered with a bot check's status is given to pass the
+/// browser and forward itself to what was asked for.
+const CHECK_WAIT: Duration = Duration::from_secs(10);
 
-/// The type of the document the pane shows.
-const CONTENT_TYPE_SCRIPT: &str = r#"String(document.contentType ?? "")"#;
+/// How often the pane is looked at again while a page loads or a check runs,
+/// besides whenever a page finishes loading.
+const LOOK_AGAIN: Duration = Duration::from_secs(2);
+
+/// The statuses a bot check answers with before the browser has passed it:
+/// Cloudflare's are 403 and 503. A page answered with one of these may yet
+/// forward itself; one answered with any other error will not.
+fn may_be_a_check(status: u16) -> bool {
+    matches!(status, 403 | 503)
+}
+
+fn refused(status: u16, waited: bool) -> String {
+    let waited = if waited {
+        format!(
+            " and did not move on within {} seconds",
+            CHECK_WAIT.as_secs()
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "The site answered HTTP {status}{waited}. If it asks for a sign-in or a check a person must pass, ask the user to open Agent browser from the browser button's menu in Wilkes, where the page is showing, deal with it there, and try again."
+    )
+}
 
 const NEEDS_USER: &str = "The site answered with a page instead of the file, most likely a sign-in or a check. The agent browser now shows that page: ask the user to open Agent browser from the browser button's menu in Wilkes, deal with it there, and try again.";
 
@@ -82,8 +102,56 @@ pub struct AgentState {
     abandoned: Mutex<HashSet<String>>,
     /// Told when the agent's pane finishes loading a page.
     loaded: Mutex<Option<oneshot::Sender<()>>>,
+    /// What the agent's pane is showing, as far as an operation needs to know.
+    page: Mutex<PageState>,
     /// One operation at a time.
     turn: tokio::sync::Mutex<()>,
+}
+
+/// The page in the agent's pane: the HTTP status its document was answered
+/// with, and whether it has finished loading. Reset when an operation opens
+/// an address, so a page from before cannot pass for the one asked for.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PageState {
+    /// None for a document that came with no HTTP status.
+    status: Option<u16>,
+    loaded: bool,
+}
+
+impl PageState {
+    /// What the operation should do about the page.
+    fn verdict(&self) -> Verdict {
+        match self.status {
+            _ if !self.loaded => Verdict::Loading,
+            Some(status) if !(200..300).contains(&status) => Verdict::Refused(status),
+            _ => Verdict::Content,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    Loading,
+    Content,
+    Refused(u16),
+}
+
+/// The agent's pane got the response to its document, with `status`: a new
+/// page, not loaded yet. Where the platform says so as the response arrives.
+pub(crate) fn response_arrived(app: &AppHandle, pane: &PaneId, status: Option<u16>) {
+    if pane.kind == crate::browser_pane::PaneKind::Agent {
+        *app.state::<AgentState>().page.lock().unwrap() = PageState {
+            status,
+            loaded: false,
+        };
+    }
+}
+
+/// The agent's pane's document was answered with `status`, said once it has
+/// loaded. Where the platform only says so then: WebView2.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn response_completed(app: &AppHandle, status: Option<u16>) {
+    app.state::<AgentState>().page.lock().unwrap().status = status;
 }
 
 /// A download starting in the agent's pane at `url`: whether it is an agent
@@ -97,7 +165,7 @@ pub(crate) fn claim(app: &AppHandle, url: &str) -> bool {
             claim.url = Some(url.to_string());
             // A navigation that became a download never finishes loading a
             // page: whoever waits for it is done waiting.
-            page_finished(app);
+            wake(app);
             true
         }
         Some(_) => {
@@ -136,8 +204,18 @@ pub(crate) fn finished(app: &AppHandle, url: &str, path: &Path, success: bool) -
     false
 }
 
-/// The agent's pane finished loading a page.
-pub(crate) fn page_finished(app: &AppHandle) {
+/// The agent's pane finished loading the page at `url`.
+pub(crate) fn page_finished(app: &AppHandle, url: &str) {
+    // The blank page the pane is made with is not a page anyone asked for:
+    // its load ending must not pass for the one an operation is waiting on.
+    if url != "about:blank" {
+        app.state::<AgentState>().page.lock().unwrap().loaded = true;
+    }
+    wake(app);
+}
+
+/// Tell whoever waits that the pane has something new to look at.
+fn wake(app: &AppHandle) {
     if let Some(loaded) = app.state::<AgentState>().loaded.lock().unwrap().take() {
         // Nothing is waiting if the operation went meanwhile.
         loaded.send(()).ok();
@@ -232,24 +310,77 @@ impl DesktopAgentBrowser {
         )
     }
 
-    /// Wait to be told the next page the pane loads has finished.
+    /// Wait to be told the pane has something new to look at.
     fn expect_load(&self) -> oneshot::Receiver<()> {
         let (loaded, waiting) = oneshot::channel();
         *self.state().loaded.lock().unwrap() = Some(loaded);
         waiting
     }
 
-    /// Open `url` in the pane and wait for it to load.
-    async fn open(&self, webview: &Webview, url: &Url) -> Result<(), String> {
+    /// The page in the pane, read on the main thread after every browser
+    /// event already queued there: a status the platform reports in a
+    /// handler of its own, after the one that says the page loaded, is in by
+    /// then.
+    async fn page(&self, webview: &Webview) -> Result<PageState, String> {
+        let (answer, answered) = oneshot::channel();
+        let app = self.app.clone();
+        webview
+            .with_webview(move |_| {
+                let page = app.state::<AgentState>().page.lock().unwrap().clone();
+                answer.send(page).ok();
+            })
+            .map_err(|e| e.to_string())?;
+        answered
+            .await
+            .map_err(|_| "The agent browser closed".to_string())
+    }
+
+    /// Open `url` in the pane and wait until it shows what was asked for: a
+    /// page loaded with a 2xx status. A page answered with a bot check's
+    /// status is given time to pass the browser and forward itself -- which
+    /// it does in the pane, hidden or not -- and any other error is the
+    /// site's answer. A download the opening started is also an end.
+    async fn open(
+        &self,
+        webview: &Webview,
+        url: &Url,
+        claim: Option<&ClaimGuard<'_>>,
+    ) -> Result<(), String> {
+        *self.state().page.lock().unwrap() = PageState::default();
         let loaded = self.expect_load();
         webview.navigate(url.clone()).map_err(|e| e.to_string())?;
-        match tokio::time::timeout(PAGE_TIMEOUT, loaded).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err("The agent browser closed before the page loaded".to_string()),
-            Err(_) => Err(format!(
-                "The page did not finish loading within {} seconds",
-                PAGE_TIMEOUT.as_secs()
-            )),
+        let load_deadline = Instant::now() + PAGE_TIMEOUT;
+        let mut check_deadline: Option<Instant> = None;
+        let mut next = loaded;
+        loop {
+            let _ = tokio::time::timeout(LOOK_AGAIN, next).await;
+            if claim.is_some_and(ClaimGuard::started) {
+                return Ok(());
+            }
+            let now = Instant::now();
+            match self.page(webview).await?.verdict() {
+                Verdict::Content => return Ok(()),
+                Verdict::Refused(status) if !may_be_a_check(status) => {
+                    return Err(refused(status, false));
+                }
+                Verdict::Refused(status) => {
+                    let deadline = *check_deadline.get_or_insert_with(|| {
+                        tracing::info!(status, "agent browser: waiting for a check to pass");
+                        now + CHECK_WAIT
+                    });
+                    if now >= deadline {
+                        return Err(refused(status, true));
+                    }
+                }
+                Verdict::Loading if now >= load_deadline && check_deadline.is_none() => {
+                    return Err(format!(
+                        "The page did not finish loading within {} seconds",
+                        PAGE_TIMEOUT.as_secs()
+                    ));
+                }
+                Verdict::Loading => {}
+            }
+            next = self.expect_load();
         }
     }
 
@@ -265,53 +396,11 @@ impl DesktopAgentBrowser {
         url: &Url,
         claim: &ClaimGuard<'_>,
     ) -> Result<(), String> {
-        self.open(webview, url).await.or_else(|error| {
-            if claim.started() {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        })?;
-        if claim.started() {
-            return Ok(());
-        }
-        self.wait_for_forwards(webview, claim).await;
+        self.open(webview, url, Some(claim)).await?;
         if claim.started() {
             return Ok(());
         }
         save_shown_page(webview)
-    }
-
-    /// Give a page shown where a file was asked for the time to move on.
-    ///
-    /// A bot check in front of a file -- Cloudflare's, at the ACM Digital
-    /// Library -- is a page of its own that loads, checks the browser, and
-    /// then forwards to the file. Saved as soon as it loads, it is the check
-    /// that is saved. So while the pane shows a web page, wait for the next
-    /// one, a few times at most; a page that stays -- a sign-in -- is saved
-    /// as it is and reported for the user to deal with.
-    async fn wait_for_forwards(&self, webview: &Webview, claim: &ClaimGuard<'_>) {
-        for _ in 0..FORWARDS {
-            let content_type =
-                match crate::browser_script::evaluate(webview, CONTENT_TYPE_SCRIPT).await {
-                    Ok(content_type) => content_type.to_ascii_lowercase(),
-                    Err(error) => {
-                        tracing::warn!("agent browser: could not tell what the page is: {error}");
-                        return;
-                    }
-                };
-            if !content_type.contains("html") {
-                return;
-            }
-            let forwarded = self.expect_load();
-            match tokio::time::timeout(FORWARD_WAIT, forwarded).await {
-                Ok(Ok(())) if claim.started() => return,
-                Ok(Ok(())) => {
-                    tracing::info!("agent browser: the page forwarded itself; looking again");
-                }
-                Ok(Err(_)) | Err(_) => return,
-            }
-        }
     }
 }
 
@@ -373,7 +462,7 @@ impl AgentBrowser for DesktopAgentBrowser {
         let _turn = self.state().turn.lock().await;
         let _busy = Busy::new(&self.app);
         let webview = self.webview()?;
-        self.open(&webview, &url).await?;
+        self.open(&webview, &url, None).await?;
         let report = crate::browser_script::evaluate(&webview, READ_SCRIPT).await?;
         let page: PageReport = serde_json::from_str(&report)
             .map_err(|e| format!("The page's report could not be read: {e}"))?;
@@ -455,6 +544,20 @@ mod tests {
         }
         drop(guard);
         assert!(state.abandoned.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_page_is_what_was_asked_for_once_loaded_with_a_2xx_status() {
+        let page = |status, loaded| PageState { status, loaded }.verdict();
+        assert_eq!(page(Some(200), false), Verdict::Loading);
+        assert_eq!(page(Some(200), true), Verdict::Content);
+        assert_eq!(page(Some(204), true), Verdict::Content);
+        // A document with no HTTP status: a file shown from elsewhere.
+        assert_eq!(page(None, true), Verdict::Content);
+        assert_eq!(page(Some(403), true), Verdict::Refused(403));
+        assert_eq!(page(Some(404), true), Verdict::Refused(404));
+        assert!(may_be_a_check(403) && may_be_a_check(503));
+        assert!(!may_be_a_check(404) && !may_be_a_check(401));
     }
 
     #[test]

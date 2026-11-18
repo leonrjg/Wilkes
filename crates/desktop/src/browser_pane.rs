@@ -537,7 +537,7 @@ pub(crate) fn create_pane(
                     paint_own_background(&webview);
                 }
                 if finished && pane.kind == PaneKind::Agent {
-                    crate::agent_browser::page_finished(&app);
+                    crate::agent_browser::page_finished(&app, payload.url().as_str());
                 }
             }
         })
@@ -587,6 +587,11 @@ pub(crate) fn create_pane(
     }
     crate::browser_find::listen_for_find_key(&webview, &app, pane);
     crate::browser_hover::listen_for_hover(&webview, &app, pane);
+    // On macOS the navigation stand-in below hears each page's status.
+    #[cfg(not(target_os = "macos"))]
+    if pane.kind == PaneKind::Agent {
+        crate::browser_status::listen(&webview, &app);
+    }
     #[cfg(target_os = "macos")]
     crate::browser_webkit_download::listen(&webview, &app, pane);
     Ok(webview)

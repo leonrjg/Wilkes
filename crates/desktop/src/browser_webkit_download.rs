@@ -20,7 +20,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use block2::{DynBlock, RcBlock};
+use block2::{Block, DynBlock, RcBlock};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, Sel};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -137,6 +137,51 @@ define_class!(
     struct NavigationStandIn;
 
     impl NavigationStandIn {
+        // Every page's response passes here before wry decides on it: the
+        // status of the agent's documents is noted, and the decision is wry's.
+        #[unsafe(method(webView:decidePolicyForNavigationResponse:decisionHandler:))]
+        fn decide_policy_for_response(
+            &self,
+            web_view: &AnyObject,
+            response: &AnyObject,
+            handler: &Block<dyn Fn(isize)>,
+        ) {
+            // SAFETY: a WKNavigationResponse, whose response is an
+            // NSURLResponse, an NSHTTPURLResponse for a page fetched by HTTP.
+            let main_frame: bool = unsafe { msg_send![response, isForMainFrame] };
+            if main_frame {
+                let answer: Option<Retained<AnyObject>> = unsafe { msg_send![response, response] };
+                let status = answer.and_then(|answer| {
+                    let http: bool =
+                        unsafe { msg_send![&*answer, respondsToSelector: objc2::sel!(statusCode)] };
+                    http.then(|| {
+                        let code: isize = unsafe { msg_send![&*answer, statusCode] };
+                        u16::try_from(code).ok()
+                    })
+                    .flatten()
+                });
+                let Route { app, pane } = self.ivars().downloads.ivars();
+                crate::agent_browser::response_arrived(app, pane, status);
+            }
+            let original = self.ivars().original.as_ref().filter(|original| unsafe {
+                msg_send![&***original, respondsToSelector: objc2::sel!(webView:decidePolicyForNavigationResponse:decisionHandler:)]
+            });
+            match original {
+                // SAFETY: wry's own answer to the same call, with what WebKit gave.
+                Some(original) => unsafe {
+                    let _: () = msg_send![
+                        &**original,
+                        webView: web_view,
+                        decidePolicyForNavigationResponse: response,
+                        decisionHandler: handler
+                    ];
+                },
+                // WKNavigationResponsePolicyAllow, what WebKit does with no
+                // delegate to ask.
+                None => handler.call((1,)),
+            }
+        }
+
         #[unsafe(method(_webView:contextMenuDidCreateDownload:))]
         fn context_menu_did_create_download(&self, _web_view: &AnyObject, download: &AnyObject) {
             let delegate = &*self.ivars().downloads;
