@@ -205,17 +205,6 @@ pub(crate) fn listen(webview: &Webview, app: &AppHandle, pane: &PaneId) {
 /// HTML -- from its own address, through the pane's own session, so a
 /// sign-in or a bot check the page needed carries over.
 pub(crate) fn save_page(webview: &Webview, pane: &PaneId) {
-    start_download(webview, pane, None);
-}
-
-/// Download `url` through the pane's own session, without showing it.
-pub(crate) fn download(webview: &Webview, pane: &PaneId, url: &Url) {
-    start_download(webview, pane, Some(url.to_string()));
-}
-
-/// Start a download of `url`, or of the pane's own address, routed like every
-/// other download from the pane.
-fn start_download(webview: &Webview, pane: &PaneId, url: Option<String>) {
     let label = pane.label();
     let saving = webview.with_webview(move |platform| {
         let Some(downloads) = STAND_INS.with_borrow(|stand_ins| {
@@ -228,12 +217,9 @@ fn start_download(webview: &Webview, pane: &PaneId, url: Option<String>) {
         };
         // SAFETY: `inner` is the pane's live WKWebView, on the main thread.
         let view = unsafe { &*platform.inner().cast::<AnyObject>() };
-        let url: Option<Retained<NSURL>> = match &url {
-            Some(url) => NSURL::URLWithString(&NSString::from_str(url)),
-            None => unsafe { msg_send![view, URL] },
-        };
+        let url: Option<Retained<NSURL>> = unsafe { msg_send![view, URL] };
         let Some(url) = url else {
-            error!("browser pane: {label} has no address to download");
+            error!("browser pane: {label} has no page to save");
             return;
         };
         let request = NSURLRequest::requestWithURL(&url);
@@ -244,7 +230,7 @@ fn start_download(webview: &Webview, pane: &PaneId, url: Option<String>) {
                 Some(download) => {
                     let _: () = unsafe { msg_send![download, setDelegate: &*downloads] };
                 }
-                None => error!("browser pane: WebKit started no download"),
+                None => error!("browser pane: WebKit started no download to save the page"),
             }
         });
         // SAFETY: WKWebView's startDownloadUsingRequest:completionHandler:
@@ -254,7 +240,7 @@ fn start_download(webview: &Webview, pane: &PaneId, url: Option<String>) {
         };
     });
     if let Err(e) = saving {
-        error!("browser pane: could not start a download: {e}");
+        error!("browser pane: could not save its page: {e}");
     }
 }
 

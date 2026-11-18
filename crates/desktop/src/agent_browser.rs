@@ -148,9 +148,7 @@ impl<'a> ClaimGuard<'a> {
         Self { state }
     }
 
-    /// Whether a download has started for this operation. On macOS the
-    /// download is started directly, so nothing asks.
-    #[cfg(any(test, not(target_os = "macos")))]
+    /// Whether a download has started for this operation.
     fn started(&self) -> bool {
         self.state
             .claim
@@ -226,23 +224,12 @@ impl DesktopAgentBrowser {
         }
     }
 
-    /// Start downloading `url` in the pane, natively: WebKit downloads an
-    /// address without showing it, whatever it serves.
-    #[cfg(target_os = "macos")]
-    async fn start_download(
-        &self,
-        webview: &Webview,
-        url: &Url,
-        _claim: &ClaimGuard<'_>,
-    ) -> Result<(), String> {
-        crate::browser_webkit_download::download(webview, &PaneId::agent(), url);
-        Ok(())
-    }
-
     /// Start downloading `url` in the pane as the user's own pane saves a
     /// page: open it, and if opening it did not already start a download --
-    /// a file served as an attachment does -- download what it shows.
-    #[cfg(not(target_os = "macos"))]
+    /// a file served as an attachment can -- save what it shows. Loaded first
+    /// rather than downloaded outright, because some sites tell the two apart:
+    /// the ACM Digital Library answers a bare download request with a page,
+    /// and serves the PDF to a browser that has loaded it.
     async fn start_download(
         &self,
         webview: &Webview,
@@ -251,12 +238,24 @@ impl DesktopAgentBrowser {
     ) -> Result<(), String> {
         match self.open(webview, url).await {
             _ if claim.started() => Ok(()),
-            Ok(()) => webview
-                .eval(crate::browser_pane::SAVE_PAGE_SCRIPT)
-                .map_err(|e| e.to_string()),
+            Ok(()) => save_shown_page(webview),
             Err(error) => Err(error),
         }
     }
+}
+
+/// Save what the agent's pane shows, as the user's pane's Save to library
+/// does.
+fn save_shown_page(webview: &Webview) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::browser_webkit_download::save_page(webview, &PaneId::agent());
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    webview
+        .eval(crate::browser_pane::SAVE_PAGE_SCRIPT)
+        .map_err(|e| e.to_string())
 }
 
 #[async_trait]
@@ -284,11 +283,8 @@ impl AgentBrowser for DesktopAgentBrowser {
         if !success {
             return Err("The agent browser could not download it".to_string());
         }
+        // The page is already in the pane, where the user will look for it.
         if is_web_page(staged.file()).map_err(|e| e.to_string())? {
-            // Shown where the user will look for it. Opening it is not
-            // waited for: the answer is the same however it loads.
-            #[cfg(target_os = "macos")]
-            webview.navigate(url).map_err(|e| e.to_string())?;
             return Err(NEEDS_USER.to_string());
         }
         Ok(staged)
