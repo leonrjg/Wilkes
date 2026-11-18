@@ -260,6 +260,50 @@ fn content_disposition_extension(value: &str) -> Option<String> {
     .then(|| extension.to_ascii_lowercase())
 }
 
+/// Why a download failed, with the HTTP status the server refused it with
+/// when that is why: a caller can tell a site that will not let this client
+/// in from everything else without reading the message.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DownloadError {
+    pub message: String,
+    pub status: Option<u16>,
+}
+
+impl DownloadError {
+    /// The server refused this client access (HTTP 401 or 403), as a site does
+    /// that serves the same address to a signed-in browser.
+    pub fn access_refused(&self) -> bool {
+        matches!(self.status, Some(401 | 403))
+    }
+}
+
+impl std::fmt::Display for DownloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for DownloadError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            status: None,
+        }
+    }
+}
+
+impl From<&str> for DownloadError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+impl From<DownloadError> for String {
+    fn from(error: DownloadError) -> Self {
+        error.message
+    }
+}
+
 /// Download with the caller's per-file size limit, checked against both the
 /// advertised Content-Length and the actual bytes received.
 pub async fn download_to_root(
@@ -267,14 +311,14 @@ pub async fn download_to_root(
     params: DownloadParams,
     progress: Option<mpsc::Sender<DownloadProgress>>,
     max_download_bytes: u64,
-) -> Result<DownloadResponse, String> {
+) -> Result<DownloadResponse, DownloadError> {
     if max_download_bytes == 0 {
-        return Err("Maximum download size must be greater than zero.".into());
+        return Err(DownloadError::from("Maximum download size must be greater than zero."));
     }
     if !root.is_dir() {
         let message = format!("Current Wilkes root does not exist: {}", root.display());
         tracing::warn!("download refused: {message}");
-        return Err(message);
+        return Err(DownloadError::from(message));
     }
     let requested_url = params.url.trim().to_string();
     let url = reqwest::Url::parse(&requested_url).map_err(|error| {
@@ -283,7 +327,7 @@ pub async fn download_to_root(
     })?;
     if !matches!(url.scheme(), "http" | "https") {
         tracing::warn!(url = %url, scheme = url.scheme(), "download refused: unsupported scheme");
-        return Err("Download URL must use HTTP or HTTPS.".to_string());
+        return Err(DownloadError::from("Download URL must use HTTP or HTTPS.".to_string()));
     }
     let named_by_caller = params.filename.is_some();
     if let Some(name) = params.filename.as_deref() {
@@ -300,7 +344,7 @@ pub async fn download_to_root(
                 filename = name,
                 "download refused: filename is not a single name"
             );
-            return Err("filename must be a single file name without directories.".to_string());
+            return Err(DownloadError::from("filename must be a single file name without directories.".to_string()));
         }
     }
     let filename = params
@@ -352,10 +396,13 @@ pub async fn download_to_root(
         .error_for_status()
         .map_err(|error| {
             tracing::warn!(url = %url, "download refused by the server: {error}");
-            format!(
-                "Download failed: {}",
-                crate::network::request_error_message(&error)
-            )
+            DownloadError {
+                message: format!(
+                    "Download failed: {}",
+                    crate::network::request_error_message(&error)
+                ),
+                status: error.status().map(|status| status.as_u16()),
+            }
         })?;
     let total_bytes = response.content_length();
     if total_bytes.is_some_and(|length| length > max_download_bytes) {
@@ -364,10 +411,10 @@ pub async fn download_to_root(
             advertised = total_bytes,
             "download refused: over the size limit before reading"
         );
-        return Err(format!(
+        return Err(DownloadError::from(format!(
             "Download exceeds the {} MB limit.",
             max_download_bytes as f64 / 1_000_000.0
-        ));
+        )));
     }
     let content_type = response
         .headers()
@@ -412,7 +459,7 @@ pub async fn download_to_root(
             filename = safe,
             "download refused: filename is not a single name"
         );
-        return Err("filename must be a single file name without directories.".to_string());
+        return Err(DownloadError::from("filename must be a single file name without directories.".to_string()));
     }
     let target = root.join(safe_path);
 
@@ -445,19 +492,19 @@ pub async fn download_to_root(
                     received,
                     "download failed after {received} bytes: {error}"
                 );
-                return Err(format!(
+                return Err(DownloadError::from(format!(
                     "Failed to read download: {}",
                     crate::network::request_error_message(&error)
-                ));
+                )));
             }
         };
         received += chunk.len() as u64;
         if received > max_download_bytes {
             tracing::warn!(url = %url, received, "download refused: over the size limit while reading");
-            return Err(format!(
+            return Err(DownloadError::from(format!(
                 "Download exceeds the {} MB limit.",
                 max_download_bytes as f64 / 1_000_000.0
-            ));
+            )));
         }
         bytes.extend_from_slice(&chunk);
         if received >= next_report {
@@ -486,7 +533,7 @@ pub async fn download_to_root(
             done: true,
         },
     );
-    store_in_root(root, &target, &bytes, url.as_str())
+    store_in_root(root, &target, &bytes, url.as_str()).map_err(DownloadError::from)
 }
 
 /// Write `bytes` to `target` under `root`, unless they are already there.
@@ -1098,10 +1145,55 @@ mod tests {
         .await
         .unwrap_err();
         mock.assert_async().await;
+        assert_eq!(error.status, Some(404));
+        assert!(!error.access_refused());
+        let error = error.message;
         assert!(error.contains("404"), "{error}");
         assert!(!error.contains(&url), "{error}");
         assert!(!error.contains("s3cret"), "{error}");
         assert!(!error.contains(&server.url()), "{error}");
+    }
+
+    /// A site that will not let this client in says so by status, which is
+    /// what a caller decides on, not the wording of the message.
+    #[tokio::test]
+    async fn a_download_refused_access_says_so_by_its_status() {
+        let dir = tempdir().unwrap();
+        let mut server = mockito::Server::new_async().await;
+        for status in [401, 403] {
+            let route = format!("/{status}.pdf");
+            let mock = server
+                .mock("GET", route.as_str())
+                .with_status(status)
+                .create_async()
+                .await;
+            let error = download_to_root(
+                dir.path(),
+                DownloadParams {
+                    url: format!("{}{route}", server.url()),
+                    filename: None,
+                },
+                None,
+                crate::types::DEFAULT_MAX_DOWNLOAD_BYTES,
+            )
+            .await
+            .unwrap_err();
+            mock.assert_async().await;
+            assert_eq!(error.status, Some(status as u16));
+            assert!(error.access_refused());
+        }
+        let refused_before_asking = download_to_root(
+            dir.path(),
+            DownloadParams {
+                url: "ftp://example.test/paper.pdf".to_string(),
+                filename: None,
+            },
+            None,
+            crate::types::DEFAULT_MAX_DOWNLOAD_BYTES,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused_before_asking.status, None);
     }
 
     #[tokio::test]
@@ -1117,7 +1209,8 @@ mod tests {
             crate::types::DEFAULT_MAX_DOWNLOAD_BYTES,
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .message;
         assert!(traversal.contains("single file name"));
         // Refused before anything left the machine: the name is wrong on its
         // own terms and no request could make it right.
@@ -1287,7 +1380,7 @@ mod tests {
                 assert_eq!(result.unwrap().bytes, length);
             } else {
                 assert_eq!(
-                    result.unwrap_err(),
+                    result.unwrap_err().message,
                     "Download exceeds the 0.000016 MB limit."
                 );
                 assert!(!dir.path().join(name).exists());
@@ -1326,7 +1419,8 @@ mod tests {
             1_000_000,
         )
         .await
-        .expect_err("a body past the limit must be refused");
+        .expect_err("a body past the limit must be refused")
+        .message;
         assert!(error.contains("exceeds"), "{error}");
         assert!(
             !dir.path().join("huge.pdf").exists(),

@@ -983,9 +983,9 @@ struct DownloadParams {
     /// result comes back as several files. Must not contain directories.
     filename: Option<String>,
     /// Fetch url through the agent browser, which is signed in wherever the
-    /// user signed in in Wilkes' browser, instead of directly. For a site that
-    /// refuses a direct download (HTTP 401 or 403) of something the user has
-    /// access to. Only with url.
+    /// user signed in in Wilkes' browser, instead of trying directly first. A
+    /// direct download the site refuses with HTTP 401 or 403 is retried there
+    /// anyway. Only with url.
     #[serde(default, deserialize_with = "deserialize_optional_bool")]
     #[schemars(with = "Option<bool>")]
     through_browser: Option<bool>,
@@ -1598,7 +1598,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Download a file into the current Wilkes root of the active workspace, or of the workspace named by workspace. Use only when the user asks to import or download a file. Name the file either by a url the user gave you, or by provider and result_id of a literature_search result whose downloadable is true; Wilkes finds the file itself. A result may come back as several files, in a folder of their own; the answer lists every file. Pass filename to choose the saved name, or the folder's when there are several; existing files are never overwritten, and a name already taken by a different file gets a number, as in 'paper (2).pdf'. When a direct download of a url is refused (HTTP 401 or 403) by a site the user has access to, retry with through_browser=true: the agent browser fetches it signed in wherever the user signed in in Wilkes' browser. If that comes back as a sign-in or check page, ask the user to open Agent browser from the browser button's menu in Wilkes, deal with it there, and try again. Refused for a workspace list_context reports as read_only, which another application owns."
+        description = "Download a file into the current Wilkes root of the active workspace, or of the workspace named by workspace. Use only when the user asks to import or download a file. Name the file either by a url the user gave you, or by provider and result_id of a literature_search result whose downloadable is true; Wilkes finds the file itself. A result may come back as several files, in a folder of their own; the answer lists every file. Pass filename to choose the saved name, or the folder's when there are several; existing files are never overwritten, and a name already taken by a different file gets a number, as in 'paper (2).pdf'. A url the site refuses with HTTP 401 or 403 is retried once, automatically, through the agent browser, which is signed in wherever the user signed in in Wilkes' browser; pass through_browser=true to go there directly. If the browser gets a sign-in or check page instead of the file, ask the user to open Agent browser from the browser button's menu in Wilkes, deal with it there, and try again. Refused for a workspace list_context reports as read_only, which another application owns."
     )]
     async fn download(&self, Parameters(params): Parameters<DownloadParams>) -> CallToolResult {
         let scope = match self.scope(params.workspace.as_deref()).await {
@@ -1635,20 +1635,12 @@ impl WilkesMcp {
                 None,
             ),
             (Some(url), None, None) => (
-                download_to_root(
-                    &root,
-                    wilkes_core::acquire::DownloadParams {
-                        url,
-                        filename: params.filename,
-                    },
-                    None,
-                    max_download_bytes,
-                )
-                .await
-                .map(|file| AcquiredFiles {
-                    folder: None,
-                    files: vec![file],
-                }),
+                self.download_url(&url, &root, params.filename, max_download_bytes)
+                    .await
+                    .map(|file| AcquiredFiles {
+                        folder: None,
+                        files: vec![file],
+                    }),
                 None,
             ),
             // The result is kept so a saved one can be marked as in the
@@ -1841,6 +1833,43 @@ impl WilkesMcp {
 }
 
 impl WilkesMcp {
+    /// Fetch `url` into `root`. A site that refuses this client access (HTTP
+    /// 401 or 403) is asked once more through the agent browser, where there
+    /// is one: such a site often serves the same address to the browser the
+    /// user is signed in with.
+    async fn download_url(
+        &self,
+        url: &str,
+        root: &Path,
+        filename: Option<String>,
+        max_download_bytes: u64,
+    ) -> Result<wilkes_core::acquire::DownloadResponse, String> {
+        let direct = download_to_root(
+            root,
+            wilkes_core::acquire::DownloadParams {
+                url: url.to_string(),
+                filename: filename.clone(),
+            },
+            None,
+            max_download_bytes,
+        )
+        .await;
+        match direct {
+            Err(refused) if refused.access_refused() && self.browser.is_some() => {
+                info!(
+                    status = ?refused.status,
+                    "download refused access; retrying once through the agent browser"
+                );
+                self.download_through_browser(url, root, filename, max_download_bytes)
+                    .await
+                    .map_err(|error| {
+                        format!("{refused} Retried through the agent browser: {error}")
+                    })
+            }
+            other => other.map_err(String::from),
+        }
+    }
+
     /// Download `url` in the agent browser and store it in `root` by the rules
     /// every download keeps.
     async fn download_through_browser(
@@ -3143,6 +3172,87 @@ mod tests {
             .unwrap();
             assert_eq!(params.through_browser, Some(true));
         }
+    }
+
+    fn direct_download(url: String) -> DownloadParams {
+        DownloadParams {
+            url: Some(url),
+            provider: None,
+            result_id: None,
+            filename: None,
+            through_browser: None,
+            workspace: None,
+        }
+    }
+
+    /// A site that refuses this client gets one more try in the agent
+    /// browser; anything else it answers is the answer.
+    #[tokio::test]
+    async fn a_download_refused_access_is_retried_once_through_the_browser() {
+        let mut server = mockito::Server::new_async().await;
+        let refused = server
+            .mock("GET", "/paper.pdf")
+            .with_status(403)
+            .expect(1)
+            .create_async()
+            .await;
+        let _gone = server
+            .mock("GET", "/gone/paper.pdf")
+            .with_status(404)
+            .create_async()
+            .await;
+        let _login = server
+            .mock("GET", "/login")
+            .with_status(401)
+            .create_async()
+            .await;
+        let root = tempdir().unwrap();
+        let staging = tempdir().unwrap();
+        let mcp = mcp_with_browser(root.path(), staging.path());
+
+        let reply = mcp
+            .download(Parameters(direct_download(format!("{}/paper.pdf", server.url()))))
+            .await;
+        assert_ne!(reply.is_error, Some(true), "{reply:?}");
+        refused.assert_async().await;
+        assert_eq!(
+            std::fs::read(root.path().join("Signed In.pdf")).unwrap(),
+            b"%PDF-1.7 signed in"
+        );
+
+        // Not a refusal of access: no second try.
+        let reply = mcp
+            .download(Parameters(direct_download(format!(
+                "{}/gone/paper.pdf",
+                server.url()
+            ))))
+            .await;
+        let text = format!("{reply:?}");
+        assert!(text.contains("404"), "{text}");
+        assert!(!text.contains("agent browser"), "{text}");
+
+        // The browser tried and failed too: both are reported.
+        let reply = mcp
+            .download(Parameters(direct_download(format!("{}/login", server.url()))))
+            .await;
+        let text = format!("{reply:?}");
+        assert!(text.contains("401"), "{text}");
+        assert!(text.contains("Retried through the agent browser"), "{text}");
+        assert!(text.contains("sign in"), "{text}");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+
+        // Without a browser, a refusal is just a refusal.
+        let plain = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(single_workspace(fake_search_with_root(root.path().into()))),
+        );
+        let reply = plain
+            .download(Parameters(direct_download(format!("{}/login", server.url()))))
+            .await;
+        let text = format!("{reply:?}");
+        assert!(text.contains("401"), "{text}");
+        assert!(!text.contains("agent browser"), "{text}");
     }
 
     #[tokio::test]

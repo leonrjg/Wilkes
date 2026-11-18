@@ -419,9 +419,10 @@ fn video_titles(entries: &[RawEntry]) -> HashMap<String, String> {
 /// Decides what one resource is, and refuses everything that is not a PDF.
 ///
 /// `used` carries the names already claimed in this course so two documents
-/// that reduce to the same filename do not collide — `download_to_root`
-/// refuses same-name-different-content, and a course containing both a
-/// `lecture5.pdf` and a `Lecture5.pdf` would otherwise fail halfway through.
+/// that reduce to the same filename are named apart here, where the course's
+/// listing can say so — `download_to_root` would otherwise number the second
+/// of a `lecture5.pdf` and a `Lecture5.pdf` itself, on a case-insensitive
+/// filesystem only, and the listing would not know.
 fn classify(
     entry: &RawEntry,
     origin: &str,
@@ -1127,9 +1128,8 @@ mod tests {
 
     #[test]
     fn two_documents_that_reduce_to_one_name_do_not_collide() {
-        // download_to_root refuses same-name-different-content, so a course
-        // holding both `lecture5.pdf` and `Lecture5.pdf` would fail partway
-        // through rather than at the start.
+        // Named apart here rather than left to download_to_root, which would
+        // number the second only where the filesystem ignores case.
         let mut used = std::collections::HashSet::new();
         assert_eq!(unique_filename("lecture5.pdf", &mut used), "lecture5.pdf");
         assert_eq!(

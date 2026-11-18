@@ -418,9 +418,8 @@ pub fn remove(
 /// through [`download_to_root`], once per document, into a directory named
 /// after the course. Giving each course its own directory is what makes the
 /// per-document names usable: a dozen courses each publish something called
-/// `lecture5.pdf`, and `download_to_root` refuses same-name-different-content
-/// by design, so a flat uploads directory would fail partway through the
-/// second course a user asked for.
+/// `lecture5.pdf`, and in a flat uploads directory every course after the
+/// first would get `lecture5 (2).pdf` and on, names no longer the course's own.
 ///
 /// Failure is per document. One dead link out of forty is reported in
 /// `failures` and costs nothing else; only an unreadable manifest — where
@@ -500,7 +499,7 @@ pub async fn acquire_course(
                 failures.push(CourseFailure {
                     filename: file.filename.clone(),
                     url: file.url.clone(),
-                    error: message,
+                    error: message.into(),
                 });
             }
         }
