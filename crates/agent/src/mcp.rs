@@ -986,8 +986,9 @@ struct DownloadParams {
     /// user signed in in Wilkes' browser, instead of directly. For a site that
     /// refuses a direct download (HTTP 401 or 403) of something the user has
     /// access to. Only with url.
-    #[serde(default)]
-    through_browser: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    #[schemars(with = "Option<bool>")]
+    through_browser: Option<bool>,
     /// Workspace id to read, from list_context. Omit for the workspace that is
     /// active in Wilkes. Naming one does not switch the app to it.
     workspace: Option<String>,
@@ -1622,8 +1623,9 @@ impl WilkesMcp {
         };
         // No progress sink: an MCP call is one request and one reply, with
         // nowhere to render a bar between them.
+        let through_browser = params.through_browser.unwrap_or(false);
         let (acquired, named) = match (params.url, params.provider, params.result_id) {
-            (Some(url), None, None) if params.through_browser => (
+            (Some(url), None, None) if through_browser => (
                 self.download_through_browser(&url, &root, params.filename, max_download_bytes)
                     .await
                     .map(|file| AcquiredFiles {
@@ -1651,7 +1653,7 @@ impl WilkesMcp {
             ),
             // The result is kept so a saved one can be marked as in the
             // library once its files are there.
-            (None, Some(_), Some(_)) if params.through_browser => {
+            (None, Some(_), Some(_)) if through_browser => {
                 return CallToolResult::error(vec![ContentBlock::text(
                     "through_browser takes a url, not a literature result.",
                 )])
@@ -3101,7 +3103,7 @@ mod tests {
             provider: None,
             result_id: None,
             filename: None,
-            through_browser: true,
+            through_browser: Some(true),
             workspace: None,
         }
     }
@@ -3129,6 +3131,18 @@ mod tests {
             .await;
         assert_eq!(refused.is_error, Some(true));
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn through_browser_is_read_however_a_client_spells_the_boolean() {
+        for value in [serde_json::json!(true), serde_json::json!("true")] {
+            let params: DownloadParams = serde_json::from_value(serde_json::json!({
+                "url": "https://dl.example/paper.pdf",
+                "through_browser": value,
+            }))
+            .unwrap();
+            assert_eq!(params.through_browser, Some(true));
+        }
     }
 
     #[tokio::test]
@@ -3800,7 +3814,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
                 provider: Some("custom:runner".to_string()),
                 result_id: Some("M1".to_string()),
                 filename: None,
-                through_browser: false,
+                through_browser: None,
                 workspace: None,
             }))
             .await;
