@@ -279,10 +279,11 @@ impl WilkesChatHost {
         backend: AgentBackend,
         cwd: PathBuf,
         workspaces: Option<Arc<dyn WorkspaceCatalog>>,
+        browser: Option<Arc<dyn crate::browser::AgentBrowser>>,
     ) -> anyhow::Result<Arc<Self>> {
         let context = ContextStateHandle::default();
         let mcp = if matches!(backend, AgentBackend::ClaudeCode | AgentBackend::Codex) {
-            Some(crate::mcp::start(context.clone(), cwd, workspaces).await?)
+            Some(crate::mcp::start(context.clone(), cwd, workspaces, browser).await?)
         } else {
             None
         };

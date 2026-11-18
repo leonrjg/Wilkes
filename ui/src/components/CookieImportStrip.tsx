@@ -5,7 +5,7 @@
 import { useEffect, useState } from "react";
 import { X } from "react-feather";
 import { api } from "../services";
-import type { CookieSourceInfo } from "../services/api";
+import type { BrowserPaneKind, CookieSourceInfo } from "../services/api";
 
 /** The site a page belongs to, as the domain field starts out: its host
  *  without `www.`. The user can widen it, say to a parent domain. */
@@ -21,10 +21,12 @@ export function siteOf(url: string | null): string {
 type Outcome = { kind: "imported"; count: number; site: string; source: string } | { kind: "error"; message: string };
 
 export default function CookieImportStrip({
+  kind = "user",
   url,
   onImported,
   onClose,
 }: {
+  kind?: BrowserPaneKind;
   url: string | null;
   onImported: () => void;
   onClose: () => void;
@@ -58,7 +60,7 @@ export default function CookieImportStrip({
     setImporting(true);
     setOutcome(null);
     try {
-      const count = (await api.browserPaneImportCookies?.(source, site)) ?? 0;
+      const count = (await api.browserPaneImportCookies?.(kind, source, site)) ?? 0;
       setOutcome({ kind: "imported", count, site, source: name });
       if (count > 0) onImported();
     } catch (e) {

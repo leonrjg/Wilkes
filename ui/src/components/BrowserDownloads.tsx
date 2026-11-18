@@ -2,7 +2,8 @@
 // system's Downloads folder. A strip under the pane's header, like the cookie
 // import, since nothing drawn over the page would be seen.
 import { CheckCircle, Loader, X, XCircle } from "react-feather";
-import { useBrowserStore, type BrowserDownload } from "../stores/useBrowserStore";
+import type { BrowserPaneKind } from "../services/api";
+import { browserStoreFor, type BrowserDownload } from "../stores/useBrowserStore";
 import { useViewerStore } from "../stores/useViewerStore";
 
 function describe(download: BrowserDownload): string {
@@ -18,9 +19,10 @@ function describe(download: BrowserDownload): string {
   }
 }
 
-export default function BrowserDownloads() {
-  const downloads = useBrowserStore((s) => s.downloads);
-  const clearDownloads = useBrowserStore((s) => s.clearDownloads);
+export default function BrowserDownloads({ kind = "user" }: { kind?: BrowserPaneKind }) {
+  const useStore = browserStoreFor(kind);
+  const downloads = useStore((s) => s.downloads);
+  const clearDownloads = useStore((s) => s.clearDownloads);
   if (downloads.length === 0) return null;
 
   return (

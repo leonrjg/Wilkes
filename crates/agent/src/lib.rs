@@ -11,6 +11,7 @@
 //! chat's own business and is re-exported below rather than decided again
 //! here.
 
+pub mod browser;
 pub mod context;
 pub mod host;
 pub mod mcp;

@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect, type ReactNode } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { BookOpen, Bookmark, Cloud, Globe, MessageSquare, Settings as SettingsIcon, ChevronDown, ChevronLeft, ChevronRight, Loader, Plus } from "react-feather";
+import { BookOpen, Bookmark, Cloud, Cpu, Globe, MessageSquare, Settings as SettingsIcon, ChevronDown, ChevronLeft, ChevronRight, Loader, Plus } from "react-feather";
 import SearchBar from "./components/SearchBar";
 import ResultList from "./components/ResultList";
 import PreviewPane from "./components/PreviewPane";
@@ -23,7 +23,7 @@ import { useChatStore } from "./stores/useChatStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useTopicsStore } from "./stores/useTopicsStore";
 import { useCatalogueStore } from "./stores/useCatalogueStore";
-import { useBrowserStore } from "./stores/useBrowserStore";
+import { useAgentBrowserStore, useBrowserPageEvents, useBrowserStore } from "./stores/useBrowserStore";
 import {
   useActiveWorkspaceName,
   useActiveWorkspaceReadOnly,
@@ -114,6 +114,8 @@ export default function App() {
     useContextMenu<null>();
   const { menu: catalogueMenu, openMenu: openCatalogueMenu, closeMenu: closeCatalogueMenu } =
     useContextMenu<null>();
+  const { menu: browserMenu, openMenu: openBrowserMenu, closeMenu: closeBrowserMenu } =
+    useContextMenu<null>();
 
   const openMatch = useViewerStore((state) => state.openMatch);
   const openFile = useViewerStore((state) => state.openFile);
@@ -134,6 +136,11 @@ export default function App() {
   const [paneWidths, setPaneWidths] = useState<Record<string, number>>({});
   const browserPaneOpen = useBrowserStore((s) => s.paneOpen);
   const toggleBrowserPane = useBrowserStore((s) => s.togglePane);
+  const agentBrowserOpen = useAgentBrowserStore((s) => s.paneOpen);
+  const toggleAgentBrowser = useAgentBrowserStore((s) => s.togglePane);
+  useBrowserPageEvents("user");
+  // Followed while its pane is closed too: opening it shows where the agent is.
+  useBrowserPageEvents("agent");
   // The arrangement of the docked panes the user last made, as pane keys.
   const [paneOrder, setPaneOrder] = useState<string[]>([]);
   // The pane being dragged by its grip, and the line showing where it would
@@ -655,20 +662,52 @@ export default function App() {
         </Tooltip>
       </div>
       {isTauri && (
-        <Tooltip content="Browser">
-          <button
-            onClick={toggleBrowserPane}
-            aria-label="Browser pane"
-            aria-pressed={browserPaneOpen}
-            className={`w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] transition-all border border-[var(--border-main)] hover:border-[var(--border-strong)] ${
-              browserPaneOpen
-                ? "text-[var(--accent-blue)] shadow-inner"
-                : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
-            }`}
-          >
-            <Globe size={14} />
-          </button>
-        </Tooltip>
+        <div className="inline-flex rounded border border-[var(--border-main)] overflow-hidden">
+          <Tooltip content="Browser">
+            <button
+              onClick={toggleBrowserPane}
+              aria-label="Browser pane"
+              aria-pressed={browserPaneOpen}
+              className={`w-[32px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] transition-all ${
+                browserPaneOpen || agentBrowserOpen
+                  ? "text-[var(--accent-blue)] shadow-inner"
+                  : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
+              }`}
+            >
+              <Globe size={14} />
+            </button>
+          </Tooltip>
+          <Tooltip content="Browser options">
+            <button
+              type="button"
+              onClick={(event) =>
+                openBrowserMenu({
+                  event,
+                  target: null,
+                  size: "content",
+                  items: [
+                    {
+                      id: "browser",
+                      label: browserPaneOpen ? "Close browser" : "Browser",
+                      icon: Globe,
+                      run: toggleBrowserPane,
+                    },
+                    {
+                      id: "agent-browser",
+                      label: agentBrowserOpen ? "Close agent browser" : "Agent browser",
+                      icon: Cpu,
+                      run: toggleAgentBrowser,
+                    },
+                  ],
+                })
+              }
+              aria-label="Browser pane options"
+              className="w-[14px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] text-[var(--text-dim)] hover:text-[var(--text-main)] transition-all border-l border-[var(--border-main)]"
+            >
+              <ChevronDown size={10} />
+            </button>
+          </Tooltip>
+        </div>
       )}
       <Tooltip content="Settings">
         <button
@@ -689,6 +728,7 @@ export default function App() {
       />
       <ContextMenu menu={chatBackendMenu} onClose={closeChatBackendMenu} />
       <ContextMenu menu={catalogueMenu} onClose={closeCatalogueMenu} />
+      <ContextMenu menu={browserMenu} onClose={closeBrowserMenu} />
     </>
   );
 
@@ -756,6 +796,16 @@ export default function App() {
       minWidth: 320,
       maxWidth: window.innerWidth * 0.5,
       children: <BrowserPane />,
+    });
+  }
+  if (isTauri && agentBrowserOpen) {
+    dockedPanes.push({
+      key: "agent-browser",
+      label: "agent browser",
+      side: "Right",
+      minWidth: 320,
+      maxWidth: window.innerWidth * 0.5,
+      children: <BrowserPane kind="agent" />,
     });
   }
 

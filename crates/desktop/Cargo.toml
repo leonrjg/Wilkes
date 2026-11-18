@@ -45,6 +45,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
 anyhow = "1"
 tracing = "0.1"
 tauri-plugin-clipboard-manager = "2"
@@ -82,3 +83,5 @@ windows-core = "0.61"
 # way to.
 webkit2gtk = "2.0"
 gtk = "0.18"
+# Reading what a script in the agent's pane returns.
+javascriptcore-rs = "1"

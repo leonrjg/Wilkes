@@ -176,11 +176,12 @@ pub fn browser_cookie_sources() -> Vec<CookieSourceInfo> {
 #[tauri::command]
 pub async fn browser_pane_import_cookies(
     window: Window,
+    kind: crate::browser_pane::PaneKind,
     source: CookieSource,
     site: String,
 ) -> Result<usize, String> {
     let site = site_domain(&site)?;
-    let webview = crate::browser_pane::pane(&window)?;
+    let webview = crate::browser_pane::pane(&window, kind)?;
     let read = {
         let site = site.clone();
         tauri::async_runtime::spawn_blocking(move || source.read(&site))

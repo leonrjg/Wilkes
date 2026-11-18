@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { useBrowserStore } from "./useBrowserStore";
+import { browserStoreFor, useAgentBrowserStore, useBrowserStore } from "./useBrowserStore";
 
 describe("useBrowserStore", () => {
   beforeEach(() => {
@@ -59,12 +59,12 @@ describe("useBrowserStore downloads", () => {
 
   it("follows a download from saving to saved, newest first", () => {
     const { applyPageEvent } = useBrowserStore.getState();
-    applyPageEvent({ kind: "download_started", url: "https://x.org/a.epub", name: "a.epub", path: "/lib/a.epub" });
-    applyPageEvent({ kind: "download_started", url: "https://x.org/b.zip", name: "b.zip", path: "/lib/b.zip" });
+    applyPageEvent({ kind: "download_started", url: "https://x.org/a.epub", name: "a.epub" });
+    applyPageEvent({ kind: "download_started", url: "https://x.org/b.zip", name: "b.zip" });
     applyPageEvent({ kind: "download_finished", url: "https://x.org/a.epub", name: "a.epub", path: "/lib/a.epub", success: true });
     expect(useBrowserStore.getState().downloads).toEqual([
       { url: "https://x.org/a.epub", name: "a.epub", path: "/lib/a.epub", state: "saved" },
-      { url: "https://x.org/b.zip", name: "b.zip", path: "/lib/b.zip", state: "saving" },
+      { url: "https://x.org/b.zip", name: "b.zip", path: null, state: "saving" },
     ]);
   });
 
@@ -82,7 +82,7 @@ describe("useBrowserStore downloads", () => {
   });
 
   it("clears", () => {
-    useBrowserStore.getState().applyPageEvent({ kind: "download_started", url: "u", name: "n", path: "/p" });
+    useBrowserStore.getState().applyPageEvent({ kind: "download_started", url: "u", name: "n" });
     useBrowserStore.getState().clearDownloads();
     expect(useBrowserStore.getState().downloads).toEqual([]);
   });
@@ -121,5 +121,18 @@ describe("useBrowserStore hovered link", () => {
     applyPageEvent({ kind: "hover", url: "https://example.org/a" });
     applyPageEvent({ kind: "loading", url: "https://example.org/a" });
     expect(useBrowserStore.getState().hoveredLink).toBeNull();
+  });
+});
+
+describe("the agent's browser store", () => {
+  it("is its own: the agent's page is not the user's", () => {
+    useBrowserStore.setState({ url: null, paneOpen: false });
+    useAgentBrowserStore.setState({ url: null, paneOpen: false });
+    useAgentBrowserStore.getState().applyPageEvent({ kind: "loaded", url: "https://dl.acm.org/doi/x" });
+    useAgentBrowserStore.getState().togglePane();
+    expect(useAgentBrowserStore.getState()).toMatchObject({ url: "https://dl.acm.org/doi/x", paneOpen: true });
+    expect(useBrowserStore.getState()).toMatchObject({ url: null, paneOpen: false });
+    expect(browserStoreFor("agent")).toBe(useAgentBrowserStore);
+    expect(browserStoreFor("user")).toBe(useBrowserStore);
   });
 });

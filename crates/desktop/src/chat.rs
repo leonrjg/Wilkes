@@ -31,7 +31,7 @@ use wilkes_api::commands::chat::{
 use wilkes_api::context::AppContext;
 use wilkes_api::context::EventEmitter;
 
-use crate::{app_context, workspace_manager, TauriEmitter};
+use crate::{agent_browser, app_context, workspace_manager, TauriEmitter};
 
 /// One open session: the subprocess, the Wilkes behind it, and the transcript
 /// being written into it.
@@ -293,7 +293,12 @@ pub async fn chat_start(
     let ctx = app_context(&app);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let (spawned, wilkes) =
-        wilkes_api::commands::chat::start(backend, cwd.clone(), Some(workspace_manager(&app)))
+        wilkes_api::commands::chat::start(
+            backend,
+            cwd.clone(),
+            Some(workspace_manager(&app)),
+            Some(agent_browser(&app)),
+        )
             .await
             .map_err(|e| format!("{e:#}"))?;
     wilkes.apply(host.unwrap_or_default());
@@ -340,7 +345,11 @@ pub async fn chat_open_conversation(
     let record = wilkes_api::commands::chat::get_conversation(&chats.store_dir, &conversation_id)
         .map_err(|e| format!("{e:#}"))?;
     let (spawned, wilkes) =
-        wilkes_api::commands::chat::open(&record, Some(workspace_manager(&app)))
+        wilkes_api::commands::chat::open(
+            &record,
+            Some(workspace_manager(&app)),
+            Some(agent_browser(&app)),
+        )
             .await
             .map_err(|e| format!("{e:#}"))?;
     wilkes.apply(host.unwrap_or_default());
@@ -418,6 +427,7 @@ pub async fn chat_fork_conversation(
         source.backend,
         cwd.clone(),
         Some(workspace_manager(&app)),
+        Some(agent_browser(&app)),
     )
     .await
     .map_err(|e| format!("{e:#}"))?;

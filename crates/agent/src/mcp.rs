@@ -20,11 +20,12 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
-use wilkes_core::acquire::{download_to_root, AcquiredFiles};
+use wilkes_core::acquire::{download_to_root, store_file_in_root, AcquiredFiles};
 use wilkes_core::integrations::{acquire_result, IntegrationRegistry};
 use wilkes_core::types::{IntegrationsSettings, LiteratureAcquisition, LiteratureSearchResult};
 
 use crate::{
+    browser::{AgentBrowser, BROWSER_UNAVAILABLE},
     context::{ActiveDoc, ContextFile},
     host::ContextStateHandle,
     reader,
@@ -110,6 +111,7 @@ pub(crate) async fn start(
     context: ContextStateHandle,
     cwd: PathBuf,
     workspaces: Option<Arc<dyn WorkspaceCatalog>>,
+    browser: Option<Arc<dyn AgentBrowser>>,
 ) -> anyhow::Result<McpRuntime> {
     let token = uuid::Uuid::new_v4().to_string();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -120,6 +122,7 @@ pub(crate) async fn start(
         McpContext::Session(context),
         cwd,
         workspaces,
+        browser,
         HostValidation::LoopbackOnly,
         "chat",
     )
@@ -195,6 +198,7 @@ pub async fn start_external(
     token: Option<String>,
     workspaces: Arc<dyn WorkspaceCatalog>,
     context: ExternalMcpContext,
+    browser: Option<Arc<dyn AgentBrowser>>,
 ) -> anyhow::Result<ExternalMcpRuntime> {
     if port == 0 {
         anyhow::bail!("External MCP port must be between 1 and 65535");
@@ -207,6 +211,7 @@ pub async fn start_external(
         McpContext::Library(context),
         PathBuf::new(),
         Some(workspaces),
+        browser,
         HostValidation::Any,
         "external",
     )
@@ -222,6 +227,9 @@ pub fn api_router(workspaces: Arc<dyn WorkspaceCatalog>) -> Router {
         McpContext::Library(ExternalMcpContext::default()),
         PathBuf::new(),
         Some(workspaces),
+        // The shared HTTP API answers with or without the desktop app, so it
+        // has no browser to drive.
+        None,
         rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
             .with_stateful_mode(false)
             .with_json_response(true)
@@ -248,6 +256,7 @@ fn mcp_service(
     context: McpContext,
     cwd: PathBuf,
     workspaces: Option<Arc<dyn WorkspaceCatalog>>,
+    browser: Option<Arc<dyn AgentBrowser>>,
     config: rmcp::transport::streamable_http_server::StreamableHttpServerConfig,
 ) -> McpService {
     let literature_results = LiteratureResultCache::default();
@@ -255,7 +264,8 @@ fn mcp_service(
         move || {
             Ok(
                 WilkesMcp::new(context.clone(), cwd.clone(), workspaces.clone())
-                    .with_literature_results(literature_results.clone()),
+                    .with_literature_results(literature_results.clone())
+                    .with_browser(browser.clone()),
             )
         },
         Default::default(),
@@ -282,6 +292,7 @@ async fn start_server(
     context: McpContext,
     cwd: PathBuf,
     workspaces: Option<Arc<dyn WorkspaceCatalog>>,
+    browser: Option<Arc<dyn AgentBrowser>>,
     host_validation: HostValidation,
     lifecycle: &'static str,
 ) -> anyhow::Result<McpRuntime> {
@@ -296,7 +307,7 @@ async fn start_server(
         HostValidation::LoopbackOnly => config,
         HostValidation::Any => config.disable_allowed_hosts(),
     };
-    let service = mcp_service(context, cwd, workspaces, config);
+    let service = mcp_service(context, cwd, workspaces, browser, config);
 
     let router =
         Router::new()
@@ -373,6 +384,9 @@ struct WilkesMcp {
     /// can resolve a chosen result server-side. The model is shown a view
     /// without file URLs and names a result by id only.
     literature_results: LiteratureResultCache,
+    /// The desktop app's browser, signed in where the user signed in; none
+    /// where Wilkes runs without the desktop app.
+    browser: Option<Arc<dyn AgentBrowser>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -402,6 +416,17 @@ impl WilkesMcp {
         self
     }
 
+    fn with_browser(mut self, browser: Option<Arc<dyn AgentBrowser>>) -> Self {
+        self.browser = browser;
+        self
+    }
+
+    fn require_browser(&self) -> Result<&Arc<dyn AgentBrowser>, String> {
+        self.browser
+            .as_ref()
+            .ok_or_else(|| BROWSER_UNAVAILABLE.to_string())
+    }
+
     fn new(
         context: McpContext,
         cwd: PathBuf,
@@ -414,6 +439,7 @@ impl WilkesMcp {
             cwd,
             workspaces,
             literature_results: Arc::default(),
+            browser: None,
             tool_router,
         }
     }
@@ -956,9 +982,33 @@ struct DownloadParams {
     /// File name inside the current Wilkes root, or the folder's name when a
     /// result comes back as several files. Must not contain directories.
     filename: Option<String>,
+    /// Fetch url through the agent browser, which is signed in wherever the
+    /// user signed in in Wilkes' browser, instead of directly. For a site that
+    /// refuses a direct download (HTTP 401 or 403) of something the user has
+    /// access to. Only with url.
+    #[serde(default)]
+    through_browser: bool,
     /// Workspace id to read, from list_context. Omit for the workspace that is
     /// active in Wilkes. Naming one does not switch the app to it.
     workspace: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ReadWebPageParams {
+    /// HTTP(S) address of the page.
+    url: String,
+    /// Maximum characters to return (default 24000, capped at 120000).
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
+    #[schemars(with = "Option<usize>")]
+    max_chars: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadWebPageResponse {
+    url: String,
+    title: String,
+    text: String,
+    truncated: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1547,7 +1597,7 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Download a file into the current Wilkes root of the active workspace, or of the workspace named by workspace. Use only when the user asks to import or download a file. Name the file either by a url the user gave you, or by provider and result_id of a literature_search result whose downloadable is true; Wilkes finds the file itself. A result may come back as several files, in a folder of their own; the answer lists every file. Pass filename to choose the saved name, or the folder's when there are several; existing files are never overwritten. Refused for a workspace list_context reports as read_only, which another application owns."
+        description = "Download a file into the current Wilkes root of the active workspace, or of the workspace named by workspace. Use only when the user asks to import or download a file. Name the file either by a url the user gave you, or by provider and result_id of a literature_search result whose downloadable is true; Wilkes finds the file itself. A result may come back as several files, in a folder of their own; the answer lists every file. Pass filename to choose the saved name, or the folder's when there are several; existing files are never overwritten, and a name already taken by a different file gets a number, as in 'paper (2).pdf'. When a direct download of a url is refused (HTTP 401 or 403) by a site the user has access to, retry with through_browser=true: the agent browser fetches it signed in wherever the user signed in in Wilkes' browser. If that comes back as a sign-in or check page, ask the user to open Agent browser from the browser button's menu in Wilkes, deal with it there, and try again. Refused for a workspace list_context reports as read_only, which another application owns."
     )]
     async fn download(&self, Parameters(params): Parameters<DownloadParams>) -> CallToolResult {
         let scope = match self.scope(params.workspace.as_deref()).await {
@@ -1573,6 +1623,15 @@ impl WilkesMcp {
         // No progress sink: an MCP call is one request and one reply, with
         // nowhere to render a bar between them.
         let (acquired, named) = match (params.url, params.provider, params.result_id) {
+            (Some(url), None, None) if params.through_browser => (
+                self.download_through_browser(&url, &root, params.filename, max_download_bytes)
+                    .await
+                    .map(|file| AcquiredFiles {
+                        folder: None,
+                        files: vec![file],
+                    }),
+                None,
+            ),
             (Some(url), None, None) => (
                 download_to_root(
                     &root,
@@ -1592,6 +1651,11 @@ impl WilkesMcp {
             ),
             // The result is kept so a saved one can be marked as in the
             // library once its files are there.
+            (None, Some(_), Some(_)) if params.through_browser => {
+                return CallToolResult::error(vec![ContentBlock::text(
+                    "through_browser takes a url, not a literature result.",
+                )])
+            }
             (None, Some(provider), Some(result_id)) => {
                 match self.cached_literature_result(&provider, &result_id) {
                     Ok(result) => (
@@ -1634,6 +1698,35 @@ impl WilkesMcp {
                     }
                 }
                 structured(acquired)
+            }
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        }
+    }
+
+    #[tool(
+        description = "Open a web page in the agent browser and return its text. The agent browser is Wilkes' own, signed in wherever the user signed in in Wilkes' browser, so it reads pages a plain fetch cannot, such as articles behind the user's library sign-in. The user can watch it by opening Agent browser from the browser button's menu in Wilkes. If the page asks to sign in or to pass a check, ask the user to open Agent browser there, deal with it, and try again. For a file such as a PDF, use download with through_browser=true instead."
+    )]
+    async fn read_web_page(
+        &self,
+        Parameters(params): Parameters<ReadWebPageParams>,
+    ) -> CallToolResult {
+        let browser = match self.require_browser() {
+            Ok(browser) => browser,
+            Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
+        };
+        match browser.read(&params.url).await {
+            Ok(page) => {
+                let max_chars = params
+                    .max_chars
+                    .unwrap_or(DEFAULT_TEXT_CHAR_LIMIT)
+                    .min(MAX_TEXT_CHAR_LIMIT);
+                let excerpt = reader::limit_excerpt(&page.text, max_chars);
+                structured(ReadWebPageResponse {
+                    url: page.url,
+                    title: page.title,
+                    text: excerpt.text,
+                    truncated: excerpt.truncated,
+                })
             }
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
@@ -1746,6 +1839,26 @@ impl WilkesMcp {
 }
 
 impl WilkesMcp {
+    /// Download `url` in the agent browser and store it in `root` by the rules
+    /// every download keeps.
+    async fn download_through_browser(
+        &self,
+        url: &str,
+        root: &Path,
+        filename: Option<String>,
+        max_download_bytes: u64,
+    ) -> Result<wilkes_core::acquire::DownloadResponse, String> {
+        let staged = self.require_browser()?.download(url).await?;
+        let name = filename.unwrap_or_else(|| staged.suggested_name.clone());
+        store_file_in_root(
+            root,
+            staged.file(),
+            &name,
+            Some(max_download_bytes),
+            "agent browser",
+        )
+    }
+
     /// The service custom integrations are read and written through, the
     /// active workspace's because integration settings are the installation's.
     async fn integrations_service(&self) -> Result<Arc<dyn SearchService>, String> {
@@ -2936,6 +3049,133 @@ mod tests {
         }
     }
 
+    /// A browser that serves one file and one page, as the desktop app's
+    /// would for a site that let it in.
+    struct FakeBrowser {
+        staging: PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBrowser for FakeBrowser {
+        async fn download(
+            &self,
+            url: &str,
+        ) -> Result<crate::browser::StagedDownload, String> {
+            if !url.ends_with("/paper.pdf") {
+                return Err("The page asks you to sign in".to_string());
+            }
+            let dir = self.staging.join(uuid::Uuid::new_v4().to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("download");
+            std::fs::write(&file, b"%PDF-1.7 signed in").unwrap();
+            Ok(crate::browser::StagedDownload::new(
+                dir,
+                file,
+                "Signed In - Anna's Archive.pdf".to_string(),
+            ))
+        }
+
+        async fn read(&self, url: &str) -> Result<crate::browser::BrowserPage, String> {
+            Ok(crate::browser::BrowserPage {
+                url: url.to_string(),
+                title: "Full text".to_string(),
+                text: "é".repeat(10),
+            })
+        }
+    }
+
+    fn mcp_with_browser(root: &Path, staging: &Path) -> WilkesMcp {
+        WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(single_workspace(fake_search_with_root(root.to_path_buf()))),
+        )
+        .with_browser(Some(Arc::new(FakeBrowser {
+            staging: staging.to_path_buf(),
+        })))
+    }
+
+    fn browser_download(url: &str) -> DownloadParams {
+        DownloadParams {
+            url: Some(url.to_string()),
+            provider: None,
+            result_id: None,
+            filename: None,
+            through_browser: true,
+            workspace: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_download_through_the_browser_is_stored_like_any_other_and_its_staging_goes() {
+        let root = tempdir().unwrap();
+        let staging = tempdir().unwrap();
+        let mcp = mcp_with_browser(root.path(), staging.path());
+
+        let reply = mcp
+            .download(Parameters(browser_download("https://dl.example/paper.pdf")))
+            .await;
+        assert_ne!(reply.is_error, Some(true), "{reply:?}");
+        let saved = root.path().join("Signed In.pdf");
+        assert_eq!(std::fs::read(&saved).unwrap(), b"%PDF-1.7 signed in");
+        assert_eq!(
+            reply.structured_content.unwrap()["files"][0]["path"],
+            saved.display().to_string()
+        );
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
+
+        let refused = mcp
+            .download(Parameters(browser_download("https://dl.example/login")))
+            .await;
+        assert_eq!(refused.is_error, Some(true));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn browser_tools_say_so_where_there_is_no_browser() {
+        let root = tempdir().unwrap();
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(single_workspace(fake_search_with_root(root.path().into()))),
+        );
+        let reply = mcp
+            .download(Parameters(browser_download("https://dl.example/paper.pdf")))
+            .await;
+        assert!(format!("{reply:?}").contains(BROWSER_UNAVAILABLE), "{reply:?}");
+        let reply = mcp
+            .read_web_page(Parameters(ReadWebPageParams {
+                url: "https://dl.example/".to_string(),
+                max_chars: None,
+            }))
+            .await;
+        assert!(format!("{reply:?}").contains(BROWSER_UNAVAILABLE), "{reply:?}");
+
+        let mut by_result = browser_download("https://dl.example/paper.pdf");
+        by_result.url = None;
+        by_result.provider = Some("openalex".to_string());
+        by_result.result_id = Some("W1".to_string());
+        let reply = mcp.download(Parameters(by_result)).await;
+        assert!(format!("{reply:?}").contains("through_browser takes a url"), "{reply:?}");
+    }
+
+    #[tokio::test]
+    async fn a_page_read_in_the_browser_is_cut_by_characters() {
+        let root = tempdir().unwrap();
+        let staging = tempdir().unwrap();
+        let mcp = mcp_with_browser(root.path(), staging.path());
+        let reply = mcp
+            .read_web_page(Parameters(ReadWebPageParams {
+                url: "https://dl.example/article".to_string(),
+                max_chars: Some(4),
+            }))
+            .await;
+        let content = reply.structured_content.unwrap();
+        assert_eq!(content["text"], "éééé");
+        assert_eq!(content["truncated"], true);
+        assert_eq!(content["title"], "Full text");
+    }
+
     fn single_workspace(search: Arc<FakeSearch>) -> Arc<FakeWorkspaces> {
         Arc::new(FakeWorkspaces::new("active", vec![("active", search)]))
     }
@@ -3406,6 +3646,7 @@ mod tests {
             None,
             single_workspace(fake_search_with_root(library.path().to_path_buf())),
             ExternalMcpContext::default(),
+            None,
         )
         .await
         .unwrap();
@@ -3559,6 +3800,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
                 provider: Some("custom:runner".to_string()),
                 result_id: Some("M1".to_string()),
                 filename: None,
+                through_browser: false,
                 workspace: None,
             }))
             .await;
@@ -3638,6 +3880,7 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
             Some("test-token".to_string()),
             single_workspace(fake_search_with_root(library.path().to_path_buf())),
             ExternalMcpContext::default(),
+            None,
         )
         .await
         .unwrap();

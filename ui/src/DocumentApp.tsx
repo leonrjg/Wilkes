@@ -6,7 +6,7 @@ import { api } from "./services";
 import { useNativeOpen } from "./hooks/useNativeOpen";
 import { useWindowTitle } from "./hooks/useWindowTitle";
 import { useSettingsStore } from "./stores/useSettingsStore";
-import { useBrowserStore } from "./stores/useBrowserStore";
+import { useBrowserPageEvents, useBrowserStore } from "./stores/useBrowserStore";
 import { activeViewerTab, useViewerStore } from "./stores/useViewerStore";
 import type { NativeOpenRequest } from "./lib/types";
 
@@ -17,6 +17,7 @@ export default function DocumentApp() {
   const { addToast } = useToasts();
   const activePath = useViewerStore((state) => activeViewerTab(state)?.path ?? null);
   const browserPaneOpen = useBrowserStore((state) => state.paneOpen);
+  useBrowserPageEvents("user");
 
   // This window belongs to no workspace or root, so its title is only the
   // document it is showing.

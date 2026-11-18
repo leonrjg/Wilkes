@@ -2,12 +2,17 @@
 // desktop shell keeps a native webview over its rectangle. That webview sits
 // above everything the page draws -- a menu or a dialog that overlaps the pane
 // is hidden under it -- which is accepted rather than worked around.
+//
+// The same pane shows the agent's browser (`kind="agent"`): the webview MCP
+// tools fetch and read pages in, which exists whether or not this pane is open.
+// Opening it shows that webview where the agent left it, for the user to watch
+// or take over -- sign in, pass a check -- and closing it only hides it.
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, ArrowRight, Download, ExternalLink, Globe, Loader, LogIn, Moon, RotateCw, Trash2, X } from "react-feather";
+import { ArrowLeft, ArrowRight, Cpu, Download, ExternalLink, Globe, Loader, LogIn, Moon, RotateCw, Trash2, X } from "react-feather";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { api } from "../services";
-import type { BrowserStep, PaneBounds, RgbColor } from "../services/api";
-import { useBrowserStore } from "../stores/useBrowserStore";
+import type { BrowserPaneKind, BrowserStep, PaneBounds, RgbColor } from "../services/api";
+import { browserStoreFor, useBrowserStore } from "../stores/useBrowserStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { darkPageFilter } from "../lib/darkPages";
 import { confirmDialog } from "../lib/utils/dialog";
@@ -66,23 +71,26 @@ export function addressFrom(input: string): string {
 const iconButton =
   "inline-flex shrink-0 rounded p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-40 disabled:hover:bg-transparent";
 
-export default function BrowserPane() {
+export default function BrowserPane({ kind = "user" }: { kind?: BrowserPaneKind }) {
+  const agent = kind === "agent";
+  const useStore = browserStoreFor(kind);
   const root = useRef<HTMLDivElement>(null);
   const stage = useRef<HTMLDivElement>(null);
-  // Whether the native webview exists yet: it is made by the first address
-  // the pane is asked to show, not by the pane opening.
+  // Whether the native webview is shown here yet. The user's is made by the
+  // first address the pane is asked to show; the agent's is shown on opening.
   const created = useRef(false);
-  const request = useBrowserStore((s) => s.request);
-  const url = useBrowserStore((s) => s.url);
-  const title = useBrowserStore((s) => s.title);
-  const loading = useBrowserStore((s) => s.loading);
+  const request = useStore((s) => s.request);
+  const url = useStore((s) => s.url);
+  const title = useStore((s) => s.title);
+  const loading = useStore((s) => s.loading);
+  // A drag in the window: every pane steps aside for it.
   const held = useBrowserStore((s) => s.held);
-  const closePane = useBrowserStore((s) => s.closePane);
-  const darkenLightPages = useBrowserStore((s) => s.darkenLightPages);
-  const toggleDarkening = useBrowserStore((s) => s.toggleDarkening);
-  const finding = useBrowserStore((s) => s.finding);
-  const findRequests = useBrowserStore((s) => s.findRequests);
-  const hoveredLink = useBrowserStore((s) => s.hoveredLink);
+  const closePane = useStore((s) => s.closePane);
+  const darkenLightPages = useStore((s) => s.darkenLightPages);
+  const toggleDarkening = useStore((s) => s.toggleDarkening);
+  const finding = useStore((s) => s.finding);
+  const findRequests = useStore((s) => s.findRequests);
+  const hoveredLink = useStore((s) => s.hoveredLink);
   const dark = useSettingsStore((s) => s.colorScheme === "dark");
   // The reader's dark-mode filter: inverted or dimmed, as the reader's pages are.
   const readerFilter = useSettingsStore((s) => darkPageFilter(s.settings ?? {}));
@@ -95,22 +103,6 @@ export default function BrowserPane() {
     if (!editing && url) setDraft(url);
   }, [url, editing]);
 
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    let disposed = false;
-    api
-      .onBrowserPanePage?.(useBrowserStore.getState().applyPageEvent)
-      .then((stop) => {
-        if (disposed) stop();
-        else unlisten = stop;
-      })
-      .catch((e) => console.error("browser pane: could not listen to its page", e));
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
-
   // Follow the stage wherever the layout moves it. A frame loop rather than a
   // ResizeObserver, because a neighbouring pane moves the stage without
   // resizing it. The webview closes with the pane.
@@ -122,58 +114,75 @@ export default function BrowserPane() {
       const next = boundsOf(element);
       if (!sameBounds(last, next)) {
         last = next;
-        api.browserPaneSetBounds?.(next).catch((e) => console.error("browser pane: move failed", e));
+        api.browserPaneSetBounds?.(kind, next).catch((e) => console.error("browser pane: move failed", e));
       }
       frame = requestAnimationFrame(follow);
     });
     return () => {
       cancelAnimationFrame(frame);
       created.current = false;
-      api.browserPaneClose?.().catch((e) => console.error("browser pane: close failed", e));
+      api.browserPaneClose?.(kind).catch((e) => console.error("browser pane: close failed", e));
     };
-  }, []);
+  }, [kind]);
+
+  // The agent's webview is there whether or not anyone watches, once an
+  // agent has opened something: shown here, where the agent left it, as soon
+  // as there is a page to show.
+  const hasAgentPage = agent && url !== null;
+  useEffect(() => {
+    const element = stage.current;
+    const pane = root.current;
+    if (!hasAgentPage || created.current || !element || !pane) return;
+    api
+      .browserPaneShow?.(kind, null, boundsOf(element), backgroundOf(pane))
+      .then(() => {
+        created.current = true;
+      })
+      .catch((e) => console.error("browser pane: could not show the agent's browser", e));
+  }, [hasAgentPage, kind]);
 
   useEffect(() => {
     const element = stage.current;
     const pane = root.current;
     if (!request || !element || !pane) return;
     setDraft(request.url);
-    const show = async () => api.browserPaneShow?.(request.url, boundsOf(element), backgroundOf(pane));
+    const show = async () => api.browserPaneShow?.(kind, request.url, boundsOf(element), backgroundOf(pane));
     show()
       .then(() => {
         created.current = true;
       })
       .catch((e) => console.error("browser pane: could not open", request.url, e));
-  }, [request]);
+  }, [request, kind]);
 
   // Held by the shell for every page the pane loads, so it is sent whether or
   // not the webview exists yet.
   useEffect(() => {
-    api.browserPaneSetDarkFilter?.(darkFilter).catch((e) => console.error("browser pane: could not set the dark filter", e));
-  }, [darkFilter]);
+    api.browserPaneSetDarkFilter?.(kind, darkFilter).catch((e) => console.error("browser pane: could not set the dark filter", e));
+  }, [darkFilter, kind]);
 
   useEffect(() => {
     if (!created.current) return;
-    api.browserPaneSetVisible?.(!held).catch((e) => console.error("browser pane: could not step aside", e));
-  }, [held]);
+    api.browserPaneSetVisible?.(kind, !held).catch((e) => console.error("browser pane: could not step aside", e));
+  }, [held, kind]);
 
   const step = (to: BrowserStep) =>
-    api.browserPaneStep?.(to).catch((e) => console.error(`browser pane: ${to} failed`, e));
+    api.browserPaneStep?.(kind, to).catch((e) => console.error(`browser pane: ${to} failed`, e));
 
   const clearData = async () => {
     const confirmed = await confirmDialog(
       "Clear the browser pane's cookies and site data? This signs you out of every site you signed in to there.",
     );
     if (!confirmed) return;
-    await api.browserPaneClearData?.().catch((e) => console.error("browser pane: clearing data failed", e));
+    await api.browserPaneClearData?.(kind).catch((e) => console.error("browser pane: clearing data failed", e));
   };
 
   const endFind = () => {
-    useBrowserStore.getState().closeFind();
-    api.browserPaneEndFind?.().catch((e) => console.error("browser pane: could not end find", e));
+    useStore.getState().closeFind();
+    api.browserPaneEndFind?.(kind).catch((e) => console.error("browser pane: could not end find", e));
   };
 
-  const hasPage = url !== null && request !== null;
+  // The agent's pane shows whatever the agent opened, with no request of its own.
+  const hasPage = url !== null && (agent || request !== null);
 
   return (
     <div ref={root} className="flex h-full min-h-0 flex-col bg-[var(--bg-sidebar)]">
@@ -182,10 +191,21 @@ export default function BrowserPane() {
         onSubmit={(event) => {
           event.preventDefault();
           if (draft.trim() === "") return;
-          useBrowserStore.getState().show(addressFrom(draft));
+          useStore.getState().show(addressFrom(draft));
           (document.activeElement as HTMLElement | null)?.blur();
         }}
       >
+        {agent && (
+          <Tooltip content="The agent's browser. Sign-ins are shared with yours.">
+            <span
+              aria-label="Agent browser"
+              className="inline-flex shrink-0 items-center gap-1 rounded bg-[var(--bg-active)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent-blue)]"
+            >
+              <Cpu size={10} />
+              Agent
+            </span>
+          </Tooltip>
+        )}
         <Tooltip content="Back">
           <button type="button" aria-label="Back" disabled={!hasPage} onClick={() => step("back")} className={iconButton}>
             <ArrowLeft size={12} />
@@ -224,7 +244,7 @@ export default function BrowserPane() {
             aria-label="Save to library"
             disabled={!hasPage}
             onClick={() => {
-              api.browserPaneSavePage?.().catch((e) => console.error("browser pane: save to library failed", e));
+              api.browserPaneSavePage?.(kind).catch((e) => console.error("browser pane: save to library failed", e));
             }}
             className={iconButton}
           >
@@ -281,24 +301,30 @@ export default function BrowserPane() {
           </button>
         </Tooltip>
         <Tooltip content="Close">
-          <button type="button" aria-label="Close browser pane" onClick={closePane} className={iconButton}>
+          <button type="button" aria-label={agent ? "Close agent browser" : "Close browser pane"} onClick={closePane} className={iconButton}>
             <X size={12} />
           </button>
         </Tooltip>
       </form>
-      {finding && hasPage && <BrowserFindStrip requests={findRequests} onClose={endFind} />}
-      <BrowserDownloads />
+      {finding && hasPage && <BrowserFindStrip kind={kind} requests={findRequests} onClose={endFind} />}
+      <BrowserDownloads kind={kind} />
       {importingCookies && hasPage && (
         <CookieImportStrip
+          kind={kind}
           url={url}
           onImported={() => void step("reload")}
           onClose={() => setImportingCookies(false)}
         />
       )}
       <div ref={stage} className="relative min-h-0 flex-1">
-        {!request && (
+        {!request && !agent && (
           <p className="p-4 text-center text-[11px] text-[var(--text-dim)]">
             Links you follow open here.
+          </p>
+        )}
+        {agent && !url && (
+          <p className="p-4 text-center text-[11px] text-[var(--text-dim)]">
+            Pages an agent opens show here. Where a site asks for you, sign in here and the agent can try again.
           </p>
         )}
       </div>

@@ -1,5 +1,7 @@
+import { useEffect } from "react";
 import { create } from "zustand";
-import type { BrowserPageEvent } from "../services/api";
+import { api } from "../services";
+import type { BrowserPageEvent, BrowserPaneKind } from "../services/api";
 
 /** A download from the pane, which goes into the library root. */
 export interface BrowserDownload {
@@ -24,8 +26,9 @@ interface BrowserStore {
   url: string | null;
   title: string | null;
   loading: boolean;
-  /** A drag in the page is in progress, and the native pane must step aside
-   *  for it to keep the pointer. */
+  /** A drag in the page is in progress, and the native panes must step aside
+   *  for it to keep the pointer. The window's, so held in the user's store and
+   *  read from there by every pane. */
   held: boolean;
   /** In dark mode, darken pages that come out light, as the reader darkens its
    *  own. On by default; the pane's own switch, for a page the lightness check
@@ -56,7 +59,7 @@ function withDownload(downloads: BrowserDownload[], next: BrowserDownload): Brow
   return [next, ...rest];
 }
 
-export const useBrowserStore = create<BrowserStore>((set, get) => ({
+const createBrowserStore = () => create<BrowserStore>((set, get) => ({
   paneOpen: false,
   request: null,
   url: null,
@@ -88,7 +91,7 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
         break;
       case "download_started":
         set((state) => ({
-          downloads: withDownload(state.downloads, { url: event.url, name: event.name, path: event.path, state: "saving" }),
+          downloads: withDownload(state.downloads, { url: event.url, name: event.name, path: null, state: "saving" }),
         }));
         break;
       case "download_finished":
@@ -125,3 +128,33 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
   clearDownloads: () => set({ downloads: [] }),
   closeFind: () => set({ finding: false }),
 }));
+
+/** The user's own pane. */
+export const useBrowserStore = createBrowserStore();
+/** The pane the agent browses in, which the user opens to watch or take over. */
+export const useAgentBrowserStore = createBrowserStore();
+
+export function browserStoreFor(kind: BrowserPaneKind) {
+  return kind === "agent" ? useAgentBrowserStore : useBrowserStore;
+}
+
+/** Keep `kind`'s store following its pane's page for as long as the window
+ *  lives, open or not: the agent browses with nobody watching, and opening its
+ *  pane should show where it is. */
+export function useBrowserPageEvents(kind: BrowserPaneKind) {
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    api
+      .onBrowserPanePage?.(kind, browserStoreFor(kind).getState().applyPageEvent)
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch((e) => console.error(`browser pane (${kind}): could not listen to its page`, e));
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [kind]);
+}

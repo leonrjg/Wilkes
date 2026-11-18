@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Webview};
 use tracing::error;
 
-use crate::browser_pane::{emit, PageEvent};
+use crate::browser_pane::{emit, PageEvent, PaneId};
 
 #[cfg(target_os = "linux")]
 mod gtk;
@@ -25,22 +25,22 @@ mod webview2;
 
 /// Start telling the window which link is under the pointer in a pane just
 /// made. Only changes are told: the platforms report every move.
-pub(crate) fn listen_for_hover(webview: &Webview, app: &AppHandle, owner: &str) {
+pub(crate) fn listen_for_hover(webview: &Webview, app: &AppHandle, pane: &PaneId) {
     let report = {
         let app = app.clone();
-        let owner = owner.to_string();
+        let pane = pane.clone();
         let last = Mutex::new(None::<String>);
         move |url: Option<String>| {
             let url = url.filter(|url| !url.is_empty());
             let mut last = last.lock().unwrap();
             if *last != url {
                 last.clone_from(&url);
-                emit(&app, &owner, PageEvent::Hover { url });
+                emit(&app, &pane, PageEvent::Hover { url });
             }
         }
     };
     #[cfg(target_os = "macos")]
-    let listening = macos::listen_for_hover(webview, owner, report);
+    let listening = macos::listen_for_hover(webview, &pane.label(), report);
     #[cfg(target_os = "linux")]
     let listening = gtk::listen_for_hover(webview, report);
     #[cfg(windows)]
@@ -57,11 +57,11 @@ pub(crate) fn listen_for_hover(webview: &Webview, app: &AppHandle, owner: &str) 
 
 /// Stop for a pane about to close. Only macOS holds anything for it: the
 /// stand-in delegate, which the app keeps since WebKit holds delegates weakly.
-pub(crate) fn stop_listening(webview: &Webview, owner: &str) {
+pub(crate) fn stop_listening(webview: &Webview, pane: &PaneId) {
     #[cfg(target_os = "macos")]
-    if let Err(e) = macos::stop_listening(webview, owner) {
+    if let Err(e) = macos::stop_listening(webview, &pane.label()) {
         error!("browser pane: could not stop listening for the link under the pointer: {e}");
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = (webview, owner);
+    let _ = (webview, pane);
 }

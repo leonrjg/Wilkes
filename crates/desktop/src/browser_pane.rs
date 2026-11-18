@@ -12,6 +12,17 @@
 //! What the page in the pane is doing (its address, whether it is loading,
 //! its title) goes back to the window that owns the pane as events.
 //!
+//! A window may also have the agent's pane: the browser MCP tools fetch and
+//! read pages through (`agent_browser`). It lives in the main window, made
+//! hidden the first time an agent needs it, and is shown only when the user
+//! opens it, to watch it or to take over -- sign in, pass a check. It opens
+//! the same data store, so a sign-in made in either pane is the other's too.
+//!
+//! Every download from a pane is staged beside the library and stored by the
+//! rules every download keeps (`wilkes_core::acquire::store_file_in_root`):
+//! no file is overwritten, a taken name is numbered, and content the library
+//! already has is not stored twice.
+//!
 //! In dark mode a light page is inverted the way the reader inverts a PDF.
 //! Pages see the window's appearance, so a site with a dark theme of its own
 //! shows it and is left alone: inverting it would make it light again.
@@ -37,6 +48,10 @@ use tracing::error;
 
 /// The event a window hears about the page in its pane.
 pub const PAGE_EVENT: &str = "browser-pane:page";
+/// The event the main window hears about the page in the agent's pane.
+pub const AGENT_PAGE_EVENT: &str = "browser-agent:page";
+/// The window the agent's pane lives in.
+pub(crate) const AGENT_OWNER: &str = "main";
 
 /// The data store every pane opens; any fixed value would do, but it must not
 /// change, or every sign-in made in the pane is forgotten.
@@ -44,6 +59,55 @@ pub const PAGE_EVENT: &str = "browser-pane:page";
 const DATA_STORE: [u8; 16] = [
     0x32, 0x79, 0x85, 0x6d, 0x56, 0x0b, 0x4e, 0xa1, 0x94, 0x7c, 0xe6, 0x26, 0x29, 0x52, 0xb9, 0x9d,
 ];
+
+/// Whose pane: the user's own, or the one the agent browses in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneKind {
+    User,
+    Agent,
+}
+
+/// One pane: the window it is in, and whose it is.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PaneId {
+    pub(crate) owner: String,
+    pub(crate) kind: PaneKind,
+}
+
+impl PaneId {
+    /// The pane of `kind` in `window`. The agent's is in the main window only.
+    pub(crate) fn of(window: &Window, kind: PaneKind) -> Result<Self, String> {
+        if kind == PaneKind::Agent && window.label() != AGENT_OWNER {
+            return Err("The agent browser is in the main window".to_string());
+        }
+        Ok(Self {
+            owner: window.label().to_string(),
+            kind,
+        })
+    }
+
+    pub(crate) fn agent() -> Self {
+        Self {
+            owner: AGENT_OWNER.to_string(),
+            kind: PaneKind::Agent,
+        }
+    }
+
+    pub(crate) fn label(&self) -> String {
+        match self.kind {
+            PaneKind::User => format!("browser-pane-{}", self.owner),
+            PaneKind::Agent => format!("browser-agent-{}", self.owner),
+        }
+    }
+
+    fn event(&self) -> &'static str {
+        match self.kind {
+            PaneKind::User => PAGE_EVENT,
+            PaneKind::Agent => AGENT_PAGE_EVENT,
+        }
+    }
+}
 
 /// The placeholder's rectangle in CSS pixels, relative to the owning window's
 /// own webview.
@@ -71,7 +135,6 @@ pub(crate) enum PageEvent {
     DownloadStarted {
         url: String,
         name: String,
-        path: String,
     },
     DownloadFinished {
         url: String,
@@ -100,22 +163,22 @@ pub enum Step {
     Reload,
 }
 
-/// The filter each window's pane darkens a light page with, keyed by the
-/// owning window's label; a window without an entry does not darken. Kept here
-/// rather than in the page because every page load replaces the page.
+/// The filter each pane darkens a light page with, keyed by the pane's label;
+/// a pane without an entry does not darken. Kept here rather than in the page
+/// because every page load replaces the page.
 #[derive(Default)]
 pub struct DarkFilters(Mutex<HashMap<String, String>>);
 
 impl DarkFilters {
-    fn get(&self, owner: &str) -> Option<String> {
-        self.0.lock().unwrap().get(owner).cloned()
+    fn get(&self, pane: &PaneId) -> Option<String> {
+        self.0.lock().unwrap().get(&pane.label()).cloned()
     }
 
-    fn set(&self, owner: &str, filter: Option<String>) {
+    fn set(&self, pane: &PaneId, filter: Option<String>) {
         let mut filters = self.0.lock().unwrap();
         match filter {
-            Some(filter) => filters.insert(owner.to_string(), filter),
-            None => filters.remove(owner),
+            Some(filter) => filters.insert(pane.label(), filter),
+            None => filters.remove(&pane.label()),
         };
     }
 }
@@ -195,12 +258,8 @@ fn paint_own_background(webview: &Webview) {
     }
 }
 
-fn label(owner: &str) -> String {
-    format!("browser-pane-{owner}")
-}
-
 /// Only web pages: the pane is not a way into the filesystem or the app.
-fn web_url(url: &str) -> Result<Url, String> {
+pub(crate) fn web_url(url: &str) -> Result<Url, String> {
     let url = Url::parse(url).map_err(|e| format!("Not a web address: {e}"))?;
     match url.scheme() {
         "http" | "https" => Ok(url),
@@ -210,28 +269,30 @@ fn web_url(url: &str) -> Result<Url, String> {
     }
 }
 
-pub(crate) fn pane(window: &Window) -> Result<Webview, String> {
+pub(crate) fn pane(window: &Window, kind: PaneKind) -> Result<Webview, String> {
+    let id = PaneId::of(window, kind)?;
     window
         .app_handle()
-        .get_webview(&label(window.label()))
+        .get_webview(&id.label())
         .ok_or_else(|| "The browser pane is not open".to_string())
 }
 
-/// Where each download in flight is going, by its URL: WebKit says where a
-/// download finished on no platform but Windows, so the shell remembers.
+/// Where each download in flight is staged, by its pane's label and its URL:
+/// WebKit says where a download finished on no platform but Windows, so the
+/// shell remembers.
 #[derive(Default)]
-pub struct Downloads(Mutex<HashMap<String, PathBuf>>);
+pub struct Downloads(Mutex<HashMap<(String, String), PathBuf>>);
 
-/// The addresses the pane was asked to save to the library, until their
-/// download finishes. Such a download is staged beside the library: a web page
-/// becomes its article, with its pictures inside, as a feed's post does; any
-/// other file goes into the library as it came.
+/// The addresses each pane was asked to save to the library, until their
+/// download finishes. A web page so saved becomes its article, with its
+/// pictures inside, as a feed's post does; any other file goes into the
+/// library as it came.
 #[derive(Default)]
-pub struct PageSaves(Mutex<HashSet<String>>);
+pub struct PageSaves(Mutex<HashSet<(String, String)>>);
 
 /// Whether a downloaded file is a web page, by its own first bytes: WebKit's
 /// suggested name for a page need not end in `.html`.
-fn is_web_page(path: &Path) -> std::io::Result<bool> {
+pub(crate) fn is_web_page(path: &Path) -> std::io::Result<bool> {
     use std::io::Read;
     let mut head = Vec::with_capacity(1024);
     std::fs::File::open(path)?
@@ -243,51 +304,81 @@ fn is_web_page(path: &Path) -> std::io::Result<bool> {
     Ok(head.starts_with('<') && (head.starts_with("<!doctype html") || head.contains("<html")))
 }
 
-/// Put a saved page's download where it belongs, once it is in, and say so.
-async fn finish_page_save(
+/// A directory of its own beside the library for one download to arrive in.
+fn staging_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let staging = crate::app_context(app)
+        .data_dir
+        .join("page-staging")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&staging).map_err(|e| format!("Could not stage it: {e}"))?;
+    Ok(staging)
+}
+
+/// Remove a download's staging directory, once what it held is dealt with.
+pub(crate) fn clear_staging(staged: &Path) {
+    let Some(staging) = staged.parent() else {
+        return;
+    };
+    if let Err(e) = std::fs::remove_dir_all(staging) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            error!("browser pane: could not clear {}: {e}", staging.display());
+        }
+    }
+}
+
+/// Put a pane's finished download where it belongs, and say so.
+async fn finish_download(
     app: AppHandle,
-    owner: String,
+    pane: PaneId,
     url: String,
     staged: PathBuf,
     success: bool,
+    saving_page: bool,
 ) {
-    let staging = staged.parent().map(Path::to_path_buf);
+    if !success {
+        clear_staging(&staged);
+        emit(
+            &app,
+            &pane,
+            PageEvent::DownloadFinished {
+                url,
+                name: file_name(&staged),
+                path: String::new(),
+                success: false,
+            },
+        );
+        return;
+    }
     let outcome: Result<PathBuf, String> = async {
-        if !success {
-            return Err("The download failed".to_string());
-        }
         let ctx = crate::app_context(&app);
+        ctx.ensure_writable().map_err(|e| e.to_string())?;
         let root = ctx
             .get_settings()
             .await
             .last_directory
             .filter(|root| root.is_dir())
             .ok_or_else(|| "No library folder is open to save it in".to_string())?;
-        if is_web_page(&staged).map_err(|e| e.to_string())? {
-            ctx.save_web_page(&url, &staged, &root)
+        if saving_page && is_web_page(&staged).map_err(|e| e.to_string())? {
+            return ctx
+                .save_web_page(&url, &staged, &root)
                 .await
-                .map_err(|e| format!("Its article could not be saved: {e:#}"))
-        } else {
-            let name = file_name(&staged);
-            let target = free_path(&root, &name);
-            tokio::fs::rename(&staged, &target)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(target)
+                .map_err(|e| format!("Its article could not be saved: {e:#}"));
         }
+        let name = file_name(&staged);
+        let (file, source) = (staged.clone(), url.clone());
+        tauri::async_runtime::spawn_blocking(move || {
+            wilkes_core::acquire::store_file_in_root(&root, &file, &name, None, &source)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|saved| PathBuf::from(saved.path))
     }
     .await;
-    if let Some(staging) = staging {
-        if let Err(e) = tokio::fs::remove_dir_all(&staging).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                error!("browser pane: could not clear {}: {e}", staging.display());
-            }
-        }
-    }
+    clear_staging(&staged);
     match outcome {
         Ok(path) => emit(
             &app,
-            &owner,
+            &pane,
             PageEvent::DownloadFinished {
                 url,
                 name: file_name(&path),
@@ -296,31 +387,10 @@ async fn finish_page_save(
             },
         ),
         Err(reason) => {
-            error!("browser pane: saving {url}: {reason}");
-            emit(&app, &owner, PageEvent::DownloadRefused { url, reason });
+            error!("browser pane: saving a download: {reason}");
+            emit(&app, &pane, PageEvent::DownloadRefused { url, reason });
         }
     }
-}
-
-/// `name` in `root`, or `name (2)`, `name (3)`… if it is taken: a download
-/// never replaces a file already in the library.
-fn free_path(root: &Path, name: &str) -> PathBuf {
-    let candidate = root.join(name);
-    if !candidate.exists() {
-        return candidate;
-    }
-    let path = Path::new(name);
-    let stem = path
-        .file_stem()
-        .map_or_else(|| name.to_string(), |s| s.to_string_lossy().into_owned());
-    let extension = path
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
-    (2..)
-        .map(|n| root.join(format!("{stem} ({n}){extension}")))
-        .find(|candidate| !candidate.exists())
-        .expect("some numbered name is free")
 }
 
 /// The library root a download from the pane is saved into: the active
@@ -336,101 +406,65 @@ fn download_root(app: &AppHandle) -> Result<PathBuf, String> {
         .ok_or_else(|| "No library folder is open to save it in".to_string())
 }
 
-/// Send a download from the pane to the library root instead of the system's
-/// Downloads folder, under the name WebKit suggests.
-pub(crate) fn route_download(app: &AppHandle, owner: &str, event: DownloadEvent<'_>) -> bool {
+/// Stage a download from a pane, then send it to the library root -- or, in
+/// the agent's pane while an agent is fetching, to the agent.
+pub(crate) fn route_download(app: &AppHandle, pane: &PaneId, event: DownloadEvent<'_>) -> bool {
     match event {
         DownloadEvent::Requested { url, destination } => {
             let url = url.to_string();
+            let key = (pane.label(), url.clone());
+            let refuse = |reason: String| {
+                app.state::<PageSaves>().0.lock().unwrap().remove(&key);
+                emit(app, pane, PageEvent::DownloadRefused { url: url.clone(), reason });
+                false
+            };
             let Some(name) = destination
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
             else {
-                app.state::<PageSaves>().0.lock().unwrap().remove(&url);
-                emit(
-                    app,
-                    owner,
-                    PageEvent::DownloadRefused {
-                        url,
-                        reason: "The download has no file name".into(),
-                    },
-                );
-                return false;
+                return refuse("The download has no file name".into());
             };
-            let root = match download_root(app) {
-                Ok(root) => root,
-                Err(reason) => {
-                    app.state::<PageSaves>().0.lock().unwrap().remove(&url);
-                    emit(app, owner, PageEvent::DownloadRefused { url, reason });
-                    return false;
+            let agents = pane.kind == PaneKind::Agent && crate::agent_browser::claim(app, &url);
+            // The agent stores what it fetched in the library its call names,
+            // so only a download for the open library needs one open.
+            if !agents {
+                if let Err(reason) = download_root(app) {
+                    return refuse(reason);
                 }
-            };
-            let saving_page = app.state::<PageSaves>().0.lock().unwrap().contains(&url);
-            let path = if saving_page {
-                let staging = crate::app_context(app)
-                    .data_dir
-                    .join("page-staging")
-                    .join(uuid::Uuid::new_v4().to_string());
-                if let Err(e) = std::fs::create_dir_all(&staging) {
-                    app.state::<PageSaves>().0.lock().unwrap().remove(&url);
-                    emit(
-                        app,
-                        owner,
-                        PageEvent::DownloadRefused {
-                            url,
-                            reason: format!("Could not stage it: {e}"),
-                        },
-                    );
-                    return false;
-                }
-                staging.join(&name)
-            } else {
-                free_path(&root, &name)
+            }
+            let path = match staging_dir(app) {
+                Ok(staging) => staging.join(&name),
+                Err(reason) => return refuse(reason),
             };
             *destination = path.clone();
-            app.state::<Downloads>()
-                .0
-                .lock()
-                .unwrap()
-                .insert(url.clone(), path.clone());
-            emit(
-                app,
-                owner,
-                PageEvent::DownloadStarted {
-                    url,
-                    name: file_name(&path),
-                    path: path.display().to_string(),
-                },
-            );
+            app.state::<Downloads>().0.lock().unwrap().insert(key, path);
+            if !agents {
+                emit(app, pane, PageEvent::DownloadStarted { url, name });
+            }
             true
         }
         DownloadEvent::Finished { url, path, success } => {
             let url = url.to_string();
-            let remembered = app.state::<Downloads>().0.lock().unwrap().remove(&url);
+            let key = (pane.label(), url.clone());
+            let remembered = app.state::<Downloads>().0.lock().unwrap().remove(&key);
             let Some(path) = path.or(remembered) else {
-                error!("browser pane: a download finished that was never started: {url}");
+                error!("browser pane: a download finished that was never started");
                 return true;
             };
-            if app.state::<PageSaves>().0.lock().unwrap().remove(&url) {
-                tauri::async_runtime::spawn(finish_page_save(
-                    app.clone(),
-                    owner.to_string(),
-                    url,
-                    path,
-                    success,
-                ));
+            if pane.kind == PaneKind::Agent
+                && crate::agent_browser::finished(app, &url, &path, success)
+            {
                 return true;
             }
-            emit(
-                app,
-                owner,
-                PageEvent::DownloadFinished {
-                    url,
-                    name: file_name(&path),
-                    path: path.display().to_string(),
-                    success,
-                },
-            );
+            let saving_page = app.state::<PageSaves>().0.lock().unwrap().remove(&key);
+            tauri::async_runtime::spawn(finish_download(
+                app.clone(),
+                pane.clone(),
+                url,
+                path,
+                success,
+                saving_page,
+            ));
             true
         }
         _ => true,
@@ -442,9 +476,12 @@ fn file_name(path: &Path) -> String {
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
 }
 
-pub(crate) fn emit(app: &AppHandle, owner: &str, event: PageEvent) {
-    if let Err(e) = app.emit_to(owner, PAGE_EVENT, event) {
-        error!("browser pane: could not tell {owner} about its page: {e}");
+pub(crate) fn emit(app: &AppHandle, pane: &PaneId, event: PageEvent) {
+    if let Err(e) = app.emit_to(pane.owner.as_str(), pane.event(), event) {
+        error!(
+            "browser pane: could not tell {} about its page: {e}",
+            pane.owner
+        );
     }
 }
 
@@ -457,30 +494,28 @@ fn place(webview: &Webview, bounds: &PaneBounds) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Open `url` in the calling window's pane, creating the pane at `bounds` in
-/// `background`, the colour of what is behind it, if the window has none yet.
-#[tauri::command]
-pub async fn browser_pane_show(
-    window: Window,
-    url: String,
-    bounds: PaneBounds,
-    background: Color,
-) -> Result<(), String> {
-    let url = web_url(&url)?;
-    if let Ok(webview) = pane(&window) {
-        webview.navigate(url).map_err(|e| e.to_string())?;
-        return place(&webview, &bounds);
-    }
+/// The size the agent's pane lays pages out at while nobody watches: a
+/// browser window's, so a page shows the layout it would show the user.
+const UNSEEN_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 900.0);
 
+/// Make `pane` in `window`, showing `url`, at `bounds` -- or, without them,
+/// hidden at a browser window's size, for the agent to use unwatched.
+/// `background` is the colour of what is behind it until its first page is in.
+pub(crate) fn create_pane(
+    window: &Window,
+    pane: &PaneId,
+    url: Url,
+    bounds: Option<&PaneBounds>,
+    background: Color,
+) -> Result<Webview, String> {
     let app = window.app_handle().clone();
-    let owner = window.label().to_string();
-    let label = label(&owner);
+    let label = pane.label();
     let first_load = AtomicBool::new(true);
     let builder = WebviewBuilder::new(&label, WebviewUrl::External(url))
         .background_color(background)
         .on_page_load({
             let app = app.clone();
-            let owner = owner.clone();
+            let pane = pane.clone();
             move |webview, payload| {
                 let finished = matches!(payload.event(), PageLoadEvent::Finished);
                 let url = payload.url().to_string();
@@ -488,25 +523,28 @@ pub async fn browser_pane_show(
                     PageLoadEvent::Started => PageEvent::Loading { url },
                     PageLoadEvent::Finished => PageEvent::Loaded { url },
                 };
-                emit(&app, &owner, event);
+                emit(&app, &pane, event);
                 // Started is the new page committed, so the script lands in it
                 // and judges it as soon as its markup is in. Finished judges
                 // it again with every stylesheet applied.
-                darken(&webview, app.state::<DarkFilters>().get(&owner).as_deref());
+                darken(&webview, app.state::<DarkFilters>().get(&pane).as_deref());
                 if finished && first_load.swap(false, Ordering::Relaxed) {
                     paint_own_background(&webview);
+                }
+                if finished && pane.kind == PaneKind::Agent {
+                    crate::agent_browser::page_finished(&app);
                 }
             }
         })
         .on_document_title_changed({
             let app = app.clone();
-            let owner = owner.clone();
-            move |_, title| emit(&app, &owner, PageEvent::Title { title })
+            let pane = pane.clone();
+            move |_, title| emit(&app, &pane, PageEvent::Title { title })
         })
         .on_download({
             let app = app.clone();
-            let owner = owner.clone();
-            move |_, event| route_download(&app, &owner, event)
+            let pane = pane.clone();
+            move |_, event| route_download(&app, &pane, event)
         })
         // A page that asks for a new window gets the pane it is already in.
         .on_new_window({
@@ -529,25 +567,69 @@ pub async fn browser_pane_show(
     #[cfg(not(target_os = "macos"))]
     let builder = builder.data_directory(crate::app_context(&app).shared_data_dir.join("browser"));
 
-    let webview = window
-        .add_child(
-            builder,
+    let (position, size) = match bounds {
+        Some(bounds) => (
             LogicalPosition::new(bounds.x, bounds.y),
             LogicalSize::new(bounds.width, bounds.height),
-        )
+        ),
+        None => (LogicalPosition::new(0.0, 0.0), UNSEEN_SIZE),
+    };
+    let webview = window
+        .add_child(builder, position, size)
         .map_err(|e| e.to_string())?;
-    crate::browser_find::listen_for_find_key(&webview, &app, &owner);
-    crate::browser_hover::listen_for_hover(&webview, &app, &owner);
+    if bounds.is_none() {
+        webview.hide().map_err(|e| e.to_string())?;
+    }
+    crate::browser_find::listen_for_find_key(&webview, &app, pane);
+    crate::browser_hover::listen_for_hover(&webview, &app, pane);
     #[cfg(target_os = "macos")]
-    crate::browser_webkit_download::listen(&webview, &app, &owner);
-    Ok(())
+    crate::browser_webkit_download::listen(&webview, &app, pane);
+    Ok(webview)
+}
+
+/// Show the calling window's pane of `kind` at `bounds`, at `url` if one is
+/// given, creating it for that `url` in `background`, the colour of what is
+/// behind it, if the window has none yet. Without a `url` only a pane that
+/// exists is shown: the agent's, made hidden by an agent, which the user has
+/// opened to watch.
+#[tauri::command]
+pub async fn browser_pane_show(
+    window: Window,
+    kind: PaneKind,
+    url: Option<String>,
+    bounds: PaneBounds,
+    background: Color,
+) -> Result<(), String> {
+    let url = url.as_deref().map(web_url).transpose()?;
+    if let Ok(webview) = pane(&window, kind) {
+        if let Some(url) = url {
+            webview.navigate(url).map_err(|e| e.to_string())?;
+        }
+        place(&webview, &bounds)?;
+        return webview.show().map_err(|e| e.to_string());
+    }
+    let Some(url) = url else {
+        return Ok(());
+    };
+    create_pane(
+        &window,
+        &PaneId::of(&window, kind)?,
+        url,
+        Some(&bounds),
+        background,
+    )
+    .map(|_| ())
 }
 
 /// Follow the placeholder. A pane that is not open has nothing to move: the
 /// page reports its layout until it hears the pane is gone.
 #[tauri::command]
-pub async fn browser_pane_set_bounds(window: Window, bounds: PaneBounds) -> Result<(), String> {
-    match pane(&window) {
+pub async fn browser_pane_set_bounds(
+    window: Window,
+    kind: PaneKind,
+    bounds: PaneBounds,
+) -> Result<(), String> {
+    match pane(&window, kind) {
         Ok(webview) => place(&webview, &bounds),
         Err(_) => Ok(()),
     }
@@ -558,15 +640,14 @@ pub async fn browser_pane_set_bounds(window: Window, bounds: PaneBounds) -> Resu
 #[tauri::command]
 pub async fn browser_pane_set_dark_filter(
     window: Window,
+    kind: PaneKind,
     filter: Option<String>,
 ) -> Result<(), String> {
-    if let Ok(webview) = pane(&window) {
+    let id = PaneId::of(&window, kind)?;
+    if let Ok(webview) = pane(&window, kind) {
         darken(&webview, filter.as_deref());
     }
-    window
-        .app_handle()
-        .state::<DarkFilters>()
-        .set(window.label(), filter);
+    window.app_handle().state::<DarkFilters>().set(&id, filter);
     Ok(())
 }
 
@@ -574,8 +655,12 @@ pub async fn browser_pane_set_dark_filter(
 /// mouse event over it, so a drag in the page that crosses the pane would lose
 /// its moves and its release.
 #[tauri::command]
-pub async fn browser_pane_set_visible(window: Window, visible: bool) -> Result<(), String> {
-    let webview = pane(&window)?;
+pub async fn browser_pane_set_visible(
+    window: Window,
+    kind: PaneKind,
+    visible: bool,
+) -> Result<(), String> {
+    let webview = pane(&window, kind)?;
     if visible {
         webview.show()
     } else {
@@ -585,8 +670,8 @@ pub async fn browser_pane_set_visible(window: Window, visible: bool) -> Result<(
 }
 
 #[tauri::command]
-pub async fn browser_pane_step(window: Window, step: Step) -> Result<(), String> {
-    let webview = pane(&window)?;
+pub async fn browser_pane_step(window: Window, kind: PaneKind, step: Step) -> Result<(), String> {
+    let webview = pane(&window, kind)?;
     match step {
         Step::Back => webview.eval("history.back()"),
         Step::Forward => webview.eval("history.forward()"),
@@ -602,7 +687,7 @@ pub async fn browser_pane_step(window: Window, step: Step) -> Result<(), String>
 /// as an attachment -- a PDF that asks to be downloaded -- in a sandbox that
 /// runs no script, so the pane starts the download natively instead.
 #[cfg(not(target_os = "macos"))]
-const SAVE_PAGE_SCRIPT: &str = r#"(() => {
+pub(crate) const SAVE_PAGE_SCRIPT: &str = r#"(() => {
   const link = document.createElement("a");
   link.href = location.href;
   link.download = "";
@@ -613,8 +698,9 @@ const SAVE_PAGE_SCRIPT: &str = r#"(() => {
 
 /// Save what the calling window's pane is showing into the library root.
 #[tauri::command]
-pub async fn browser_pane_save_page(window: Window) -> Result<(), String> {
-    let webview = pane(&window)?;
+pub async fn browser_pane_save_page(window: Window, kind: PaneKind) -> Result<(), String> {
+    let id = PaneId::of(&window, kind)?;
+    let webview = pane(&window, kind)?;
     let url = webview.url().map_err(|e| e.to_string())?.to_string();
     window
         .app_handle()
@@ -622,10 +708,10 @@ pub async fn browser_pane_save_page(window: Window) -> Result<(), String> {
         .0
         .lock()
         .unwrap()
-        .insert(url);
+        .insert((id.label(), url));
     #[cfg(target_os = "macos")]
     {
-        crate::browser_webkit_download::save_page(&webview, window.label());
+        crate::browser_webkit_download::save_page(&webview, &id);
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]
@@ -635,26 +721,30 @@ pub async fn browser_pane_save_page(window: Window) -> Result<(), String> {
 /// Forget every cookie and site record the panes hold, then reload, so the
 /// page in view shows what a signed-out visit sees.
 #[tauri::command]
-pub async fn browser_pane_clear_data(window: Window) -> Result<(), String> {
-    let webview = pane(&window)?;
+pub async fn browser_pane_clear_data(window: Window, kind: PaneKind) -> Result<(), String> {
+    let webview = pane(&window, kind)?;
     webview
         .clear_all_browsing_data()
         .map_err(|e| e.to_string())?;
     webview.reload().map_err(|e| e.to_string())
 }
 
+/// Close the calling window's pane of `kind`. The agent's is only hidden: an
+/// agent may be using it, and the user closing it is the user looking away.
 #[tauri::command]
-pub async fn browser_pane_close(window: Window) -> Result<(), String> {
-    match pane(&window) {
-        Ok(webview) => {
-            crate::browser_find::stop_listening(&webview, window.label());
-            crate::browser_hover::stop_listening(&webview, window.label());
-            #[cfg(target_os = "macos")]
-            crate::browser_webkit_download::stop_listening(&webview, window.label());
-            webview.close().map_err(|e| e.to_string())
-        }
-        Err(_) => Ok(()),
+pub async fn browser_pane_close(window: Window, kind: PaneKind) -> Result<(), String> {
+    let id = PaneId::of(&window, kind)?;
+    let Ok(webview) = pane(&window, kind) else {
+        return Ok(());
+    };
+    if kind == PaneKind::Agent {
+        return webview.hide().map_err(|e| e.to_string());
     }
+    crate::browser_find::stop_listening(&webview, &id);
+    crate::browser_hover::stop_listening(&webview, &id);
+    #[cfg(target_os = "macos")]
+    crate::browser_webkit_download::stop_listening(&webview, &id);
+    webview.close().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -703,43 +793,33 @@ mod tests {
         assert!(dark_filter_script(None).contains("const filter = null;"));
     }
 
+    fn user(owner: &str) -> PaneId {
+        PaneId {
+            owner: owner.to_string(),
+            kind: PaneKind::User,
+        }
+    }
+
     #[test]
-    fn the_dark_filter_is_held_per_window() {
+    fn the_dark_filter_is_held_per_pane() {
         let filters = DarkFilters::default();
-        filters.set("main", Some("brightness(0.5)".to_string()));
-        assert_eq!(filters.get("main").as_deref(), Some("brightness(0.5)"));
-        assert_eq!(filters.get("document"), None);
-        filters.set("main", None);
-        assert_eq!(filters.get("main"), None);
+        filters.set(&user("main"), Some("brightness(0.5)".to_string()));
+        assert_eq!(
+            filters.get(&user("main")).as_deref(),
+            Some("brightness(0.5)")
+        );
+        assert_eq!(filters.get(&user("document")), None);
+        assert_eq!(filters.get(&PaneId::agent()), None);
+        filters.set(&user("main"), None);
+        assert_eq!(filters.get(&user("main")), None);
     }
 
     #[test]
-    fn a_download_takes_a_free_name_in_the_root() {
-        let root = tempfile::tempdir().unwrap();
-        assert_eq!(
-            free_path(root.path(), "paper.epub"),
-            root.path().join("paper.epub")
-        );
-        std::fs::write(root.path().join("paper.epub"), b"").unwrap();
-        assert_eq!(
-            free_path(root.path(), "paper.epub"),
-            root.path().join("paper (2).epub")
-        );
-        std::fs::write(root.path().join("paper (2).epub"), b"").unwrap();
-        assert_eq!(
-            free_path(root.path(), "paper.epub"),
-            root.path().join("paper (3).epub")
-        );
-        std::fs::write(root.path().join("README"), b"").unwrap();
-        assert_eq!(
-            free_path(root.path(), "README"),
-            root.path().join("README (2)")
-        );
-    }
-
-    #[test]
-    fn each_window_has_its_own_pane() {
-        assert_eq!(label("main"), "browser-pane-main");
-        assert_ne!(label("main"), label("document"));
+    fn each_window_has_its_own_pane_and_the_agent_its_own() {
+        assert_eq!(user("main").label(), "browser-pane-main");
+        assert_ne!(user("main").label(), user("document").label());
+        assert_eq!(PaneId::agent().label(), "browser-agent-main");
+        assert_eq!(PaneId::agent().event(), AGENT_PAGE_EVENT);
+        assert_eq!(user("main").event(), PAGE_EVENT);
     }
 }

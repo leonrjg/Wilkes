@@ -21,7 +21,7 @@ vi.mock("../services", () => ({
 vi.mock("../lib/utils/dialog", () => ({ confirmDialog: vi.fn(() => Promise.resolve(true)) }));
 
 import { api } from "../services";
-import { useBrowserStore } from "../stores/useBrowserStore";
+import { useAgentBrowserStore, useBrowserStore } from "../stores/useBrowserStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import type { Settings } from "../lib/types";
 import BrowserPane, { addressFrom } from "./BrowserPane";
@@ -57,12 +57,13 @@ describe("BrowserPane", () => {
       render(<BrowserPane />);
     });
     expect(api.browserPaneSetDarkFilter).toHaveBeenLastCalledWith(
+      "user",
       "invert(0.8) hue-rotate(180deg) brightness(1.1)",
     );
     await act(async () => {
       fireEvent.click(screen.getByLabelText("Darken light pages"));
     });
-    expect(api.browserPaneSetDarkFilter).toHaveBeenLastCalledWith(null);
+    expect(api.browserPaneSetDarkFilter).toHaveBeenLastCalledWith("user", null);
   });
 
   it("dims light pages instead when the reader dims its own", async () => {
@@ -73,14 +74,14 @@ describe("BrowserPane", () => {
     await act(async () => {
       render(<BrowserPane />);
     });
-    expect(api.browserPaneSetDarkFilter).toHaveBeenLastCalledWith("brightness(0.6)");
+    expect(api.browserPaneSetDarkFilter).toHaveBeenLastCalledWith("user", "brightness(0.6)");
   });
 
   it("does not darken in light mode", async () => {
     await act(async () => {
       render(<BrowserPane />);
     });
-    expect(api.browserPaneSetDarkFilter).toHaveBeenLastCalledWith(null);
+    expect(api.browserPaneSetDarkFilter).toHaveBeenLastCalledWith("user", null);
     expect(screen.queryByLabelText("Darken light pages")).toBeNull();
   });
 
@@ -90,6 +91,7 @@ describe("BrowserPane", () => {
       render(<BrowserPane />);
     });
     expect(api.browserPaneShow).toHaveBeenCalledWith(
+      "user",
       "https://example.org/",
       expect.objectContaining({ x: expect.any(Number), width: expect.any(Number) }),
       [30, 31, 34],
@@ -135,7 +137,7 @@ describe("BrowserPane", () => {
     await act(async () => {
       fireEvent.submit(address.closest("form")!);
     });
-    expect(api.browserPaneShow).toHaveBeenCalledWith("https://arxiv.org", expect.anything(), expect.anything());
+    expect(api.browserPaneShow).toHaveBeenCalledWith("user", "https://arxiv.org", expect.anything(), expect.anything());
   });
 
   it("steps aside while the page holds the pointer, once the webview exists", async () => {
@@ -146,11 +148,34 @@ describe("BrowserPane", () => {
     await act(async () => {
       useBrowserStore.getState().setHeld(true);
     });
-    expect(api.browserPaneSetVisible).toHaveBeenLastCalledWith(false);
+    expect(api.browserPaneSetVisible).toHaveBeenLastCalledWith("user", false);
     await act(async () => {
       useBrowserStore.getState().setHeld(false);
     });
-    expect(api.browserPaneSetVisible).toHaveBeenLastCalledWith(true);
+    expect(api.browserPaneSetVisible).toHaveBeenLastCalledWith("user", true);
+  });
+
+  it("shows the agent's webview where the agent left it, and only hides it on close", async () => {
+    useAgentBrowserStore.setState({ paneOpen: true, request: null, url: null });
+    let view: ReturnType<typeof render>;
+    await act(async () => {
+      view = render(<BrowserPane kind="agent" />);
+    });
+    // Nothing opened yet: no webview to show, and the pane says what it is for.
+    expect(api.browserPaneShow).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("Agent browser")).toBeInTheDocument();
+    expect(screen.getByText(/Pages an agent opens show here/)).toBeInTheDocument();
+    await act(async () => {
+      useAgentBrowserStore.getState().applyPageEvent({ kind: "loaded", url: "https://dl.acm.org/doi/pdf/1" });
+    });
+    expect(api.browserPaneShow).toHaveBeenCalledWith(
+      "agent",
+      null,
+      expect.objectContaining({ width: expect.any(Number) }),
+      expect.anything(),
+    );
+    view!.unmount();
+    expect(api.browserPaneClose).toHaveBeenCalledWith("agent");
   });
 
   it("closes its webview when the pane closes", async () => {

@@ -29,12 +29,12 @@ use tauri::webview::DownloadEvent;
 use tauri::{AppHandle, Url, Webview};
 use tracing::error;
 
-use crate::browser_pane::route_download;
+use crate::browser_pane::{route_download, PaneId};
 
-/// Where a pane's downloads are reported: the window that owns the pane.
+/// Where a pane's downloads are reported: the pane they came from.
 struct Route {
     app: AppHandle,
-    owner: String,
+    pane: PaneId,
 }
 
 /// The address a download was asked for.
@@ -70,12 +70,12 @@ define_class!(
             suggested_filename: &NSString,
             completion_handler: &DynBlock<dyn Fn(*const NSURL)>,
         ) {
-            let Route { app, owner } = self.ivars();
+            let Route { app, pane } = self.ivars();
             let mut destination = PathBuf::from(suggested_filename.to_string());
             let accepted = url_of(download).is_some_and(|url| {
                 route_download(
                     app,
-                    owner,
+                    pane,
                     DownloadEvent::Requested {
                         url,
                         destination: &mut destination,
@@ -105,11 +105,11 @@ define_class!(
 
 impl DownloadDelegate {
     fn finished(&self, download: &AnyObject, success: bool) {
-        let Route { app, owner } = self.ivars();
+        let Route { app, pane } = self.ivars();
         if let Some(url) = url_of(download) {
             route_download(
                 app,
-                owner,
+                pane,
                 DownloadEvent::Finished {
                     url,
                     path: None,
@@ -167,23 +167,23 @@ define_class!(
 );
 
 thread_local! {
-    /// Each pane's stand-in, by the window that owns the pane: WebKit holds
+    /// Each pane's stand-in, by the pane's label: WebKit holds
     /// its navigation delegate weakly. Main thread only.
     static STAND_INS: RefCell<HashMap<String, Retained<NavigationStandIn>>> = RefCell::new(HashMap::new());
 }
 
 /// Route a pane's context-menu downloads, and what it is asked to save, into
 /// the library from now on.
-pub(crate) fn listen(webview: &Webview, app: &AppHandle, owner: &str) {
+pub(crate) fn listen(webview: &Webview, app: &AppHandle, pane: &PaneId) {
     let route = Route {
         app: app.clone(),
-        owner: owner.to_string(),
+        pane: pane.clone(),
     };
     let listening = webview.with_webview(move |platform| {
         let mtm = MainThreadMarker::new().expect("with_webview calls back on the main thread");
         // SAFETY: `inner` is the pane's live WKWebView, on the main thread.
         let view = unsafe { &*platform.inner().cast::<AnyObject>() };
-        let owner = route.owner.clone();
+        let label = route.pane.label();
         let downloads = DownloadDelegate::alloc(mtm).set_ivars(route);
         // SAFETY: NSObject's init, on freshly allocated objects.
         let downloads: Retained<DownloadDelegate> = unsafe { msg_send![super(downloads), init] };
@@ -194,7 +194,7 @@ pub(crate) fn listen(webview: &Webview, app: &AppHandle, owner: &str) {
         });
         let stand_in: Retained<NavigationStandIn> = unsafe { msg_send![super(stand_in), init] };
         let _: () = unsafe { msg_send![view, setNavigationDelegate: &*stand_in] };
-        STAND_INS.with_borrow_mut(|stand_ins| stand_ins.insert(owner, stand_in));
+        STAND_INS.with_borrow_mut(|stand_ins| stand_ins.insert(label, stand_in));
     });
     if let Err(e) = listening {
         error!("browser pane: could not take its context menu's downloads: {e}");
@@ -204,22 +204,36 @@ pub(crate) fn listen(webview: &Webview, app: &AppHandle, owner: &str) {
 /// Download what the pane is showing -- the PDF in its viewer, the page's
 /// HTML -- from its own address, through the pane's own session, so a
 /// sign-in or a bot check the page needed carries over.
-pub(crate) fn save_page(webview: &Webview, owner: &str) {
-    let owner = owner.to_string();
+pub(crate) fn save_page(webview: &Webview, pane: &PaneId) {
+    start_download(webview, pane, None);
+}
+
+/// Download `url` through the pane's own session, without showing it.
+pub(crate) fn download(webview: &Webview, pane: &PaneId, url: &Url) {
+    start_download(webview, pane, Some(url.to_string()));
+}
+
+/// Start a download of `url`, or of the pane's own address, routed like every
+/// other download from the pane.
+fn start_download(webview: &Webview, pane: &PaneId, url: Option<String>) {
+    let label = pane.label();
     let saving = webview.with_webview(move |platform| {
         let Some(downloads) = STAND_INS.with_borrow(|stand_ins| {
             stand_ins
-                .get(&owner)
+                .get(&label)
                 .map(|stand_in| stand_in.ivars().downloads.clone())
         }) else {
-            error!("browser pane: {owner}'s pane has no download delegate to save with");
+            error!("browser pane: {label} has no download delegate to save with");
             return;
         };
         // SAFETY: `inner` is the pane's live WKWebView, on the main thread.
         let view = unsafe { &*platform.inner().cast::<AnyObject>() };
-        let url: Option<Retained<NSURL>> = unsafe { msg_send![view, URL] };
+        let url: Option<Retained<NSURL>> = match &url {
+            Some(url) => NSURL::URLWithString(&NSString::from_str(url)),
+            None => unsafe { msg_send![view, URL] },
+        };
         let Some(url) = url else {
-            error!("browser pane: {owner}'s pane has no page to save");
+            error!("browser pane: {label} has no address to download");
             return;
         };
         let request = NSURLRequest::requestWithURL(&url);
@@ -230,7 +244,7 @@ pub(crate) fn save_page(webview: &Webview, owner: &str) {
                 Some(download) => {
                     let _: () = unsafe { msg_send![download, setDelegate: &*downloads] };
                 }
-                None => error!("browser pane: WebKit started no download to save the page"),
+                None => error!("browser pane: WebKit started no download"),
             }
         });
         // SAFETY: WKWebView's startDownloadUsingRequest:completionHandler:
@@ -240,15 +254,15 @@ pub(crate) fn save_page(webview: &Webview, owner: &str) {
         };
     });
     if let Err(e) = saving {
-        error!("browser pane: could not save its page: {e}");
+        error!("browser pane: could not start a download: {e}");
     }
 }
 
 /// Give a pane about to close back wry's navigation delegate.
-pub(crate) fn stop_listening(webview: &Webview, owner: &str) {
-    let owner = owner.to_string();
+pub(crate) fn stop_listening(webview: &Webview, pane: &PaneId) {
+    let label = pane.label();
     let stopped = webview.with_webview(move |platform| {
-        if let Some(stand_in) = STAND_INS.with_borrow_mut(|stand_ins| stand_ins.remove(&owner)) {
+        if let Some(stand_in) = STAND_INS.with_borrow_mut(|stand_ins| stand_ins.remove(&label)) {
             // SAFETY: as in `listen`.
             let view = unsafe { &*platform.inner().cast::<AnyObject>() };
             let original = stand_in.ivars().original.as_deref();

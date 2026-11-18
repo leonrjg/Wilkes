@@ -32,7 +32,7 @@ describe("BrowserFindStrip", () => {
     render(<BrowserFindStrip requests={1} onClose={vi.fn()} />);
     expect(screen.getByLabelText("Find in page")).toHaveFocus();
     await type("attention");
-    expect(api.browserPaneFind).toHaveBeenLastCalledWith("attention", false);
+    expect(api.browserPaneFind).toHaveBeenLastCalledWith("user", "attention", false);
     expect(screen.getByRole("status")).toHaveTextContent("3 matches");
   });
 
@@ -43,11 +43,11 @@ describe("BrowserFindStrip", () => {
     await act(async () => {
       fireEvent.keyDown(input, { key: "Enter" });
     });
-    expect(api.browserPaneFind).toHaveBeenLastCalledWith("attention", false);
+    expect(api.browserPaneFind).toHaveBeenLastCalledWith("user", "attention", false);
     await act(async () => {
       fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
     });
-    expect(api.browserPaneFind).toHaveBeenLastCalledWith("attention", true);
+    expect(api.browserPaneFind).toHaveBeenLastCalledWith("user", "attention", true);
   });
 
   it("does not search for nothing", async () => {

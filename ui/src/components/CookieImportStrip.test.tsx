@@ -42,7 +42,7 @@ describe("CookieImportStrip", () => {
     await act(async () => {
       fireEvent.click(screen.getByText("Import"));
     });
-    expect(api.browserPaneImportCookies).toHaveBeenCalledWith("firefox", "elsevier.com");
+    expect(api.browserPaneImportCookies).toHaveBeenCalledWith("user", "firefox", "elsevier.com");
     expect(screen.getByRole("status")).toHaveTextContent("Imported 3 cookies for elsevier.com from Firefox.");
     expect(onImported).toHaveBeenCalled();
   });

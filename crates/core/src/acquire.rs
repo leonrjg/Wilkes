@@ -491,26 +491,24 @@ pub async fn download_to_root(
 
 /// Write `bytes` to `target` under `root`, unless they are already there.
 ///
-/// The rules every file that reaches a root keeps, fetched or written by a
-/// program: the user's file is never overwritten, and content already in the
-/// root under any name is reported where it is rather than written twice.
-/// `source` says in the log where the bytes came from.
-fn store_in_root(
+/// The rules every file that reaches a root keeps, fetched, written by a
+/// program, or downloaded in the browser: the user's file is never
+/// overwritten, and content already in the root under any name is reported
+/// where it is rather than written twice. A different file already holding
+/// the name leaves this one to the first free numbered name beside it —
+/// `paper (2).pdf` — as a browser does. `source` says in the log where the
+/// bytes came from.
+pub fn store_in_root(
     root: &Path,
     target: &Path,
     bytes: &[u8],
     source: &str,
 ) -> Result<DownloadResponse, String> {
-    // The name is checked here rather than before the request, because
-    // whether an existing file is a collision depends on what is in it. A
-    // caller that fetches the same record twice — an acquisition retried after
-    // the import failed, say — writes the same bytes to the same name, and
-    // refusing that is refusing a no-op: the second attempt could never
-    // succeed, and the first one's leftovers would have to be deleted by hand
-    // before the button worked again. Different content under the same name is
-    // still a refusal, and the user's file is still never overwritten.
+    // Same content under the same name is a no-op, not a clash: a caller that
+    // fetches the same record twice — an acquisition retried after the import
+    // failed, say — would otherwise leave a numbered copy per attempt.
     if target.exists() {
-        let existing = std::fs::read(&target)
+        let existing = std::fs::read(target)
             .map_err(|error| format!("Failed to read {}: {error}", target.display()))?;
         if Sha256::digest(&existing) == Sha256::digest(bytes) {
             tracing::info!(
@@ -525,15 +523,6 @@ fn store_in_root(
                 already_present: true,
             });
         }
-        tracing::warn!(
-            source = %source,
-            path = %target.display(),
-            "download refused: a different file already has that name"
-        );
-        return Err(format!(
-            "Refusing to overwrite existing file: {}",
-            target.display()
-        ));
     }
     if let Some(existing) = find_file_with_content(root, target, bytes)? {
         tracing::info!(
@@ -548,7 +537,8 @@ fn store_in_root(
             already_present: true,
         });
     }
-    std::fs::write(target, bytes).map_err(|error| {
+    let target = free_path(target);
+    std::fs::write(&target, bytes).map_err(|error| {
         tracing::warn!(path = %target.display(), "download could not be saved: {error}");
         format!("Failed to save {}: {error}", target.display())
     })?;
@@ -559,10 +549,62 @@ fn store_in_root(
         "download saved"
     );
     Ok(DownloadResponse {
-        path: display_path(target),
+        path: display_path(&target),
         bytes: bytes.len(),
         already_present: false,
     })
+}
+
+/// `target`, or `name (2)`, `name (3)`… beside it if that is taken.
+fn free_path(target: &Path) -> PathBuf {
+    if !target.exists() {
+        return target.to_path_buf();
+    }
+    let stem = target
+        .file_stem()
+        .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
+    let extension = target
+        .extension()
+        .map(|extension| format!(".{}", extension.to_string_lossy()))
+        .unwrap_or_default();
+    (2..)
+        .map(|n| target.with_file_name(format!("{stem} ({n}){extension}")))
+        .find(|candidate| !candidate.exists())
+        .expect("some numbered name is free")
+}
+
+/// Store a file something else already downloaded — the browser, through its
+/// own session — in `root` under `name`, by the rules [`store_in_root`]
+/// keeps. The name is made fit for the library as a fetched one is: the
+/// mirrors' provenance markers come off and it is cut to what the filesystem
+/// allows. `max_bytes` is the caller's size limit, if it has one.
+pub fn store_file_in_root(
+    root: &Path,
+    file: &Path,
+    name: &str,
+    max_bytes: Option<u64>,
+    source: &str,
+) -> Result<DownloadResponse, String> {
+    if !root.is_dir() {
+        return Err(format!(
+            "Current Wilkes root does not exist: {}",
+            root.display()
+        ));
+    }
+    let size = std::fs::metadata(file)
+        .map_err(|error| format!("Failed to inspect the download: {error}"))?
+        .len();
+    if let Some(max) = max_bytes.filter(|max| size > *max) {
+        return Err(format!(
+            "Download exceeds the {} MB limit.",
+            max as f64 / 1_000_000.0
+        ));
+    }
+    let named = wilkes_path::sanitize_file_name(&strip_source_markers(name))
+        .map_err(|error| format!("Download filename is unusable: {error}"))?;
+    let bytes =
+        std::fs::read(file).map_err(|error| format!("Failed to read the download: {error}"))?;
+    store_in_root(root, &root.join(named), &bytes, source)
 }
 
 /// Find an existing regular file with exactly the downloaded content. Size is
@@ -877,11 +919,14 @@ mod tests {
         );
         assert!(!root.path().join("new.pdf").exists());
 
-        // And the user's file is never overwritten.
-        let error = acquire_run(root.path(), r#"printf mine > "$1/taken.pdf""#, 1024)
+        // And the user's file is never overwritten: the new one is numbered.
+        let output = acquire_run(root.path(), r#"printf mine > "$1/taken.pdf""#, 1024)
             .await
-            .unwrap_err();
-        assert!(error.contains("Refusing to overwrite"), "{error}");
+            .unwrap();
+        assert_eq!(
+            output.files[0].path,
+            display_path(&root.path().join("taken (2).pdf"))
+        );
         assert_eq!(
             std::fs::read(root.path().join("taken.pdf")).unwrap(),
             b"theirs"
@@ -1080,9 +1125,10 @@ mod tests {
     }
 
     /// A file already there under the same name and holding different content
-    /// is a real collision, and the existing file survives it.
+    /// is a real collision: the existing file survives it, and the download
+    /// takes the next free numbered name.
     #[tokio::test]
-    async fn download_refuses_to_overwrite_a_different_file_of_the_same_name() {
+    async fn a_download_whose_name_is_taken_by_a_different_file_is_numbered() {
         let dir = tempdir().unwrap();
         let mut server = mockito::Server::new_async().await;
         let mock = server
@@ -1094,7 +1140,7 @@ mod tests {
 
         let existing = dir.path().join("paper.pdf");
         std::fs::write(&existing, b"existing").unwrap();
-        let refusal = download_to_root(
+        let saved = download_to_root(
             dir.path(),
             DownloadParams {
                 url: format!("{}/paper.pdf", server.url()),
@@ -1104,9 +1150,14 @@ mod tests {
             crate::types::DEFAULT_MAX_DOWNLOAD_BYTES,
         )
         .await
-        .unwrap_err();
-        assert!(refusal.contains("Refusing to overwrite"), "{refusal}");
+        .unwrap();
+        assert_eq!(saved.path, display_path(&dir.path().join("paper (2).pdf")));
+        assert!(!saved.already_present);
         assert_eq!(std::fs::read(&existing).unwrap(), b"existing");
+        assert_eq!(
+            std::fs::read(dir.path().join("paper (2).pdf")).unwrap(),
+            b"downloaded"
+        );
         mock.assert_async().await;
     }
 
@@ -1490,6 +1541,49 @@ mod tests {
         assert!(name.ends_with(".pdf"), "{name}");
         assert!(!name.to_lowercase().contains("anna"), "{name}");
         assert!(Path::new(&saved.path).exists());
+    }
+
+    #[test]
+    fn a_taken_name_is_numbered_before_its_extension() {
+        let root = tempdir().unwrap();
+        let paper = root.path().join("paper.epub");
+        assert_eq!(free_path(&paper), paper);
+        std::fs::write(&paper, b"").unwrap();
+        assert_eq!(free_path(&paper), root.path().join("paper (2).epub"));
+        std::fs::write(root.path().join("paper (2).epub"), b"").unwrap();
+        assert_eq!(free_path(&paper), root.path().join("paper (3).epub"));
+        let readme = root.path().join("README");
+        std::fs::write(&readme, b"").unwrap();
+        assert_eq!(free_path(&readme), root.path().join("README (2)"));
+    }
+
+    /// What the browser downloaded is stored by the same rules as a fetch:
+    /// a library name, the size limit, and no second copy.
+    #[test]
+    fn a_file_the_browser_downloaded_is_stored_like_a_fetch() {
+        let root = tempdir().unwrap();
+        let staging = tempdir().unwrap();
+        let file = staging.path().join("download");
+        std::fs::write(&file, b"%PDF-1.7").unwrap();
+
+        let saved = store_file_in_root(
+            root.path(),
+            &file,
+            "Wilkes 1992 - Anna\u{2019}s Archive.pdf",
+            Some(1024),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(saved.path, display_path(&root.path().join("Wilkes 1992.pdf")));
+        assert!(!saved.already_present);
+
+        let again = store_file_in_root(root.path(), &file, "other.pdf", None, "test").unwrap();
+        assert!(again.already_present);
+        assert_eq!(again.path, saved.path);
+
+        let error = store_file_in_root(root.path(), &file, "big.pdf", Some(4), "test").unwrap_err();
+        assert!(error.contains("exceeds"), "{error}");
+        assert!(!root.path().join("big.pdf").exists());
     }
 
     #[test]

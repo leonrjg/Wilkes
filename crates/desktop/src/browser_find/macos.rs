@@ -18,7 +18,7 @@ use tracing::error;
 use super::Found;
 
 thread_local! {
-    /// Each pane's key monitor, by the window that owns the pane. AppKit
+    /// Each pane's key monitor, by the pane's label. AppKit
     /// calls monitors on the main thread, which is where these live.
     static MONITORS: RefCell<HashMap<String, Retained<AnyObject>>> = RefCell::new(HashMap::new());
 }
@@ -39,10 +39,10 @@ fn holds_keyboard(view: &NSView, window: &NSWindow) -> bool {
 /// webview still gets its Cmd+F.
 pub fn listen_for_find_key(
     webview: &Webview,
-    owner: &str,
+    label: &str,
     on_find: impl Fn() + Send + 'static,
 ) -> tauri::Result<()> {
-    let owner = owner.to_string();
+    let label = label.to_string();
     webview.with_webview(move |platform| {
         let mtm = MainThreadMarker::new().expect("with_webview calls back on the main thread");
         // SAFETY: `inner` is the pane's live WKWebView, an NSView, and this
@@ -78,7 +78,7 @@ pub fn listen_for_find_key(
         };
         match monitor {
             Some(monitor) => {
-                let replaced = MONITORS.with_borrow_mut(|monitors| monitors.insert(owner, monitor));
+                let replaced = MONITORS.with_borrow_mut(|monitors| monitors.insert(label, monitor));
                 if let Some(replaced) = replaced {
                     // SAFETY: a monitor AppKit returned, removed once.
                     unsafe { NSEvent::removeMonitor(&replaced) };
@@ -89,10 +89,10 @@ pub fn listen_for_find_key(
     })
 }
 
-pub fn stop_listening(webview: &Webview, owner: &str) -> tauri::Result<()> {
-    let owner = owner.to_string();
+pub fn stop_listening(webview: &Webview, label: &str) -> tauri::Result<()> {
+    let label = label.to_string();
     webview.with_webview(move |_| {
-        if let Some(monitor) = MONITORS.with_borrow_mut(|monitors| monitors.remove(&owner)) {
+        if let Some(monitor) = MONITORS.with_borrow_mut(|monitors| monitors.remove(&label)) {
             // SAFETY: a monitor AppKit returned, removed once.
             unsafe { NSEvent::removeMonitor(&monitor) };
         }

@@ -9860,12 +9860,14 @@ name = "wilkes-desktop"
 version = "1.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "block2",
  "clipboard-files",
  "futures-util",
  "gethostname",
  "gtk",
+ "javascriptcore-rs",
  "libc",
  "mdns-sd",
  "objc2",

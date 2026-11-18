@@ -76,17 +76,17 @@ fn link_of(element: &AnyObject) -> Option<String> {
 }
 
 thread_local! {
-    /// Each pane's stand-in, by the window that owns the pane: WebKit holds
+    /// Each pane's stand-in, by the pane's label: WebKit holds
     /// its delegate weakly, so the stand-in lives here. Main thread only.
     static DELEGATES: RefCell<HashMap<String, Retained<HoverDelegate>>> = RefCell::new(HashMap::new());
 }
 
 pub fn listen_for_hover(
     webview: &Webview,
-    owner: &str,
+    label: &str,
     on_hover: impl Fn(Option<String>) + Send + 'static,
 ) -> tauri::Result<()> {
-    let owner = owner.to_string();
+    let label = label.to_string();
     webview.with_webview(move |platform| {
         let mtm = MainThreadMarker::new().expect("with_webview calls back on the main thread");
         // SAFETY: `inner` is the pane's live WKWebView, on the main thread.
@@ -99,15 +99,15 @@ pub fn listen_for_hover(
         // SAFETY: NSObject's init, on a freshly allocated stand-in.
         let stand_in: Retained<HoverDelegate> = unsafe { msg_send![super(stand_in), init] };
         let _: () = unsafe { msg_send![view, setUIDelegate: &*stand_in] };
-        DELEGATES.with_borrow_mut(|delegates| delegates.insert(owner, stand_in));
+        DELEGATES.with_borrow_mut(|delegates| delegates.insert(label, stand_in));
     })
 }
 
 /// Give the pane back wry's delegate and let the stand-in go.
-pub fn stop_listening(webview: &Webview, owner: &str) -> tauri::Result<()> {
-    let owner = owner.to_string();
+pub fn stop_listening(webview: &Webview, label: &str) -> tauri::Result<()> {
+    let label = label.to_string();
     webview.with_webview(move |platform| {
-        if let Some(stand_in) = DELEGATES.with_borrow_mut(|delegates| delegates.remove(&owner)) {
+        if let Some(stand_in) = DELEGATES.with_borrow_mut(|delegates| delegates.remove(&label)) {
             // SAFETY: as in `listen_for_hover`.
             let view = unsafe { &*platform.inner().cast::<AnyObject>() };
             let original = stand_in.ivars().original.as_deref();

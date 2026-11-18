@@ -5,7 +5,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronUp, Search, X } from "react-feather";
 import { api } from "../services";
-import type { BrowserFound } from "../services/api";
+import type { BrowserFound, BrowserPaneKind } from "../services/api";
 
 /** What a find turned up, as the strip says it. A platform that only says
  *  whether it found something leaves the highlighted match to say the rest. */
@@ -19,7 +19,15 @@ export function findStatus(found: BrowserFound | null): string {
 const iconButton =
   "inline-flex shrink-0 rounded p-1 text-[var(--text-dim)] transition-colors hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] disabled:opacity-40 disabled:hover:bg-transparent";
 
-export default function BrowserFindStrip({ requests, onClose }: { requests: number; onClose: () => void }) {
+export default function BrowserFindStrip({
+  kind = "user",
+  requests,
+  onClose,
+}: {
+  kind?: BrowserPaneKind;
+  requests: number;
+  onClose: () => void;
+}) {
   const input = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState("");
   const [found, setFound] = useState<BrowserFound | null>(null);
@@ -40,7 +48,7 @@ export default function BrowserFindStrip({ requests, onClose }: { requests: numb
       return;
     }
     try {
-      const result = (await api.browserPaneFind?.(text, backwards)) ?? null;
+      const result = (await api.browserPaneFind?.(kind, text, backwards)) ?? null;
       if (asked !== latest.current) return;
       setFound(result);
       setError(null);

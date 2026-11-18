@@ -28,9 +28,11 @@ use wilkes_core::types::{
 };
 use wilkes_core::worker::manager::WorkerStatus;
 
+mod agent_browser;
 mod browser_find;
 mod browser_hover;
 mod browser_pane;
+mod browser_script;
 #[cfg(target_os = "macos")]
 mod browser_webkit_download;
 mod chat;
@@ -173,6 +175,13 @@ pub(crate) fn app_context(app: &AppHandle) -> Arc<AppContext> {
 
 pub(crate) fn workspace_manager(app: &AppHandle) -> Arc<WorkspaceManager> {
     app.state::<Arc<WorkspaceManager>>().inner().clone()
+}
+
+/// The browser MCP tools fetch and read pages through.
+pub(crate) fn agent_browser(app: &AppHandle) -> Arc<dyn wilkes_agent::browser::AgentBrowser> {
+    app.state::<Arc<dyn wilkes_agent::browser::AgentBrowser>>()
+        .inner()
+        .clone()
 }
 
 fn active_searches_state(app: &AppHandle) -> Arc<ActiveSearches> {
@@ -576,6 +585,7 @@ struct ManagedExternalMcp {
 struct ExternalMcpManager {
     token_path: PathBuf,
     context: wilkes_agent::mcp::ExternalMcpContext,
+    browser: Option<Arc<dyn wilkes_agent::browser::AgentBrowser>>,
     runtime: tokio::sync::Mutex<Option<ManagedExternalMcp>>,
     last_error: Mutex<Option<String>>,
 }
@@ -593,10 +603,14 @@ struct ExternalMcpStatus {
 }
 
 impl ExternalMcpManager {
-    fn new(data_dir: PathBuf) -> Self {
+    fn new(
+        data_dir: PathBuf,
+        browser: Option<Arc<dyn wilkes_agent::browser::AgentBrowser>>,
+    ) -> Self {
         Self {
             token_path: data_dir.join(EXTERNAL_MCP_TOKEN_FILENAME),
             context: wilkes_agent::mcp::ExternalMcpContext::default(),
+            browser,
             runtime: tokio::sync::Mutex::new(None),
             last_error: Mutex::new(None),
         }
@@ -658,6 +672,7 @@ impl ExternalMcpManager {
                 token.clone(),
                 Arc::clone(&workspaces),
                 self.context.clone(),
+                self.browser.clone(),
             )
         };
         let mut next = start().await;
@@ -695,6 +710,7 @@ impl ExternalMcpManager {
                         previous_token,
                         workspaces,
                         self.context.clone(),
+                        self.browser.clone(),
                     )
                     .await
                     {
@@ -2595,6 +2611,7 @@ pub fn run() {
         .manage(browser_pane::DarkFilters::default())
         .manage(browser_pane::Downloads::default())
         .manage(browser_pane::PageSaves::default())
+        .manage(agent_browser::AgentState::default())
         .setup(|app| {
             let startup = Arc::new(DesktopStartupState::default());
             app.manage(Arc::clone(&startup));
@@ -2632,7 +2649,14 @@ pub fn run() {
                 webview: TauriEmitter(handle.clone()),
                 http: events_tx.clone(),
             });
-            let external_mcp = Arc::new(ExternalMcpManager::new(data_dir.clone()));
+            let agent_browser: Arc<dyn wilkes_agent::browser::AgentBrowser> = Arc::new(
+                agent_browser::DesktopAgentBrowser::new(app.handle().clone()),
+            );
+            app.manage(Arc::clone(&agent_browser));
+            let external_mcp = Arc::new(ExternalMcpManager::new(
+                data_dir.clone(),
+                Some(agent_browser),
+            ));
             let lan_share_data_dir = data_dir.clone();
             let (workspaces, event_rx, loop_fut) =
                 match WorkspaceManager::new(data_dir, settings_path, Arc::clone(&emitter)) {
@@ -3571,7 +3595,7 @@ mod tests {
             .await
             .unwrap();
         let token_dir = tempdir().unwrap();
-        let manager = ExternalMcpManager::new(token_dir.path().to_path_buf());
+        let manager = ExternalMcpManager::new(token_dir.path().to_path_buf(), None);
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
@@ -3610,7 +3634,7 @@ mod tests {
     async fn external_mcp_manager_toggles_token_authentication_live() {
         let (_dir, workspaces) = test_workspaces();
         let token_dir = tempdir().unwrap();
-        let manager = ExternalMcpManager::new(token_dir.path().to_path_buf());
+        let manager = ExternalMcpManager::new(token_dir.path().to_path_buf(), None);
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
@@ -3659,7 +3683,7 @@ mod tests {
     async fn external_mcp_manager_reports_port_collision_without_fallback() {
         let (_dir, workspaces) = test_workspaces();
         let token_dir = tempdir().unwrap();
-        let manager = ExternalMcpManager::new(token_dir.path().to_path_buf());
+        let manager = ExternalMcpManager::new(token_dir.path().to_path_buf(), None);
         let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = occupied.local_addr().unwrap().port();
         let enabled = ExternalMcpSettings {
@@ -3680,7 +3704,7 @@ mod tests {
     async fn external_mcp_manager_switches_bind_address_on_the_same_port() {
         let (_dir, workspaces) = test_workspaces();
         let token_dir = tempdir().unwrap();
-        let manager = ExternalMcpManager::new(token_dir.path().to_path_buf());
+        let manager = ExternalMcpManager::new(token_dir.path().to_path_buf(), None);
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);

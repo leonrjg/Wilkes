@@ -112,6 +112,7 @@ import type {
   RgbColor,
   BrowserStep,
   BrowserPageEvent,
+  BrowserPaneKind,
   CookieSourceInfo,
 } from "./api";
 
@@ -509,57 +510,58 @@ export class TauriSearchApi implements SearchApi {
     await window.setBackgroundColor(background);
   }
 
-  async browserPaneShow(url: string, bounds: PaneBounds, background: RgbColor): Promise<void> {
-    return inTurn(() => invoke("browser_pane_show", { url, bounds, background }));
+  async browserPaneShow(kind: BrowserPaneKind, url: string | null, bounds: PaneBounds, background: RgbColor): Promise<void> {
+    return inTurn(() => invoke("browser_pane_show", { kind, url, bounds, background }));
   }
 
-  async browserPaneSetBounds(bounds: PaneBounds): Promise<void> {
-    return invoke("browser_pane_set_bounds", { bounds });
+  async browserPaneSetBounds(kind: BrowserPaneKind, bounds: PaneBounds): Promise<void> {
+    return invoke("browser_pane_set_bounds", { kind, bounds });
   }
 
-  async browserPaneSetVisible(visible: boolean): Promise<void> {
-    return invoke("browser_pane_set_visible", { visible });
+  async browserPaneSetVisible(kind: BrowserPaneKind, visible: boolean): Promise<void> {
+    return invoke("browser_pane_set_visible", { kind, visible });
   }
 
-  async browserPaneSetDarkFilter(filter: string | null): Promise<void> {
-    return invoke("browser_pane_set_dark_filter", { filter });
+  async browserPaneSetDarkFilter(kind: BrowserPaneKind, filter: string | null): Promise<void> {
+    return invoke("browser_pane_set_dark_filter", { kind, filter });
   }
 
-  async browserPaneStep(step: BrowserStep): Promise<void> {
-    return invoke("browser_pane_step", { step });
+  async browserPaneStep(kind: BrowserPaneKind, step: BrowserStep): Promise<void> {
+    return invoke("browser_pane_step", { kind, step });
   }
 
-  async browserPaneClearData(): Promise<void> {
-    return invoke("browser_pane_clear_data");
+  async browserPaneClearData(kind: BrowserPaneKind): Promise<void> {
+    return invoke("browser_pane_clear_data", { kind });
   }
 
-  async browserPaneSavePage(): Promise<void> {
-    return invoke("browser_pane_save_page");
+  async browserPaneSavePage(kind: BrowserPaneKind): Promise<void> {
+    return invoke("browser_pane_save_page", { kind });
   }
 
-  async browserPaneFind(query: string, backwards: boolean): Promise<BrowserFound> {
-    return invoke("browser_pane_find", { query, backwards });
+  async browserPaneFind(kind: BrowserPaneKind, query: string, backwards: boolean): Promise<BrowserFound> {
+    return invoke("browser_pane_find", { kind, query, backwards });
   }
 
-  async browserPaneEndFind(): Promise<void> {
-    return invoke("browser_pane_end_find");
+  async browserPaneEndFind(kind: BrowserPaneKind): Promise<void> {
+    return invoke("browser_pane_end_find", { kind });
   }
 
   async browserCookieSources(): Promise<CookieSourceInfo[]> {
     return invoke<CookieSourceInfo[]>("browser_cookie_sources");
   }
 
-  async browserPaneImportCookies(source: string, site: string): Promise<number> {
-    return invoke<number>("browser_pane_import_cookies", { source, site });
+  async browserPaneImportCookies(kind: BrowserPaneKind, source: string, site: string): Promise<number> {
+    return invoke<number>("browser_pane_import_cookies", { kind, source, site });
   }
 
-  async browserPaneClose(): Promise<void> {
-    return inTurn(() => invoke("browser_pane_close"));
+  async browserPaneClose(kind: BrowserPaneKind): Promise<void> {
+    return inTurn(() => invoke("browser_pane_close", { kind }));
   }
 
-  async onBrowserPanePage(handler: (event: BrowserPageEvent) => void): Promise<() => void> {
+  async onBrowserPanePage(kind: BrowserPaneKind, handler: (event: BrowserPageEvent) => void): Promise<() => void> {
     // Addressed to this window only: each window has its own pane.
-    return listen<BrowserPageEvent>("browser-pane:page", (event) => handler(event.payload), {
+    const event = kind === "agent" ? "browser-agent:page" : "browser-pane:page";
+    return listen<BrowserPageEvent>(event, (event) => handler(event.payload), {
       target: getCurrentWebview().label,
     });
   }

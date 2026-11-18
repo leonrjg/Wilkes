@@ -14,7 +14,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, Webview, Window};
 use tracing::error;
 
-use crate::browser_pane::{emit, pane, PageEvent};
+use crate::browser_pane::{emit, pane, PageEvent, PaneId, PaneKind};
 
 #[cfg(target_os = "linux")]
 mod gtk;
@@ -32,30 +32,30 @@ pub struct Found {
 
 /// Ask the window's page for its find strip, with the keyboard in it: the
 /// strip is the app's, and keys go to whichever webview has focus.
-fn request_find(app: &AppHandle, owner: &str) {
-    match app.get_webview(owner) {
+fn request_find(app: &AppHandle, pane: &PaneId) {
+    match app.get_webview(&pane.owner) {
         Some(webview) => {
             if let Err(e) = webview.set_focus() {
                 error!("browser pane: could not move the keyboard to the find strip: {e}");
             }
         }
-        None => error!("browser pane: {owner} has no webview to find in"),
+        None => error!("browser pane: {} has no webview to find in", pane.owner),
     }
-    emit(app, owner, PageEvent::FindRequested);
+    emit(app, pane, PageEvent::FindRequested);
 }
 
 /// Start answering Cmd/Ctrl+F in a pane just made, where the platform needs
 /// it: only while the pane has the keyboard, and in place of its page.
-pub(crate) fn listen_for_find_key(webview: &Webview, app: &AppHandle, owner: &str) {
+pub(crate) fn listen_for_find_key(webview: &Webview, app: &AppHandle, pane: &PaneId) {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let request = {
             let app = app.clone();
-            let owner = owner.to_string();
-            move || request_find(&app, &owner)
+            let pane = pane.clone();
+            move || request_find(&app, &pane)
         };
         #[cfg(target_os = "macos")]
-        let listening = macos::listen_for_find_key(webview, owner, request);
+        let listening = macos::listen_for_find_key(webview, &pane.label(), request);
         #[cfg(target_os = "linux")]
         let listening = gtk::listen_for_find_key(webview, request);
         if let Err(e) = listening {
@@ -63,19 +63,19 @@ pub(crate) fn listen_for_find_key(webview: &Webview, app: &AppHandle, owner: &st
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let _ = (webview, app, owner);
+    let _ = (webview, app, pane);
 }
 
 /// Stop answering Cmd+F for a pane about to close. On Linux the key's handler
 /// goes with the pane's widget; on macOS it is the app's, and stays until
 /// removed.
-pub(crate) fn stop_listening(webview: &Webview, owner: &str) {
+pub(crate) fn stop_listening(webview: &Webview, pane: &PaneId) {
     #[cfg(target_os = "macos")]
-    if let Err(e) = macos::stop_listening(webview, owner) {
+    if let Err(e) = macos::stop_listening(webview, &pane.label()) {
         error!("browser pane: could not stop listening for Cmd+F: {e}");
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = (webview, owner);
+    let _ = (webview, pane);
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -86,10 +86,11 @@ const UNSUPPORTED: &str = "On Windows the pane finds with WebView2's own find ba
 #[tauri::command]
 pub async fn browser_pane_find(
     window: Window,
+    kind: PaneKind,
     query: String,
     backwards: bool,
 ) -> Result<Found, String> {
-    let webview = pane(&window)?;
+    let webview = pane(&window, kind)?;
     #[cfg(target_os = "macos")]
     return macos::find(&webview, query, backwards).await;
     #[cfg(target_os = "linux")]
@@ -104,8 +105,8 @@ pub async fn browser_pane_find(
 /// Stop finding and give the keyboard back to the page. WebKitGTK clears its
 /// highlights; WKWebView has no way to, so the last match stays selected.
 #[tauri::command]
-pub async fn browser_pane_end_find(window: Window) -> Result<(), String> {
-    let webview = pane(&window)?;
+pub async fn browser_pane_end_find(window: Window, kind: PaneKind) -> Result<(), String> {
+    let webview = pane(&window, kind)?;
     #[cfg(target_os = "linux")]
     gtk::end_find(&webview).map_err(|e| e.to_string())?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]

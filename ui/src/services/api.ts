@@ -104,6 +104,9 @@ export type RgbColor = [number, number, number];
 
 export type BrowserStep = "back" | "forward" | "reload";
 
+/** Whose browser pane: the user's own, or the one the agent browses in. */
+export type BrowserPaneKind = "user" | "agent";
+
 /** A browser whose cookies for a site can be brought into the browser pane. */
 export interface CookieSourceInfo {
   id: string;
@@ -115,7 +118,7 @@ export type BrowserPageEvent =
   | { kind: "loading"; url: string }
   | { kind: "loaded"; url: string }
   | { kind: "title"; title: string }
-  | { kind: "download_started"; url: string; name: string; path: string }
+  | { kind: "download_started"; url: string; name: string }
   | { kind: "download_finished"; url: string; name: string; path: string; success: boolean }
   | { kind: "download_refused"; url: string; reason: string }
   | { kind: "find_requested" }
@@ -164,28 +167,31 @@ export interface SearchApi {
   /** Desktop-only docked browser: a native webview this window keeps over a
    *  page rectangle. Opens `url` in it, creating it at `bounds` if needed,
    *  in `background` until its first page is in. */
-  browserPaneShow?(url: string, bounds: PaneBounds, background: RgbColor): Promise<void>;
-  browserPaneSetBounds?(bounds: PaneBounds): Promise<void>;
+  /** Show `kind`'s pane at `bounds`, at `url` if given, creating it if the
+   *  window has none. The agent's may exist already, made hidden by an agent. */
+  browserPaneShow?(kind: BrowserPaneKind, url: string | null, bounds: PaneBounds, background: RgbColor): Promise<void>;
+  browserPaneSetBounds?(kind: BrowserPaneKind, bounds: PaneBounds): Promise<void>;
   /** Native views take the pointer from the page; a drag in the page hides
    *  the pane until it ends. */
-  browserPaneSetVisible?(visible: boolean): Promise<void>;
+  browserPaneSetVisible?(kind: BrowserPaneKind, visible: boolean): Promise<void>;
   /** The CSS filter light pages in the pane are darkened with; null stops. */
-  browserPaneSetDarkFilter?(filter: string | null): Promise<void>;
-  browserPaneStep?(step: BrowserStep): Promise<void>;
-  browserPaneClearData?(): Promise<void>;
+  browserPaneSetDarkFilter?(kind: BrowserPaneKind, filter: string | null): Promise<void>;
+  browserPaneStep?(kind: BrowserPaneKind, step: BrowserStep): Promise<void>;
+  browserPaneClearData?(kind: BrowserPaneKind): Promise<void>;
   /** Save what the pane is showing into the library root, as a download. */
-  browserPaneSavePage?(): Promise<void>;
+  browserPaneSavePage?(kind: BrowserPaneKind): Promise<void>;
   /** Find in the pane's page with the platform's own find: the next match, or
    *  with `backwards` the one before. The same text again steps on. */
-  browserPaneFind?(query: string, backwards: boolean): Promise<BrowserFound>;
+  browserPaneFind?(kind: BrowserPaneKind, query: string, backwards: boolean): Promise<BrowserFound>;
   /** Stop finding and give the keyboard back to the page. */
-  browserPaneEndFind?(): Promise<void>;
+  browserPaneEndFind?(kind: BrowserPaneKind): Promise<void>;
   browserCookieSources?(): Promise<CookieSourceInfo[]>;
   /** Copy one site's cookies from the user's browser into the pane; returns
    *  how many were copied. */
-  browserPaneImportCookies?(source: string, site: string): Promise<number>;
-  browserPaneClose?(): Promise<void>;
-  onBrowserPanePage?(handler: (event: BrowserPageEvent) => void): Promise<() => void>;
+  browserPaneImportCookies?(kind: BrowserPaneKind, source: string, site: string): Promise<number>;
+  /** Close `kind`'s pane. The agent's is only hidden: an agent may be using it. */
+  browserPaneClose?(kind: BrowserPaneKind): Promise<void>;
+  onBrowserPanePage?(kind: BrowserPaneKind, handler: (event: BrowserPageEvent) => void): Promise<() => void>;
   /** Desktop-only lifecycle controls for the opt-in external MCP endpoint. */
   getExternalMcpStatus?(): Promise<ExternalMcpStatus>;
   /** Desktop-only live viewer context exposed by the external MCP endpoint. */
