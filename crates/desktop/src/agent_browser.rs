@@ -306,6 +306,12 @@ impl AgentBrowser for DesktopAgentBrowser {
         }
         // The page is already in the pane, where the user will look for it.
         if is_web_page(staged.file()).map_err(|e| e.to_string())? {
+            tracing::warn!(
+                url = %url,
+                bytes = std::fs::metadata(staged.file()).map(|m| m.len()).unwrap_or(0),
+                title = ?page_title(staged.file()),
+                "agent browser: the download came back as a page"
+            );
             return Err(NEEDS_USER.to_string());
         }
         Ok(staged)
@@ -336,6 +342,26 @@ impl AgentBrowser for DesktopAgentBrowser {
             text: page.text,
         })
     }
+}
+
+/// The `<title>` of a downloaded page, for saying in the log what a site
+/// answered with instead of the file.
+fn page_title(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(64 * 1024)
+        .read_to_end(&mut head)
+        .ok()?;
+    let head = String::from_utf8_lossy(&head);
+    // ASCII lowercasing keeps every character's length, so a position found
+    // in the lowered text is the same position in the text.
+    let lowered = head.to_ascii_lowercase();
+    let open = lowered.find("<title")?;
+    let start = open + lowered[open..].find('>')? + 1;
+    let end = start + lowered[start..].find("</title")?;
+    Some(head[start..end].trim().chars().take(200).collect())
 }
 
 #[cfg(test)]
@@ -378,6 +404,16 @@ mod tests {
         }
         drop(guard);
         assert!(state.abandoned.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_downloaded_page_is_named_by_its_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = dir.path().join("page");
+        std::fs::write(&page, "<html><head><TITLE> Just a moment… </TITLE>").unwrap();
+        assert_eq!(page_title(&page).as_deref(), Some("Just a moment…"));
+        std::fs::write(&page, "<html><body>no title").unwrap();
+        assert_eq!(page_title(&page), None);
     }
 
     #[test]
