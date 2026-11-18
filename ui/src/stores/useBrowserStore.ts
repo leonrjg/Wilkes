@@ -40,6 +40,8 @@ interface BrowserStore {
   hoveredLink: string | null;
   /** The find strip is open. */
   finding: boolean;
+  /** An agent is fetching or reading in the pane. The agent's pane only. */
+  busy: boolean;
   /** How many times Cmd/Ctrl+F has asked for the strip, so asking again while
    *  it is open puts the keyboard back in it. */
   findRequests: number;
@@ -71,6 +73,7 @@ const createBrowserStore = () => create<BrowserStore>((set, get) => ({
   hoveredLink: null,
   finding: false,
   findRequests: 0,
+  busy: false,
   show: (url) => set({ paneOpen: true, request: { url } }),
   togglePane: () => {
     const { paneOpen, url } = get();
@@ -118,6 +121,9 @@ const createBrowserStore = () => create<BrowserStore>((set, get) => ({
       case "hover":
         set({ hoveredLink: event.url });
         break;
+      case "busy":
+        set({ busy: event.busy });
+        break;
       case "find_requested":
         set((state) => ({ finding: true, findRequests: state.findRequests + 1 }));
         break;
@@ -133,6 +139,13 @@ const createBrowserStore = () => create<BrowserStore>((set, get) => ({
 export const useBrowserStore = createBrowserStore();
 /** The pane the agent browses in, which the user opens to watch or take over. */
 export const useAgentBrowserStore = createBrowserStore();
+
+/** Whether the agent's browser is worth offering: an agent has opened
+ *  something in it, is using it now, or the user has it open. Until then
+ *  there is nothing in it to watch or take over. */
+export function agentBrowserInUse(state: Pick<BrowserStore, "url" | "busy" | "paneOpen">): boolean {
+  return state.url !== null || state.busy || state.paneOpen;
+}
 
 export function browserStoreFor(kind: BrowserPaneKind) {
   return kind === "agent" ? useAgentBrowserStore : useBrowserStore;

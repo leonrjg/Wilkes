@@ -153,6 +153,11 @@ pub(crate) enum PageEvent {
     Hover {
         url: Option<String>,
     },
+    /// Whether an agent is using the pane: fetching or reading through it.
+    /// The agent's pane only.
+    Busy {
+        busy: bool,
+    },
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { browserStoreFor, useAgentBrowserStore, useBrowserStore } from "./useBrowserStore";
+import { agentBrowserInUse, browserStoreFor, useAgentBrowserStore, useBrowserStore } from "./useBrowserStore";
 
 describe("useBrowserStore", () => {
   beforeEach(() => {
@@ -136,3 +136,21 @@ describe("the agent's browser store", () => {
     expect(browserStoreFor("user")).toBe(useBrowserStore);
   });
 });
+
+describe("whether the agent's browser is in use", () => {
+  it("is offered once an agent has opened something, and while it browses", () => {
+    useAgentBrowserStore.setState({ url: null, busy: false, paneOpen: false });
+    expect(agentBrowserInUse(useAgentBrowserStore.getState())).toBe(false);
+
+    useAgentBrowserStore.getState().applyPageEvent({ kind: "busy", busy: true });
+    expect(useAgentBrowserStore.getState().busy).toBe(true);
+    expect(agentBrowserInUse(useAgentBrowserStore.getState())).toBe(true);
+
+    useAgentBrowserStore.getState().applyPageEvent({ kind: "loaded", url: "https://dl.acm.org/doi/pdf/1" });
+    useAgentBrowserStore.getState().applyPageEvent({ kind: "busy", busy: false });
+    // Done browsing, but what it left there is still for the user to see.
+    expect(useAgentBrowserStore.getState().busy).toBe(false);
+    expect(agentBrowserInUse(useAgentBrowserStore.getState())).toBe(true);
+  });
+});
+

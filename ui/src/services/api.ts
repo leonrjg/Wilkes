@@ -122,7 +122,9 @@ export type BrowserPageEvent =
   | { kind: "download_finished"; url: string; name: string; path: string; success: boolean }
   | { kind: "download_refused"; url: string; reason: string }
   | { kind: "find_requested" }
-  | { kind: "hover"; url: string | null };
+  | { kind: "hover"; url: string | null }
+  /** The agent's pane only: whether an agent is fetching or reading in it. */
+  | { kind: "busy"; busy: boolean };
 
 /** What finding in the pane's page turned up. `matches` is how many there
  *  are, where the platform counts them. */

@@ -23,7 +23,7 @@ import { useChatStore } from "./stores/useChatStore";
 import { useSemanticStore } from "./stores/useSemanticStore";
 import { useTopicsStore } from "./stores/useTopicsStore";
 import { useCatalogueStore } from "./stores/useCatalogueStore";
-import { useAgentBrowserStore, useBrowserPageEvents, useBrowserStore } from "./stores/useBrowserStore";
+import { agentBrowserInUse, useAgentBrowserStore, useBrowserPageEvents, useBrowserStore } from "./stores/useBrowserStore";
 import {
   useActiveWorkspaceName,
   useActiveWorkspaceReadOnly,
@@ -138,6 +138,8 @@ export default function App() {
   const toggleBrowserPane = useBrowserStore((s) => s.togglePane);
   const agentBrowserOpen = useAgentBrowserStore((s) => s.paneOpen);
   const toggleAgentBrowser = useAgentBrowserStore((s) => s.togglePane);
+  const agentBrowserUsed = useAgentBrowserStore(agentBrowserInUse);
+  const agentBrowsing = useAgentBrowserStore((s) => s.busy);
   useBrowserPageEvents("user");
   // Followed while its pane is closed too: opening it shows where the agent is.
   useBrowserPageEvents("agent");
@@ -663,50 +665,59 @@ export default function App() {
       </div>
       {isTauri && (
         <div className="inline-flex rounded border border-[var(--border-main)] overflow-hidden">
-          <Tooltip content="Browser">
+          <Tooltip content={agentBrowsing ? "Browser — an agent is browsing" : "Browser"}>
             <button
               onClick={toggleBrowserPane}
               aria-label="Browser pane"
               aria-pressed={browserPaneOpen}
-              className={`w-[32px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] transition-all ${
+              className={`relative w-[32px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] transition-all ${
                 browserPaneOpen || agentBrowserOpen
                   ? "text-[var(--accent-blue)] shadow-inner"
                   : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
               }`}
             >
               <Globe size={14} />
+              {agentBrowsing && (
+                <span
+                  role="status"
+                  aria-label="An agent is browsing"
+                  className="absolute right-[5px] top-[5px] h-[6px] w-[6px] rounded-full bg-[var(--accent-blue)] animate-pulse"
+                />
+              )}
             </button>
           </Tooltip>
-          <Tooltip content="Browser options">
-            <button
-              type="button"
-              onClick={(event) =>
-                openBrowserMenu({
-                  event,
-                  target: null,
-                  size: "content",
-                  items: [
-                    {
-                      id: "browser",
-                      label: browserPaneOpen ? "Close browser" : "Browser",
-                      icon: Globe,
-                      run: toggleBrowserPane,
-                    },
-                    {
-                      id: "agent-browser",
-                      label: agentBrowserOpen ? "Close agent browser" : "Agent browser",
-                      icon: Cpu,
-                      run: toggleAgentBrowser,
-                    },
-                  ],
-                })
-              }
-              aria-label="Browser pane options"
-              className="w-[14px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] text-[var(--text-dim)] hover:text-[var(--text-main)] transition-all border-l border-[var(--border-main)]"
-            >
-              <ChevronDown size={10} />
-            </button>
-          </Tooltip>
+          {agentBrowserUsed && (
+            <Tooltip content="Browser options">
+              <button
+                type="button"
+                onClick={(event) =>
+                  openBrowserMenu({
+                    event,
+                    target: null,
+                    size: "content",
+                    items: [
+                      {
+                        id: "browser",
+                        label: browserPaneOpen ? "Close browser" : "Browser",
+                        icon: Globe,
+                        run: toggleBrowserPane,
+                      },
+                      {
+                        id: "agent-browser",
+                        label: agentBrowserOpen ? "Close agent browser" : "Agent browser",
+                        icon: Cpu,
+                        run: toggleAgentBrowser,
+                      },
+                    ],
+                  })
+                }
+                aria-label="Browser pane options"
+                className="w-[14px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] text-[var(--text-dim)] hover:text-[var(--text-main)] transition-all border-l border-[var(--border-main)]"
+              >
+                <ChevronDown size={10} />
+              </button>
+            </Tooltip>
+          )}
         </div>
       )}
       <Tooltip content="Settings">

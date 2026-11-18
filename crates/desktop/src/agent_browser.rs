@@ -25,7 +25,9 @@ use tauri::{AppHandle, Manager, Url, Webview};
 use tokio::sync::oneshot;
 use wilkes_agent::browser::{AgentBrowser, BrowserPage, StagedDownload};
 
-use crate::browser_pane::{clear_staging, create_pane, is_web_page, web_url, PaneId, AGENT_OWNER};
+use crate::browser_pane::{
+    clear_staging, create_pane, emit, is_web_page, web_url, PageEvent, PaneId, AGENT_OWNER,
+};
 
 /// How long a page has to load before the agent is told it did not.
 const PAGE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -171,6 +173,24 @@ impl Drop for ClaimGuard<'_> {
     }
 }
 
+/// The window told an agent is using its browser, for as long as this lives.
+struct Busy<'a> {
+    app: &'a AppHandle,
+}
+
+impl<'a> Busy<'a> {
+    fn new(app: &'a AppHandle) -> Self {
+        emit(app, &PaneId::agent(), PageEvent::Busy { busy: true });
+        Self { app }
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        emit(self.app, &PaneId::agent(), PageEvent::Busy { busy: false });
+    }
+}
+
 pub struct DesktopAgentBrowser {
     app: AppHandle,
 }
@@ -263,6 +283,7 @@ impl AgentBrowser for DesktopAgentBrowser {
     async fn download(&self, url: &str) -> Result<StagedDownload, String> {
         let url = web_url(url)?;
         let _turn = self.state().turn.lock().await;
+        let _busy = Busy::new(&self.app);
         let webview = self.webview()?;
         let (answer, fetched) = oneshot::channel();
         let claim = ClaimGuard::new(self.state(), answer);
@@ -293,6 +314,7 @@ impl AgentBrowser for DesktopAgentBrowser {
     async fn read(&self, url: &str) -> Result<BrowserPage, String> {
         let url = web_url(url)?;
         let _turn = self.state().turn.lock().await;
+        let _busy = Busy::new(&self.app);
         let webview = self.webview()?;
         self.open(&webview, &url).await?;
         let report = crate::browser_script::evaluate(&webview, READ_SCRIPT).await?;

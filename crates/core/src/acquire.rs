@@ -584,11 +584,7 @@ pub fn store_in_root(
             already_present: true,
         });
     }
-    let target = free_path(target);
-    std::fs::write(&target, bytes).map_err(|error| {
-        tracing::warn!(path = %target.display(), "download could not be saved: {error}");
-        format!("Failed to save {}: {error}", target.display())
-    })?;
+    let target = write_new(target, bytes)?;
     tracing::info!(
         source = %source,
         path = %target.display(),
@@ -602,9 +598,9 @@ pub fn store_in_root(
     })
 }
 
-/// `target`, or `name (2)`, `name (3)`… beside it if that is taken.
-fn free_path(target: &Path) -> PathBuf {
-    if !target.exists() {
+/// The `n`th name for `target`: itself, then `name (2)`, `name (3)`…
+fn numbered(target: &Path, n: u32) -> PathBuf {
+    if n == 1 {
         return target.to_path_buf();
     }
     let stem = target
@@ -614,10 +610,48 @@ fn free_path(target: &Path) -> PathBuf {
         .extension()
         .map(|extension| format!(".{}", extension.to_string_lossy()))
         .unwrap_or_default();
-    (2..)
-        .map(|n| target.with_file_name(format!("{stem} ({n}){extension}")))
-        .find(|candidate| !candidate.exists())
-        .expect("some numbered name is free")
+    target.with_file_name(format!("{stem} ({n}){extension}"))
+}
+
+/// Write `bytes` under the first of `target`'s numbered names that is free,
+/// and return it.
+///
+/// Free is decided by creating the file, not by looking first: two downloads
+/// finishing at once that both looked would both see the same name free, and
+/// the second write would replace the first's file. Creating it exclusively
+/// gives the name to exactly one of them, and the other moves on.
+fn write_new(target: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    use std::io::Write;
+    for n in 1.. {
+        let candidate = numbered(target, n);
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                tracing::warn!(path = %candidate.display(), "download could not be saved: {error}");
+                return Err(format!("Failed to save {}: {error}", candidate.display()));
+            }
+        };
+        if let Err(error) = file.write_all(bytes) {
+            tracing::warn!(path = %candidate.display(), "download could not be saved: {error}");
+            drop(file);
+            // A partial file is no file: it would be found by name later, and
+            // its name would no longer be free.
+            if let Err(removal) = std::fs::remove_file(&candidate) {
+                tracing::warn!(
+                    path = %candidate.display(),
+                    "a partly saved download could not be removed: {removal}"
+                );
+            }
+            return Err(format!("Failed to save {}: {error}", candidate.display()));
+        }
+        return Ok(candidate);
+    }
+    unreachable!("some numbered name is free")
 }
 
 /// Store a file something else already downloaded — the browser, through its
@@ -1641,14 +1675,53 @@ mod tests {
     fn a_taken_name_is_numbered_before_its_extension() {
         let root = tempdir().unwrap();
         let paper = root.path().join("paper.epub");
-        assert_eq!(free_path(&paper), paper);
-        std::fs::write(&paper, b"").unwrap();
-        assert_eq!(free_path(&paper), root.path().join("paper (2).epub"));
-        std::fs::write(root.path().join("paper (2).epub"), b"").unwrap();
-        assert_eq!(free_path(&paper), root.path().join("paper (3).epub"));
+        assert_eq!(write_new(&paper, b"1").unwrap(), paper);
+        assert_eq!(
+            write_new(&paper, b"2").unwrap(),
+            root.path().join("paper (2).epub")
+        );
+        assert_eq!(
+            write_new(&paper, b"3").unwrap(),
+            root.path().join("paper (3).epub")
+        );
+        assert_eq!(std::fs::read(&paper).unwrap(), b"1");
         let readme = root.path().join("README");
         std::fs::write(&readme, b"").unwrap();
-        assert_eq!(free_path(&readme), root.path().join("README (2)"));
+        assert_eq!(
+            write_new(&readme, b"x").unwrap(),
+            root.path().join("README (2)")
+        );
+    }
+
+    /// Different files finishing at once under one name each keep a name of
+    /// their own: none replaces another.
+    #[test]
+    fn downloads_finishing_at_once_under_one_name_all_survive() {
+        let root = tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8u8)
+            .map(|i| {
+                let root = root.path().to_path_buf();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store_in_root(&root, &root.join("paper.pdf"), &[i; 64], "test").unwrap()
+                })
+            })
+            .collect();
+        let mut paths: Vec<String> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().path)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), 8, "{paths:?}");
+        let mut contents: Vec<Vec<u8>> = paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        contents.sort();
+        assert_eq!(contents, (0..8u8).map(|i| vec![i; 64]).collect::<Vec<_>>());
     }
 
     /// What the browser downloaded is stored by the same rules as a fetch:

@@ -9,6 +9,7 @@ import { useCatalogueStore } from "./stores/useCatalogueStore";
 import { useBookmarksStore } from "./stores/useBookmarksStore";
 import { useViewerStore } from "./stores/useViewerStore";
 import { useWorkspaceStore } from "./stores/useWorkspaceStore";
+import { useAgentBrowserStore } from "./stores/useBrowserStore";
 import { ToastProvider } from "./components/Toast";
 import { api, source } from "./services";
 import { capturePointer, pointerEvent } from "./test/pointerDrag";
@@ -424,6 +425,35 @@ describe("App", () => {
     fireEvent.click(await screen.findByText("New literature pane"));
     expect(newPane).toHaveBeenCalledTimes(1);
     expect(useCatalogueStore.getState().panes.map((pane) => pane.id)).toHaveLength(3);
+  });
+
+  it("offers the agent's browser only once an agent has used it, and marks the icon while it browses", async () => {
+    useAgentBrowserStore.setState({ url: null, busy: false, paneOpen: false });
+    render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>
+    );
+    expect(screen.getByRole("button", { name: "Browser pane" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Browser pane options" })).toBeNull();
+    expect(screen.queryByLabelText("An agent is browsing")).toBeNull();
+
+    act(() => {
+      useAgentBrowserStore.getState().applyPageEvent({ kind: "busy", busy: true });
+    });
+    expect(screen.getByLabelText("An agent is browsing")).toBeInTheDocument();
+
+    act(() => {
+      useAgentBrowserStore.getState().applyPageEvent({ kind: "loaded", url: "https://dl.acm.org/doi/pdf/1" });
+      useAgentBrowserStore.getState().applyPageEvent({ kind: "busy", busy: false });
+    });
+    expect(screen.queryByLabelText("An agent is browsing")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Browser pane options" }));
+    fireEvent.click(await screen.findByText("Agent browser"));
+    expect(useAgentBrowserStore.getState().paneOpen).toBe(true);
+    act(() => {
+      useAgentBrowserStore.setState({ url: null, busy: false, paneOpen: false });
+    });
   });
 
   it("opens bookmarks in This file scope when a document was opened while the pane was closed", () => {
