@@ -17,7 +17,7 @@ use wilkes_core::types::{
 /// Unindexed exact matching over a corpus of PDFs is minutes, so the wait has
 /// to be bounded somewhere, and here is the only place that knows the caller
 /// cannot stream.
-pub const AGENT_SEARCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+pub const AGENT_SEARCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CollectedSearch {

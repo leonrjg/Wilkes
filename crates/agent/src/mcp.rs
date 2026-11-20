@@ -12,6 +12,7 @@ use axum::{
     response::Response,
     Router,
 };
+use futures_util::{stream, StreamExt};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
@@ -969,8 +970,26 @@ struct ListDocumentsParams {
     workspace: Option<String>,
 }
 
+/// The most downloads one `download` call takes.
+const MAX_DOWNLOADS_PER_CALL: usize = 20;
+
+/// How many of one call's downloads are fetched at the same time. Enough to
+/// overlap the waits on several slow sites; few enough not to look like a
+/// flood to one site named several times.
+const CONCURRENT_DOWNLOADS: usize = 6;
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct DownloadParams {
+    /// Every file to download (1-20), fetched at the same time. Put all the
+    /// files the user asked for in one call rather than one call per file.
+    downloads: Vec<DownloadItem>,
+    /// Workspace id to read, from list_context. Omit for the workspace that is
+    /// active in Wilkes. Naming one does not switch the app to it.
+    workspace: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct DownloadItem {
     /// Direct HTTP(S) URL of the file to download, when the user supplied one.
     /// Give either url or provider with result_id, not both.
     url: Option<String>,
@@ -989,9 +1008,49 @@ struct DownloadParams {
     #[serde(default, deserialize_with = "deserialize_optional_bool")]
     #[schemars(with = "Option<bool>")]
     through_browser: Option<bool>,
-    /// Workspace id to read, from list_context. Omit for the workspace that is
-    /// active in Wilkes. Naming one does not switch the app to it.
-    workspace: Option<String>,
+}
+
+/// What became of one download a call asked for, in the order asked.
+#[derive(Debug, Serialize)]
+struct DownloadOutcome {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_id: Option<String>,
+    #[serde(flatten)]
+    result: DownloadResult,
+}
+
+impl DownloadOutcome {
+    /// What the caller named the file by, to report it under.
+    fn asked_for(&self) -> String {
+        match (&self.url, &self.provider, &self.result_id) {
+            (Some(url), _, _) => url.clone(),
+            (None, Some(provider), Some(result_id)) => format!("{provider} {result_id}"),
+            _ => "A download naming neither url nor a result".to_string(),
+        }
+    }
+
+    fn error(&self) -> Option<&str> {
+        match &self.result {
+            DownloadResult::Failed { error } => Some(error),
+            DownloadResult::Acquired(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum DownloadResult {
+    Acquired(AcquiredFiles),
+    Failed { error: String },
+}
+
+#[derive(Debug, Serialize)]
+struct DownloadResponse {
+    downloads: Vec<DownloadOutcome>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1374,7 +1433,8 @@ struct EditLibraryParams {
 #[tool_router]
 impl WilkesMcp {
     #[tool(
-        description = "Read bookmarks (quotes and notes), saved_works (literature results kept for later, each with where it landed if added to the library), tags, or recent search_history from a workspace. Offset is zero-based and limit is 1..500 (default 50). Search history covers the most recent 1000 entries. Use list_smart_collections for collections."
+        description = "Read bookmarks (quotes and notes), saved_works (literature results kept for later, each with where it landed if added to the library), tags, or recent search_history from a workspace. Offset is zero-based and limit is 1..500 (default 50). Search history covers the most recent 1000 entries. Use list_smart_collections for collections.",
+        annotations(read_only_hint = true)
     )]
     async fn read_library(
         &self,
@@ -1424,7 +1484,8 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "List the current Wilkes context: every workspace and its id, the configured library roots and active root of the workspace read, the document currently visible in Wilkes, and any files explicitly added to an in-app chat. Read this first to learn the workspace ids other tools accept."
+        description = "List the current Wilkes context: every workspace and its id, the configured library roots and active root of the workspace read, the document currently visible in Wilkes, and any files explicitly added to an in-app chat. Read this first to learn the workspace ids other tools accept.",
+        annotations(read_only_hint = true)
     )]
     async fn list_context(
         &self,
@@ -1453,7 +1514,8 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "List saved Wilkes smart collections and their IDs for collection-scoped searches. Collections are per workspace; omit workspace for the active one."
+        description = "List saved Wilkes smart collections and their IDs for collection-scoped searches. Collections are per workspace; omit workspace for the active one.",
+        annotations(read_only_hint = true)
     )]
     async fn list_smart_collections(
         &self,
@@ -1473,7 +1535,8 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Read Wilkes-extracted document text from any configured Wilkes library root. Reads the active workspace unless workspace names another. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. Use page for one PDF page or page_range in \"N-M\" format (for example, \"7-9\") for an inclusive PDF page range."
+        description = "Read Wilkes-extracted document text from any configured Wilkes library root. Reads the active workspace unless workspace names another. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. Use page for one PDF page or page_range in \"N-M\" format (for example, \"7-9\") for an inclusive PDF page range.",
+        annotations(read_only_hint = true)
     )]
     async fn get_document_text(
         &self,
@@ -1486,7 +1549,8 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Read a document's declared outline (PDF bookmarks or Markdown headings) without requiring the semantic index. Reads the active workspace unless workspace names another. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. An empty outline means the document declares no table of contents."
+        description = "Read a document's declared outline (PDF bookmarks or Markdown headings) without requiring the semantic index. Reads the active workspace unless workspace names another. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. An empty outline means the document declares no table of contents.",
+        annotations(read_only_hint = true)
     )]
     async fn get_document_outline(
         &self,
@@ -1499,7 +1563,8 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Find documents semantically related to a document in Wilkes. Searches the active workspace unless workspace names another. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. Set scope='all' to search that workspace's whole library; otherwise results are limited to its current root."
+        description = "Find documents semantically related to a document in Wilkes. Searches the active workspace unless workspace names another. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document. Set scope='all' to search that workspace's whole library; otherwise results are limited to its current root.",
+        annotations(read_only_hint = true)
     )]
     async fn get_related_documents(
         &self,
@@ -1512,7 +1577,8 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Read full bibliographic metadata for a document in any configured Wilkes library root: title, author, DOI, publication date, and any enrichment from an enabled literature provider (under `providers`, keyed by provider id). Reads the active workspace unless workspace names another. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document."
+        description = "Read full bibliographic metadata for a document in any configured Wilkes library root: title, author, DOI, publication date, and any enrichment from an enabled literature provider (under `providers`, keyed by provider id). Reads the active workspace unless workspace names another. External MCP clients must pass path; an in-app chat may omit it to use that chat's active document.",
+        annotations(read_only_hint = true)
     )]
     async fn get_file_metadata(
         &self,
@@ -1525,7 +1591,8 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "List documents in the Wilkes library with their title, author, and DOI. Lists the active workspace unless workspace names another. Set scope='all' to list that workspace's whole library; otherwise lists its current root. Use this to browse what documents exist rather than searching their contents."
+        description = "List documents in the Wilkes library with their title, author, and DOI. Lists the active workspace unless workspace names another. Set scope='all' to list that workspace's whole library; otherwise lists its current root. Use this to browse what documents exist rather than searching their contents.",
+        annotations(read_only_hint = true)
     )]
     async fn list_documents(
         &self,
@@ -1538,7 +1605,8 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Search Wilkes-readable documents, including direct filename, cached-title and cached-author matches. mode defaults to 'combined', which finds the query text as written and passages about the same subject in different words; each returned document carries evidence=['exact_phrase'], ['related_passage'], or both, so you can tell which. Set mode='exact' for literal/regex matching only (is_regex applies to this mode alone), or mode='semantic' for meaning-based content search only; both narrow what combined already covers, so prefer the default unless the user asked for one of them. Each returned match has kind='content', 'filename', 'title', or 'author'. Searches the active workspace unless workspace names another. Set scope='all' to search every configured library root of that workspace; omit scope to search its current root. If the user asks about a specific document, set file to that document path; omit file only for corpus-wide searches. A search answers within a time budget: complete=false means the scan did not reach the end of the search root and the matches are those found so far. Anything the search could not do, such as a combined search whose semantic lane was unavailable, is reported in notes; stats.errors carries only faults."
+        description = "Search Wilkes-readable documents, including direct filename, cached-title and cached-author matches. mode defaults to 'combined', which finds the query text as written and passages about the same subject in different words; each returned document carries evidence=['exact_phrase'], ['related_passage'], or both, so you can tell which. Set mode='exact' for literal/regex matching only (is_regex applies to this mode alone), or mode='semantic' for meaning-based content search only; both narrow what combined already covers, so prefer the default unless the user asked for one of them. Each returned match has kind='content', 'filename', 'title', or 'author'. Searches the active workspace unless workspace names another. Set scope='all' to search every configured library root of that workspace; omit scope to search its current root. If the user asks about a specific document, set file to that document path; omit file only for corpus-wide searches. A search answers within a time budget: complete=false means the scan did not reach the end of the search root and the matches are those found so far. Anything the search could not do, such as a combined search whose semantic lane was unavailable, is reported in notes; stats.errors carries only faults.",
+        annotations(read_only_hint = true)
     )]
     async fn search(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         match search_documents_for_mcp(self, params).await {
@@ -1548,7 +1616,8 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Search scholarly literature, or an open learning catalogue of textbooks, courses or documentation, using an enabled provider. Pass provider as an id from list_context's literature_providers, for example 'openalex', 'semantic_scholar', a catalogue such as 'libretexts', or a user-defined 'custom:<id>'."
+        description = "Search scholarly literature, or an open learning catalogue of textbooks, courses or documentation, using an enabled provider. Pass provider as an id from list_context's literature_providers, for example 'openalex', 'semantic_scholar', a catalogue such as 'libretexts', or a user-defined 'custom:<id>'.",
+        annotations(read_only_hint = true)
     )]
     async fn literature_search(
         &self,
@@ -1598,16 +1667,27 @@ impl WilkesMcp {
     }
 
     #[tool(
-        description = "Download a file into the current Wilkes root of the active workspace, or of the workspace named by workspace. Use only when the user asks to import or download a file. Name the file either by a url the user gave you, or by provider and result_id of a literature_search result whose downloadable is true; Wilkes finds the file itself. A result may come back as several files, in a folder of their own; the answer lists every file. Pass filename to choose the saved name, or the folder's when there are several; existing files are never overwritten, and a name already taken by a different file gets a number, as in 'paper (2).pdf'. A url the site refuses with HTTP 401 or 403 is retried once, automatically, through the agent browser, which is signed in wherever the user signed in in Wilkes' browser; pass through_browser=true to go there directly. If the browser gets a sign-in or check page instead of the file, ask the user to open Agent browser from the browser button's menu in Wilkes, deal with it there, and try again. Refused for a workspace list_context reports as read_only, which another application owns."
+        description = "Download files into the current Wilkes root of the active workspace, or of the workspace named by workspace. Use only when the user asks to import or download files. Pass every file in one call, as the list downloads: they are fetched at the same time, so one call for several files is much faster than one call each. Name each file either by a url the user gave you, or by provider and result_id of a literature_search result whose downloadable is true; Wilkes finds the file itself. The answer lists, in the order asked, each download's files or its error; one failing does not stop the others. A result may come back as several files, in a folder of their own. Pass filename to choose the saved name, or the folder's when there are several; existing files are never overwritten, and a name already taken by a different file gets a number, as in 'paper (2).pdf'. A url the site refuses with HTTP 401 or 403 is retried once, automatically, through the agent browser, which is signed in wherever the user signed in in Wilkes' browser; pass through_browser=true to go there directly. The agent browser fetches one file at a time. If the browser gets a sign-in or check page instead of the file, ask the user to open Agent browser from the browser button's menu in Wilkes, deal with it there, and try again. Refused for a workspace list_context reports as read_only, which another application owns.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn download(&self, Parameters(params): Parameters<DownloadParams>) -> CallToolResult {
+        if params.downloads.is_empty() || params.downloads.len() > MAX_DOWNLOADS_PER_CALL {
+            return CallToolResult::error(vec![ContentBlock::text(format!(
+                "downloads takes 1 to {MAX_DOWNLOADS_PER_CALL} files; {} were given.",
+                params.downloads.len()
+            ))]);
+        }
         let scope = match self.scope(params.workspace.as_deref()).await {
             Ok(scope) => scope,
             Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
         };
         if scope.is_read_only() {
             return CallToolResult::error(vec![ContentBlock::text(
-                "MANAGED_WORKSPACE_PROTECTED: this workspace is owned by another application and                  can only be read",
+                "MANAGED_WORKSPACE_PROTECTED: this workspace is owned by another application and can only be read",
             )]);
         }
         let root = match self.current_root(&scope).await {
@@ -1621,80 +1701,44 @@ impl WilkesMcp {
             // A standalone chat session has no application settings service.
             None => wilkes_core::types::DEFAULT_MAX_DOWNLOAD_BYTES,
         };
-        // No progress sink: an MCP call is one request and one reply, with
-        // nowhere to render a bar between them.
-        let through_browser = params.through_browser.unwrap_or(false);
-        let (acquired, named) = match (params.url, params.provider, params.result_id) {
-            (Some(url), None, None) if through_browser => (
-                self.download_through_browser(&url, &root, params.filename, max_download_bytes)
+        // In the order asked, whichever finishes first. Downloads through the
+        // agent browser still take their turn there, one at a time.
+        let outcomes: Vec<DownloadOutcome> = stream::iter(params.downloads)
+            .map(|item| async {
+                let result = match self
+                    .download_one(&scope, &root, max_download_bytes, &item)
                     .await
-                    .map(|file| AcquiredFiles {
-                        folder: None,
-                        files: vec![file],
-                    }),
-                None,
-            ),
-            (Some(url), None, None) => (
-                self.download_url(&url, &root, params.filename, max_download_bytes)
-                    .await
-                    .map(|file| AcquiredFiles {
-                        folder: None,
-                        files: vec![file],
-                    }),
-                None,
-            ),
-            // The result is kept so a saved one can be marked as in the
-            // library once its files are there.
-            (None, Some(_), Some(_)) if through_browser => {
-                return CallToolResult::error(vec![ContentBlock::text(
-                    "through_browser takes a url, not a literature result.",
-                )])
-            }
-            (None, Some(provider), Some(result_id)) => {
-                match self.cached_literature_result(&provider, &result_id) {
-                    Ok(result) => (
-                        acquire_result(
-                            &self.integrations().await,
-                            self.literature_mirror().await.as_deref(),
-                            &provider,
-                            &result,
-                            &root,
-                            params.filename,
-                            None,
-                            max_download_bytes,
-                        )
-                        .await,
-                        Some((provider, result)),
-                    ),
-                    Err(message) => {
-                        return CallToolResult::error(vec![ContentBlock::text(message)])
-                    }
-                }
-            }
-            _ => {
-                return CallToolResult::error(vec![ContentBlock::text(
-                    "Pass either url, or provider together with result_id, but not both.",
-                )])
-            }
-        };
-        match acquired {
-            Ok(acquired) => {
-                if let (Some((provider, result)), Some(search), Some(first)) =
-                    (named, scope.search(), acquired.files.first())
                 {
-                    // The files are in the library whether or not the mark is
-                    // written, so a failure here is reported, not returned.
-                    if let Err(message) = search
-                        .mark_literature_acquired(provider, result, PathBuf::from(&first.path))
-                        .await
-                    {
-                        error!("marking a saved work as acquired failed: {message}");
-                    }
+                    Ok(acquired) => DownloadResult::Acquired(acquired),
+                    Err(error) => DownloadResult::Failed { error },
+                };
+                DownloadOutcome {
+                    url: item.url,
+                    provider: item.provider,
+                    result_id: item.result_id,
+                    result,
                 }
-                structured(acquired)
-            }
-            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+            })
+            .buffered(CONCURRENT_DOWNLOADS)
+            .collect()
+            .await;
+        let errors: Option<Vec<String>> = outcomes
+            .iter()
+            .map(|outcome| match outcomes.len() {
+                1 => outcome.error().map(str::to_string),
+                _ => outcome
+                    .error()
+                    .map(|error| format!("{}: {error}", outcome.asked_for())),
+            })
+            .collect();
+        if let Some(errors) = errors {
+            // Nothing reached the library: an error, so a client that only
+            // looks at that flag still sees it, with every reason.
+            return CallToolResult::error(vec![ContentBlock::text(errors.join("\n"))]);
         }
+        structured(DownloadResponse {
+            downloads: outcomes,
+        })
     }
 
     #[tool(
@@ -1751,7 +1795,8 @@ impl WilkesMcp {
         }
     }
     #[tool(
-        description = "List the custom literature integrations the user stored, each a manifest describing a web service Wilkes can search and fetch from: id, provider id for literature_search, name and enabled. Neither manifest text nor secrets are returned; to change an integration, the user gives you its manifest. Set authoring_guide=true to get the manifest format's guide, which you need before writing or editing a manifest."
+        description = "List the custom literature integrations the user stored, each a manifest describing a web service Wilkes can search and fetch from: id, provider id for literature_search, name and enabled. Neither manifest text nor secrets are returned; to change an integration, the user gives you its manifest. Set authoring_guide=true to get the manifest format's guide, which you need before writing or editing a manifest.",
+        annotations(read_only_hint = true)
     )]
     async fn read_custom_integrations(
         &self,
@@ -1833,6 +1878,70 @@ impl WilkesMcp {
 }
 
 impl WilkesMcp {
+    /// Put the one file, or the files of the one result, `item` names into
+    /// `root`. A saved work is marked as in the library once its files are.
+    async fn download_one(
+        &self,
+        scope: &WorkspaceScope,
+        root: &Path,
+        max_download_bytes: u64,
+        item: &DownloadItem,
+    ) -> Result<AcquiredFiles, String> {
+        // No progress sink: an MCP call is one request and one reply, with
+        // nowhere to render a bar between them.
+        let through_browser = item.through_browser.unwrap_or(false);
+        let one = |file| AcquiredFiles {
+            folder: None,
+            files: vec![file],
+        };
+        let filename = item.filename.clone();
+        match (&item.url, &item.provider, &item.result_id) {
+            (Some(url), None, None) if through_browser => self
+                .download_through_browser(url, root, filename, max_download_bytes)
+                .await
+                .map(one),
+            (Some(url), None, None) => self
+                .download_url(url, root, filename, max_download_bytes)
+                .await
+                .map(one),
+            (None, Some(_), Some(_)) if through_browser => {
+                Err("through_browser takes a url, not a literature result.".to_string())
+            }
+            (None, Some(provider), Some(result_id)) => {
+                let result = self.cached_literature_result(provider, result_id)?;
+                let acquired = acquire_result(
+                    &self.integrations().await,
+                    self.literature_mirror().await.as_deref(),
+                    provider,
+                    &result,
+                    root,
+                    filename,
+                    None,
+                    max_download_bytes,
+                )
+                .await?;
+                if let (Some(search), Some(first)) = (scope.search(), acquired.files.first()) {
+                    // The files are in the library whether or not the mark is
+                    // written, so a failure here is reported, not returned.
+                    if let Err(message) = search
+                        .mark_literature_acquired(
+                            provider.clone(),
+                            result,
+                            PathBuf::from(&first.path),
+                        )
+                        .await
+                    {
+                        error!("marking a saved work as acquired failed: {message}");
+                    }
+                }
+                Ok(acquired)
+            }
+            _ => Err(
+                "Pass either url, or provider together with result_id, but not both.".to_string(),
+            ),
+        }
+    }
+
     /// Fetch `url` into `root`. A site that refuses this client access (HTTP
     /// 401 or 403) is asked once more through the agent browser, where there
     /// is one: such a site often serves the same address to the browser the
@@ -3088,10 +3197,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentBrowser for FakeBrowser {
-        async fn download(
-            &self,
-            url: &str,
-        ) -> Result<crate::browser::StagedDownload, String> {
+        async fn download(&self, url: &str) -> Result<crate::browser::StagedDownload, String> {
             if !url.ends_with("/paper.pdf") {
                 return Err("The page asks you to sign in".to_string());
             }
@@ -3126,15 +3232,25 @@ mod tests {
         })))
     }
 
-    fn browser_download(url: &str) -> DownloadParams {
-        DownloadParams {
+    fn browser_item(url: &str) -> DownloadItem {
+        DownloadItem {
             url: Some(url.to_string()),
             provider: None,
             result_id: None,
             filename: None,
             through_browser: Some(true),
+        }
+    }
+
+    fn batch(downloads: Vec<DownloadItem>) -> DownloadParams {
+        DownloadParams {
+            downloads,
             workspace: None,
         }
+    }
+
+    fn browser_download(url: &str) -> DownloadParams {
+        batch(vec![browser_item(url)])
     }
 
     #[tokio::test]
@@ -3150,7 +3266,7 @@ mod tests {
         let saved = root.path().join("Signed In.pdf");
         assert_eq!(std::fs::read(&saved).unwrap(), b"%PDF-1.7 signed in");
         assert_eq!(
-            reply.structured_content.unwrap()["files"][0]["path"],
+            reply.structured_content.unwrap()["downloads"][0]["files"][0]["path"],
             saved.display().to_string()
         );
         assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
@@ -3166,23 +3282,28 @@ mod tests {
     fn through_browser_is_read_however_a_client_spells_the_boolean() {
         for value in [serde_json::json!(true), serde_json::json!("true")] {
             let params: DownloadParams = serde_json::from_value(serde_json::json!({
-                "url": "https://dl.example/paper.pdf",
-                "through_browser": value,
+                "downloads": [{
+                    "url": "https://dl.example/paper.pdf",
+                    "through_browser": value,
+                }],
             }))
             .unwrap();
-            assert_eq!(params.through_browser, Some(true));
+            assert_eq!(params.downloads[0].through_browser, Some(true));
         }
     }
 
-    fn direct_download(url: String) -> DownloadParams {
-        DownloadParams {
+    fn direct_item(url: String) -> DownloadItem {
+        DownloadItem {
             url: Some(url),
             provider: None,
             result_id: None,
             filename: None,
             through_browser: None,
-            workspace: None,
         }
+    }
+
+    fn direct_download(url: String) -> DownloadParams {
+        batch(vec![direct_item(url)])
     }
 
     /// A site that refuses this client gets one more try in the agent
@@ -3211,7 +3332,10 @@ mod tests {
         let mcp = mcp_with_browser(root.path(), staging.path());
 
         let reply = mcp
-            .download(Parameters(direct_download(format!("{}/paper.pdf", server.url()))))
+            .download(Parameters(direct_download(format!(
+                "{}/paper.pdf",
+                server.url()
+            ))))
             .await;
         assert_ne!(reply.is_error, Some(true), "{reply:?}");
         refused.assert_async().await;
@@ -3233,7 +3357,10 @@ mod tests {
 
         // The browser tried and failed too: both are reported.
         let reply = mcp
-            .download(Parameters(direct_download(format!("{}/login", server.url()))))
+            .download(Parameters(direct_download(format!(
+                "{}/login",
+                server.url()
+            ))))
             .await;
         let text = format!("{reply:?}");
         assert!(text.contains("401"), "{text}");
@@ -3248,11 +3375,156 @@ mod tests {
             Some(single_workspace(fake_search_with_root(root.path().into()))),
         );
         let reply = plain
-            .download(Parameters(direct_download(format!("{}/login", server.url()))))
+            .download(Parameters(direct_download(format!(
+                "{}/login",
+                server.url()
+            ))))
             .await;
         let text = format!("{reply:?}");
         assert!(text.contains("401"), "{text}");
         assert!(!text.contains("agent browser"), "{text}");
+    }
+
+    /// Several files in one call are fetched together: each server answer
+    /// waits until every request has arrived, so fetching them one after
+    /// another would never finish.
+    #[tokio::test]
+    async fn the_downloads_of_one_call_are_fetched_at_the_same_time_and_answered_in_order() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let files = 3;
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut waiting = Vec::new();
+            for _ in 0..files {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 1024];
+                let read = stream.read(&mut request).unwrap();
+                let line = String::from_utf8_lossy(&request[..read]).to_string();
+                waiting.push((stream, line));
+            }
+            for (mut stream, line) in waiting {
+                if line.starts_with("GET /missing.pdf") {
+                    stream
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .unwrap();
+                    continue;
+                }
+                let name = line.split_whitespace().nth(1).unwrap().to_string();
+                let body = format!("%PDF-1.7 {name}");
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/pdf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+            }
+        });
+        let root = tempdir().unwrap();
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(single_workspace(fake_search_with_root(root.path().into()))),
+        );
+        let url = |path: &str| format!("http://{address}/{path}");
+
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            mcp.download(Parameters(batch(vec![
+                direct_item(url("a.pdf")),
+                direct_item(url("missing.pdf")),
+                direct_item(url("b.pdf")),
+            ]))),
+        )
+        .await
+        .expect("downloads fetched one at a time never get their answers");
+
+        // One failing leaves the others in the library, and says why.
+        assert_ne!(reply.is_error, Some(true), "{reply:?}");
+        let downloads = reply.structured_content.unwrap()["downloads"].clone();
+        assert_eq!(downloads[0]["url"], url("a.pdf"));
+        assert_eq!(
+            downloads[0]["files"][0]["path"],
+            root.path().join("a.pdf").display().to_string()
+        );
+        assert_eq!(downloads[1]["url"], url("missing.pdf"));
+        assert!(downloads[1]["error"].as_str().unwrap().contains("404"));
+        assert!(downloads[1].get("files").is_none());
+        assert_eq!(downloads[2]["url"], url("b.pdf"));
+        assert_eq!(
+            std::fs::read(root.path().join("b.pdf")).unwrap(),
+            b"%PDF-1.7 /b.pdf"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_whose_every_download_failed_is_an_error_naming_each() {
+        let root = tempdir().unwrap();
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            Some(single_workspace(fake_search_with_root(root.path().into()))),
+        );
+        let reply = mcp
+            .download(Parameters(batch(vec![
+                direct_item("ftp://dl.example/a.pdf".to_string()),
+                browser_item("https://dl.example/b.pdf"),
+            ])))
+            .await;
+        assert_eq!(reply.is_error, Some(true));
+        let text = format!("{reply:?}");
+        assert!(
+            text.contains("ftp://dl.example/a.pdf: Download URL must use HTTP"),
+            "{text}"
+        );
+        assert!(text.contains("https://dl.example/b.pdf: "), "{text}");
+        assert!(text.contains(BROWSER_UNAVAILABLE), "{text}");
+
+        for size in [0, MAX_DOWNLOADS_PER_CALL + 1] {
+            let downloads = (0..size)
+                .map(|n| direct_item(format!("https://dl.example/{n}.pdf")))
+                .collect();
+            let reply = mcp.download(Parameters(batch(downloads))).await;
+            assert_eq!(reply.is_error, Some(true));
+            assert!(
+                format!("{reply:?}").contains("downloads takes 1 to 20"),
+                "{reply:?}"
+            );
+        }
+    }
+
+    /// A client runs calls side by side only when a tool says it changes
+    /// nothing, and the in-app chat lets exactly the tools on
+    /// `WILKES_MCP_TOOL_NAMES` run without asking: the two must agree.
+    #[test]
+    fn the_tools_that_say_they_change_nothing_are_the_read_only_ones() {
+        let mcp = WilkesMcp::new(
+            McpContext::Library(ExternalMcpContext::default()),
+            PathBuf::new(),
+            None,
+        );
+        let mut read_only: Vec<String> = mcp
+            .tool_router
+            .list_all()
+            .into_iter()
+            .filter(|tool| {
+                tool.annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.read_only_hint)
+                    == Some(true)
+            })
+            .map(|tool| tool.name.to_string())
+            .collect();
+        read_only.sort();
+        let mut expected: Vec<String> = WILKES_MCP_TOOL_NAMES
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(read_only, expected);
     }
 
     #[tokio::test]
@@ -3266,21 +3538,30 @@ mod tests {
         let reply = mcp
             .download(Parameters(browser_download("https://dl.example/paper.pdf")))
             .await;
-        assert!(format!("{reply:?}").contains(BROWSER_UNAVAILABLE), "{reply:?}");
+        assert!(
+            format!("{reply:?}").contains(BROWSER_UNAVAILABLE),
+            "{reply:?}"
+        );
         let reply = mcp
             .read_web_page(Parameters(ReadWebPageParams {
                 url: "https://dl.example/".to_string(),
                 max_chars: None,
             }))
             .await;
-        assert!(format!("{reply:?}").contains(BROWSER_UNAVAILABLE), "{reply:?}");
+        assert!(
+            format!("{reply:?}").contains(BROWSER_UNAVAILABLE),
+            "{reply:?}"
+        );
 
-        let mut by_result = browser_download("https://dl.example/paper.pdf");
+        let mut by_result = browser_item("https://dl.example/paper.pdf");
         by_result.url = None;
         by_result.provider = Some("openalex".to_string());
         by_result.result_id = Some("W1".to_string());
-        let reply = mcp.download(Parameters(by_result)).await;
-        assert!(format!("{reply:?}").contains("through_browser takes a url"), "{reply:?}");
+        let reply = mcp.download(Parameters(batch(vec![by_result]))).await;
+        assert!(
+            format!("{reply:?}").contains("through_browser takes a url"),
+            "{reply:?}"
+        );
     }
 
     #[tokio::test]
@@ -3919,21 +4200,20 @@ run = { program = "/bin/sh", args = ["-c", "printf manga > \"$1/{id}.pdf\"", "sh
         );
 
         let reply = mcp
-            .download(Parameters(DownloadParams {
+            .download(Parameters(batch(vec![DownloadItem {
                 url: None,
                 provider: Some("custom:runner".to_string()),
                 result_id: Some("M1".to_string()),
                 filename: None,
                 through_browser: None,
-                workspace: None,
-            }))
+            }])))
             .await;
 
         assert_ne!(reply.is_error, Some(true), "{reply:?}");
         let saved = root.path().join("M1.pdf");
         assert_eq!(std::fs::read(&saved).unwrap(), b"manga");
         assert_eq!(
-            reply.structured_content.unwrap()["files"][0]["path"],
+            reply.structured_content.unwrap()["downloads"][0]["files"][0]["path"],
             saved.display().to_string()
         );
         // The run's own directory is not in the library.

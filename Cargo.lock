@@ -9725,6 +9725,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "futures-util",
  "ignore",
  "mockito",
  "reqwest 0.12.28",
