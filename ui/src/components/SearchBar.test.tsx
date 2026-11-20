@@ -109,6 +109,20 @@ describe("SearchBar", () => {
     expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
   });
 
+  it("selects the whole query on a double-click in the space right of it", () => {
+    render(<SearchBar sourceSlot={<MockSourceSlot />} />);
+    const input = screen.getByPlaceholderText("Search…") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "two words" } });
+    input.setSelectionRange(9, 9);
+
+    const searchField = input.parentElement!.parentElement!;
+    const spacer = searchField.querySelector(':scope > div[aria-hidden="true"]')!;
+    fireEvent.doubleClick(spacer);
+
+    expect(input).toHaveFocus();
+    expect([input.selectionStart, input.selectionEnd]).toEqual([0, 9]);
+  });
+
   it("keeps the clear button beside the query within a shrinkable ceiling", () => {
     render(<SearchBar sourceSlot={<MockSourceSlot />} />);
     const input = screen.getByPlaceholderText("Search…");

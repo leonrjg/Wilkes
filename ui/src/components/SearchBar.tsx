@@ -352,6 +352,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
               event.preventDefault();
               inputRef.current?.focus();
             }}
+            onDoubleClick={() => inputRef.current?.select()}
           />
           <Tooltip content={searchAll ? "Search current directory" : "Search all directories"}>
             <button
