@@ -12,6 +12,15 @@
 //! first is what it fetched, any other is discarded. A download the user
 //! starts there with no operation running goes to the library like one from
 //! their own pane.
+//!
+//! A download is taken from the page the pane already shows when that page is
+//! the address asked for, or where opening that address led -- a redirect, a
+//! bot check that forwarded once the user passed it there -- rather than by
+//! opening the address again: some sites (ETH's Research Collection) ask a
+//! fresh visit to pass their check again, however recently it was passed.
+//! What the page shows is taken as it loaded, on macOS, without asking the
+//! site again; elsewhere it is downloaded from the page's own address through
+//! the pane's session.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -25,6 +34,8 @@ use tauri::{AppHandle, Manager, Url, Webview};
 use tokio::sync::oneshot;
 use wilkes_agent::browser::{AgentBrowser, BrowserPage, StagedDownload};
 
+#[cfg(target_os = "macos")]
+use crate::browser_pane::staging_dir;
 use crate::browser_pane::{
     clear_staging, create_pane, emit, is_web_page, web_url, PageEvent, PaneId, AGENT_OWNER,
 };
@@ -104,6 +115,10 @@ pub struct AgentState {
     loaded: Mutex<Option<oneshot::Sender<()>>>,
     /// What the agent's pane is showing, as far as an operation needs to know.
     page: Mutex<PageState>,
+    /// The address last opened in the agent's pane, by an operation or by the
+    /// user from its address bar. The page shown is that address or one it
+    /// led to by itself, unless the user followed a link from it.
+    opened: Mutex<Option<Url>>,
     /// One operation at a time.
     turn: tokio::sync::Mutex<()>,
 }
@@ -116,6 +131,11 @@ struct PageState {
     /// None for a document that came with no HTTP status.
     status: Option<u16>,
     loaded: bool,
+    /// The name the response gave the document, to save it by. Said by the
+    /// platform with the response on macOS, the one platform that takes the
+    /// document as it loaded.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    suggested_name: Option<String>,
 }
 
 impl PageState {
@@ -136,15 +156,48 @@ enum Verdict {
     Refused(u16),
 }
 
-/// The agent's pane got the response to its document, with `status`: a new
-/// page, not loaded yet. Where the platform says so as the response arrives.
-pub(crate) fn response_arrived(app: &AppHandle, pane: &PaneId, status: Option<u16>) {
+/// The agent's pane got the response to its document, with `status` and the
+/// name it gives the document: a new page, not loaded yet. Where the platform
+/// says so as the response arrives.
+pub(crate) fn response_arrived(
+    app: &AppHandle,
+    pane: &PaneId,
+    status: Option<u16>,
+    suggested_name: Option<String>,
+) {
     if pane.kind == crate::browser_pane::PaneKind::Agent {
         *app.state::<AgentState>().page.lock().unwrap() = PageState {
             status,
             loaded: false,
+            suggested_name,
         };
     }
+}
+
+/// The user opened `url` in the agent's pane from its address bar: what it
+/// shows from now on comes from there.
+pub(crate) fn opening(app: &AppHandle, url: &Url) {
+    *app.state::<AgentState>().opened.lock().unwrap() = Some(url.clone());
+}
+
+/// The same address, whatever place in the page each points at.
+fn same_address(a: &Url, b: &Url) -> bool {
+    let (mut a, mut b) = (a.clone(), b.clone());
+    a.set_fragment(None);
+    b.set_fragment(None);
+    a == b
+}
+
+/// Whether a download of `asked` is to be taken from the page the pane shows,
+/// at `shown`, rather than by opening `asked` again: the pane is at that
+/// address, or `asked` is the address last `opened` there and the pane is
+/// where it led, and the page has loaded what was asked for or is loading
+/// still. A page the site refused is opened afresh: a check not passed yet
+/// starts over, and an error may not be the site's answer the next time.
+fn reusable(asked: &Url, opened: Option<&Url>, shown: &Url, page: &PageState) -> bool {
+    let from_asked =
+        same_address(shown, asked) || opened.is_some_and(|opened| same_address(opened, asked));
+    from_asked && !matches!(page.verdict(), Verdict::Refused(_))
 }
 
 /// The agent's pane's document was answered with `status`, said once it has
@@ -301,6 +354,9 @@ impl DesktopAgentBrowser {
             .app
             .get_window(AGENT_OWNER)
             .ok_or_else(|| "The Wilkes window is not open".to_string())?;
+        // A pane before this one, gone with its window, left its page behind.
+        *self.state().opened.lock().unwrap() = None;
+        *self.state().page.lock().unwrap() = PageState::default();
         create_pane(
             &window,
             &pane,
@@ -335,11 +391,7 @@ impl DesktopAgentBrowser {
             .map_err(|_| "The agent browser closed".to_string())
     }
 
-    /// Open `url` in the pane and wait until it shows what was asked for: a
-    /// page loaded with a 2xx status. A page answered with a bot check's
-    /// status is given time to pass the browser and forward itself -- which
-    /// it does in the pane, hidden or not -- and any other error is the
-    /// site's answer. A download the opening started is also an end.
+    /// Open `url` in the pane and wait until it shows what was asked for.
     async fn open(
         &self,
         webview: &Webview,
@@ -347,13 +399,40 @@ impl DesktopAgentBrowser {
         claim: Option<&ClaimGuard<'_>>,
     ) -> Result<(), String> {
         *self.state().page.lock().unwrap() = PageState::default();
+        *self.state().opened.lock().unwrap() = Some(url.clone());
         let loaded = self.expect_load();
         webview.navigate(url.clone()).map_err(|e| e.to_string())?;
+        self.settle(webview, claim, Some(loaded)).await
+    }
+
+    /// Whether the pane shows the page a download of `url` is to be taken
+    /// from, rather than opening `url` again (`reusable`).
+    async fn shows_page_from(&self, webview: &Webview, url: &Url) -> Result<bool, String> {
+        let shown = webview.url().map_err(|e| e.to_string())?;
+        let opened = self.state().opened.lock().unwrap().clone();
+        let page = self.page(webview).await?;
+        Ok(reusable(url, opened.as_ref(), &shown, &page))
+    }
+
+    /// Wait until the pane shows what was asked for: a page loaded with a 2xx
+    /// status. A page answered with a bot check's status is given time to
+    /// pass the browser and forward itself -- which it does in the pane,
+    /// hidden or not -- and any other error is the site's answer. A download
+    /// the page started is also an end. With `next`, told of the load the
+    /// caller just started, the pane is looked at once that load ends;
+    /// without, at once.
+    async fn settle(
+        &self,
+        webview: &Webview,
+        claim: Option<&ClaimGuard<'_>>,
+        mut next: Option<oneshot::Receiver<()>>,
+    ) -> Result<(), String> {
         let load_deadline = Instant::now() + PAGE_TIMEOUT;
         let mut check_deadline: Option<Instant> = None;
-        let mut next = loaded;
         loop {
-            let _ = tokio::time::timeout(LOOK_AGAIN, next).await;
+            if let Some(next) = next.take() {
+                let _ = tokio::time::timeout(LOOK_AGAIN, next).await;
+            }
             if claim.is_some_and(ClaimGuard::started) {
                 return Ok(());
             }
@@ -380,42 +459,87 @@ impl DesktopAgentBrowser {
                 }
                 Verdict::Loading => {}
             }
-            next = self.expect_load();
+            next = Some(self.expect_load());
         }
     }
 
-    /// Start downloading `url` in the pane as the user's own pane saves a
-    /// page: open it, and if opening it did not already start a download --
-    /// a file served as an attachment can -- save what it shows. Loaded first
-    /// rather than downloaded outright, because some sites tell the two apart:
-    /// the ACM Digital Library answers a bare download request with a page,
-    /// and serves the PDF to a browser that has loaded it.
-    async fn start_download(
+    /// Take what the pane shows as it loaded it, by the name its response
+    /// gave it -- the PDF a site let through once, without asking again.
+    #[cfg(target_os = "macos")]
+    async fn take_shown_page(
         &self,
         webview: &Webview,
-        url: &Url,
-        claim: &ClaimGuard<'_>,
-    ) -> Result<(), String> {
-        self.open(webview, url, Some(claim)).await?;
-        if claim.started() {
-            return Ok(());
-        }
-        save_shown_page(webview)
+        _fetched: oneshot::Receiver<Fetched>,
+    ) -> Result<StagedDownload, String> {
+        let (answer, answered) = oneshot::channel();
+        let app = self.app.clone();
+        webview
+            .with_webview(move |platform| {
+                // Read with the document, on the main thread, so a page that
+                // replaces it meanwhile cannot lend it its name.
+                let name = app
+                    .state::<AgentState>()
+                    .page
+                    .lock()
+                    .unwrap()
+                    .suggested_name
+                    .clone();
+                crate::browser_webkit_download::loaded_document(&platform, move |data| {
+                    // Nothing is waiting if the operation went meanwhile.
+                    answer.send(data.map(|data| (name, data))).ok();
+                });
+            })
+            .map_err(|e| e.to_string())?;
+        let (name, data) = answered
+            .await
+            .map_err(|_| "The agent browser closed".to_string())??;
+        let name = name.ok_or_else(|| "WebKit gave the page no name to save it by".to_string())?;
+        let name = Path::new(&name)
+            .file_name()
+            .ok_or_else(|| format!("The page's name is not a file name: {name}"))?
+            .to_os_string();
+        let dir = staging_dir(&self.app)?;
+        let file = dir.join(&name);
+        let staged = StagedDownload::new(dir, file.clone(), name.to_string_lossy().into_owned());
+        tokio::fs::write(&file, data)
+            .await
+            .map_err(|e| format!("Could not stage the page: {e}"))?;
+        Ok(staged)
+    }
+
+    /// Download what the pane shows from its own address, through the pane's
+    /// own session, as the user's pane's Save to library does.
+    #[cfg(not(target_os = "macos"))]
+    async fn take_shown_page(
+        &self,
+        webview: &Webview,
+        fetched: oneshot::Receiver<Fetched>,
+    ) -> Result<StagedDownload, String> {
+        webview
+            .eval(crate::browser_pane::SAVE_PAGE_SCRIPT)
+            .map_err(|e| e.to_string())?;
+        staged(fetched).await
     }
 }
 
-/// Save what the agent's pane shows, as the user's pane's Save to library
-/// does.
-fn save_shown_page(webview: &Webview) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        crate::browser_webkit_download::save_page(webview, &PaneId::agent());
-        Ok(())
+/// The download the agent's pane finished for an operation, staged.
+async fn staged(fetched: oneshot::Receiver<Fetched>) -> Result<StagedDownload, String> {
+    let Fetched { path, success } = fetched
+        .await
+        .map_err(|_| "The agent browser stopped before the download finished".to_string())?;
+    let dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "The download has no staging directory".to_string())?;
+    let suggested_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let staged = StagedDownload::new(dir, path, suggested_name);
+    if !success {
+        return Err("The agent browser could not download it".to_string());
     }
-    #[cfg(not(target_os = "macos"))]
-    webview
-        .eval(crate::browser_pane::SAVE_PAGE_SCRIPT)
-        .map_err(|e| e.to_string())
+    Ok(staged)
 }
 
 #[async_trait]
@@ -427,23 +551,23 @@ impl AgentBrowser for DesktopAgentBrowser {
         let webview = self.webview()?;
         let (answer, fetched) = oneshot::channel();
         let claim = ClaimGuard::new(self.state(), answer);
-        self.start_download(&webview, &url, &claim).await?;
-        let Fetched { path, success } = fetched
-            .await
-            .map_err(|_| "The agent browser stopped before the download finished".to_string())?;
-        drop(claim);
-        let dir = path
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| "The download has no staging directory".to_string())?;
-        let suggested_name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let staged = StagedDownload::new(dir, path, suggested_name);
-        if !success {
-            return Err("The agent browser could not download it".to_string());
+        // Loaded first rather than downloaded outright, because some sites
+        // tell the two apart: the ACM Digital Library answers a bare download
+        // request with a page, and serves the PDF to a browser that has
+        // loaded it. Opening it may start a download of its own, of a file
+        // served as an attachment; otherwise what it shows is taken.
+        if self.shows_page_from(&webview, &url).await? {
+            tracing::info!(url = %url, "agent browser: taking the download from the page it shows, not opening it again");
+            self.settle(&webview, Some(&claim), None).await?;
+        } else {
+            self.open(&webview, &url, Some(&claim)).await?;
         }
+        let staged = if claim.started() {
+            staged(fetched).await?
+        } else {
+            self.take_shown_page(&webview, fetched).await?
+        };
+        drop(claim);
         // The page is already in the pane, where the user will look for it.
         if is_web_page(staged.file()).map_err(|e| e.to_string())? {
             tracing::warn!(
@@ -546,9 +670,99 @@ mod tests {
         assert!(state.abandoned.lock().unwrap().is_empty());
     }
 
+    fn url(address: &str) -> Url {
+        Url::parse(address).unwrap()
+    }
+
+    fn page(status: Option<u16>, loaded: bool) -> PageState {
+        PageState {
+            status,
+            loaded,
+            suggested_name: None,
+        }
+    }
+
+    const ASKED: &str = "https://www.research-collection.ethz.ch/bitstreams/5c1c/download";
+    const LED_TO: &str =
+        "https://www.research-collection.ethz.ch/server/api/core/bitstreams/5c1c/content";
+
+    #[test]
+    fn a_download_is_taken_from_the_page_already_at_its_address() {
+        let asked = url(ASKED);
+        // A check passed in the pane, which reloaded the same address.
+        assert!(reusable(
+            &asked,
+            Some(&asked),
+            &asked,
+            &page(Some(200), true)
+        ));
+        // Opened by the user from the address bar, or before the pane
+        // remembered what it opened: the address shown is enough.
+        assert!(reusable(&asked, None, &asked, &page(Some(200), true)));
+        // Another place in the same page.
+        assert!(reusable(
+            &asked,
+            None,
+            &url(&format!("{ASKED}#page=2")),
+            &page(Some(200), true)
+        ));
+        // Still loading what the check forwarded to: waited for, not reloaded.
+        assert!(reusable(
+            &asked,
+            Some(&asked),
+            &asked,
+            &page(Some(200), false)
+        ));
+    }
+
+    #[test]
+    fn a_download_is_taken_from_the_page_its_address_led_to() {
+        let (asked, led_to) = (url(ASKED), url(LED_TO));
+        assert!(reusable(
+            &asked,
+            Some(&asked),
+            &led_to,
+            &page(Some(200), true)
+        ));
+        // A PDF shown from elsewhere, with no HTTP status.
+        assert!(reusable(&asked, Some(&asked), &led_to, &page(None, true)));
+    }
+
+    #[test]
+    fn an_address_is_opened_afresh_where_the_pane_shows_no_page_from_it() {
+        let (asked, led_to) = (url(ASKED), url(LED_TO));
+        // Nothing opened yet, or another address opened since.
+        assert!(!reusable(
+            &asked,
+            None,
+            &url("about:blank"),
+            &page(None, false)
+        ));
+        let other = url("https://dl.acm.org/doi/pdf/10.1145/1");
+        assert!(!reusable(
+            &asked,
+            Some(&other),
+            &led_to,
+            &page(Some(200), true)
+        ));
+        // The check not passed yet starts over; an error is asked again.
+        assert!(!reusable(
+            &asked,
+            Some(&asked),
+            &led_to,
+            &page(Some(403), true)
+        ));
+        assert!(!reusable(
+            &asked,
+            Some(&asked),
+            &asked,
+            &page(Some(404), true)
+        ));
+    }
+
     #[test]
     fn a_page_is_what_was_asked_for_once_loaded_with_a_2xx_status() {
-        let page = |status, loaded| PageState { status, loaded }.verdict();
+        let page = |status, loaded| page(status, loaded).verdict();
         assert_eq!(page(Some(200), false), Verdict::Loading);
         assert_eq!(page(Some(200), true), Verdict::Content);
         assert_eq!(page(Some(204), true), Verdict::Content);

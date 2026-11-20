@@ -151,17 +151,24 @@ define_class!(
             let main_frame: bool = unsafe { msg_send![response, isForMainFrame] };
             if main_frame {
                 let answer: Option<Retained<AnyObject>> = unsafe { msg_send![response, response] };
-                let status = answer.and_then(|answer| {
+                let status = answer.as_ref().and_then(|answer| {
                     let http: bool =
-                        unsafe { msg_send![&*answer, respondsToSelector: objc2::sel!(statusCode)] };
+                        unsafe { msg_send![&**answer, respondsToSelector: objc2::sel!(statusCode)] };
                     http.then(|| {
-                        let code: isize = unsafe { msg_send![&*answer, statusCode] };
+                        let code: isize = unsafe { msg_send![&**answer, statusCode] };
                         u16::try_from(code).ok()
                     })
                     .flatten()
                 });
+                // The name the site gave the document, or one made from its
+                // address and type: what the agent saves it as.
+                let name = answer.as_ref().and_then(|answer| {
+                    let name: Option<Retained<NSString>> =
+                        unsafe { msg_send![&**answer, suggestedFilename] };
+                    name.map(|name| name.to_string())
+                });
                 let Route { app, pane } = self.ivars().downloads.ivars();
-                crate::agent_browser::response_arrived(app, pane, status);
+                crate::agent_browser::response_arrived(app, pane, status, name);
             }
             let original = self.ivars().original.as_ref().filter(|original| unsafe {
                 msg_send![&***original, respondsToSelector: objc2::sel!(webView:decidePolicyForNavigationResponse:decisionHandler:)]
@@ -287,6 +294,61 @@ pub(crate) fn save_page(webview: &Webview, pane: &PaneId) {
     if let Err(e) = saving {
         error!("browser pane: could not save its page: {e}");
     }
+}
+
+/// The document the pane shows, as it loaded it -- the PDF in its viewer, the
+/// page's HTML -- handed to `done` without asking the site again: a site that
+/// let the page through once, after a check, need not serve it twice.
+/// WebKit says it through `_getMainResourceDataWithCompletionHandler:`, which
+/// Safari saves pages with; it has no public counterpart.
+pub(crate) fn loaded_document(
+    platform: &tauri::webview::PlatformWebview,
+    done: impl FnOnce(Result<Vec<u8>, String>) + 'static,
+) {
+    // SAFETY: `inner` is the pane's live WKWebView, on the main thread, where
+    // `with_webview` calls back.
+    let view = unsafe { &*platform.inner().cast::<AnyObject>() };
+    let selector = objc2::sel!(_getMainResourceDataWithCompletionHandler:);
+    let available: bool = unsafe { msg_send![view, respondsToSelector: selector] };
+    if !available {
+        done(Err(
+            "This version of macOS's WebKit cannot hand over the page the agent browser shows"
+                .to_string(),
+        ));
+        return;
+    }
+    // WebKit answers once; the block only has to hand that on.
+    let done = std::cell::Cell::new(Some(done));
+    let answered = RcBlock::new(move |data: *mut AnyObject, error: *mut AnyObject| {
+        // SAFETY: WebKit hands over an NSData or an NSError, each live for the
+        // call; an NSData's bytes are `length` long.
+        let outcome = match (unsafe { data.as_ref() }, unsafe { error.as_ref() }) {
+            (_, Some(error)) => {
+                let description: Option<Retained<NSString>> =
+                    unsafe { msg_send![error, localizedDescription] };
+                Err(format!(
+                    "WebKit could not hand over the page: {}",
+                    description.map_or_else(|| "no reason given".to_string(), |d| d.to_string())
+                ))
+            }
+            (Some(data), None) => {
+                let length: usize = unsafe { msg_send![data, length] };
+                let bytes: *const u8 = unsafe { msg_send![data, bytes] };
+                Ok(if length == 0 {
+                    Vec::new()
+                } else {
+                    unsafe { std::slice::from_raw_parts(bytes, length) }.to_vec()
+                })
+            }
+            (None, None) => Err("WebKit handed over no page".to_string()),
+        };
+        if let Some(done) = done.take() {
+            done(outcome);
+        }
+    });
+    // SAFETY: WKWebView's _getMainResourceDataWithCompletionHandler:, checked
+    // above, on the main thread.
+    let _: () = unsafe { msg_send![view, _getMainResourceDataWithCompletionHandler: &*answered] };
 }
 
 /// Give a pane about to close back wry's navigation delegate.

@@ -310,7 +310,7 @@ pub(crate) fn is_web_page(path: &Path) -> std::io::Result<bool> {
 }
 
 /// A directory of its own beside the library for one download to arrive in.
-fn staging_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn staging_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let staging = crate::app_context(app)
         .data_dir
         .join("page-staging")
@@ -611,6 +611,9 @@ pub async fn browser_pane_show(
     background: Color,
 ) -> Result<(), String> {
     let url = url.as_deref().map(web_url).transpose()?;
+    if let (PaneKind::Agent, Some(url)) = (kind, &url) {
+        crate::agent_browser::opening(window.app_handle(), url);
+    }
     if let Ok(webview) = pane(&window, kind) {
         if let Some(url) = url {
             webview.navigate(url).map_err(|e| e.to_string())?;
