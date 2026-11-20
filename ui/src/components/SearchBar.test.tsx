@@ -62,7 +62,7 @@ describe("SearchBar", () => {
     render(<SearchBar sourceSlot={<MockSourceSlot />} />);
     const input = screen.getByPlaceholderText("Search…");
     expect(input).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Search all directories" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: "Search current directory" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.queryByText(/^All$/i)).not.toBeInTheDocument();
     expect(screen.getByTestId("source-slot")).toBeInTheDocument();
   });
@@ -125,7 +125,7 @@ describe("SearchBar", () => {
     expect(inputSizer?.firstElementChild).toHaveClass("pr-1");
     expect(searchField).toHaveClass("min-w-0", "flex-1");
     expect(inputSizer?.nextElementSibling).toBe(clearButton);
-    expect(screen.getByRole("button", { name: "Search all directories" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Search current directory" })).toBeInTheDocument();
   });
 
   it("toggles regex option", () => {
@@ -249,20 +249,35 @@ describe("SearchBar", () => {
     );
   });
 
-  it("sends the backend-owned all scope without directory paths", () => {
+  it("searches all directories by default with the backend-owned all scope", () => {
     const searchMock = vi.fn();
     useSearchStore.setState({ search: searchMock });
     render(<SearchBar sourceSlot={<MockSourceSlot />} />);
 
+    expect(useSemanticStore.getState().refreshGlobalStatus).toHaveBeenCalled();
     fireEvent.change(screen.getByPlaceholderText("Search…"), { target: { value: "everywhere" } });
     act(() => vi.advanceTimersByTime(300));
-    searchMock.mockClear();
-    fireEvent.click(screen.getByRole("button", { name: "Search all directories" }));
 
     expect(searchMock).toHaveBeenCalledWith(
       expect.objectContaining({ scope: { type: "all" }, root: "/test/dir" }),
     );
     expect(searchMock.mock.calls[0][0]).not.toHaveProperty("roots");
+  });
+
+  it("narrows the search to the current directory when the toggle is turned off", () => {
+    const searchMock = vi.fn();
+    useSearchStore.setState({ search: searchMock });
+    render(<SearchBar sourceSlot={<MockSourceSlot />} />);
+
+    fireEvent.change(screen.getByPlaceholderText("Search…"), { target: { value: "here" } });
+    act(() => vi.advanceTimersByTime(300));
+    searchMock.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Search current directory" }));
+
+    expect(searchMock).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: { type: "corpus" }, root: "/test/dir" }),
+    );
+    expect(screen.getByRole("button", { name: "Search all directories" })).toHaveAttribute("aria-pressed", "false");
   });
 
   it("queues a semantic search and triggers indexing when no index is ready", () => {
@@ -277,6 +292,7 @@ describe("SearchBar", () => {
     useSettingsStore.setState({ preferSemantic: true } as any);
 
     render(<SearchBar sourceSlot={<MockSourceSlot />} />);
+    fireEvent.click(screen.getByRole("button", { name: "Search current directory" }));
     fireEvent.change(screen.getByPlaceholderText("Search…"), { target: { value: "semantic query" } });
     act(() => {
       vi.advanceTimersByTime(300);

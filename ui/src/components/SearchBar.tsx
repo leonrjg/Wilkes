@@ -47,7 +47,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const [isRegex, setIsRegex] = useState(false);
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [isCombinedMode, setIsCombinedMode] = useState(preferSemantic);
-  const [searchAll, setSearchAll] = useState(false);
+  const [searchAll, setSearchAll] = useState(true);
   const [historyOpen, setHistoryOpen] = useState(false);
   const collections = useResearchStore((s) => s.collections);
   const tags = useResearchStore((s) => s.tags);
@@ -65,6 +65,12 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const prevFilterKey = useRef(`${selectedCollectionId ?? ""}|${selectedTagId ?? ""}`);
   const replayQueryRef = useRef<SearchQuery | null>(null);
   const historyRef = useRef<HTMLDivElement | null>(null);
+
+  // Searching everywhere is the default, so learn the global index state up
+  // front, as turning the toggle on does.
+  useEffect(() => {
+    refreshGlobalStatus().catch(console.error);
+  }, [refreshGlobalStatus]);
 
   // Sync combined mode when the setting is loaded from the backend
   useEffect(() => {
