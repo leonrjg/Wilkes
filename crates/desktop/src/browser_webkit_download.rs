@@ -167,8 +167,21 @@ define_class!(
                         unsafe { msg_send![&**answer, suggestedFilename] };
                     name.map(|name| name.to_string())
                 });
+                let mime_type = answer.as_ref().and_then(|answer| {
+                    let mime: Option<Retained<NSString>> =
+                        unsafe { msg_send![&**answer, MIMEType] };
+                    mime.map(|mime| mime.to_string())
+                });
                 let Route { app, pane } = self.ivars().downloads.ivars();
-                crate::agent_browser::response_arrived(app, pane, status, name);
+                crate::agent_browser::response_arrived(
+                    app,
+                    pane,
+                    crate::agent_browser::Response {
+                        status,
+                        suggested_name: name,
+                        mime_type,
+                    },
+                );
             }
             let original = self.ivars().original.as_ref().filter(|original| unsafe {
                 msg_send![&***original, respondsToSelector: objc2::sel!(webView:decidePolicyForNavigationResponse:decisionHandler:)]

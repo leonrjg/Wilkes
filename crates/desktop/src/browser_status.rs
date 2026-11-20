@@ -45,9 +45,17 @@ mod gtk {
                     // Not an HTTP document: WebKitGTK says 0.
                     .filter(|status| *status != 0)
                     .and_then(|status| u16::try_from(status).ok());
-                // The suggested name is for taking the document as loaded,
+                // The name and type are for taking the document as loaded,
                 // which only macOS does.
-                crate::agent_browser::response_arrived(&app, &PaneId::agent(), status, None);
+                crate::agent_browser::response_arrived(
+                    &app,
+                    &PaneId::agent(),
+                    crate::agent_browser::Response {
+                        status,
+                        suggested_name: None,
+                        mime_type: None,
+                    },
+                );
             });
         })
     }

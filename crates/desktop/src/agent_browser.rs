@@ -47,6 +47,12 @@ const PAGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// browser and forward itself to what was asked for.
 const CHECK_WAIT: Duration = Duration::from_secs(10);
 
+/// How long a web page shown where a file was asked for is given to move on
+/// to the file by itself. ETH's Research Collection answers a file's address
+/// with its own page, which fetches the file by script a few seconds after it
+/// has loaded.
+const FORWARD_WAIT: Duration = Duration::from_secs(10);
+
 /// How often the pane is looked at again while a page loads or a check runs,
 /// besides whenever a page finishes loading.
 const LOOK_AGAIN: Duration = Duration::from_secs(2);
@@ -141,9 +147,27 @@ struct PageState {
     /// document as it loaded.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     suggested_name: Option<String>,
+    /// The document's MIME type, as its response gave it. Said on macOS.
+    mime_type: Option<String>,
+}
+
+/// What the platform says about a document's response as it arrives.
+pub(crate) struct Response {
+    pub status: Option<u16>,
+    pub suggested_name: Option<String>,
+    pub mime_type: Option<String>,
 }
 
 impl PageState {
+    /// Whether the document is a web page, by its response's type. A page
+    /// whose type was not said is not known to be one.
+    fn is_web_page(&self) -> bool {
+        self.mime_type.as_deref().is_some_and(|mime| {
+            let mime = mime.trim().to_ascii_lowercase();
+            mime == "text/html" || mime == "application/xhtml+xml"
+        })
+    }
+
     /// What the operation should do about the page.
     fn verdict(&self) -> Verdict {
         match self.status {
@@ -161,20 +185,15 @@ enum Verdict {
     Refused(u16),
 }
 
-/// The agent's pane got the response to its document, with `status` and the
-/// name it gives the document: a new page, not loaded yet. Where the platform
-/// says so as the response arrives.
-pub(crate) fn response_arrived(
-    app: &AppHandle,
-    pane: &PaneId,
-    status: Option<u16>,
-    suggested_name: Option<String>,
-) {
+/// The agent's pane got the `response` to its document: a new page, not
+/// loaded yet. Where the platform says so as the response arrives.
+pub(crate) fn response_arrived(app: &AppHandle, pane: &PaneId, response: Response) {
     if pane.kind == crate::browser_pane::PaneKind::Agent {
         *app.state::<AgentState>().page.lock().unwrap() = PageState {
-            status,
+            status: response.status,
             loaded: false,
-            suggested_name,
+            suggested_name: response.suggested_name,
+            mime_type: response.mime_type,
         };
     }
 }
@@ -430,10 +449,12 @@ impl DesktopAgentBrowser {
     /// Wait until the pane shows what was asked for: a page loaded with a 2xx
     /// status. A page answered with a bot check's status is given time to
     /// pass the browser and forward itself -- which it does in the pane,
-    /// hidden or not -- and any other error is the site's answer. A download
-    /// the page started is also an end. With `next`, told of the load the
-    /// caller just started, the pane is looked at once that load ends;
-    /// without, at once.
+    /// hidden or not -- and any other error is the site's answer. A download,
+    /// which holds a `claim`, wants a file: a web page loaded in its place is
+    /// given time to move on to it, and is what the download takes if it
+    /// does not. A download the page started is also an end. With `next`,
+    /// told of the load the caller just started, the pane is looked at once
+    /// that load ends; without, at once.
     async fn settle(
         &self,
         webview: &Webview,
@@ -442,6 +463,7 @@ impl DesktopAgentBrowser {
     ) -> Result<(), String> {
         let load_deadline = Instant::now() + PAGE_TIMEOUT;
         let mut check_deadline: Option<Instant> = None;
+        let mut forward_deadline: Option<Instant> = None;
         loop {
             if let Some(next) = next.take() {
                 let _ = tokio::time::timeout(LOOK_AGAIN, next).await;
@@ -450,7 +472,17 @@ impl DesktopAgentBrowser {
                 return Ok(());
             }
             let now = Instant::now();
-            match self.page(webview).await?.verdict() {
+            let page = self.page(webview).await?;
+            match page.verdict() {
+                Verdict::Content if claim.is_some() && page.is_web_page() => {
+                    let deadline = *forward_deadline.get_or_insert_with(|| {
+                        tracing::info!("agent browser: waiting for a page to move on to the file");
+                        now + FORWARD_WAIT
+                    });
+                    if now >= deadline {
+                        return Ok(());
+                    }
+                }
                 Verdict::Content => return Ok(()),
                 Verdict::Refused(status) if !may_be_a_check(status) => {
                     return Err(refused(status, false));
@@ -692,7 +724,20 @@ mod tests {
             status,
             loaded,
             suggested_name: None,
+            mime_type: None,
         }
+    }
+
+    #[test]
+    fn a_page_is_told_from_a_file_by_its_type() {
+        let typed = |mime: Option<&str>| PageState {
+            mime_type: mime.map(str::to_string),
+            ..page(Some(200), true)
+        };
+        assert!(typed(Some("text/html")).is_web_page());
+        assert!(typed(Some("application/xhtml+xml")).is_web_page());
+        assert!(!typed(Some("application/pdf")).is_web_page());
+        assert!(!typed(None).is_web_page());
     }
 
     const ASKED: &str = "https://www.research-collection.ethz.ch/bitstreams/5c1c/download";
