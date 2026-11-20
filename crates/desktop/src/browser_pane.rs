@@ -537,7 +537,7 @@ pub(crate) fn create_pane(
                     paint_own_background(&webview);
                 }
                 if finished && pane.kind == PaneKind::Agent {
-                    crate::agent_browser::page_finished(&app, payload.url().as_str());
+                    crate::agent_browser::page_finished(&app, payload.url());
                 }
             }
         })

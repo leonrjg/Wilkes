@@ -119,6 +119,11 @@ pub struct AgentState {
     /// user from its address bar. The page shown is that address or one it
     /// led to by itself, unless the user followed a link from it.
     opened: Mutex<Option<Url>>,
+    /// The address of the last page the agent's pane finished loading, after
+    /// any redirect. Noted here rather than asked of the webview: a WKWebView
+    /// that has shown nothing yet has no address, and wry's `url()` panics on
+    /// one.
+    shown: Mutex<Option<Url>>,
     /// One operation at a time.
     turn: tokio::sync::Mutex<()>,
 }
@@ -189,12 +194,16 @@ fn same_address(a: &Url, b: &Url) -> bool {
 }
 
 /// Whether a download of `asked` is to be taken from the page the pane shows,
-/// at `shown`, rather than by opening `asked` again: the pane is at that
-/// address, or `asked` is the address last `opened` there and the pane is
-/// where it led, and the page has loaded what was asked for or is loading
-/// still. A page the site refused is opened afresh: a check not passed yet
-/// starts over, and an error may not be the site's answer the next time.
-fn reusable(asked: &Url, opened: Option<&Url>, shown: &Url, page: &PageState) -> bool {
+/// last loaded at `shown`, rather than by opening `asked` again: the pane is
+/// at that address, or `asked` is the address last `opened` there and the
+/// pane is where it led, and the page has loaded what was asked for or is
+/// loading still. A pane that has loaded nothing shows nothing to take. A
+/// page the site refused is opened afresh: a check not passed yet starts
+/// over, and an error may not be the site's answer the next time.
+fn reusable(asked: &Url, opened: Option<&Url>, shown: Option<&Url>, page: &PageState) -> bool {
+    let Some(shown) = shown else {
+        return false;
+    };
     let from_asked =
         same_address(shown, asked) || opened.is_some_and(|opened| same_address(opened, asked));
     from_asked && !matches!(page.verdict(), Verdict::Refused(_))
@@ -258,11 +267,13 @@ pub(crate) fn finished(app: &AppHandle, url: &str, path: &Path, success: bool) -
 }
 
 /// The agent's pane finished loading the page at `url`.
-pub(crate) fn page_finished(app: &AppHandle, url: &str) {
+pub(crate) fn page_finished(app: &AppHandle, url: &Url) {
     // The blank page the pane is made with is not a page anyone asked for:
     // its load ending must not pass for the one an operation is waiting on.
-    if url != "about:blank" {
-        app.state::<AgentState>().page.lock().unwrap().loaded = true;
+    if url.as_str() != "about:blank" {
+        let state = app.state::<AgentState>();
+        state.page.lock().unwrap().loaded = true;
+        *state.shown.lock().unwrap() = Some(url.clone());
     }
     wake(app);
 }
@@ -356,6 +367,7 @@ impl DesktopAgentBrowser {
             .ok_or_else(|| "The Wilkes window is not open".to_string())?;
         // A pane before this one, gone with its window, left its page behind.
         *self.state().opened.lock().unwrap() = None;
+        *self.state().shown.lock().unwrap() = None;
         *self.state().page.lock().unwrap() = PageState::default();
         create_pane(
             &window,
@@ -408,10 +420,11 @@ impl DesktopAgentBrowser {
     /// Whether the pane shows the page a download of `url` is to be taken
     /// from, rather than opening `url` again (`reusable`).
     async fn shows_page_from(&self, webview: &Webview, url: &Url) -> Result<bool, String> {
-        let shown = webview.url().map_err(|e| e.to_string())?;
-        let opened = self.state().opened.lock().unwrap().clone();
+        // Read after the pane's queued events, as the page is.
         let page = self.page(webview).await?;
-        Ok(reusable(url, opened.as_ref(), &shown, &page))
+        let shown = self.state().shown.lock().unwrap().clone();
+        let opened = self.state().opened.lock().unwrap().clone();
+        Ok(reusable(url, opened.as_ref(), shown.as_ref(), &page))
     }
 
     /// Wait until the pane shows what was asked for: a page loaded with a 2xx
@@ -686,78 +699,46 @@ mod tests {
     const LED_TO: &str =
         "https://www.research-collection.ethz.ch/server/api/core/bitstreams/5c1c/content";
 
+    /// Whether a download of `ASKED` reuses the pane's page, with `opened` the
+    /// address last opened there and `shown` the page it last loaded.
+    fn reuses(opened: Option<&str>, shown: Option<&str>, page: PageState) -> bool {
+        let (opened, shown) = (opened.map(url), shown.map(url));
+        reusable(&url(ASKED), opened.as_ref(), shown.as_ref(), &page)
+    }
+
     #[test]
     fn a_download_is_taken_from_the_page_already_at_its_address() {
-        let asked = url(ASKED);
         // A check passed in the pane, which reloaded the same address.
-        assert!(reusable(
-            &asked,
-            Some(&asked),
-            &asked,
-            &page(Some(200), true)
-        ));
+        assert!(reuses(Some(ASKED), Some(ASKED), page(Some(200), true)));
         // Opened by the user from the address bar, or before the pane
         // remembered what it opened: the address shown is enough.
-        assert!(reusable(&asked, None, &asked, &page(Some(200), true)));
+        assert!(reuses(None, Some(ASKED), page(Some(200), true)));
         // Another place in the same page.
-        assert!(reusable(
-            &asked,
-            None,
-            &url(&format!("{ASKED}#page=2")),
-            &page(Some(200), true)
-        ));
+        let elsewhere_in_it = format!("{ASKED}#page=2");
+        assert!(reuses(None, Some(&elsewhere_in_it), page(Some(200), true)));
         // Still loading what the check forwarded to: waited for, not reloaded.
-        assert!(reusable(
-            &asked,
-            Some(&asked),
-            &asked,
-            &page(Some(200), false)
-        ));
+        assert!(reuses(Some(ASKED), Some(ASKED), page(Some(200), false)));
     }
 
     #[test]
     fn a_download_is_taken_from_the_page_its_address_led_to() {
-        let (asked, led_to) = (url(ASKED), url(LED_TO));
-        assert!(reusable(
-            &asked,
-            Some(&asked),
-            &led_to,
-            &page(Some(200), true)
-        ));
+        assert!(reuses(Some(ASKED), Some(LED_TO), page(Some(200), true)));
         // A PDF shown from elsewhere, with no HTTP status.
-        assert!(reusable(&asked, Some(&asked), &led_to, &page(None, true)));
+        assert!(reuses(Some(ASKED), Some(LED_TO), page(None, true)));
     }
 
     #[test]
     fn an_address_is_opened_afresh_where_the_pane_shows_no_page_from_it() {
-        let (asked, led_to) = (url(ASKED), url(LED_TO));
-        // Nothing opened yet, or another address opened since.
-        assert!(!reusable(
-            &asked,
-            None,
-            &url("about:blank"),
-            &page(None, false)
-        ));
-        let other = url("https://dl.acm.org/doi/pdf/10.1145/1");
-        assert!(!reusable(
-            &asked,
-            Some(&other),
-            &led_to,
-            &page(Some(200), true)
-        ));
+        // A pane just made, which has loaded nothing -- even where the address
+        // was opened in a pane before it.
+        assert!(!reuses(None, None, page(None, false)));
+        assert!(!reuses(Some(ASKED), None, page(Some(200), true)));
+        // Another address opened since.
+        let other = "https://dl.acm.org/doi/pdf/10.1145/1";
+        assert!(!reuses(Some(other), Some(LED_TO), page(Some(200), true)));
         // The check not passed yet starts over; an error is asked again.
-        assert!(!reusable(
-            &asked,
-            Some(&asked),
-            &led_to,
-            &page(Some(403), true)
-        ));
-        assert!(!reusable(
-            &asked,
-            Some(&asked),
-            &asked,
-            &page(Some(404), true)
-        ));
+        assert!(!reuses(Some(ASKED), Some(LED_TO), page(Some(403), true)));
+        assert!(!reuses(Some(ASKED), Some(ASKED), page(Some(404), true)));
     }
 
     #[test]
