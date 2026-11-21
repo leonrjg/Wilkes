@@ -136,8 +136,10 @@ const INTRODUCTORY: &[&str] = &[
 const ADVANCED: &[&str] = &["advanced", "graduate"];
 
 /// Words that say how a subject is treated, not which subject or at what
-/// level: "Applied Statistics" is a book on statistics.
-const TREATMENT: &[&str] = &["applied", "general", "modern", "practical"];
+/// level: "Applied Statistics" is a book on statistics. Kept to the one word
+/// that reliably leaves the subject behind: dropping "practical" from
+/// "Arithmetic for the Practical Man" left "man" as a subject.
+const TREATMENT: &[&str] = &["applied"];
 
 /// Words that describe the book or the file, not what it is about.
 const BIBLIOGRAPHIC: &[&str] = &[
@@ -388,16 +390,18 @@ fn is_roman_numeral(word: &str) -> bool {
 }
 
 /// The stretches of a segment that could be a subject, longest first, and at
-/// equal length the one that opens the segment before the one that closes it:
-/// "statistics open" names its subject first, "data science" second in
-/// "of data science".
+/// equal length the one that closes the segment before the one that opens it.
+/// An English name ends on what it is a kind of: a book filed under "Linear
+/// Algebra" whose text never spells the phrase is an algebra book, not a
+/// "linear" one. The opening stretch is still tried after it, which is what
+/// finds "statistics" in "Statistics Open".
 fn stretches(segment: &[LabelWord]) -> Vec<&[LabelWord]> {
     let mut out: Vec<&[LabelWord]> = Vec::new();
     let longest = segment.len().min(MAX_SUBJECT_WORDS);
     for length in (1..=longest).rev() {
         let opening = &segment[..length];
         let closing = &segment[segment.len() - length..];
-        for stretch in [opening, closing] {
+        for stretch in [closing, opening] {
             if is_nameable(stretch) && !out.iter().any(|known| std::ptr::eq(*known, stretch)) {
                 out.push(stretch);
             }
@@ -564,8 +568,9 @@ pub fn read_text(text: &str, lexicon: &Lexicon) -> Reading {
             any_word = true;
         } else {
             end_word(&mut word, &mut recent, characters);
-            // A sentence does not carry a name across its end.
-            if matches!(c, '.' | '!' | '?' | ';' | ':' | '\n') {
+            // A sentence does not carry a name across its end. A line break
+            // is not one: a page breaks its lines wherever they fill.
+            if matches!(c, '.' | '!' | '?' | ';' | ':') {
                 recent.clear();
             }
         }
@@ -1163,6 +1168,10 @@ mod tests {
         );
         assert_eq!(keys("High School Statistics"), ["high statistic"]);
         assert_eq!(
+            keys("Arithmetic for the Practical Man"),
+            ["arithmetic", "practical man"]
+        );
+        assert_eq!(
             keys("Statistics – Probability and Descriptive Statistics"),
             ["statistic", "probability", "descriptive statistic"]
         );
@@ -1232,6 +1241,13 @@ mod tests {
     }
 
     #[test]
+    fn a_name_runs_across_a_line_break() {
+        let lexicon = Lexicon::new(["linear algebra".to_string()]);
+        let reading = read_text("a first course in linear\nalgebra and its uses", &lexicon);
+        assert_eq!(reading.uses("linear algebra"), 1);
+    }
+
+    #[test]
     fn an_empty_text_spans_no_passage() {
         let reading = read_text("  \n ", &Lexicon::new(["algebra".to_string()]));
         assert_eq!(reading.passages, 0);
@@ -1274,6 +1290,21 @@ mod tests {
             .collect();
 
         assert_eq!(names, ["statistics"]);
+    }
+
+    #[test]
+    fn a_phrase_the_text_never_spells_falls_back_to_what_it_is_a_kind_of() {
+        let described = described("Notes", &["Linear Algebra"]);
+        let lexicon = Lexicon::new(described.candidates());
+        let text = book(20, &[("linear maps", 20), ("algebra", 10)]);
+
+        let names: Vec<String> = described
+            .subjects(&read_text(&text, &lexicon))
+            .into_iter()
+            .map(|subject| subject.name)
+            .collect();
+
+        assert_eq!(names, ["algebra"]);
     }
 
     #[test]
