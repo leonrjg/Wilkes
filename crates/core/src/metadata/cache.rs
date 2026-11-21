@@ -21,7 +21,9 @@ use super::doi::normalize_doi;
 use super::MetadataField;
 use crate::types::{CitationReference, DocumentMetadata, MetadataSourcePreference, ProviderWork};
 
-const SCHEMA_VERSION: i64 = 8;
+/// Bumped whenever what a fill writes changes, not only the tables: 9 drops a
+/// file-name title, which a refresh cannot clear, since refresh never clears.
+const SCHEMA_VERSION: i64 = 9;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 const FIELD_TITLE: &str = MetadataField::Title.as_str();

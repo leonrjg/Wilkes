@@ -5892,14 +5892,47 @@ impl AppContext {
                 }
             }
 
-            // Pass 3: provider enrichment. Every enabled provider that can look
+            // No mirror: passes 3 and 4 ask only providers that can look a DOI
+            // up, and a catalogue answered from the mirror is not one.
+            let registry = IntegrationRegistry::from_settings(&settings.integrations, None);
+
+            // Pass 3: a DOI by title. A document that names no DOI, neither in
+            // its file nor in Zotero, is searched for by its title, in turn, at
+            // each provider pass 4 will ask about it, and the first that names
+            // exactly one work under that title gives the DOI. Nothing is
+            // written here: the DOI is kept only once pass 4's lookup of it
+            // answers, under the provider that answered.
+            let doi_finders: Vec<_> = registry
+                .literature_sources()
+                .filter(|entry| entry.enabled && entry.source().capabilities().lookup)
+                .collect();
+            for (path, _, metadata) in composed.iter_mut() {
+                if metadata.doi.is_some() {
+                    continue;
+                }
+                let Some(title) = metadata.title.clone() else {
+                    continue;
+                };
+                for entry in &doi_finders {
+                    if let Some(doi) = doi_by_title(
+                        entry.source().as_ref(),
+                        path,
+                        &title,
+                        metadata.author.as_deref(),
+                    )
+                    .await
+                    {
+                        metadata.doi = Some(doi);
+                        break;
+                    }
+                }
+            }
+
+            // Pass 4: provider enrichment. Every enabled provider that can look
             // a work up by DOI is asked about each file that has one, and what
             // it answers is written under that provider's id, keyed by the
             // composed DOI. Which providers exist, and what each can do, is
             // the registry's answer; nothing here names one.
-            // No mirror: this pass asks only providers that can look a DOI
-            // up, and a catalogue answered from the mirror is not one.
-            let registry = IntegrationRegistry::from_settings(&settings.integrations, None);
             for entry in registry.literature_sources().filter(|entry| entry.enabled) {
                 let source = Arc::clone(entry.source());
                 let capabilities = source.capabilities();
@@ -10700,6 +10733,50 @@ async fn enrichment_for(
     }
 }
 
+/// How many results a title search reads: enough that a second work under the
+/// same title shows up and makes the match ambiguous rather than wrong.
+const TITLE_SEARCH_LIMIT: usize = 10;
+
+/// The DOI one provider's search names for a document's title, when exactly
+/// one work it returns bears that title: see
+/// [`wilkes_core::metadata::title::match_title`]. A provider that does not
+/// know the work is not a failure.
+async fn doi_by_title(
+    source: &dyn LiteratureSource,
+    path: &Path,
+    title: &str,
+    author: Option<&str>,
+) -> Option<String> {
+    use wilkes_core::metadata::title::{match_title, TitleMatch};
+
+    let results = match source.search(title, TITLE_SEARCH_LIMIT, 1).await {
+        Ok(results) => results,
+        Err(e) => {
+            info!("{} title search for {}: {e:#}", source.id(), path.display());
+            return None;
+        }
+    };
+    match match_title(title, author, &results) {
+        TitleMatch::Found(doi) => {
+            info!(
+                "{} names {doi} for {} by its title {title:?}",
+                source.id(),
+                path.display()
+            );
+            Some(doi)
+        }
+        TitleMatch::Ambiguous(dois) => {
+            info!(
+                "{} holds several works titled {title:?}, so {} is given none of {dois:?}",
+                source.id(),
+                path.display()
+            );
+            None
+        }
+        TitleMatch::NotFound => None,
+    }
+}
+
 /// The texts a projection import still has to embed: one `(hash, text)` per
 /// distinct text hash that `vectors` holds nothing for, in the order each hash
 /// first appears among the chunks. A text repeated across chunks is embedded
@@ -10749,6 +10826,112 @@ mod tests {
             .iter()
             .map(|text| wilkes_core::embed::identity::sha256_bytes(text.as_bytes()))
             .collect()
+    }
+
+    /// A provider whose search answers with fixed works, or fails.
+    struct TitleSearchSource(Option<Vec<(&'static str, &'static str)>>);
+
+    #[async_trait::async_trait]
+    impl LiteratureSource for TitleSearchSource {
+        fn id(&self) -> &str {
+            "fake"
+        }
+        fn name(&self) -> &str {
+            "Fake"
+        }
+        fn manifest(&self) -> Option<&wilkes_core::integrations::custom::manifest::Manifest> {
+            None
+        }
+        fn base_url(&self) -> &str {
+            "http://fake.invalid"
+        }
+        fn capabilities(&self) -> wilkes_core::integrations::ProviderCapabilities {
+            wilkes_core::integrations::ProviderCapabilities {
+                paged_search: false,
+                browse: None,
+                lookup: true,
+                references: false,
+                resolve_download: false,
+                mirrored: false,
+            }
+        }
+        async fn search(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _page: usize,
+        ) -> anyhow::Result<Vec<wilkes_core::types::LiteratureSearchResult>> {
+            let works = self
+                .0
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("search is down"))?;
+            Ok(works
+                .iter()
+                .map(|(title, doi)| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": doi, "doi": doi, "title": title, "year": null,
+                        "publication_date": null, "venue": null, "citation_count": null,
+                        "is_open_access": false, "pdf_url": null, "landing_page_url": null,
+                        "open_access_status": null, "license": null,
+                    }))
+                    .unwrap()
+                })
+                .collect())
+        }
+        async fn status(
+            &self,
+            _enabled: bool,
+        ) -> anyhow::Result<wilkes_core::types::IntegrationStatus> {
+            anyhow::bail!("not asked in these tests")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_title_one_work_bears_gives_its_doi() {
+        let source = TitleSearchSource(Some(vec![
+            ("Story Embeddings", "10.1/other"),
+            (
+                "Aspect-based Document Similarity for Research Papers",
+                "10.18653/v1/2020.coling-main.545",
+            ),
+        ]));
+        let doi = doi_by_title(
+            &source,
+            Path::new("/library/ostendorff.pdf"),
+            "Aspect-based Document Similarity for Research Papers",
+            None,
+        )
+        .await;
+        assert_eq!(doi.as_deref(), Some("10.18653/v1/2020.coling-main.545"));
+    }
+
+    #[tokio::test]
+    async fn a_title_two_works_bear_gives_no_doi() {
+        let source = TitleSearchSource(Some(vec![
+            ("The narrative arc", "10.1126/sciadv.aba2196"),
+            ("The narrative arc", "10.29025/2079-6021-2022-4-17-34"),
+        ]));
+        let doi = doi_by_title(
+            &source,
+            Path::new("/library/boyd.pdf"),
+            "The narrative arc",
+            None,
+        )
+        .await;
+        assert_eq!(doi, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_title_search_gives_no_doi() {
+        let source = TitleSearchSource(None);
+        let doi = doi_by_title(
+            &source,
+            Path::new("/library/boyd.pdf"),
+            "The narrative arc",
+            None,
+        )
+        .await;
+        assert_eq!(doi, None);
     }
 
     /// The forallx failure: a text appears in two chunks and its vector was

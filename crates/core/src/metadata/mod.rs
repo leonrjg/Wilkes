@@ -3,6 +3,7 @@ pub mod cache;
 pub mod document;
 pub mod doi;
 pub mod text;
+pub mod title;
 
 use std::path::Path;
 
@@ -76,11 +77,24 @@ impl MetadataExtractorRegistry {
             .map(|e| e.as_ref())
     }
 
+    /// What the file says about itself, less a title that is only the name of
+    /// a file: see [`title::is_file_name`]. Such a title is dropped here, for
+    /// every format, so that a title another source holds is the one shown.
     pub fn extract_for(&self, path: &Path, mime: Option<&str>) -> anyhow::Result<DocumentMetadata> {
-        match self.find(path, mime) {
-            Some(extractor) => extractor.extract_metadata(path),
-            None => Ok(DocumentMetadata::default()),
+        let mut metadata = match self.find(path, mime) {
+            Some(extractor) => extractor.extract_metadata(path)?,
+            None => return Ok(DocumentMetadata::default()),
+        };
+        if let Some(found) = metadata
+            .title
+            .take_if(|found| title::is_file_name(found, path))
+        {
+            tracing::info!(
+                "{}: its metadata title {found:?} is a file name, not a title",
+                path.display()
+            );
         }
+        Ok(metadata)
     }
 }
 
@@ -120,6 +134,50 @@ mod tests {
 
         let metadata = registry.extract_for(Path::new("paper.mock"), None).unwrap();
         assert_eq!(metadata.title.as_deref(), Some("Mock Title"));
+    }
+
+    struct TitledExtractor(&'static str);
+
+    impl FileMetadataExtractor for TitledExtractor {
+        fn can_handle(&self, _path: &Path, _mime: Option<&str>) -> bool {
+            true
+        }
+
+        fn extract_metadata(&self, _path: &Path) -> anyhow::Result<DocumentMetadata> {
+            Ok(DocumentMetadata {
+                title: Some(self.0.into()),
+                doi: Some("10.1145/371920.372071".into()),
+                ..DocumentMetadata::default()
+            })
+        }
+    }
+
+    #[test]
+    fn a_file_name_title_is_dropped_and_the_rest_kept() {
+        let mut registry = MetadataExtractorRegistry::new();
+        registry.register(Box::new(TitledExtractor("www10_sarwar.dvi")));
+
+        let metadata = registry
+            .extract_for(Path::new("/library/sarwar-2001.pdf"), None)
+            .unwrap();
+        assert_eq!(metadata.title, None);
+        assert_eq!(metadata.doi.as_deref(), Some("10.1145/371920.372071"));
+    }
+
+    #[test]
+    fn a_real_title_is_kept() {
+        let mut registry = MetadataExtractorRegistry::new();
+        registry.register(Box::new(TitledExtractor(
+            "Item-Based Collaborative Filtering",
+        )));
+
+        let metadata = registry
+            .extract_for(Path::new("/library/sarwar-2001.pdf"), None)
+            .unwrap();
+        assert_eq!(
+            metadata.title.as_deref(),
+            Some("Item-Based Collaborative Filtering")
+        );
     }
 
     #[test]
