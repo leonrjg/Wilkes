@@ -37,6 +37,7 @@
 
 ### Changed
 
+- The indexing toast shows how far indexing has got, as a bar and a percentage beside the elapsed time, both for an index build and when files that changed are re-read, and whether embedding runs on this machine or on another Wilkes. A build's progress now counts embedding as well as reading, so the bar in Settings › Semantic Search no longer reaches its end while documents are still being embedded.
 - **Breaking MCP change:** `download` takes a list, `downloads`, of up to 20 files, each named by `url` or by `provider` and `result_id` as before, with its own `filename` and `through_browser`; `workspace` stays outside the list. The files are fetched at the same time, six at once, and the answer lists each one's files or its error in the order asked, so one failing does not stop the others; the call is an error only when none reached the library. Several files used to take one call each, which clients run one after another with a permission check in between, so a batch of papers took seconds per file whatever the site's speed. Downloads through the agent browser still take turns there.
 - MCP tools that only read say so (`readOnlyHint`): `list_context`, `search`, `literature_search`, the document and library readers and `read_custom_integrations`. Clients that run read-only calls side by side, as Claude Code does, no longer queue them one at a time. `download` says it only adds files (`destructiveHint: false`).
 - An MCP `search` answers with what it has found after 20 seconds instead of 60.

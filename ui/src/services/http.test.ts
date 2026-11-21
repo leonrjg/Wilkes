@@ -287,16 +287,17 @@ describe("HttpSearchApi", () => {
     const c2 = await api.onEmbedDone(vi.fn());
     const c3 = await api.onEmbedError(vi.fn());
     const c4 = await api.onManagerEvent(vi.fn());
+    const c5 = await api.onReindexProgress(vi.fn());
 
     // Only one EventSource should have been created
     expect(EventSource).toHaveBeenCalledTimes(1);
 
     // Closing all but the last should not close the connection
-    c1(); c2(); c3();
+    c1(); c2(); c3(); c4();
     expect(mockEventSource.close).not.toHaveBeenCalled();
 
     // Closing the last one should close it
-    c4();
+    c5();
     expect(mockEventSource.close).toHaveBeenCalledTimes(1);
   });
 

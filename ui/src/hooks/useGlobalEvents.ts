@@ -13,11 +13,12 @@ import { useCatalogueStore } from "../stores/useCatalogueStore";
 import { useLanPeersStore } from "../stores/useLanPeersStore";
 
 export function useGlobalEvents() {
-  const { addToast, removeToast } = useToasts();
+  const { addToast, removeToast, setToastProgress } = useToasts();
   const reindexToastId = useRef<string | null>(null);
 
   useEffect(() => {
     let managerUnlisten: (() => void) | undefined;
+    let reindexProgressUnlisten: (() => void) | undefined;
     let fileListUnlisten: (() => void) | undefined;
     let researchUnlisten: (() => void) | undefined;
     let integrationsUnlisten: (() => void) | undefined;
@@ -61,6 +62,15 @@ export function useGlobalEvents() {
       } else {
         managerUnlisten = u;
       }
+    });
+
+    // Builds and the watcher's passes both report here. A count with no toast
+    // open belongs to a pass that has already ended, and is dropped.
+    api.onReindexProgress((progress) => {
+      if (!mounted || !reindexToastId.current) return;
+      setToastProgress(reindexToastId.current, progress);
+    }).then((u) => {
+      if (mounted) reindexProgressUnlisten = u; else u();
     });
 
     // Subscribed once here rather than per row: a download is reported by URL
@@ -192,6 +202,7 @@ export function useGlobalEvents() {
     return () => {
       mounted = false;
       if (managerUnlisten) managerUnlisten();
+      if (reindexProgressUnlisten) reindexProgressUnlisten();
       if (fileListUnlisten) fileListUnlisten();
       if (researchUnlisten) researchUnlisten();
       if (integrationsUnlisten) integrationsUnlisten();
@@ -203,5 +214,5 @@ export function useGlobalEvents() {
       if (lanPeersUnlisten) lanPeersUnlisten();
       if (lanReceivedUnlisten) lanReceivedUnlisten();
     };
-  }, [addToast, removeToast]);
+  }, [addToast, removeToast, setToastProgress]);
 }

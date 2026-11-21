@@ -9,6 +9,7 @@ import type {
   EmbedDone,
   EmbedError,
   EmbedProgress,
+  ReindexProgress,
   EmbeddingEngine,
   ModelSearchHit,
   Bookmark,
@@ -566,6 +567,8 @@ export interface SearchApi {
   onEmbedDone(handler: (done: EmbedDone) => void): Promise<() => void>;
   onEmbedError(handler: (err: EmbedError) => void): Promise<() => void>;
   onManagerEvent(handler: (event: string) => void): Promise<() => void>;
+  /** The count behind the indexing toast, for builds and watcher passes alike. */
+  onReindexProgress(handler: (progress: ReindexProgress) => void): Promise<() => void>;
   onFileListChanged(handler: (event: FileListChanged) => void): Promise<() => void>;
   onResearchStateUpdated(handler: () => void): Promise<() => void>;
   /** Integration settings were changed by an agent, with no screen of ours

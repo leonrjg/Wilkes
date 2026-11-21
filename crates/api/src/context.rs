@@ -48,7 +48,7 @@ use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::integrations::{IntegrationRegistry, LiteratureSource};
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
 use wilkes_core::metadata::doi::normalize_doi;
-use wilkes_core::models::progress::EmbedProgress;
+use wilkes_core::models::progress::{EmbedProgress, ReindexProgress};
 use wilkes_core::types::{
     Bookmark, BookmarkCluster, BookmarkClustersQuery, BookmarkClustersResult, ChunkTopic,
     ChunkTopicMember, ChunkTopicsQuery, ChunkTopicsResult, CitationCoverage, CitationGraph,
@@ -661,6 +661,15 @@ struct TextIndexUpkeep {
 
 /// The library's roots as configured, before any of them is checked: the open
 /// directory, the favorites and the recent directories.
+/// What the indexing toast reads. Emitted by full builds and by the watcher's
+/// passes alike, so it shows a count whichever is rewriting the index.
+fn emit_reindex_progress(events: &dyn EventEmitter, progress: ReindexProgress) {
+    match serde_json::to_value(progress) {
+        Ok(payload) => events.emit("reindex-progress", payload),
+        Err(e) => error!("could not serialise reindex progress {progress:?}: {e}"),
+    }
+}
+
 fn configured_library_roots(settings: &Settings) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(root) = settings.last_directory.clone() {
@@ -6580,6 +6589,7 @@ impl AppContext {
         let config = Self::restore_state_indexing_config(&settings);
         let ev1 = Arc::clone(&self.events);
         let ev2 = Arc::clone(&self.events);
+        let ev3 = Arc::clone(&self.events);
 
         let result = tokio::task::spawn_blocking(move || {
             process_directory_change(
@@ -6590,6 +6600,9 @@ impl AppContext {
                 &embedder,
                 &config,
                 &move || ev1.emit("manager-event", serde_json::json!("Reindexing")),
+                &move |done, total| {
+                    emit_reindex_progress(ev3.as_ref(), ReindexProgress { done, total })
+                },
                 &move || ev2.emit("manager-event", serde_json::json!("ReindexingDone")),
             );
         })
@@ -9306,6 +9319,11 @@ impl AppContext {
             "embed-progress",
             serde_json::to_value(progress).unwrap_or_default(),
         );
+        // The same count, on the stream that follows the index being rewritten
+        // whatever is rewriting it — the one the watcher's passes report on.
+        if let EmbedProgress::Build(build) = progress {
+            emit_reindex_progress(self.events.as_ref(), ReindexProgress::from(build));
+        }
     }
 
     async fn open_built_index(

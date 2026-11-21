@@ -3818,6 +3818,66 @@ mod tests {
         assert_eq!(results[0].chunk_text, "old content");
     }
 
+    /// Embedding is a unit of its own: a bar that moved only when text was
+    /// extracted reached its end while the model was still working.
+    #[test]
+    fn build_progress_counts_embedding_as_its_own_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let root = dir.path().join("root");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let paths: Vec<PathBuf> = ["a.txt", "b.txt"]
+            .iter()
+            .map(|name| {
+                let path = root.join(name);
+                fs::write(&path, format!("contents of {name}")).unwrap();
+                path
+            })
+            .collect();
+
+        let registry = ExtractorRegistry::new();
+        let embedder = CountingEmbedder::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        SemanticIndex::build(
+            &data_dir,
+            &root,
+            &paths,
+            &registry,
+            &embedder,
+            BuildOptions::new(
+                BuildReporter::without_journal(tx),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            &txt_indexing(),
+        )
+        .unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(crate::models::progress::EmbedProgress::Build(event)) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|event| event.total_files == 4));
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[0].files_processed <= pair[1].files_processed));
+        // A document waiting on the model is not counted as done with.
+        assert!(events
+            .iter()
+            .filter(|event| event.stage == Some(DocumentStage::Embedding))
+            .all(|event| event.files_processed < 4));
+        let settled: Vec<usize> = events
+            .iter()
+            .filter(|event| event.outcome.is_some())
+            .map(|event| event.files_processed)
+            .collect();
+        assert_eq!(settled.last(), Some(&4));
+        let last = events.last().unwrap();
+        assert!(last.done);
+        assert_eq!(last.files_processed, 4);
+    }
+
     /// An embedder that raises a cancel flag once it has embedded `after`
     /// batches, so a build can be stopped mid-corpus at a known point.
     struct CancelAfter {
@@ -5193,7 +5253,7 @@ impl SemanticIndex {
         embedder: &dyn Embedder,
         queue: Vec<PendingFile>,
         options: &BuildOptions,
-        done_units: usize,
+        done_units: &mut usize,
         total_units: usize,
     ) -> Result<(), BatchStop> {
         if queue.is_empty() {
@@ -5202,9 +5262,12 @@ impl SemanticIndex {
         let paths: Vec<PathBuf> = queue.iter().map(|file| file.path.clone()).collect();
         match Self::embed_and_write(idx, embedder, queue) {
             Ok(settled) => {
+                // Each document in the batch spends its embedding unit here,
+                // whatever its outcome: it is finished with either way.
+                *done_units += paths.len();
                 options
                     .reporter
-                    .settle_batch(&settled, done_units, total_units);
+                    .settle_batch(&settled, *done_units, total_units);
                 Ok(())
             }
             Err(e) => {
@@ -5226,9 +5289,10 @@ impl SemanticIndex {
                     .into_iter()
                     .map(|path| (path, DocumentOutcome::Failed, Some(detail.clone()), None))
                     .collect();
+                *done_units += settled.len();
                 options
                     .reporter
-                    .settle_batch(&settled, done_units, total_units);
+                    .settle_batch(&settled, *done_units, total_units);
                 Err(BatchStop::Failed(e))
             }
         }
@@ -5308,20 +5372,20 @@ impl SemanticIndex {
         let batch_target = embedder.preferred_batch_size();
 
         // Progress is counted in units of work, not files, because a document
-        // with figures is visited twice — once to read them and once to
-        // embed the reading — and a bar that counted files would sit still
-        // for the whole of the first visit. Each path costs one unit, plus a
-        // second when its extractor enriches images. Known before any work
-        // starts, so the denominator never moves under the user.
+        // is visited more than once and a bar that counted files would sit
+        // still for whole passes. Each path costs one unit to extract and one
+        // to embed — embedding is usually the slow half, and remotely it is
+        // a network round trip, so a count that moved only on extraction
+        // reached its end while the model was still working — plus one more
+        // when its extractor enriches images. Known before any work starts,
+        // so the denominator never moves under the user.
         let reads_figures = |path: &Path| -> bool {
             extractors
                 .find(path, None)
                 .is_some_and(|extractor| !extractor.image_analyzer_identity().is_empty())
         };
-        let total_units: usize = paths
-            .iter()
-            .map(|path| if reads_figures(path) { 2 } else { 1 })
-            .sum();
+        let units_of = |path: &Path| -> usize { 2 + usize::from(reads_figures(path)) };
+        let total_units: usize = paths.iter().map(|path| units_of(path)).sum();
         let mut done_units = 0usize;
 
         // Cancellation leaves each pass rather than the function, because the
@@ -5352,7 +5416,7 @@ impl SemanticIndex {
                     // Reused whole: every unit this path was going to cost is
                     // spent, the recognition one included.
                     Ok(true) => {
-                        done_units += if reads_figures(path) { 2 } else { 1 };
+                        done_units += units_of(path);
                         reporter.settle(
                             path,
                             DocumentOutcome::Reused,
@@ -5440,8 +5504,10 @@ impl SemanticIndex {
                 let (full_text, chunks, retained) = match extracted {
                     Ok((text, c, retained)) if !c.is_empty() => (text, c, retained),
                     // A document that yielded no chunk is indexed by nothing;
-                    // that is a reading, not a failure.
+                    // that is a reading, not a failure. Nothing is left to
+                    // embed, so its embedding unit is spent with it.
                     Ok(_) => {
+                        done_units += 1;
                         reporter.settle(
                             path,
                             DocumentOutcome::Empty,
@@ -5454,6 +5520,7 @@ impl SemanticIndex {
                     }
                     Err(e) => {
                         error!("[SemanticIndex::build] skipping {}: {e:#}", path.display());
+                        done_units += 1;
                         reporter.settle(
                             path,
                             DocumentOutcome::Failed,
@@ -5490,7 +5557,7 @@ impl SemanticIndex {
                         embedder,
                         std::mem::take(&mut queue),
                         &options,
-                        done_units,
+                        &mut done_units,
                         total_units,
                     ) {
                         Ok(()) => queued_chunks = 0,
@@ -5515,7 +5582,7 @@ impl SemanticIndex {
                     embedder,
                     queue,
                     &options,
-                    done_units,
+                    &mut done_units,
                     total_units,
                 ) {
                     Ok(()) => {}

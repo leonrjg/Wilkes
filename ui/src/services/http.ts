@@ -22,6 +22,7 @@ import type {
   EmbedDone,
   EmbedError,
   EmbedProgress,
+  ReindexProgress,
   EmbeddingEngine,
   Bookmark,
   BookmarkClustersQuery,
@@ -899,6 +900,13 @@ export class HttpSearchApi implements SearchApi {
     const listener = (e: any) => handler(JSON.parse(e.data));
     es.addEventListener("manager-event", listener);
     return () => this.releaseEventSource("manager-event", listener);
+  }
+
+  async onReindexProgress(handler: (p: ReindexProgress) => void): Promise<() => void> {
+    const es = this.acquireEventSource();
+    const listener = (e: any) => handler(JSON.parse(e.data));
+    es.addEventListener("reindex-progress", listener);
+    return () => this.releaseEventSource("reindex-progress", listener);
   }
 
   async onFileListChanged(

@@ -25,6 +25,7 @@ vi.mock("./services", () => ({
     onEmbedDone: vi.fn(() => Promise.resolve(() => {})),
     onEmbedError: vi.fn(() => Promise.resolve(() => {})),
     onManagerEvent: vi.fn(() => Promise.resolve(() => {})),
+    onReindexProgress: vi.fn(() => Promise.resolve(() => {})),
     onFileMetadataUpdated: vi.fn(() => Promise.resolve(() => {})),
     onFileListChanged: vi.fn(() => Promise.resolve(() => {})),
     onResearchStateUpdated: vi.fn(() => Promise.resolve(() => {})),

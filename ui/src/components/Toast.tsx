@@ -5,12 +5,19 @@ import { X, Info, AlertCircle, CheckCircle, Clock } from "react-feather";
 
 export type ToastType = "info" | "success" | "error" | "warning";
 
+/** Work done out of work to do. Units are the caller's; only the ratio is shown. */
+export interface ToastProgress {
+  done: number;
+  total: number;
+}
+
 interface Toast {
   id: string;
   message: string;
   type: ToastType;
   startTime?: number;
   shimmer?: boolean;
+  progress?: ToastProgress;
 }
 
 const RECENT_TOASTS_WINDOW = 1000; // 1 second
@@ -25,6 +32,9 @@ interface ToastOptions {
 interface ToastContextType {
   addToast: (message: string, options?: ToastOptions) => string;
   removeToast: (id: string) => void;
+  /** Set how far a toast's work has got. Until the first count arrives a
+   *  shimmering toast shimmers; after it, it shows a determinate bar. */
+  setToastProgress: (id: string, progress: ToastProgress) => void;
   /** Show a persistent "working" toast immediately and return a dismisser to
    *  call once the async action settles. Reusable for any button whose result
    *  toast would otherwise be the first sign anything happened. */
@@ -74,6 +84,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     return id;
   }, [removeToast]);
 
+  const setToastProgress = useCallback((id: string, progress: ToastProgress) => {
+    setToasts((prev) => prev.map((t) => (t.id === id ? { ...t, progress } : t)));
+  }, []);
+
   const notifyPending = useCallback(
     (message: string) => {
       const id = addToast(message, { type: "info", shimmer: true, duration: 0 });
@@ -83,7 +97,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   );
 
   return (
-    <ToastContext.Provider value={{ addToast, removeToast, notifyPending }}>
+    <ToastContext.Provider value={{ addToast, removeToast, setToastProgress, notifyPending }}>
       {children}
       <div className="fixed bottom-4 right-4 z-[200] flex flex-col gap-2 max-w-sm w-full">
         {toasts.map((toast) => (
@@ -111,6 +125,11 @@ function ToastItem({ toast, onRemove }: { toast: Toast; onRemove: (id: string) =
     return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
   };
 
+  const percent =
+    toast.progress && toast.progress.total > 0
+      ? Math.min(100, Math.floor((toast.progress.done / toast.progress.total) * 100))
+      : null;
+
   return (
     <div
       className={`flex flex-col rounded-lg border shadow-lg animate-in slide-in-from-right-4 fade-in duration-300 overflow-hidden ${
@@ -136,6 +155,7 @@ function ToastItem({ toast, onRemove }: { toast: Toast; onRemove: (id: string) =
             <div className="flex items-center gap-1 text-[10px] font-mono opacity-70">
               <Clock size={10} />
               <span>Elapsed: {formatElapsed(elapsed)}</span>
+              {percent !== null && <span data-testid="toast-progress-percent">· {percent}%</span>}
             </div>
           )}
         </div>
@@ -146,7 +166,21 @@ function ToastItem({ toast, onRemove }: { toast: Toast; onRemove: (id: string) =
           <X size={14} />
         </button>
       </div>
-      {toast.shimmer && (
+      {percent !== null ? (
+        <div
+          data-testid="toast-progress-bar"
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={percent}
+          className="h-1.5 w-full relative overflow-hidden bg-[var(--accent-blue-muted)]/60"
+        >
+          <div
+            className="absolute inset-y-0 left-0 bg-[var(--accent-blue)] transition-[width] duration-300"
+            style={{ width: `${percent}%` }}
+          />
+        </div>
+      ) : toast.shimmer && (
         <div
           data-testid="toast-shimmer-bar"
           className="h-1.5 w-full relative overflow-hidden bg-[var(--accent-blue-muted)]/60"

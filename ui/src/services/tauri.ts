@@ -29,6 +29,7 @@ import type {
   EmbedDone,
   EmbedError,
   EmbedProgress,
+  ReindexProgress,
   EmbeddingEngine,
   Bookmark,
   BookmarkClustersQuery,
@@ -977,6 +978,12 @@ export class TauriSearchApi implements SearchApi {
 
   async onManagerEvent(handler: (event: string) => void): Promise<() => void> {
     return listen<string>("manager-event", (e) => handler(e.payload));
+  }
+
+  async onReindexProgress(
+    handler: (progress: ReindexProgress) => void,
+  ): Promise<() => void> {
+    return listen<ReindexProgress>("reindex-progress", (e) => handler(e.payload));
   }
 
   async onFileListChanged(

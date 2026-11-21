@@ -87,7 +87,7 @@ fn apply_renames(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn process_directory_change<F1, F2>(
+pub fn process_directory_change<F1, F2, F3>(
     batch: DirectoryChangeBatch,
     index: &Arc<Mutex<Option<SemanticIndex>>>,
     cache: &CacheHandle,
@@ -95,10 +95,12 @@ pub fn process_directory_change<F1, F2>(
     embedder: &Arc<dyn Embedder>,
     config: &IndexingConfig,
     on_reindex: &F1,
+    on_progress: &F3,
     on_reindex_done: &F2,
 ) where
     F1: Fn(),
     F2: Fn(),
+    F3: Fn(usize, usize),
 {
     let mut changed_paths: Vec<PathBuf> = batch
         .changed
@@ -161,11 +163,12 @@ pub fn process_directory_change<F1, F2>(
     // Handle additions/modifications
     if !changed_paths.is_empty() {
         on_reindex();
-        info!(
-            "[SemanticUpdater] incremental update: {} files changed",
-            changed_paths.len()
-        );
-        for path in changed_paths {
+        let total = changed_paths.len();
+        info!("[SemanticUpdater] incremental update: {total} files changed");
+        // One unit per file: each is read and embedded in a single call, so
+        // there is nothing finer to count from here.
+        on_progress(0, total);
+        for (done, path) in changed_paths.into_iter().enumerate() {
             handle_event(
                 &path,
                 index,
@@ -174,6 +177,7 @@ pub fn process_directory_change<F1, F2>(
                 config.chunk_size,
                 config.chunk_overlap,
             );
+            on_progress(done + 1, total);
         }
         on_reindex_done();
     }
@@ -475,6 +479,7 @@ mod tests {
         let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
         let reindex_calls = Arc::new(AtomicUsize::new(0));
         let reindex_done_calls = Arc::new(AtomicUsize::new(0));
+        let progress = Mutex::new(Vec::new());
         let config = IndexingConfig {
             chunk_size: 100,
             chunk_overlap: 10,
@@ -496,6 +501,7 @@ mod tests {
             &|| {
                 reindex_calls.fetch_add(1, Ordering::Relaxed);
             },
+            &|done, total| progress.lock().unwrap().push((done, total)),
             &|| {
                 reindex_done_calls.fetch_add(1, Ordering::Relaxed);
             },
@@ -503,6 +509,8 @@ mod tests {
 
         assert_eq!(reindex_calls.load(Ordering::Relaxed), 1);
         assert_eq!(reindex_done_calls.load(Ordering::Relaxed), 1);
+        // The removal is not re-embedded, so only the changed file is counted.
+        assert_eq!(*progress.lock().unwrap(), vec![(0, 1), (1, 1)]);
     }
 
     #[test]
@@ -551,6 +559,7 @@ mod tests {
                 supported_extensions: vec!["txt".to_string()],
             },
             &|| {},
+            &|_, _| {},
             &|| {},
         );
 
@@ -667,6 +676,7 @@ mod tests {
             &embedder,
             &config,
             &|| {},
+            &|_, _| {},
             &|| {},
         );
 
@@ -783,6 +793,7 @@ mod tests {
             &embedder,
             &config,
             &|| {},
+            &|_, _| {},
             &|| {},
         );
 

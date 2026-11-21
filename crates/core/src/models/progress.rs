@@ -35,6 +35,29 @@ pub struct IndexBuildProgress {
     pub done: bool,
 }
 
+/// How far the index is through being rewritten, whichever way it is being
+/// rewritten: a build the user started, or the watcher re-reading files that
+/// changed under it.
+///
+/// Its own event rather than [`EmbedProgress::Build`], because a watcher pass
+/// is not a build: it has no `embed-done`, and anything that took its
+/// progress for a build's would wait for one forever. `done` and `total` are
+/// units of work, not files; only their ratio means anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReindexProgress {
+    pub done: usize,
+    pub total: usize,
+}
+
+impl From<&IndexBuildProgress> for ReindexProgress {
+    fn from(build: &IndexBuildProgress) -> Self {
+        Self {
+            done: build.files_processed,
+            total: build.total_files,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum EmbedProgress {
     Download(DownloadProgress),

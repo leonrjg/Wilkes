@@ -1705,6 +1705,16 @@ export interface IndexActivity {
   history: JobSummary[];
 }
 
+/**
+ * How far the index is through being rewritten, by a build or by the watcher
+ * re-reading changed files. Units of work, not files: only the ratio means
+ * anything.
+ */
+export interface ReindexProgress {
+  done: number;
+  total: number;
+}
+
 export type EmbedProgress =
   | { Download: DownloadProgress }
   | { Build: IndexBuildProgress }

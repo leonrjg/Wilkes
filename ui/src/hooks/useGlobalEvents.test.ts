@@ -12,6 +12,7 @@ import { useSearchStore } from "../stores/useSearchStore";
 vi.mock("../services", () => ({
   api: {
     onManagerEvent: vi.fn().mockResolvedValue(vi.fn()),
+    onReindexProgress: vi.fn().mockResolvedValue(vi.fn()),
     onFileListChanged: vi.fn().mockResolvedValue(vi.fn()),
     onResearchStateUpdated: vi.fn().mockResolvedValue(vi.fn()),
     onIntegrationsUpdated: vi.fn().mockResolvedValue(vi.fn()),
@@ -50,6 +51,7 @@ vi.mock("../stores/useBookmarksStore", () => ({
 describe("useGlobalEvents", () => {
   const addToast = vi.fn().mockReturnValue("toast-id");
   const removeToast = vi.fn();
+  const setToastProgress = vi.fn();
   const handleIndexUpdated = vi.fn().mockResolvedValue(undefined);
   const handleIndexTerminated = vi.fn().mockResolvedValue(undefined);
   const refreshFileList = vi.fn();
@@ -59,7 +61,7 @@ describe("useGlobalEvents", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    (useToasts as any).mockReturnValue({ addToast, removeToast });
+    (useToasts as any).mockReturnValue({ addToast, removeToast, setToastProgress });
     (useSettingsStore.getState as any).mockReturnValue({
       directory: "/docs",
       refreshFileList,
@@ -145,6 +147,37 @@ describe("useGlobalEvents", () => {
     });
     expect(removeToast).toHaveBeenCalledWith("toast-id");
     expect(handleIndexUpdated).toHaveBeenCalled();
+  });
+
+  it("puts reindex progress on the open indexing toast, and drops it once closed", async () => {
+    let managerHandler: any;
+    let progressHandler: any;
+    (api.onManagerEvent as any).mockImplementation((h: any) => {
+      managerHandler = h;
+      return Promise.resolve(vi.fn());
+    });
+    (api.onReindexProgress as any).mockImplementation((h: any) => {
+      progressHandler = h;
+      return Promise.resolve(vi.fn());
+    });
+
+    renderHook(() => useGlobalEvents());
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    // Before any toast is open there is nothing to put the count on.
+    act(() => progressHandler({ done: 1, total: 4 }));
+    expect(setToastProgress).not.toHaveBeenCalled();
+
+    act(() => managerHandler("Reindexing"));
+    act(() => progressHandler({ done: 2, total: 4 }));
+    expect(setToastProgress).toHaveBeenCalledWith("toast-id", { done: 2, total: 4 });
+
+    act(() => managerHandler("ReindexingDone"));
+    setToastProgress.mockClear();
+    act(() => progressHandler({ done: 4, total: 4 }));
+    expect(setToastProgress).not.toHaveBeenCalled();
   });
 
   it("refreshes the file list on matching file-list-changed events", async () => {

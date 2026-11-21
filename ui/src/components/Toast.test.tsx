@@ -104,4 +104,50 @@ describe("Toast", () => {
 
     expect(screen.getByTestId("toast-shimmer-bar")).toBeInTheDocument();
   });
+
+  it("swaps the shimmer for a determinate bar once progress arrives", () => {
+    let api!: ReturnType<typeof useToasts>;
+    let id = "";
+    const Probe = () => {
+      api = useToasts();
+      return null;
+    };
+    render(
+      <ToastProvider>
+        <Probe />
+      </ToastProvider>
+    );
+    act(() => {
+      id = api.addToast("Indexing", { duration: 0, startTime: Date.now(), shimmer: true });
+    });
+    expect(screen.getByTestId("toast-shimmer-bar")).toBeInTheDocument();
+    expect(screen.queryByTestId("toast-progress-bar")).not.toBeInTheDocument();
+
+    act(() => api.setToastProgress(id, { done: 3, total: 8 }));
+
+    expect(screen.queryByTestId("toast-shimmer-bar")).not.toBeInTheDocument();
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "37");
+    expect(screen.getByTestId("toast-progress-percent")).toHaveTextContent("37%");
+  });
+
+  it("keeps shimmering while the total is still unknown", () => {
+    let api!: ReturnType<typeof useToasts>;
+    let id = "";
+    const Probe = () => {
+      api = useToasts();
+      return null;
+    };
+    render(
+      <ToastProvider>
+        <Probe />
+      </ToastProvider>
+    );
+    act(() => {
+      id = api.addToast("Indexing", { duration: 0, startTime: Date.now(), shimmer: true });
+    });
+    act(() => api.setToastProgress(id, { done: 0, total: 0 }));
+
+    expect(screen.getByTestId("toast-shimmer-bar")).toBeInTheDocument();
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  });
 });
