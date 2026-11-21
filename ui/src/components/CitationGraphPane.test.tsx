@@ -38,9 +38,13 @@ describe("CitationGraphPane", () => {
       all_references: [
         {
           doi: "10.1000/reference",
-          citation_line: "Smith (2024). A cited work. doi:10.1000/reference",
+          title: "A cited work",
+          authors: "Ada Lovelace, Charles Babbage",
+          year: 2024,
+          venue: "Journal of Works",
         },
-        { doi: "10.1000/missing", citation_line: null },
+        { doi: "10.1000/untitled", title: null, authors: "Smith", year: null, venue: null },
+        { doi: "10.1000/missing", title: null, authors: null, year: null, venue: null },
       ],
     });
     const onOpenDocument = vi.fn();
@@ -61,8 +65,14 @@ describe("CitationGraphPane", () => {
     expect(
       citedBy.compareDocumentPosition(references) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    expect(screen.getByRole("button", { name: "References, 2" })).toBeInTheDocument();
-    expect(screen.getByText("Smith (2024). A cited work. doi:10.1000/reference")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "References, 3" })).toBeInTheDocument();
+    expect(screen.getByText("A cited work")).toBeInTheDocument();
+    expect(
+      screen.getByText("Ada Lovelace, Charles Babbage · 2024 · Journal of Works"),
+    ).toBeInTheDocument();
+    // A work the provider did not name is shown by its DOI, with what it did say.
+    expect(screen.getByText("10.1000/untitled")).toBeInTheDocument();
+    expect(screen.getByText("Smith")).toBeInTheDocument();
     expect(screen.getByText("10.1000/missing")).toBeInTheDocument();
     fireEvent.click(screen.getByText("reference.pdf"));
     expect(onOpenDocument).toHaveBeenCalledWith("/docs/reference.pdf");

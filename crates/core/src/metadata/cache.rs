@@ -19,9 +19,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use super::doi::normalize_doi;
 use super::MetadataField;
-use crate::types::{DocumentMetadata, MetadataSourcePreference, ProviderWork};
+use crate::types::{CitationReference, DocumentMetadata, MetadataSourcePreference, ProviderWork};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 const FIELD_TITLE: &str = MetadataField::Title.as_str();
@@ -227,7 +227,8 @@ impl MetadataCache {
 
         if stored_version != Some(SCHEMA_VERSION) {
             conn.execute_batch(
-                "DROP TABLE IF EXISTS document_citations;
+                "DROP TABLE IF EXISTS cited_works;
+                 DROP TABLE IF EXISTS document_citations;
                  DROP TABLE IF EXISTS file_metadata;
                  DROP TABLE IF EXISTS files;
                  DROP TABLE IF EXISTS meta;",
@@ -275,6 +276,13 @@ impl MetadataCache {
             );
             CREATE INDEX IF NOT EXISTS idx_document_citations_target
                 ON document_citations(target_doi);
+            CREATE TABLE IF NOT EXISTS cited_works (
+                doi     TEXT PRIMARY KEY,
+                title   TEXT,
+                authors TEXT,
+                year    INTEGER,
+                venue   TEXT
+            );
             PRAGMA foreign_keys = ON;
             ",
         )?;
@@ -980,15 +988,18 @@ impl MetadataCache {
     }
 
     /// Replace the stored outgoing citation edges for `source_doi` with
-    /// `target_dois`. Delete-then-insert so a re-enrichment reflects the
-    /// current reference list rather than accumulating stale edges. Edges are
-    /// stored by normalized DOI only — no provider identifier and no `file_id`,
-    /// so an edge to a paper not yet in the library remains valid and resolves
-    /// the moment that paper is added.
+    /// `targets`, and store what the provider said about each cited work.
+    /// Delete-then-insert so a re-enrichment reflects the current reference
+    /// list rather than accumulating stale edges. Edges are stored by
+    /// normalized DOI only — no provider identifier and no `file_id`, so an
+    /// edge to a paper not yet in the library remains valid and resolves the
+    /// moment that paper is added. A cited work's fields are keyed by its DOI
+    /// alone, since they describe the work and not the edge: the latest
+    /// provider answer for that DOI replaces any earlier one.
     pub fn replace_citations(
         &self,
         source_doi: &str,
-        target_dois: &[String],
+        targets: &[CitationReference],
     ) -> anyhow::Result<usize> {
         let Some(source) = normalize_doi(source_doi) else {
             return Ok(0);
@@ -998,17 +1009,22 @@ impl MetadataCache {
             params![source],
         )?;
         let mut inserted = 0;
-        for target in target_dois {
-            let Some(target) = normalize_doi(target) else {
+        for target in targets {
+            let Some(doi) = normalize_doi(&target.doi) else {
                 continue;
             };
-            if target == source {
+            if doi == source {
                 continue;
             }
             inserted += self.conn.execute(
                 "INSERT OR IGNORE INTO document_citations (source_doi, target_doi)
                  VALUES (?1, ?2)",
-                params![source, target],
+                params![source, doi],
+            )?;
+            self.conn.execute(
+                "INSERT OR REPLACE INTO cited_works (doi, title, authors, year, venue)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![doi, target.title, target.authors, target.year, target.venue],
             )?;
         }
         Ok(inserted)
@@ -1045,21 +1061,31 @@ impl MetadataCache {
         })
     }
 
-    /// Every outgoing DOI for a work, whether or not it currently resolves to
-    /// a file in the library. Results are canonicalized, deduplicated
-    /// case-insensitively, and sorted for a stable UI order.
-    pub fn citation_references(&self, doi: &str) -> anyhow::Result<Vec<String>> {
+    /// Every work `doi` cites, whether or not it currently resolves to a file
+    /// in the library, with the fields the provider stored for it. DOIs are
+    /// canonicalized, deduplicated case-insensitively, and sorted for a
+    /// stable UI order.
+    pub fn citation_references(&self, doi: &str) -> anyhow::Result<Vec<CitationReference>> {
         let Some(doi) = normalize_doi(doi) else {
             return Ok(Vec::new());
         };
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT lower(target_doi)
-             FROM document_citations
-             WHERE source_doi = ?1 COLLATE NOCASE
-             ORDER BY lower(target_doi)",
+            "SELECT DISTINCT lower(c.target_doi), w.title, w.authors, w.year, w.venue
+             FROM document_citations c
+             LEFT JOIN cited_works w ON w.doi = lower(c.target_doi)
+             WHERE c.source_doi = ?1 COLLATE NOCASE
+             ORDER BY lower(c.target_doi)",
         )?;
         let references = stmt
-            .query_map(params![doi], |row| row.get::<_, String>(0))?
+            .query_map(params![doi], |row| {
+                Ok(CitationReference {
+                    doi: row.get(0)?,
+                    title: row.get(1)?,
+                    authors: row.get(2)?,
+                    year: row.get(3)?,
+                    venue: row.get(4)?,
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(references)
     }
@@ -1122,6 +1148,20 @@ mod tests {
         }
     }
 
+    fn cited(doi: &str) -> CitationReference {
+        CitationReference {
+            doi: doi.into(),
+            ..CitationReference::default()
+        }
+    }
+
+    fn dois(references: Vec<CitationReference>) -> Vec<String> {
+        references
+            .into_iter()
+            .map(|reference| reference.doi)
+            .collect()
+    }
+
     #[test]
     fn citation_links_resolve_both_directions_by_doi() {
         let dir = tempdir().unwrap();
@@ -1144,14 +1184,14 @@ mod tests {
         // A cites B (and a paper not in the library, which is stored but does
         // not resolve to a path).
         cache
-            .replace_citations("10.1/a", &["10.1/b".into(), "10.1/absent".into()])
+            .replace_citations("10.1/a", &[cited("10.1/b"), cited("10.1/absent")])
             .unwrap();
 
         let from_a = cache.citation_links("10.1/a").unwrap();
         assert_eq!(from_a.references, vec![b.to_path_buf()]);
         assert!(from_a.cited_by.is_empty());
         assert_eq!(
-            cache.citation_references("10.1/A").unwrap(),
+            dois(cache.citation_references("10.1/A").unwrap()),
             vec!["10.1/absent".to_string(), "10.1/b".to_string()]
         );
 
@@ -1224,12 +1264,12 @@ mod tests {
             vec![a.to_path_buf()]
         );
         assert_eq!(
-            cache.citation_references("10.1/a").unwrap(),
+            dois(cache.citation_references("10.1/a").unwrap()),
             vec!["10.1/b".to_string()]
         );
 
         cache
-            .replace_citations("10.1/a", &["10.1/C".into()])
+            .replace_citations("10.1/a", &[cited("10.1/C")])
             .unwrap();
         let stored = cache
             .conn
@@ -1257,7 +1297,7 @@ mod tests {
             .unwrap();
 
         cache
-            .replace_citations("10.1/a", &["10.1/b".into(), "10.1/b".into()])
+            .replace_citations("10.1/a", &[cited("10.1/b"), cited("10.1/b")])
             .unwrap();
         assert_eq!(
             cache.citation_links("10.1/a").unwrap().references,
@@ -1266,13 +1306,54 @@ mod tests {
 
         // Re-running with an empty list clears the edge; a self-edge is ignored.
         cache
-            .replace_citations("10.1/a", &["10.1/a".into()])
+            .replace_citations("10.1/a", &[cited("10.1/a")])
             .unwrap();
         assert!(cache
             .citation_links("10.1/a")
             .unwrap()
             .references
             .is_empty());
+    }
+
+    #[test]
+    fn cited_works_keep_the_provider_fields_of_each_reference() {
+        let dir = tempdir().unwrap();
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        let described = CitationReference {
+            doi: "10.1/B".into(),
+            title: Some("A cited work".into()),
+            authors: Some("Ada Lovelace, Charles Babbage".into()),
+            year: Some(1843),
+            venue: Some("Scientific Memoirs".into()),
+        };
+        cache
+            .replace_citations("10.1/a", &[described.clone(), cited("10.1/c")])
+            .unwrap();
+
+        assert_eq!(
+            cache.citation_references("10.1/a").unwrap(),
+            vec![
+                CitationReference {
+                    doi: "10.1/b".into(),
+                    ..described.clone()
+                },
+                cited("10.1/c"),
+            ]
+        );
+
+        // The fields describe the work: another source citing it shares
+        // them, and a later answer for the DOI replaces the earlier one.
+        let renamed = CitationReference {
+            title: Some("A cited work, revised".into()),
+            ..described
+        };
+        cache.replace_citations("10.1/z", &[renamed]).unwrap();
+        assert_eq!(
+            cache.citation_references("10.1/a").unwrap()[0]
+                .title
+                .as_deref(),
+            Some("A cited work, revised")
+        );
     }
 
     #[test]

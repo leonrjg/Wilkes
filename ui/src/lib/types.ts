@@ -204,14 +204,19 @@ export interface CitationLinksQuery {
   path: string;
 }
 
+/** A cited work as the citation provider resolved it. Every field but the
+ *  DOI is null when the provider did not report it. */
 export interface CitationReference {
   doi: string;
-  /** First document line containing this exact normalized DOI, when available. */
-  citation_line?: string | null;
+  title: string | null;
+  /** Display names, comma-separated, as the provider lists them. */
+  authors: string | null;
+  year: number | null;
+  venue: string | null;
 }
 
 /** Citation neighbours resolved by DOI. The two document lists contain only
- *  library files; `all_references` contains every known outgoing DOI. */
+ *  library files; `all_references` contains every known outgoing work. */
 export interface CitationLinks {
   references: FileEntry[];
   cited_by: FileEntry[];

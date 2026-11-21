@@ -31,19 +31,19 @@ use url::Url;
 
 use self::expr::{Evaluator, Projected};
 use self::manifest::{
-    lookup_field_type, placeholders, query_parts, search_field_type, Bases, BrowseCapability,
-    FieldSpec, FieldType, FilterSpec, LookupCapability, Manifest, Missing, ParamValue,
-    ReferencesCapability, RequestRef, ResolverStep, ResponseFormat, RunArg, RunSpec,
-    SearchCapability, SecretSlot, UrlTemplate, ValueRule, BROWSE_FILTERS, BROWSE_QUERY,
-    BROWSE_SORT, MAX_FILTER_VALUES, MAX_SUGGESTIONS, MIN_SUGGEST_CHARS,
+    lookup_field_type, placeholders, query_parts, reference_field_type, search_field_type, Bases,
+    BrowseCapability, FieldSpec, FieldType, FilterSpec, LookupCapability, Manifest, Missing,
+    ParamValue, ReferencesCapability, ReferencesResolve, RequestRef, ResolverStep, ResponseFormat,
+    RunArg, RunSpec, SearchCapability, SecretSlot, UrlTemplate, ValueRule, BROWSE_FILTERS,
+    BROWSE_QUERY, BROWSE_SORT, MAX_FILTER_VALUES, MAX_SUGGESTIONS, MIN_SUGGEST_CHARS,
 };
 use crate::integrations::{LiteratureSource, ProviderCapabilities};
 use crate::metadata::doi::normalize_doi;
 use crate::network::{ProviderHttpClient, ProviderHttpErrorKind};
 use crate::types::{
-    BrowsePage, BrowseRequest, CustomIntegrationConfig, DownloadPlan, FilterSuggestion,
-    IntegrationState, IntegrationStatus, LiteratureAcquisition, LiteratureSearchResult, ProgramArg,
-    ProgramRun, ProviderWork, ResolvedLiteratureDownload,
+    BrowsePage, BrowseRequest, CitationReference, CustomIntegrationConfig, DownloadPlan,
+    FilterSuggestion, IntegrationState, IntegrationStatus, LiteratureAcquisition,
+    LiteratureSearchResult, ProgramArg, ProgramRun, ProviderWork, ResolvedLiteratureDownload,
 };
 
 /// How much of a probe's raw response is shown back to the user. Enough to see
@@ -1057,7 +1057,7 @@ impl CustomSource {
             .ok_or_else(|| anyhow::anyhow!("{} does not offer references", self.manifest.name))
     }
 
-    async fn run_references(&self, doi: &str) -> anyhow::Result<Vec<String>> {
+    async fn run_references(&self, doi: &str) -> anyhow::Result<Vec<CitationReference>> {
         let doi = normalize_doi(doi).ok_or_else(|| anyhow::anyhow!("Invalid DOI: {doi}"))?;
         let references = self.references_capability()?;
         let evaluator = Evaluator::new(self.base_url.as_ref());
@@ -1097,7 +1097,7 @@ impl CustomSource {
         }
 
         let resolve = &references.resolve;
-        let mut dois = Vec::new();
+        let mut cited = Vec::new();
         let mut without_doi = 0usize;
         for chunk in identifiers.chunks(resolve.chunk) {
             let body = match resolve.request() {
@@ -1141,7 +1141,9 @@ impl CustomSource {
                     .and_then(Value::as_str)
                     .and_then(normalize_doi)
                 {
-                    Some(doi) => dois.push(doi),
+                    Some(doi) => {
+                        cited.push(self.reference_from_record(resolve, record, &evaluator, doi)?)
+                    }
                     None => without_doi += 1,
                 }
             }
@@ -1156,9 +1158,48 @@ impl CustomSource {
                 "references without a usable DOI left out of the citation graph"
             );
         }
-        dois.sort();
-        dois.dedup();
-        Ok(dois)
+        cited.sort_by(|a, b| a.doi.cmp(&b.doi));
+        cited.dedup_by(|a, b| a.doi == b.doi);
+        Ok(cited)
+    }
+
+    /// One cited work from a resolve record. A field the manifest maps that is
+    /// present but unusable is a manifest that does not match the service, and
+    /// the cache must not store half a record, so it fails the whole call as a
+    /// lookup does; a field that matches nothing is one the service did not
+    /// report for this work.
+    fn reference_from_record(
+        &self,
+        resolve: &ReferencesResolve,
+        record: &Value,
+        evaluator: &Evaluator,
+        doi: String,
+    ) -> anyhow::Result<CitationReference> {
+        let mut issues = Vec::new();
+        let mut fields = self.project_fields(
+            &resolve.fields,
+            reference_field_type,
+            None,
+            0,
+            &mut issues,
+            evaluator,
+            |spec, field_type| self.select_json(spec, record, field_type, evaluator),
+        );
+        if let Some(issue) = issues.first() {
+            anyhow::bail!(
+                "{} references could not read '{}' of {doi}: {}",
+                self.manifest.name,
+                issue.field,
+                issue.problem
+            );
+        }
+        Ok(CitationReference {
+            title: fields.text("title"),
+            authors: fields.text("authors"),
+            year: fields.int("year"),
+            venue: fields.text("venue"),
+            doi,
+        })
     }
 
     async fn fetch_raw(&self, url: String, headers: &[(&str, String)]) -> anyhow::Result<Vec<u8>> {
@@ -2205,13 +2246,14 @@ impl LiteratureSource for CustomSource {
         self.run_lookup(doi).await
     }
 
-    /// The DOIs the work identified by `doi` references. **DOI in, DOIs out**:
-    /// callers identify a work by its DOI and receive normalized DOIs, so no
-    /// provider-specific identifier ever crosses this boundary and the
-    /// citation-graph storage stays decoupled from whichever provider supplies
-    /// the edges. References the provider cannot resolve to a DOI are omitted:
-    /// they can never participate in a DOI-keyed library join.
-    async fn references(&self, doi: &str) -> anyhow::Result<Vec<String>> {
+    /// The works the work identified by `doi` references. **DOI in, DOI-keyed
+    /// works out**: callers identify a work by its DOI and receive each cited
+    /// work under its normalized DOI, so no provider-specific identifier ever
+    /// crosses this boundary and the citation-graph storage stays decoupled
+    /// from whichever provider supplies the edges. References the provider
+    /// cannot resolve to a DOI are omitted: they can never participate in a
+    /// DOI-keyed library join.
+    async fn references(&self, doi: &str) -> anyhow::Result<Vec<CitationReference>> {
         self.run_references(doi).await
     }
 
@@ -3697,7 +3739,7 @@ items = "{items}"
     // ── References ───────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn references_resolve_a_works_identifiers_to_dois_in_one_batch() {
+    async fn references_resolve_a_works_identifiers_to_cited_works_in_one_batch() {
         let mut server = mockito::Server::new_async().await;
         let work = server
             .mock("GET", "/works")
@@ -3719,23 +3761,52 @@ items = "{items}"
             .match_query(Matcher::AllOf(vec![
                 Matcher::UrlEncoded("filter".into(), "openalex_id:W10|W11|W12".into()),
                 Matcher::UrlEncoded("per-page".into(), "3".into()),
+                Matcher::UrlEncoded(
+                    "select".into(),
+                    "id,doi,display_name,publication_year,authorships,primary_location".into(),
+                ),
             ]))
             .with_status(200)
             .with_body(
-                r#"{"results":[{"id":"https://openalex.org/W12","doi":"https://doi.org/10.5/B"},{"id":"https://openalex.org/W10","doi":"https://doi.org/10.5/ref"},{"id":"https://openalex.org/W11"},{"id":"W13","doi":"https://doi.org/10.5/ref"}]}"#,
+                r#"{"results":[
+                    {"id":"https://openalex.org/W12","doi":"https://doi.org/10.5/B","display_name":"Cited B","publication_year":2020,"authorships":[{"author":{"display_name":"Ada Lovelace"}},{"author":{"display_name":"Charles Babbage"}}],"primary_location":{"source":{"display_name":"Venue B"}}},
+                    {"id":"https://openalex.org/W10","doi":"https://doi.org/10.5/ref","display_name":"A reference","publication_year":2019,"authorships":[],"primary_location":null},
+                    {"id":"https://openalex.org/W11","display_name":"No DOI"},
+                    {"id":"W13","doi":"https://doi.org/10.5/ref"}
+                ]}"#,
             )
             .expect(1)
             .create_async()
             .await;
 
-        let dois = shipped("openalex", &server.url(), &[])
+        let cited = shipped("openalex", &server.url(), &[])
             .references("https://doi.org/10.1/CITES")
             .await
             .unwrap();
 
         // Sorted, deduplicated, normalized; the record without a DOI is not an
-        // edge a DOI-keyed library can join.
-        assert_eq!(dois, vec!["10.5/b", "10.5/ref"]);
+        // edge a DOI-keyed library can join. Each cited work carries the
+        // fields the same batch returned for it, and what the service did not
+        // report stays unknown.
+        assert_eq!(
+            cited,
+            vec![
+                CitationReference {
+                    doi: "10.5/b".into(),
+                    title: Some("Cited B".into()),
+                    authors: Some("Ada Lovelace, Charles Babbage".into()),
+                    year: Some(2020),
+                    venue: Some("Venue B".into()),
+                },
+                CitationReference {
+                    doi: "10.5/ref".into(),
+                    title: Some("A reference".into()),
+                    authors: None,
+                    year: Some(2019),
+                    venue: None,
+                },
+            ]
+        );
         work.assert_async().await;
         resolve.assert_async().await;
     }
@@ -3794,13 +3865,74 @@ doi = "doi"
             .create_async()
             .await;
 
-        let dois = source(CHUNKED, &server.url(), &[])
+        let cited = source(CHUNKED, &server.url(), &[])
             .references("10.1/x")
             .await
             .unwrap();
-        assert_eq!(dois, vec!["10.9/a", "10.9/c"]);
+        // A manifest that maps no fields yields bare DOIs.
+        assert_eq!(
+            cited,
+            vec![
+                CitationReference {
+                    doi: "10.9/a".into(),
+                    ..CitationReference::default()
+                },
+                CitationReference {
+                    doi: "10.9/c".into(),
+                    ..CitationReference::default()
+                },
+            ]
+        );
         first.assert_async().await;
         second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_reference_field_fails_the_references_rather_than_storing_half() {
+        const TYPED: &str = r#"
+manifest_version = 2
+id = "typed"
+name = "Typed"
+[http]
+base_url = "BASE_URL"
+[capabilities.search]
+path = "/s?q={query}"
+items = "r"
+[capabilities.search.fields]
+id = "id"
+title = "t"
+[capabilities.references]
+path = "/w/{doi}"
+ids = "refs"
+[capabilities.references.resolve]
+path = "/batch?ids={ids}"
+join = ","
+chunk = 10
+items = "r"
+doi = "doi"
+fields = { title = "t", year = "y" }
+"#;
+        let mut server = mockito::Server::new_async().await;
+        let _work = server
+            .mock("GET", "/w/10.1%2Fx")
+            .with_status(200)
+            .with_body(r#"{"refs":["a"]}"#)
+            .create_async()
+            .await;
+        let _batch = server
+            .mock("GET", "/batch")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"r":[{"doi":"10.9/a","t":"A","y":"soon"}]}"#)
+            .create_async()
+            .await;
+
+        let error = source(TYPED, &server.url(), &[])
+            .references("10.1/x")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("could not read 'year' of 10.9/a"), "{error}");
     }
 
     #[tokio::test]
@@ -3814,11 +3946,11 @@ doi = "doi"
             .expect(1)
             .create_async()
             .await;
-        let dois = shipped("openalex", &server.url(), &[])
+        let cited = shipped("openalex", &server.url(), &[])
             .references("10.1/x")
             .await
             .unwrap();
-        assert!(dois.is_empty());
+        assert!(cited.is_empty());
         mock.assert_async().await;
     }
 
@@ -3833,11 +3965,11 @@ doi = "doi"
             .expect(1)
             .create_async()
             .await;
-        let dois = shipped("openalex", &server.url(), &[])
+        let cited = shipped("openalex", &server.url(), &[])
             .references("10.1/x")
             .await
             .unwrap();
-        assert!(dois.is_empty());
+        assert!(cited.is_empty());
         mock.assert_async().await;
     }
 

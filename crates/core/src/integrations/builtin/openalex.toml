@@ -268,7 +268,7 @@ venue = "primary_location.source.display_name"
 citation_count = "cited_by_count"
 external_ids = "ids"
 
-# ── References: DOI in, the DOIs the work cites out (citation graph) ──────────
+# ── References: DOI in, the works it cites out (citation graph) ───────────────
 
 [capabilities.references]
 path = "/works?filter=doi:https://doi.org/{doi}&select=id,referenced_works&per-page=1"
@@ -276,11 +276,13 @@ path = "/works?filter=doi:https://doi.org/{doi}&select=id,referenced_works&per-p
 ids = "map(&split(@, '/')[-1], results[0].referenced_works || `[]`)"
 
 # OpenAlex accepts up to 50 OR-values per filter; one request resolves a chunk
-# back to DOIs. A reference without a DOI is not an edge a DOI-keyed library
+# back to DOIs, and the same records carry each cited work's title, authors,
+# year and venue. A reference without a DOI is not an edge a DOI-keyed library
 # can join, so it is left out.
 [capabilities.references.resolve]
-path = "/works?filter=openalex_id:{ids}&select=id,doi&per-page={count}"
+path = "/works?filter=openalex_id:{ids}&select=id,doi,display_name,publication_year,authorships,primary_location&per-page={count}"
 join = "|"
 chunk = 50
 items = "results"
 doi = "doi"
+fields = { title = "display_name", year = "publication_year", venue = "primary_location.source.display_name", authors = "join(', ', authorships[:8].author.display_name || `[]`) || `null`" }

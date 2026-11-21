@@ -149,18 +149,32 @@ function ReferenceSection({ entries }: { entries: CitationReference[] }) {
         </span>
       </button>
       {!collapsed &&
-        entries.map((entry) => (
-          <Tooltip key={entry.doi} content={entry.doi} size="wide">
-            <div
-              className={`px-3 py-1.5 text-[11px] leading-snug text-[var(--text-main)] ${
-                entry.citation_line ? "break-words" : "break-all font-mono"
-              }`}
-            >
-              {entry.citation_line ?? entry.doi}
-            </div>
-          </Tooltip>
-        ))}
+        entries.map((entry) => <ReferenceRow key={entry.doi} entry={entry} />)}
     </section>
+  );
+}
+
+/** A cited work by the title its provider gave, with who, when and where
+ *  beneath. A work the provider did not name is shown by its DOI. */
+function ReferenceRow({ entry }: { entry: CitationReference }) {
+  const byline = [entry.authors, entry.year?.toString(), entry.venue]
+    .filter((part): part is string => Boolean(part))
+    .join(" · ");
+  return (
+    <Tooltip content={entry.doi} size="wide">
+      <div className="px-3 py-1.5 text-[11px] leading-snug">
+        <div
+          className={`text-[var(--text-main)] ${
+            entry.title ? "break-words" : "break-all font-mono"
+          }`}
+        >
+          {entry.title ?? entry.doi}
+        </div>
+        {byline && (
+          <div className="mt-0.5 break-words text-[10px] text-[var(--text-dim)]">{byline}</div>
+        )}
+      </div>
+    </Tooltip>
   );
 }
 

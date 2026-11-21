@@ -44,17 +44,16 @@ use wilkes_core::integrations::zotero::model::ZoteroItem;
 use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::integrations::{IntegrationRegistry, LiteratureSource};
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
-use wilkes_core::metadata::doi::find_dois;
 use wilkes_core::models::progress::EmbedProgress;
 use wilkes_core::types::{
     Bookmark, BookmarkCluster, BookmarkClustersQuery, BookmarkClustersResult, ChunkTopic,
     ChunkTopicMember, ChunkTopicsQuery, ChunkTopicsResult, CitationLinks, CitationLinksQuery,
-    CitationReference, CollectionValidation, DocumentMetadata, DocumentTagUpdate, FileEntry,
-    FileListResponse, FileType, IndexStatus, IndexingConfig, MetadataConflictValue,
-    MetadataSourcePreference, NewBookmark, NewSmartCollection, NewTag, OmittedFileReason,
-    PreviewData, RelatedDocument, RelatedDocumentsQuery, RootCoverage, SearchDocument,
-    SearchLogEntry, SearchMode, SearchQuery, SearchScope, SelectedEmbedder, SemanticSettings,
-    Settings, SmartCollection, Tag, TopicLibraryCoverage, UpdateSmartCollection, UpdateTag,
+    CollectionValidation, DocumentMetadata, DocumentTagUpdate, FileEntry, FileListResponse,
+    FileType, IndexStatus, IndexingConfig, MetadataConflictValue, MetadataSourcePreference,
+    NewBookmark, NewSmartCollection, NewTag, OmittedFileReason, PreviewData, RelatedDocument,
+    RelatedDocumentsQuery, RootCoverage, SearchDocument, SearchLogEntry, SearchMode, SearchQuery,
+    SearchScope, SelectedEmbedder, SemanticSettings, Settings, SmartCollection, Tag,
+    TopicLibraryCoverage, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::types::{
     GenerationSettings, GenerationStreamEvent, GenerationTask, GeneratorDescriptor,
@@ -7798,7 +7797,7 @@ impl AppContext {
         let cache = self
             .metadata_cache()
             .ok_or_else(|| "Metadata cache is unavailable".to_string())?;
-        let (paths, reference_dois) = {
+        let (paths, all_references) = {
             let guard = cache
                 .lock()
                 .map_err(|_| "Metadata cache lock failed".to_string())?;
@@ -7813,16 +7812,9 @@ impl AppContext {
                 guard.citation_references(&doi).map_err(|e| e.to_string())?,
             )
         };
-        if paths.references.is_empty() && paths.cited_by.is_empty() && reference_dois.is_empty() {
+        if paths.references.is_empty() && paths.cited_by.is_empty() && all_references.is_empty() {
             return Ok(CitationLinks::default());
         }
-
-        let reference_text = if reference_dois.is_empty() {
-            None
-        } else {
-            self.citation_reference_text(&source_path).await
-        };
-        let all_references = enrich_citation_references(reference_dois, reference_text.as_deref());
 
         // Resolve edge paths to the same metadata-enriched record shape as every
         // other document list. Citation edges span the whole library, so list
@@ -8094,26 +8086,6 @@ impl AppContext {
     /// usable stored full text (including legacy empty rows), extract it once
     /// off the async runtime so citation labels still work without an index
     /// rebuild.
-    async fn citation_reference_text(&self, path: &Path) -> Option<String> {
-        if let Some(indexed) = self.indexed_document_text(path) {
-            return Some(indexed);
-        }
-
-        let path = path.to_path_buf();
-        match tokio::task::spawn_blocking(move || Self::read_document_text(&path)).await {
-            Ok(Ok(text)) if !text.trim().is_empty() => Some(text),
-            Ok(Ok(_)) => None,
-            Ok(Err(error)) => {
-                info!(%error, "citation text extraction skipped");
-                None
-            }
-            Err(error) => {
-                info!(%error, "citation text extraction task failed");
-                None
-            }
-        }
-    }
-
     fn document_title(&self, path: &Path) -> String {
         FileIdentity::for_path(path)
             .zip(self.metadata_cache())
@@ -9964,37 +9936,6 @@ enum FillOutcome {
     Renamed(DocumentMetadata),
 }
 
-fn enrich_citation_references(
-    reference_dois: Vec<String>,
-    document_text: Option<&str>,
-) -> Vec<CitationReference> {
-    let wanted = reference_dois.iter().cloned().collect::<HashSet<_>>();
-    let mut lines_by_doi = HashMap::new();
-    if let Some(text) = document_text {
-        for raw_line in text.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            for found in find_dois(line) {
-                if wanted.contains(&found) {
-                    lines_by_doi
-                        .entry(found)
-                        .or_insert_with(|| line.to_string());
-                }
-            }
-        }
-    }
-
-    reference_dois
-        .into_iter()
-        .map(|doi| CitationReference {
-            citation_line: lines_by_doi.remove(&doi),
-            doi,
-        })
-        .collect()
-}
-
 /// JSON payload entry for the `file-metadata-updated` event.
 fn metadata_update_json(
     path: &Path,
@@ -10301,8 +10242,8 @@ mod tests {
     use wilkes_core::generate::mock::MockGenerator;
     use wilkes_core::types::EmbeddingEngine;
     use wilkes_core::types::{
-        BookmarkDock, ByteRange, EmbedderModel, IndexStatus, SearchMode, SelectedEmbedder,
-        SemanticSettings, Settings, SourceOrigin, Theme,
+        BookmarkDock, ByteRange, CitationReference, EmbedderModel, IndexStatus, SearchMode,
+        SelectedEmbedder, SemanticSettings, Settings, SourceOrigin, Theme,
     };
 
     fn topic_chunk(file_id: i64, chunk_id: i64) -> TopicChunkData {
@@ -15766,11 +15707,7 @@ exit 0
         std::fs::create_dir_all(&library).unwrap();
         let source = library.join("source.txt");
         let cited = library.join("cited.txt");
-        std::fs::write(
-            &source,
-            "References\nSmith (2024). Exact cited work. https://doi.org/10.1000/CITED.LONG.\n",
-        )
-        .unwrap();
+        std::fs::write(&source, "source").unwrap();
         std::fs::write(&cited, "cited").unwrap();
 
         let cache = ctx.metadata_cache().expect("cache opens");
@@ -15808,9 +15745,21 @@ exit 0
                 .replace_citations(
                     "10.1000/source",
                     &[
-                        "10.1000/cited".into(),
-                        "10.1000/cited.long".into(),
-                        "10.1000/missing".into(),
+                        CitationReference {
+                            doi: "10.1000/cited".into(),
+                            ..CitationReference::default()
+                        },
+                        CitationReference {
+                            doi: "10.1000/cited.long".into(),
+                            title: Some("Exact cited work".into()),
+                            authors: Some("Smith".into()),
+                            year: Some(2024),
+                            venue: None,
+                        },
+                        CitationReference {
+                            doi: "10.1000/missing".into(),
+                            ..CitationReference::default()
+                        },
                     ],
                 )
                 .unwrap();
@@ -15845,15 +15794,22 @@ exit 0
             links
                 .all_references
                 .iter()
-                .map(|reference| (reference.doi.as_str(), reference.citation_line.as_deref(),))
+                .map(|reference| (
+                    reference.doi.as_str(),
+                    reference.title.as_deref(),
+                    reference.authors.as_deref(),
+                    reference.year,
+                ))
                 .collect::<Vec<_>>(),
             vec![
-                ("10.1000/cited", None),
+                ("10.1000/cited", None, None, None),
                 (
                     "10.1000/cited.long",
-                    Some("Smith (2024). Exact cited work. https://doi.org/10.1000/CITED.LONG."),
+                    Some("Exact cited work"),
+                    Some("Smith"),
+                    Some(2024),
                 ),
-                ("10.1000/missing", None),
+                ("10.1000/missing", None, None, None),
             ]
         );
 

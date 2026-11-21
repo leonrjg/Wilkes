@@ -300,9 +300,10 @@ pub struct CitationLinksQuery {
 /// Citation neighbours of a document that are present in the library, resolved
 /// by DOI. `references` are documents the anchor cites; `cited_by` are
 /// documents that cite the anchor. `all_references` contains every outgoing
-/// DOI known to the citation provider, including works absent from the library.
-/// Both library directions carry the same metadata-enriched [`FileEntry`] shape
-/// as every other document list.
+/// work known to the citation provider, including works absent from the
+/// library, with the bibliographic fields the provider returned for it. Both
+/// library directions carry the same metadata-enriched [`FileEntry`] shape as
+/// every other document list.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CitationLinks {
     pub references: Vec<FileEntry>,
@@ -311,11 +312,22 @@ pub struct CitationLinks {
     pub all_references: Vec<CitationReference>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// One work a document cites, as the citation provider resolved it: the
+/// normalized DOI that keys the edge, and what the provider said about the
+/// work in the same batched request. Every field but the DOI is the provider's
+/// to know; `None` is "the provider did not say", never an empty value.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CitationReference {
     pub doi: String,
-    /// First document line that contains this exact normalized DOI.
-    pub citation_line: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Display names, comma-separated, as the provider lists them.
+    #[serde(default)]
+    pub authors: Option<String>,
+    #[serde(default)]
+    pub year: Option<i64>,
+    #[serde(default)]
+    pub venue: Option<String>,
 }
 
 /// How Wilkes reads a file — not what format it is. `extension` and

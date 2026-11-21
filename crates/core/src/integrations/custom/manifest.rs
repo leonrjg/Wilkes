@@ -940,7 +940,9 @@ pub struct LookupCapability {
 ///
 /// Two stages, because that is how the services that offer references offer
 /// them: the work lists identifiers (`ids`), and the identifiers are turned
-/// back into DOIs in fixed-size batches. The chunk size is declared and
+/// back into DOIs in fixed-size batches. The same batched request returns the
+/// cited works' records, so their bibliographic fields are read from it
+/// rather than asked for one DOI at a time. The chunk size is declared and
 /// bounded; there is no loop a manifest controls.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -977,6 +979,10 @@ pub struct ReferencesResolve {
     /// A JMESPath expression over one record yielding its DOI. A record whose
     /// expression yields `null` or a non-DOI has no edge and is left out.
     pub doi: String,
+    /// Reference field name → where to find it in one record. Written as one
+    /// inline table. Omitted means the provider's references carry only DOIs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: BTreeMap<String, FieldSpec>,
 }
 
 /// A finite, acyclic resolver from one selected result to a file.
@@ -1435,6 +1441,16 @@ pub const LOOKUP_FIELDS: &[(&str, FieldType)] = &[
 
 pub const REQUIRED_LOOKUP_FIELDS: &[&str] = &["id"];
 
+/// The fields `references.resolve.fields` may name: what
+/// [`crate::types::CitationReference`] holds beyond the DOI, which the
+/// record's `doi` expression already supplies.
+pub const REFERENCE_FIELDS: &[(&str, FieldType)] = &[
+    ("title", FieldType::Text),
+    ("authors", FieldType::Text),
+    ("year", FieldType::Integer),
+    ("venue", FieldType::Text),
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldType {
     Text,
@@ -1465,6 +1481,13 @@ pub fn search_field_type(field: &str) -> Option<FieldType> {
 
 pub fn lookup_field_type(field: &str) -> Option<FieldType> {
     LOOKUP_FIELDS
+        .iter()
+        .find(|(name, _)| *name == field)
+        .map(|(_, ty)| *ty)
+}
+
+pub fn reference_field_type(field: &str) -> Option<FieldType> {
+    REFERENCE_FIELDS
         .iter()
         .find(|(name, _)| *name == field)
         .map(|(_, ty)| *ty)
@@ -1677,11 +1700,12 @@ path = "/works?filter=doi:https://doi.org/{doi}&select=id,referenced_works"
 ids = "results[0].referenced_works[*] | map(&split(@, '/')[-1], @)"
 
 [capabilities.references.resolve]
-path = "/works?filter=openalex_id:{ids}&select=id,doi&per-page={count}"
+path = "/works?filter=openalex_id:{ids}&select=id,doi,display_name,publication_year,authorships,primary_location&per-page={count}"
 join = "|"
 chunk = 50
 items = "results"
 doi = "doi"
+fields = { title = "display_name", year = "publication_year", venue = "primary_location.source.display_name", authors = "join(', ', authorships[*].author.display_name || `[]`) || `null`" }
 "#;
 
 const AUTHORING_PARAMETERS_EXAMPLE: &str = r#"manifest_version = 2
@@ -1851,6 +1875,11 @@ pub fn authoring_prompt() -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let reference_fields = REFERENCE_FIELDS
+        .iter()
+        .map(|(name, field_type)| format!("- {name}: {}", field_type.name()))
+        .collect::<Vec<_>>()
+        .join("\n");
     let functions = expr::registered_function_hints()
         .iter()
         .map(|(name, hint)| format!("- {name}: {hint}"))
@@ -2005,7 +2034,7 @@ record = "expression"                 # optional JMESPath to the record; null me
 [capabilities.lookup.fields]
 id = "expression"                     # lookup fields are listed below
 
-[capabilities.references]             # optional; DOI to the DOIs a work cites
+[capabilities.references]             # optional; DOI to the works it cites
 path = "/work?doi={doi}"
 ids = "expression"                    # JMESPath yielding an array of identifiers (null or empty means none)
 
@@ -2015,6 +2044,7 @@ join = "|"
 chunk = 50                            # identifiers per request, 1-100
 items = "expression"                  # optional; where the records are
 doi = "expression"                    # JMESPath over one record yielding its DOI (null or a non-DOI leaves the record out)
+fields = { title = "expression" }     # optional; reference fields (listed below) read from the same records; select them in the path
 
 [capabilities.resolve_download]       # optional; runs only after the user selects a result
 url = "{result_or_step_value}"        # required; HTTP(S) or relative to http.base_url. Or a list in order of preference,
@@ -2067,6 +2097,7 @@ JMESPath selects keys (`a.b`), indices (`a[0]`, `a[-1]`), projections (`a[*].b`)
     prompt.push_str("\nSearch result fields:\n");
     writeln!(prompt, "{fields}").unwrap();
     writeln!(prompt, "\nLookup record fields:\n{lookup_fields}").unwrap();
+    writeln!(prompt, "\nReference record fields:\n{reference_fields}").unwrap();
     writeln!(
         prompt,
         "\nClosed enum values: response_format = {response_formats}; secret kind = {secret_kinds}; step field missing = {missing}."
@@ -2686,6 +2717,7 @@ enum FieldOf {
     /// The only place a typed input exists to be carried.
     Search,
     Lookup,
+    References,
     /// The only place a field must match, and so the only place that can say
     /// what it means when it does not.
     ResolverStep,
@@ -3352,6 +3384,25 @@ fn references_problems(references: &ReferencesCapability, http: bool) -> Vec<Str
     }
     if let Err(error) = expr::check(&resolve.doi) {
         problems.push(format!("references.resolve.doi: {error}"));
+    }
+    for (field, spec) in &resolve.fields {
+        if reference_field_type(field).is_none() {
+            problems.push(format!(
+                "references.resolve.fields.{field} is not a reference field; expected one of: {}",
+                REFERENCE_FIELDS
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            continue;
+        }
+        problems.extend(field_spec_problems(
+            &format!("references.resolve.fields.{field}"),
+            ResponseFormat::Json,
+            spec,
+            FieldOf::References,
+        ));
     }
     problems
 }
@@ -4433,6 +4484,38 @@ url = "{id}"
             .replace("/works?filter=doi:https://doi.org/{doi}\",", "/works\",");
         let error = Manifest::parse(&no_doi).unwrap_err().to_string();
         assert!(error.contains("must contain {doi}"), "{error}");
+    }
+
+    #[test]
+    fn reference_fields_are_named_from_the_reference_vocabulary() {
+        let parsed = Manifest::parse(AUTHORING_FULL_EXAMPLE).unwrap();
+        let fields = &parsed.capabilities.references.unwrap().resolve.fields;
+        assert_eq!(
+            fields.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["authors", "title", "venue", "year"]
+        );
+
+        let from = r#"fields = { title = "display_name","#;
+        assert!(AUTHORING_FULL_EXAMPLE.contains(from));
+        let unknown = AUTHORING_FULL_EXAMPLE.replace(
+            from,
+            r#"fields = { abstract = "x", title = "display_name","#,
+        );
+        let error = Manifest::parse(&unknown).unwrap_err().to_string();
+        assert!(
+            error.contains("references.resolve.fields.abstract is not a reference field"),
+            "{error}"
+        );
+
+        let missing = AUTHORING_FULL_EXAMPLE.replace(
+            from,
+            r#"fields = { title = { path = "display_name", missing = "unavailable" },"#,
+        );
+        let error = Manifest::parse(&missing).unwrap_err().to_string();
+        assert!(
+            error.contains("references.resolve.fields.title.missing"),
+            "{error}"
+        );
     }
 
     #[test]

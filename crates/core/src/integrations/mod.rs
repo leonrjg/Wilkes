@@ -30,9 +30,9 @@ use crate::acquire::{acquire_plan, AcquiredFiles, DownloadProgress};
 use crate::catalogue::{mirrored_sources, CatalogueStore};
 
 use crate::types::{
-    BrowsePage, BrowseRequest, BuiltinProviderState, DownloadPlan, FilterSuggestion,
-    IntegrationStatus, IntegrationsSettings, LiteratureSearchResult, ProviderWork,
-    ResolvedLiteratureDownload,
+    BrowsePage, BrowseRequest, BuiltinProviderState, CitationReference, DownloadPlan,
+    FilterSuggestion, IntegrationStatus, IntegrationsSettings, LiteratureSearchResult,
+    ProviderWork, ResolvedLiteratureDownload,
 };
 
 pub mod builtin;
@@ -124,16 +124,18 @@ pub trait LiteratureSource: Send + Sync {
         anyhow::bail!("{} does not offer lookup", self.name())
     }
 
-    /// The normalized DOIs the work identified by `doi` references.
+    /// The works the work identified by `doi` references, each under its
+    /// normalized DOI with whatever bibliographic fields the provider returned
+    /// for it in the same batched request.
     ///
-    /// **DOI in, DOIs out**: callers identify a work by its DOI and receive
-    /// DOIs, so no provider-specific identifier ever crosses this boundary and
-    /// the citation-graph storage stays decoupled from whichever provider
-    /// supplies the edges. References the provider cannot resolve to a DOI
-    /// (books, datasets, works without a registered one) are omitted: they can
-    /// never participate in a DOI-keyed library join, so they are not edges we
-    /// can store.
-    async fn references(&self, _doi: &str) -> anyhow::Result<Vec<String>> {
+    /// **DOI in, DOI-keyed works out**: callers identify a work by its DOI and
+    /// receive works keyed by DOI, so no provider-specific identifier ever
+    /// crosses this boundary and the citation-graph storage stays decoupled
+    /// from whichever provider supplies the edges. References the provider
+    /// cannot resolve to a DOI (books, datasets, works without a registered
+    /// one) are omitted: they can never participate in a DOI-keyed library
+    /// join, so they are not edges we can store.
+    async fn references(&self, _doi: &str) -> anyhow::Result<Vec<CitationReference>> {
         anyhow::bail!("{} does not offer references", self.name())
     }
 
