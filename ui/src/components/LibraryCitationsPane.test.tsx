@@ -89,11 +89,11 @@ describe("LibraryCitationsPane", () => {
 
     expect(screen.getByText("Outside work")).toBeInTheDocument();
     expect(screen.getByText("Ada Lovelace · 1843 · Memoirs")).toBeInTheDocument();
-    fireEvent.click(screen.getByText("Find"));
+    fireEvent.click(screen.getByRole("button", { name: "Find Outside work" }));
     expect(searchInPane).toHaveBeenCalledWith("Outside work");
     // A work elsewhere in the library opens instead of being searched for.
     expect(screen.getByText("in library")).toBeInTheDocument();
-    fireEvent.click(screen.getByText("Open"));
+    fireEvent.click(screen.getByRole("button", { name: "Open 10.9/y" }));
     expect(openFile).toHaveBeenCalledWith("/other/y.pdf");
   });
 

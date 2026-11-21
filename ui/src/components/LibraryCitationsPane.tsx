@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, FileText, Loader, Sidebar, X } from "react-feather";
+import { ChevronDown, ChevronRight, FileText, Loader, Search, Sidebar, X } from "react-feather";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import type {
   CitationGraph,
@@ -564,35 +564,43 @@ function ExternalWorkRow({
             )}
           </div>
         </Tooltip>
-        <span className="flex-shrink-0 text-[10px] text-[var(--text-dim)]">
+        <span className="flex-shrink-0 pt-1 text-[10px] text-[var(--text-dim)]">
           cited by {work.cited_by.length}
         </span>
-      </div>
-      <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[10px] text-[var(--text-dim)]">
-        {byline && <span className="break-words">{byline}</span>}
         {work.library_entry ? (
-          <button
-            type="button"
-            onClick={() => onOpen(work.library_entry!.path)}
-            className="text-[var(--accent-blue)] hover:underline"
-          >
-            Open
-          </button>
+          <Tooltip content="Open this work from your library">
+            <button
+              type="button"
+              onClick={() => onOpen(work.library_entry!.path)}
+              aria-label={`Open ${externalLabel(work)}`}
+              className={ROW_ACTION_CLASS}
+            >
+              <FileText size={11} /> Open
+            </button>
+          </Tooltip>
         ) : (
           <Tooltip content="Search the literature pane for this work">
             <button
               type="button"
               onClick={() => onFind(work)}
-              className="text-[var(--accent-blue)] hover:underline"
+              aria-label={`Find ${externalLabel(work)}`}
+              className={ROW_ACTION_CLASS}
             >
-              Find
+              <Search size={11} /> Find
             </button>
           </Tooltip>
         )}
       </div>
+      {byline && (
+        <div className="mt-0.5 break-words text-[10px] text-[var(--text-dim)]">{byline}</div>
+      )}
     </div>
   );
 }
+
+/** A row's one action, drawn as the literature pane draws its Add button. */
+const ROW_ACTION_CLASS =
+  "flex h-[26px] flex-shrink-0 items-center justify-center gap-1 rounded border border-[var(--border-main)] bg-[var(--bg-app)] px-1.5 text-[10px] font-bold uppercase tracking-wider text-[var(--text-main)] transition-colors hover:bg-[var(--bg-active)]";
 
 /** The year-axis drawing of the graph. Older work is to the left, so every
  *  citation runs leftward or within a year's column. */
