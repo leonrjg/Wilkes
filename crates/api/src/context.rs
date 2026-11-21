@@ -16,6 +16,9 @@ use wilkes_core::completion::{
 };
 use wilkes_core::directory_watcher::{DirectoryChangeBatch, DirectoryWatcher};
 use wilkes_core::embed::cluster::WardTree;
+use wilkes_core::embed::engines::remote::{
+    EmbedderAddress, InstallEvent, RemoteHost, RemoteInstaller, RemoteSeal,
+};
 use wilkes_core::embed::index::db::{
     BuildScope, ChunkAccumulation, ManagedChunkData, ManagedChunkNeighbors, ManagedDocumentData,
     TopicChunkData, TopicCoveragePrototype,
@@ -50,13 +53,13 @@ use wilkes_core::types::{
     Bookmark, BookmarkCluster, BookmarkClustersQuery, BookmarkClustersResult, ChunkTopic,
     ChunkTopicMember, ChunkTopicsQuery, ChunkTopicsResult, CitationCoverage, CitationGraph,
     CitationGraphDocument, CitationGraphEdge, CitationGraphQuery, CitationLinks,
-    CitationLinksQuery, CollectionValidation, DocumentMetadata, DocumentTagUpdate,
+    CitationLinksQuery, CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbeddingEngine,
     ExternalCitedWork, FileEntry, FileListResponse, FileType, IndexStatus, IndexingConfig,
     MetadataConflictValue, MetadataSourcePreference, NewBookmark, NewSmartCollection, NewTag,
-    OmittedFileReason, PreviewData, RelatedDocument, RelatedDocumentsQuery, RootCoverage,
-    SearchDocument, SearchLogEntry, SearchMode, SearchQuery, SearchScope, SelectedEmbedder,
-    SemanticSettings, Settings, SmartCollection, Tag, TopicLibraryCoverage, UpdateSmartCollection,
-    UpdateTag,
+    OmittedFileReason, PreviewData, RelatedDocument, RelatedDocumentsQuery,
+    RemoteEmbeddingSettings, RootCoverage, SearchDocument, SearchLogEntry, SearchMode, SearchQuery,
+    SearchScope, SelectedEmbedder, SemanticSettings, Settings, SmartCollection, Tag,
+    TopicLibraryCoverage, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::types::{
     GenerationSettings, GenerationStreamEvent, GenerationTask, GeneratorDescriptor,
@@ -549,14 +552,44 @@ pub(crate) struct JobScope {
     continues: Option<i64>,
 }
 
+/// Where a model runs, read once from the settings and carried by every plan
+/// that will build an embedder, so that a plan and the installer it ends in
+/// cannot disagree about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EmbeddingLocation {
+    /// This machine's worker, on `device`, with `batch_size` texts per forward
+    /// pass. The two are read together: a build that ran under one is not the
+    /// same build under another, and neither has a safe guess at a call site.
+    Local { device: String, batch_size: usize },
+    /// Another Wilkes instance, reached as these settings say. Device and
+    /// batch size are the host's own.
+    Remote(RemoteEmbeddingSettings),
+}
+
+impl EmbeddingLocation {
+    fn from_settings(settings: &Settings, engine: EmbeddingEngine) -> Self {
+        if settings.remote_embedding.enabled {
+            Self::Remote(settings.remote_embedding.clone())
+        } else {
+            Self::local_from_settings(settings, engine)
+        }
+    }
+
+    /// This machine, whatever the settings say about a remote host: what
+    /// serves a request another instance sent here, and what manages the
+    /// model files on this disk.
+    fn local_from_settings(settings: &Settings, engine: EmbeddingEngine) -> Self {
+        Self::Local {
+            device: settings.semantic.device_for(engine).to_string(),
+            batch_size: settings.semantic.embed_batch_size,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BuildIndexPlan {
     root_path: PathBuf,
-    device: String,
-    /// Texts one forward pass may hold, read from the settings with the device
-    /// and carried with it: a build that ran under one is not the same build
-    /// under another, and neither has a safe guess at the call site.
-    batch_size: usize,
+    location: EmbeddingLocation,
     chunk_size: usize,
     chunk_overlap: usize,
     supported_extensions: Vec<String>,
@@ -572,18 +605,14 @@ struct BuildIndexPlan {
 
 #[derive(Clone, Debug)]
 struct DownloadModelPlan {
-    device: String,
-    /// Read with the device: the embedder this plan later loads embeds with it.
-    batch_size: usize,
+    location: EmbeddingLocation,
 }
 
 #[derive(Clone, Debug)]
 struct RestoreStatePlan {
     db_status: IndexStatus,
     selected: SelectedEmbedder,
-    device: String,
-    /// Read with the device, from the same settings, for the same reason.
-    batch_size: usize,
+    location: EmbeddingLocation,
 }
 
 struct RestoreLoadedState {
@@ -844,20 +873,7 @@ impl IndexSpace {
     }
 }
 
-/// Result of `embed_texts`: vectors from the same model the index uses,
-/// with the identity consumers pin against.
-///
-/// `embedding_space_id` is absent exactly when the addressed workspace holds
-/// no index — embedding text does not require one — and present whenever the
-/// caller pinned a space, since a pin implies an index.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct EmbeddedTexts {
-    pub embedding_space_id: Option<String>,
-    pub engine: String,
-    pub model_id: String,
-    pub dimension: usize,
-    pub vectors: Vec<Vec<f32>>,
-}
+pub use wilkes_core::embed::EmbeddedTexts;
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ChunkExport {
@@ -1771,7 +1787,28 @@ pub struct AppContext {
     managed_import_lock: tokio::sync::Mutex<()>,
     managed_pending_imports: AtomicU64,
     bookmarks_lock: tokio::sync::Mutex<()>,
+    /// What a cancellation does to embedding on a remote host: the remote
+    /// counterpart of sealing this context's workers.
+    remote_seal: Arc<RemoteSeal>,
+    /// The embedder that answers another instance's request for a model by
+    /// name, kept so that consecutive requests reuse it. It is a handle on
+    /// this context's own embed worker, so a model this workspace also uses is
+    /// the one already resident there. Locked across a load, so concurrent
+    /// requests for a new model load it once.
+    model_embedder: tokio::sync::Mutex<Option<ModelEmbedder>>,
 }
+
+/// The model named by a host-side embedding request, as loaded.
+struct ModelEmbedder {
+    address: EmbedderAddress,
+    location: EmbeddingLocation,
+    embedder: Arc<dyn Embedder>,
+}
+
+/// Where the bearer token for the remote embedding host is kept, under the
+/// installation's data directory. Beside the settings rather than in them,
+/// because the settings are served to any client of the HTTP API.
+pub const REMOTE_EMBEDDING_TOKEN_FILENAME: &str = "remote-embedding-token";
 
 impl AppContext {
     pub fn new(
@@ -1861,6 +1898,8 @@ impl AppContext {
             events,
             settings_lock: tokio::sync::Mutex::new(()),
             managed_runtime_lock: tokio::sync::Mutex::new(()),
+            remote_seal: RemoteSeal::new(),
+            model_embedder: tokio::sync::Mutex::new(None),
             managed_import_lock: tokio::sync::Mutex::new(()),
             managed_pending_imports: AtomicU64::new(0),
             bookmarks_lock: tokio::sync::Mutex::new(()),
@@ -2670,12 +2709,23 @@ impl AppContext {
         texts: Vec<String>,
         role: EmbedRole,
     ) -> Result<EmbeddedTexts, String> {
-        if texts.is_empty() {
-            return Err("No texts provided".to_string());
-        }
         let embedder = self.embedder.lock().clone().ok_or_else(|| {
             "Semantic model unavailable. Build or restore the semantic index first.".to_string()
         })?;
+        Self::embed_with(embedder, texts, role).await
+    }
+
+    /// Embed `texts` in `role` with `embedder`, and check that what comes back
+    /// is one finite vector of the embedder's width per text.
+    async fn embed_with(
+        embedder: Arc<dyn Embedder>,
+        texts: Vec<String>,
+        role: EmbedRole,
+    ) -> Result<EmbeddedTexts, String> {
+        if texts.is_empty() {
+            return Err("No texts provided".to_string());
+        }
+        let identity = embedder.embedding_space_identity();
         let engine = embedder.engine().as_str().to_string();
         let model_id = embedder.model_id().to_string();
         let dimension = embedder.dimension();
@@ -2716,7 +2766,250 @@ impl AppContext {
             model_id,
             dimension,
             vectors,
+            embedding_space_identity: Some(identity),
         })
+    }
+
+    /// Embed `texts` in the passage role with the model `address` names, on
+    /// this machine, for another instance that embeds here. See
+    /// [`Self::embed_texts_with_model`].
+    pub async fn embed_model_texts(
+        &self,
+        address: EmbedderAddress,
+        texts: Vec<String>,
+    ) -> Result<EmbeddedTexts, ConsumerError> {
+        self.embed_texts_with_model(address, texts, EmbedRole::Passage)
+            .await
+    }
+
+    /// The query-role counterpart of [`Self::embed_model_texts`]. A blank text
+    /// is refused, as it is for every query.
+    pub async fn embed_model_query_texts(
+        &self,
+        address: EmbedderAddress,
+        texts: Vec<String>,
+    ) -> Result<EmbeddedTexts, ConsumerError> {
+        if texts.iter().any(|text| text.trim().is_empty()) {
+            return Err("A query text is empty and names nothing to embed".into());
+        }
+        self.embed_texts_with_model(address, texts, EmbedRole::Query)
+            .await
+    }
+
+    /// Embed with a model named by the caller rather than by an index.
+    ///
+    /// This is what lets another Wilkes use this one's compute: it names the
+    /// model its own index is in, and the vectors come back with the identity
+    /// of that space. Nothing is written here — no corpus, no index — and
+    /// nothing is downloaded: a model this machine does not have is refused
+    /// with `MODEL_NOT_INSTALLED`, and [`Self::install_model`] fetches it with
+    /// progress.
+    ///
+    /// Always this machine's own worker, whatever this instance's own
+    /// embedding location is: a host that passed requests on would hand out
+    /// vectors from a machine nobody chose.
+    async fn embed_texts_with_model(
+        &self,
+        address: EmbedderAddress,
+        texts: Vec<String>,
+        role: EmbedRole,
+    ) -> Result<EmbeddedTexts, ConsumerError> {
+        if texts.is_empty() {
+            return Err("No texts provided".into());
+        }
+        let embedder = self.model_embedder(&address).await?;
+        let mut embedded = Self::embed_with(embedder.clone(), texts, role).await?;
+        embedded.embedding_space_id = Some(embedder.embedding_space_identity().id().0);
+        Ok(embedded)
+    }
+
+    /// The embedder for `address`, loaded on this context's worker.
+    async fn model_embedder(
+        &self,
+        address: &EmbedderAddress,
+    ) -> Result<Arc<dyn Embedder>, ConsumerError> {
+        let settings = self.settings().await;
+        let location = EmbeddingLocation::local_from_settings(&settings, address.engine);
+        let mut held = self.model_embedder.lock().await;
+        if let Some(loaded) = held
+            .as_ref()
+            .filter(|loaded| loaded.address == *address && loaded.location == location)
+        {
+            return Ok(Arc::clone(&loaded.embedder));
+        }
+
+        // Whether the model is here is the catalogue's answer, not the
+        // installer's: an installer may count a built-in model as available
+        // before a byte of it is on disk, and would then download it inside
+        // this request, with no progress and no way to cancel it.
+        let installed = self
+            .local_embedder_capabilities(&settings)
+            .models
+            .iter()
+            .any(|model| {
+                model.engine == address.engine
+                    && model.model_id == address.model.model_id()
+                    && model.locally_available
+            });
+        if !installed {
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::ModelNotInstalled,
+                format!(
+                    "{} model {} is not installed on this host",
+                    address.engine.as_str(),
+                    address.model.model_id()
+                ),
+            ));
+        }
+        let installer =
+            self.embedder_installer(&location, address.engine, address.model.clone())?;
+        let embedder = self
+            .load_embedder(installer)
+            .await
+            .map_err(|error| format!("Could not load {}: {error:#}", address.model.model_id()))?
+            .ok_or_else(|| {
+                ConsumerError::new(
+                    ConsumerErrorCode::ModelNotInstalled,
+                    format!(
+                        "{} model {} has no files on this host",
+                        address.engine.as_str(),
+                        address.model.model_id()
+                    ),
+                )
+            })?;
+        *held = Some(ModelEmbedder {
+            address: address.clone(),
+            location,
+            embedder: Arc::clone(&embedder),
+        });
+        Ok(embedder)
+    }
+
+    /// Download the model `address` names into this machine's model cache,
+    /// for another instance that embeds here, reporting each step on
+    /// `events` and ending with `Done` or `Error`.
+    ///
+    /// Download only: unlike the download this instance's own interface
+    /// starts, it does not make the model this workspace's embedder, and it
+    /// does not take the workspace's embedding slot, so it neither waits for
+    /// nor blocks a build here.
+    pub async fn install_model(
+        &self,
+        address: EmbedderAddress,
+        events: mpsc::Sender<InstallEvent>,
+    ) {
+        let settings = self.settings().await;
+        let location = EmbeddingLocation::local_from_settings(&settings, address.engine);
+        let outcome = match self.embedder_installer(&location, address.engine, address.model) {
+            Ok(installer) => {
+                let (progress_tx, mut progress_rx) = mpsc::channel::<EmbedProgress>(64);
+                let forward_events = events.clone();
+                let forward = tokio::spawn(async move {
+                    while let Some(progress) = progress_rx.recv().await {
+                        if forward_events
+                            .send(InstallEvent::Progress(progress))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                let result = installer.install(&self.model_dir, progress_tx).await;
+                let _ = forward.await;
+                result.map_err(|error| format!("{error:#}"))
+            }
+            Err(error) => Err(error),
+        };
+        let last = match outcome {
+            Ok(()) => InstallEvent::Done,
+            Err(error) => {
+                error!("install_model: {error}");
+                InstallEvent::Error(error)
+            }
+        };
+        let _ = events.send(last).await;
+    }
+
+    /// The installer for a model at `location`.
+    ///
+    /// The one place an embedder installer is chosen: a build, a download, a
+    /// restore and a managed corpus all come here, so "where does this
+    /// installation embed" has a single answer.
+    fn embedder_installer(
+        &self,
+        location: &EmbeddingLocation,
+        engine: EmbeddingEngine,
+        model: wilkes_core::types::EmbedderModel,
+    ) -> Result<Arc<dyn EmbedderInstaller>, String> {
+        match location {
+            EmbeddingLocation::Local { device, batch_size } => Ok(dispatch::get_installer(
+                engine,
+                model,
+                self.worker_manager.clone(),
+                device.clone(),
+                *batch_size,
+            )),
+            EmbeddingLocation::Remote(remote) => Ok(Arc::new(RemoteInstaller::new(
+                Arc::new(self.remote_host(remote)?),
+                Arc::clone(&self.remote_seal),
+                engine,
+                model,
+            ))),
+        }
+    }
+
+    fn remote_host(&self, remote: &RemoteEmbeddingSettings) -> Result<RemoteHost, String> {
+        let token =
+            wilkes_core::token_file::read_if_present(&self.remote_embedding_token_path())
+                .map_err(|error| format!("Could not read the embedding host's token: {error:#}"))?;
+        RemoteHost::new(&remote.address, token).map_err(|error| format!("{error:#}"))
+    }
+
+    /// Where the bearer token for the remote embedding host is stored.
+    pub fn remote_embedding_token_path(&self) -> PathBuf {
+        self.shared_data_dir.join(REMOTE_EMBEDDING_TOKEN_FILENAME)
+    }
+
+    /// What this installation can embed with, from wherever it embeds: the
+    /// remote host's models when embedding runs there, this machine's
+    /// otherwise. The model picker reads this.
+    pub async fn embedder_capabilities(
+        &self,
+    ) -> Result<wilkes_core::types::EmbedderCapabilityManifest, String> {
+        let settings = self.settings().await;
+        if settings.remote_embedding.enabled {
+            return self
+                .remote_host(&settings.remote_embedding)?
+                .capabilities()
+                .await
+                .map_err(|error| format!("{error:#}"));
+        }
+        Ok(self.local_embedder_capabilities(&settings))
+    }
+
+    /// What this machine can embed with, whatever this instance's own
+    /// embedding location: the answer a host gives another instance.
+    pub fn local_embedder_capabilities(
+        &self,
+        settings: &Settings,
+    ) -> wilkes_core::types::EmbedderCapabilityManifest {
+        dispatch::model_capabilities(
+            &self.model_dir,
+            &self.sbert_cache(),
+            &settings.semantic.custom_models,
+        )
+    }
+
+    /// Drop the embedder after the place embeddings run has changed, and load
+    /// it again from there when search wants one. An index build already
+    /// under way finishes where it started.
+    pub fn embedding_location_changed(self: &Arc<Self>) {
+        self.detach_semantic_embedder();
+        let ctx = Arc::clone(self);
+        tokio::spawn(async move {
+            ctx.activate_required_search_runtime_from_disk().await;
+        });
     }
 
     /// Attach the immutable managed workspace configuration to a concrete
@@ -2799,13 +3092,11 @@ impl AppContext {
                 return Ok(identity.id().0);
             }
         }
-        let installer = dispatch::get_installer(
+        let installer = self.embedder_installer(
+            &EmbeddingLocation::from_settings(&settings, selected.engine),
             selected.engine,
             selected.model.clone(),
-            self.worker_manager.clone(),
-            settings.semantic.device_for(selected.engine).to_string(),
-            settings.semantic.embed_batch_size,
-        );
+        )?;
         let embedder = self
             .load_embedder(installer)
             .await
@@ -6694,6 +6985,9 @@ impl AppContext {
         self.on_zotero_settings_maybe_changed(&before, &updated);
         self.on_literature_provider_settings_maybe_changed(&before, &updated);
         self.on_search_runtime_settings_maybe_changed(&before, &updated);
+        if before.remote_embedding != updated.remote_embedding {
+            self.embedding_location_changed();
+        }
         self.on_generation_settings_maybe_changed(&before, &updated);
         self.on_image_analysis_settings_maybe_changed(&before, &updated);
         Ok(updated)
@@ -8547,8 +8841,7 @@ impl AppContext {
 
         Ok(BuildIndexPlan {
             root_path,
-            device: settings.semantic.device_for(selected.engine).to_string(),
-            batch_size: settings.semantic.embed_batch_size,
+            location: EmbeddingLocation::from_settings(&settings, selected.engine),
             chunk_size: settings.semantic.chunk_size,
             chunk_overlap: settings.semantic.chunk_overlap,
             supported_extensions: settings.supported_extensions.clone(),
@@ -8689,14 +8982,12 @@ impl AppContext {
         .await?;
 
         Ok(DownloadModelPlan {
-            device: settings.semantic.device_for(selected.engine).to_string(),
-            batch_size: settings.semantic.embed_batch_size,
+            location: EmbeddingLocation::from_settings(&settings, selected.engine),
         })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build_index_options(
-        manager: WorkerManager,
         model_dir: PathBuf,
         index_dir: PathBuf,
         plan: &BuildIndexPlan,
@@ -8706,9 +8997,6 @@ impl AppContext {
         scope: BuildScope,
     ) -> crate::commands::embed::BuildIndexOptions {
         crate::commands::embed::BuildIndexOptions {
-            manager: Some(manager),
-            device: Some(plan.device.clone()),
-            batch_size: Some(plan.batch_size),
             model_dir,
             index_dir,
             reporter,
@@ -8922,7 +9210,6 @@ impl AppContext {
         cancel_flag: Arc<AtomicBool>,
         settlement: Arc<BuildSettlement>,
     ) -> JoinHandle<anyhow::Result<()>> {
-        let manager = self.worker_manager.clone();
         // The index is the workspace's; the model artefacts are the
         // installation's. Passing `data_dir` for both is what made every
         // workspace download its own copy of the same model — and derive its
@@ -8999,7 +9286,6 @@ impl AppContext {
             };
 
             let options = Self::build_index_options(
-                manager.clone(),
                 model_dir,
                 data_dir.clone(),
                 &plan,
@@ -9008,11 +9294,21 @@ impl AppContext {
                 documents,
                 scope,
             );
-            let build_fut = crate::commands::embed::build_index(
-                plan.root_path.clone(),
-                selected.clone(),
-                options,
-            );
+            let build_ctx = Arc::clone(&ctx);
+            let build_location = plan.location.clone();
+            let build_selected = selected.clone();
+            let build_root = plan.root_path.clone();
+            let build_fut = async move {
+                let installer = build_ctx
+                    .embedder_installer(
+                        &build_location,
+                        build_selected.engine,
+                        build_selected.model.clone(),
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                crate::commands::embed::build_index_with_installer(build_root, installer, options)
+                    .await
+            };
             tokio::pin!(build_fut);
             let mut progress_rx = progress_rx;
 
@@ -9102,7 +9398,6 @@ impl AppContext {
         selected: SelectedEmbedder,
     ) -> JoinHandle<anyhow::Result<()>> {
         let model_dir = self.model_dir.clone();
-        let manager = self.worker_manager.clone();
         let ctx = Arc::clone(&self);
         let (progress_tx, progress_rx) = mpsc::channel::<EmbedProgress>(64);
 
@@ -9112,28 +9407,21 @@ impl AppContext {
                 progress_rx,
             ));
 
-            let result = crate::commands::embed::download_model(
-                selected.clone(),
-                manager.clone(),
-                plan.device.clone(),
-                model_dir.clone(),
-                progress_tx,
-            )
-            .await;
+            let installer =
+                ctx.embedder_installer(&plan.location, selected.engine, selected.model.clone());
+            let result = match &installer {
+                Ok(installer) => installer.install(&model_dir, progress_tx).await,
+                Err(error) => {
+                    drop(progress_tx);
+                    Err(anyhow::anyhow!("{error}"))
+                }
+            };
 
             let _ = forward.await;
 
-            match result {
-                Ok(()) => {
-                    if let Err(e) = ctx
-                        .probe_and_load_downloaded_model(
-                            selected.clone(),
-                            manager,
-                            plan.device.clone(),
-                            plan.batch_size,
-                        )
-                        .await
-                    {
+            match result.and_then(|()| installer.map_err(anyhow::Error::msg)) {
+                Ok(installer) => {
+                    if let Err(e) = ctx.probe_and_load_downloaded_model_with(installer).await {
                         ctx.emit_embed_error("Download", e);
                     } else {
                         ctx.events
@@ -9148,23 +9436,6 @@ impl AppContext {
             ctx.clear_embed_task();
             Ok(())
         })
-    }
-
-    async fn probe_and_load_downloaded_model(
-        self: &Arc<Self>,
-        selected: SelectedEmbedder,
-        manager: WorkerManager,
-        device: String,
-        batch_size: usize,
-    ) -> Result<(), String> {
-        let installer = dispatch::get_installer(
-            selected.engine,
-            selected.model.clone(),
-            manager,
-            device,
-            batch_size,
-        );
-        self.probe_and_load_downloaded_model_with(installer).await
     }
 
     async fn probe_and_load_downloaded_model_with(
@@ -9478,13 +9749,13 @@ impl AppContext {
             return Err("Choose another model before removing the selected one.".to_string());
         }
         self.stop_worker_for_removal().await?;
-        let installer = dispatch::get_installer(
+        // The files are on this disk whatever the settings say about where
+        // embeddings run.
+        let installer = self.embedder_installer(
+            &EmbeddingLocation::local_from_settings(&settings, engine),
             engine,
             wilkes_core::types::EmbedderModel(model_id.clone()),
-            self.worker_manager.clone(),
-            settings.semantic.device_for(engine).to_string(),
-            settings.semantic.embed_batch_size,
-        );
+        )?;
         let model_dir = self.model_dir.clone();
         tokio::task::spawn_blocking(move || installer.uninstall(&model_dir))
             .await
@@ -9526,12 +9797,14 @@ impl AppContext {
     pub fn seal_all_workers(&self) {
         self.worker_manager.seal();
         self.recognize_manager.seal();
+        self.remote_seal.seal();
         self.generate_manager.request_shutdown();
     }
 
     fn unseal_all_workers(&self) {
         self.worker_manager.unseal();
         self.recognize_manager.unseal();
+        self.remote_seal.unseal();
     }
 
     /// Wait, at exit only, for a stopped build to finish publishing what it
@@ -9629,8 +9902,7 @@ impl AppContext {
             }
         } else {
             RestoreStatePreparation::Ready(RestoreStatePlan {
-                device: settings.semantic.device_for(selected.engine).to_string(),
-                batch_size: settings.semantic.embed_batch_size,
+                location: EmbeddingLocation::from_settings(&settings, selected.engine),
                 db_status,
                 selected,
             })
@@ -9693,7 +9965,7 @@ impl AppContext {
         let plan = self.load_restore_plan(settings).await?;
 
         let embedder = self
-            .restore_embedder(&plan.selected, plan.device.clone(), plan.batch_size)
+            .restore_embedder(&plan.selected, &plan.location)
             .await?;
         let index = self
             .restore_index(&plan.selected, embedder.dimension())
@@ -9724,16 +9996,16 @@ impl AppContext {
     async fn restore_embedder(
         &self,
         selected: &SelectedEmbedder,
-        device: String,
-        batch_size: usize,
+        location: &EmbeddingLocation,
     ) -> Option<Arc<dyn Embedder>> {
-        let installer = dispatch::get_installer(
-            selected.engine,
-            selected.model.clone(),
-            self.worker_manager.clone(),
-            device,
-            batch_size,
-        );
+        let installer =
+            match self.embedder_installer(location, selected.engine, selected.model.clone()) {
+                Ok(installer) => installer,
+                Err(err) => {
+                    error!("restore_state: {err}");
+                    return None;
+                }
+            };
         self.restore_embedder_with(installer).await
     }
 
@@ -13116,12 +13388,11 @@ title = "title[0]"
             ctx.get_settings().await.supported_extensions
         );
         assert_eq!(
-            plan.device,
-            ctx.get_settings()
-                .await
-                .semantic
-                .device_for(EmbeddingEngine::Candle)
-                .to_string()
+            plan.location,
+            EmbeddingLocation::local_from_settings(
+                &ctx.get_settings().await,
+                EmbeddingEngine::Candle
+            )
         );
     }
 
@@ -13180,12 +13451,11 @@ title = "title[0]"
 
         let plan = ctx.prepare_download_model(&selected).await.unwrap();
         assert_eq!(
-            plan.device,
-            ctx.get_settings()
-                .await
-                .semantic
-                .device_for(EmbeddingEngine::Candle)
-                .to_string()
+            plan.location,
+            EmbeddingLocation::local_from_settings(
+                &ctx.get_settings().await,
+                EmbeddingEngine::Candle
+            )
         );
 
         *ctx.embed_task.lock() = Some(running_embed_task());
@@ -13197,9 +13467,11 @@ title = "title[0]"
     fn test_build_index_options_and_cleanup_partial_files() {
         let dir = tempdir().unwrap();
         let plan = BuildIndexPlan {
-            batch_size: 16,
             root_path: dir.path().join("root"),
-            device: "cpu".to_string(),
+            location: EmbeddingLocation::Local {
+                device: "cpu".to_string(),
+                batch_size: 16,
+            },
             chunk_size: 123,
             chunk_overlap: 45,
             supported_extensions: vec!["rs".to_string(), "txt".to_string()],
@@ -13208,18 +13480,6 @@ title = "title[0]"
         };
         let (tx, _rx) = mpsc::channel(1);
         let options = AppContext::build_index_options(
-            WorkerManager::new(
-                WorkerPaths {
-                    python_override: None,
-                    python_package_dir: PathBuf::from("pkg"),
-                    requirements_path: PathBuf::from("reqs.txt"),
-                    uv_bin: PathBuf::from("venv"),
-                    worker_bin: PathBuf::from("worker"),
-                    data_dir: dir.path().to_path_buf(),
-                },
-                WorkerKind::Embed,
-            )
-            .0,
             dir.path().join("models"),
             dir.path().to_path_buf(),
             &plan,
@@ -13229,7 +13489,6 @@ title = "title[0]"
             BuildScope::WholeRoot,
         );
 
-        assert_eq!(options.device.as_deref(), Some("cpu"));
         assert_eq!(options.model_dir, dir.path().join("models"));
         assert_eq!(options.index_dir, dir.path().to_path_buf());
         assert_eq!(options.chunk_size, 123);
@@ -13492,7 +13751,10 @@ title = "title[0]"
         )
         .unwrap();
         let plan = RestoreStatePlan {
-            batch_size: 16,
+            location: EmbeddingLocation::Local {
+                device: "cpu".to_string(),
+                batch_size: 16,
+            },
             db_status: IndexStatus {
                 indexed_files: 1,
                 total_chunks: 1,
@@ -13509,7 +13771,6 @@ title = "title[0]"
                 model: EmbedderModel("restore-model".to_string()),
                 dimension: 1,
             },
-            device: "cpu".to_string(),
         };
         let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::default());
         ctx2.finish_restore_state(&plan, embedder, index).await;
@@ -14122,9 +14383,11 @@ title = "title[0]"
         )
         .unwrap();
         let plan = BuildIndexPlan {
-            batch_size: 16,
             root_path: root.clone(),
-            device: "cpu".to_string(),
+            location: EmbeddingLocation::Local {
+                device: "cpu".to_string(),
+                batch_size: 16,
+            },
             chunk_size: 64,
             chunk_overlap: 8,
             supported_extensions: vec!["txt".to_string()],
@@ -14217,9 +14480,11 @@ title = "title[0]"
         std::fs::write(&stale, "stale").unwrap();
 
         let plan = BuildIndexPlan {
-            batch_size: 16,
             root_path: root,
-            device: "cpu".to_string(),
+            location: EmbeddingLocation::Local {
+                device: "cpu".to_string(),
+                batch_size: 16,
+            },
             chunk_size: 64,
             chunk_overlap: 8,
             supported_extensions: vec!["txt".to_string()],
@@ -14290,9 +14555,11 @@ exit 0
         std::fs::create_dir_all(&root).unwrap();
 
         let plan = BuildIndexPlan {
-            batch_size: 16,
             root_path: root,
-            device: "cpu".to_string(),
+            location: EmbeddingLocation::Local {
+                device: "cpu".to_string(),
+                batch_size: 16,
+            },
             chunk_size: 64,
             chunk_overlap: 8,
             supported_extensions: vec!["txt".to_string()],
@@ -17151,8 +17418,10 @@ exit 0
         );
 
         let plan = DownloadModelPlan {
-            batch_size: 16,
-            device: "cpu".to_string(),
+            location: EmbeddingLocation::Local {
+                device: "cpu".to_string(),
+                batch_size: 16,
+            },
         };
         let selected = SelectedEmbedder {
             engine: EmbeddingEngine::Candle,

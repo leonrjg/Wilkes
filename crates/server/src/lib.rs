@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::http::auth::{self, require_bearer_token, ApiToken};
 use crate::http::errors::{consumer_anyhow_err, consumer_err, err, server_err, ErrorBody};
 #[cfg(test)]
 use crate::http::state::BroadcastEmitter;
@@ -44,6 +45,7 @@ use wilkes_api::workspace::{
 };
 use wilkes_core::completion::{CompletionFeedback, CompletionRequest};
 use wilkes_core::consumer::{ConsumerError, ConsumerErrorCode};
+use wilkes_core::embed::engines::remote::{EmbedderAddress, InstallEvent};
 use wilkes_core::embed::ChunkRef;
 use wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryInput;
 use wilkes_core::types::{
@@ -1440,11 +1442,7 @@ async fn embedder_capabilities_handler(
 ) -> Json<wilkes_core::types::EmbedderCapabilityManifest> {
     let context = state.context();
     let settings = context.get_settings().await;
-    Json(wilkes_core::embed::dispatch::model_capabilities(
-        &context.model_dir,
-        &context.sbert_cache(),
-        &settings.semantic.custom_models,
-    ))
+    Json(context.local_embedder_capabilities(&settings))
 }
 
 /// A server with no workspace manager can serve no corpus, so there is no id
@@ -1812,6 +1810,24 @@ struct EmbedTextBody {
     /// says so.
     #[serde(default)]
     scope: ConsumerScope,
+    /// A model to embed with, named instead of an index: what another Wilkes
+    /// sends when it embeds here. Exclusive with `scope` — a request is about
+    /// an index or about a model, and one that named both would leave the
+    /// handler to pick which to believe.
+    #[serde(default)]
+    embedder: Option<EmbedderAddress>,
+}
+
+impl EmbedTextBody {
+    /// The model this request names, refused when it also names an index.
+    fn model_address(&self) -> Result<Option<EmbedderAddress>, (StatusCode, Json<ErrorBody>)> {
+        match &self.embedder {
+            Some(_) if self.scope != ConsumerScope::default() => Err(err(
+                "a request names either an index (scope) or a model (embedder), not both",
+            )),
+            address => Ok(address.clone()),
+        }
+    }
 }
 
 /// Embed arbitrary strings with the model the addressed index uses, in the
@@ -1826,6 +1842,14 @@ async fn embed_text_handler(
 ) -> Result<Json<wilkes_api::context::EmbeddedTexts>, (StatusCode, Json<ErrorBody>)> {
     if body.texts.is_empty() {
         return Err(err("texts must not be empty"));
+    }
+    if let Some(address) = body.model_address()? {
+        return state
+            .context()
+            .embed_model_texts(address, body.texts)
+            .await
+            .map(Json)
+            .map_err(consumer_err);
     }
     let index = state.consumer_index(&body.scope).await?;
     let space = index.embedding_space_id().map(str::to_string);
@@ -1863,6 +1887,19 @@ async fn embed_query_handler(
 ) -> Result<Json<EmbeddedQueries>, (StatusCode, Json<ErrorBody>)> {
     if body.texts.is_empty() {
         return Err(err("texts must not be empty"));
+    }
+    if let Some(address) = body.model_address()? {
+        return state
+            .context()
+            .embed_model_query_texts(address, body.texts)
+            .await
+            .map(|embedded| {
+                Json(EmbeddedQueries {
+                    embedded,
+                    role: "query",
+                })
+            })
+            .map_err(consumer_err);
     }
     let index = state.consumer_index(&body.scope).await?;
     let space = index.embedding_space_id().map(str::to_string);
@@ -2788,6 +2825,47 @@ async fn get_index_status_handler(
     Ok(Json(status))
 }
 
+/// Download a model into this machine's cache for another Wilkes that embeds
+/// here, streaming `progress` events and ending with `done` or `error`.
+///
+/// Unlike `/api/embed/download`, which this instance's own interface uses, it
+/// does not make the model this workspace's embedder and does not wait for or
+/// block a build here. A caller that disconnects stops listening; a download
+/// already writing a file finishes it, so what is left in the cache is the
+/// model, never part of it.
+async fn install_model_handler(
+    State(state): State<Arc<AppState>>,
+    Json(address): Json<EmbedderAddress>,
+) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<InstallEvent>(64);
+    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+    let context = state.context();
+    let install = tokio::spawn(async move { context.install_model(address, events_tx).await });
+    tokio::spawn(async move {
+        while let Some(event) = events_rx.recv().await {
+            let sse = match &event {
+                InstallEvent::Progress(progress) => Event::default()
+                    .event("progress")
+                    .json_data(progress)
+                    .unwrap_or_else(|error| {
+                        tracing::error!("install progress did not serialize: {error}");
+                        Event::default().event("progress").data("{}")
+                    }),
+                InstallEvent::Done => Event::default().event("done").data(""),
+                InstallEvent::Error(error) => Event::default().event("error").data(error),
+            };
+            if stream_tx.send(Ok(sse)).await.is_err() {
+                // The caller has gone. The install task is dropped with the
+                // receiver it reports to; an install step that cannot be
+                // interrupted completes on its own.
+                install.abort();
+                break;
+            }
+        }
+    });
+    Sse::new(ReceiverStream::new(stream_rx))
+}
+
 #[derive(Deserialize)]
 struct DownloadBody {
     selected: SelectedEmbedder,
@@ -3003,15 +3081,19 @@ async fn set_worker_timeout_handler(
 /// workspace. Both shells mount this: the binary behind static assets, the
 /// desktop app on a loopback port. One definition, so a consumer cannot find
 /// an endpoint on one and not the other.
-pub fn api_router(state: Arc<AppState>) -> Router {
+pub fn api_router(state: Arc<AppState>, token: ApiToken) -> Router {
     // Both the headless server and the desktop's shared API serve the same
     // workspace-aware MCP. Test-only contexts without a registry expose no MCP.
-    let mcp = state
-        .workspaces
-        .as_ref()
-        .map(|manager| wilkes_agent::mcp::api_router(manager.clone()));
+    let mcp = state.workspaces.as_ref().map(|manager| {
+        wilkes_agent::mcp::api_router(manager.clone()).route_layer(
+            axum::middleware::from_fn_with_state(Arc::clone(&token), require_bearer_token),
+        )
+    });
+    let login_token = Arc::clone(&token);
     let router = Router::new()
-        .route("/health", get(health_handler))
+        // Answers 204 to a caller that holds the token, and 401 otherwise: how
+        // the web interface learns whether to ask for it.
+        .route("/api/session", get(|| async { StatusCode::NO_CONTENT }))
         // Core
         .route("/api/search", post(search_handler))
         .route("/api/related-documents", post(related_documents_handler))
@@ -3288,6 +3370,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/embed/model-search", get(search_custom_models_handler))
         .route("/api/embed/status", get(get_index_status_handler))
         .route("/api/embed/download", post(download_model_handler))
+        .route("/api/embed/install", post(install_model_handler))
         .route("/api/embed/build", post(build_index_handler))
         .route("/api/embed/activity", get(index_activity_handler))
         .route("/api/embed/coverage", post(index_coverage_handler))
@@ -3303,6 +3386,20 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/worker/statuses", get(get_worker_statuses_handler))
         .route("/api/worker/kill", post(kill_worker_handler))
         .route("/api/worker/timeout", patch(set_worker_timeout_handler))
+        // Everything above requires the token whenever one is set; the two
+        // routes below never do, since one reports the server is up and the
+        // other is how a browser presents the token in the first place.
+        .route_layer(axum::middleware::from_fn_with_state(
+            token,
+            require_bearer_token,
+        ))
+        .route("/health", get(health_handler))
+        .route(
+            "/api/login",
+            post(move |Json(body): Json<auth::LoginBody>| {
+                auth::login(Arc::clone(&login_token), body)
+            }),
+        )
         .layer(CorsLayer::permissive())
         .layer(axum::middleware::from_fn(log_http_call))
         .with_state(state);
@@ -3322,6 +3419,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
 /// caller out of axum parts.
 pub struct ApiRuntime {
     addr: std::net::SocketAddr,
+    token: ApiToken,
     shutdown: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -3336,6 +3434,26 @@ impl ApiRuntime {
 
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    /// The token this listener requires, if it requires one.
+    pub fn token(&self) -> Option<String> {
+        self.token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Require `token` from now on, without dropping the listener. A listener
+    /// that requires none — one on loopback — keeps requiring none.
+    pub fn set_token(&self, token: String) {
+        let mut current = self
+            .token
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.is_some() {
+            *current = Some(token);
+        }
     }
 
     /// Stops accepting, lets in-flight requests finish, and waits for the
@@ -3354,17 +3472,24 @@ impl ApiRuntime {
 ///
 /// Binding is awaited here rather than inside the spawned task so that "the
 /// port is taken" is returned to the caller as an error instead of surfacing
-/// as a listener that silently never came up.
+/// as a listener that silently never came up. `token` is required off
+/// loopback, and refused there by an error rather than a listener nobody can
+/// trust; see [`auth::token_for_bind`].
 pub async fn start_api(
     bind_address: std::net::IpAddr,
     port: u16,
     state: Arc<AppState>,
+    token: Option<String>,
 ) -> anyhow::Result<ApiRuntime> {
     anyhow::ensure!(port != 0, "HTTP API port must be between 1 and 65535");
+    let token: ApiToken = Arc::new(std::sync::RwLock::new(auth::token_for_bind(
+        bind_address,
+        token,
+    )?));
     let listener = tokio::net::TcpListener::bind((bind_address, port)).await?;
     let addr = listener.local_addr()?;
     let (shutdown, rx) = tokio::sync::oneshot::channel::<()>();
-    let app = api_router(state);
+    let app = api_router(state, Arc::clone(&token));
     let task = tokio::spawn(async move {
         let served = axum::serve(listener, app)
             .with_graceful_shutdown(async move {
@@ -3377,6 +3502,7 @@ pub async fn start_api(
     });
     Ok(ApiRuntime {
         addr,
+        token,
         shutdown,
         task,
     })
@@ -3467,12 +3593,15 @@ mod tests {
                 tx: events_tx.clone(),
             }),
         );
-        let _router = api_router(Arc::new(AppState {
-            ctx: Some(ctx),
-            workspaces: None,
-            uploads_dir: dir.path().join("uploads"),
-            events_tx,
-        }));
+        let _router = api_router(
+            Arc::new(AppState {
+                ctx: Some(ctx),
+                workspaces: None,
+                uploads_dir: dir.path().join("uploads"),
+                events_tx,
+            }),
+            Arc::new(std::sync::RwLock::new(None)),
+        );
     }
 
     /// Builds an `AppState` over a throwaway data dir, for handlers that need
@@ -3505,6 +3634,102 @@ mod tests {
             events_tx,
         });
         (dir, state)
+    }
+
+    /// Off loopback, every route but the two that cannot need one requires
+    /// the token, as a header or as the cookie `/api/login` hands out.
+    #[tokio::test]
+    async fn a_token_gates_every_route_but_health_and_login() {
+        use tower::ServiceExt;
+        let (_dir, state) = handler_state();
+        let token: ApiToken = Arc::new(std::sync::RwLock::new(Some("secret".to_string())));
+        let app = api_router(state, token);
+        let call = |request: axum::http::Request<Body>| {
+            let app = app.clone();
+            async move { app.oneshot(request).await.unwrap() }
+        };
+        let get = |path: &str| axum::http::Request::get(path).body(Body::empty()).unwrap();
+
+        assert_eq!(
+            call(get("/api/settings")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(get("/api/session")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(call(get("/health")).await.status(), StatusCode::OK);
+
+        let with_header = axum::http::Request::get("/api/settings")
+            .header("Authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(with_header).await.status(), StatusCode::OK);
+
+        let login = axum::http::Request::post("/api/login")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"token":"secret"}"#))
+            .unwrap();
+        let logged_in = call(login).await;
+        assert_eq!(logged_in.status(), StatusCode::NO_CONTENT);
+        let cookie = logged_in
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let with_cookie = axum::http::Request::get("/api/session")
+            .header("Cookie", cookie)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(with_cookie).await.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// A request names an index or a model, never both; and a model the host
+    /// lacks is refused with a code, not downloaded inside the request.
+    #[tokio::test]
+    async fn embedding_by_model_refuses_ambiguity_and_absent_models() {
+        let (_dir, state) = handler_state();
+        let address: EmbedderAddress = serde_json::from_value(serde_json::json!({
+            "engine": "Fastembed",
+            "model": "NoSuchModel",
+        }))
+        .unwrap();
+
+        let (status, body) = embed_text_handler(
+            State(Arc::clone(&state)),
+            Json(EmbedTextBody {
+                texts: vec!["t".to_string()],
+                scope: ConsumerScope {
+                    workspace_id: Some("w".to_string()),
+                    expected_embedding_space_id: None,
+                },
+                embedder: Some(address.clone()),
+            }),
+        )
+        .await
+        .err()
+        .expect("both addresses at once");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.error.contains("not both"), "{}", body.error);
+
+        let (status, body) = embed_query_handler(
+            State(state),
+            Json(EmbedTextBody {
+                texts: vec!["t".to_string()],
+                scope: ConsumerScope::default(),
+                embedder: Some(address),
+            }),
+        )
+        .await
+        .err()
+        .expect("a model this host does not have");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.code.as_deref(), Some("MODEL_NOT_INSTALLED"));
     }
 
     /// The import reply names the spaces that hold the document, and no
@@ -3562,6 +3787,7 @@ mod tests {
             Json(EmbedTextBody {
                 texts: Vec::new(),
                 scope: ConsumerScope::default(),
+                embedder: None,
             }),
         )
         .await
@@ -3574,6 +3800,7 @@ mod tests {
             Json(EmbedTextBody {
                 texts: vec!["what binds".to_string()],
                 scope: ConsumerScope::default(),
+                embedder: None,
             }),
         )
         .await
@@ -3593,6 +3820,7 @@ mod tests {
                 model_id: "m".to_string(),
                 dimension: 2,
                 vectors: vec![vec![1.0, 0.0]],
+                embedding_space_identity: None,
             },
             role: "query",
         })
@@ -3605,6 +3833,7 @@ mod tests {
                 "model_id": "m",
                 "dimension": 2,
                 "vectors": [[1.0, 0.0]],
+                "embedding_space_identity": null,
                 "role": "query",
             }),
             "the passage route's reply, flat, plus the role"

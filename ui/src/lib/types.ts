@@ -1463,6 +1463,8 @@ export interface Settings {
   http_api?: HttpApiSettings;
   /** Sending files to other Wilkes instances on the local network. */
   lan_sharing?: LanSharingSettings;
+  /** Running embeddings on another Wilkes instance instead of this one. */
+  remote_embedding?: RemoteEmbeddingSettings;
   /** Transcription and description of the pictures inside documents. */
   image_analysis?: ImageAnalysisSettings;
 }
@@ -1490,6 +1492,24 @@ export interface HttpApiSettings {
 export interface HttpApiStatus extends HttpApiSettings {
   running: boolean;
   url: string | null;
+  /** Whether the bind address reaches beyond this machine, which is when every
+   *  request must carry `token`. */
+  require_token: boolean;
+  /** The token the running listener requires, for copying to its clients. */
+  token: string | null;
+  error: string | null;
+}
+
+/** Where embeddings run: this machine, or the Wilkes HTTP API at `address`. */
+export interface RemoteEmbeddingSettings {
+  enabled: boolean;
+  address: string;
+}
+
+export interface RemoteEmbeddingStatus extends RemoteEmbeddingSettings {
+  /** Whether a token for the host is stored; the token itself is never sent back. */
+  has_token: boolean;
+  /** What went wrong asking the host for its models, when it was asked. */
   error: string | null;
 }
 

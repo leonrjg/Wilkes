@@ -34,4 +34,5 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tower = { version = "0.5", features = ["util"] }
 wilkes-core = { path = "../core", features = ["test-utils"] }

@@ -1393,3 +1393,26 @@ export class HttpSourceApi implements WebSourceApi {
     if (!res.ok && res.status !== 204) throw new Error(`Delete all failed: ${res.status}`);
   }
 }
+
+/**
+ * Whether this browser may call the server: true unless the server requires a
+ * token this browser has not presented. A server bound beyond loopback
+ * requires one; it is exchanged once for a cookie the browser then sends with
+ * every request, including the ones a page cannot add a header to.
+ */
+export async function checkApiSession(): Promise<boolean> {
+  const res = await fetch("/api/session");
+  if (res.status === 401) return false;
+  if (!res.ok) throw await responseError(res, "Check the session");
+  return true;
+}
+
+/** Present the server's token, which it answers by setting the session cookie. */
+export async function loginToApi(token: string): Promise<void> {
+  const res = await fetch("/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  if (!res.ok) throw await responseError(res, "Sign in");
+}

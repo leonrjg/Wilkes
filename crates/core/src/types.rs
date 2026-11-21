@@ -2789,6 +2789,29 @@ pub struct LanSharingSettings {
     pub enabled: bool,
 }
 
+/// Where this instance's embeddings are computed.
+///
+/// With this on, every embedding this installation needs — an index build, a
+/// search query, a managed corpus — is computed by the Wilkes instance at
+/// `address`, over its HTTP API, with the model this instance selected. The
+/// library, the index and extraction stay here; only text and vectors cross.
+///
+/// The host's bearer token is stored apart from these settings, for the
+/// reason [`crate::token_file`] gives. There is no fallback to this machine:
+/// with the host unreachable, embedding is unavailable until the setting is
+/// turned off.
+///
+/// Installation-wide rather than per workspace, because it describes the
+/// machine, not a library.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteEmbeddingSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The host's HTTP API: a base URL such as `http://mini.local:2020`.
+    #[serde(default)]
+    pub address: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default, alias = "bookmarked_dirs")]
@@ -2902,13 +2925,17 @@ pub struct Settings {
     /// and is intentionally never serialized as part of Settings.
     #[serde(default)]
     pub external_mcp: ExternalMcpSettings,
-    /// The read/write HTTP API, off by default. Unauthenticated like
-    /// `wilkes-server` itself, which is why it binds loopback by default.
+    /// The read/write HTTP API, off by default. Open on loopback; bound to
+    /// any other address it requires a bearer token, which is stored apart
+    /// from these settings.
     #[serde(default)]
     pub http_api: HttpApiSettings,
     /// Sending files to other Wilkes instances on the local network.
     #[serde(default)]
     pub lan_sharing: LanSharingSettings,
+    /// Running embeddings on another Wilkes instance instead of this one.
+    #[serde(default)]
+    pub remote_embedding: RemoteEmbeddingSettings,
     /// Local text generation. Off by default; every affordance that depends on
     /// it is invisible until it is both enabled and ready.
     #[serde(default)]
@@ -3079,6 +3106,7 @@ impl Default for Settings {
             external_mcp: ExternalMcpSettings::default(),
             http_api: HttpApiSettings::default(),
             lan_sharing: LanSharingSettings::default(),
+            remote_embedding: RemoteEmbeddingSettings::default(),
             generation: GenerationSettings::default(),
             retrieval: RetrievalSettings::default(),
             image_analysis: ImageAnalysisSettings::default(),

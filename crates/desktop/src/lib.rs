@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs::OpenOptions;
-use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -524,12 +522,7 @@ async fn retry_failed_documents_for_ctx(
 async fn embedder_capabilities_for_ctx(
     ctx: Arc<AppContext>,
 ) -> Result<EmbedderCapabilityManifest, String> {
-    let settings = ctx.get_settings().await;
-    Ok(wilkes_core::embed::dispatch::model_capabilities(
-        &ctx.model_dir,
-        &ctx.sbert_cache(),
-        &settings.semantic.custom_models,
-    ))
+    ctx.embedder_capabilities().await
 }
 
 async fn cancel_embed_for_ctx(ctx: Arc<AppContext>) -> Result<(), String> {
@@ -645,7 +638,7 @@ impl ExternalMcpManager {
         }
 
         let token = if settings.require_token {
-            match load_or_create_external_mcp_token(&self.token_path) {
+            match wilkes_core::token_file::load_or_create(&self.token_path) {
                 Ok(token) => Some(token),
                 Err(error) => {
                     let message = format!("Could not load the external MCP credential: {error:#}");
@@ -767,8 +760,9 @@ impl ExternalMcpManager {
         if !settings.require_token {
             return Err("External MCP bearer authentication is not enabled".to_string());
         }
-        let token = generate_external_mcp_token();
-        write_external_mcp_token(&self.token_path, &token).map_err(|error| error.to_string())?;
+        let token = wilkes_core::token_file::generate();
+        wilkes_core::token_file::write(&self.token_path, &token)
+            .map_err(|error| error.to_string())?;
         if let Some(runtime) = self.runtime.lock().await.as_ref() {
             runtime.runtime.set_token(Some(token));
         }
@@ -808,6 +802,10 @@ struct HttpApiManager {
     /// per request, so toggling the listener must not re-derive which
     /// workspace is current.
     state: Arc<wilkes_server::http::state::AppState>,
+    /// Where the token the API requires off loopback is kept. Created the
+    /// first time the API is bound beyond loopback, and kept across restarts
+    /// so the clients holding it keep working.
+    token_path: PathBuf,
     runtime: tokio::sync::Mutex<Option<ManagedHttpApi>>,
     last_error: Mutex<Option<String>>,
 }
@@ -819,13 +817,22 @@ struct HttpApiStatus {
     bind_address: std::net::IpAddr,
     port: u16,
     url: Option<String>,
+    /// Whether the bind address reaches beyond this machine, which is when
+    /// every request must carry `token`.
+    require_token: bool,
+    /// The token the running listener requires, shown so it can be copied to
+    /// the machines that call it.
+    token: Option<String>,
     error: Option<String>,
 }
 
+const HTTP_API_TOKEN_FILENAME: &str = "http-api-token";
+
 impl HttpApiManager {
-    fn new(state: Arc<wilkes_server::http::state::AppState>) -> Self {
+    fn new(state: Arc<wilkes_server::http::state::AppState>, token_path: PathBuf) -> Self {
         Self {
             state,
+            token_path,
             runtime: tokio::sync::Mutex::new(None),
             last_error: Mutex::new(None),
         }
@@ -875,10 +882,25 @@ impl HttpApiManager {
             );
         }
 
+        let token = if settings.bind_address.is_loopback() {
+            None
+        } else {
+            match wilkes_core::token_file::load_or_create(&self.token_path) {
+                Ok(token) => Some(token),
+                Err(error) => {
+                    let message = format!("Could not load the HTTP API's token: {error:#}");
+                    error!("{message}");
+                    *self.last_error.lock().unwrap() = Some(message.clone());
+                    return Err(message);
+                }
+            }
+        };
+
         match wilkes_server::start_api(
             settings.bind_address,
             settings.port,
             Arc::clone(&self.state),
+            token,
         )
         .await
         {
@@ -912,8 +934,25 @@ impl HttpApiManager {
             bind_address: settings.bind_address,
             port: settings.port,
             url: runtime.as_ref().map(|managed| managed.runtime.url()),
+            require_token: !settings.bind_address.is_loopback(),
+            token: runtime.as_ref().and_then(|managed| managed.runtime.token()),
             error: self.last_error.lock().unwrap().clone(),
         }
+    }
+
+    /// Replace the token, revoking the old one at once. Only meaningful off
+    /// loopback, where a token is required at all.
+    async fn rotate_token(&self, settings: &HttpApiSettings) -> Result<(), String> {
+        if settings.bind_address.is_loopback() {
+            return Err("The HTTP API requires no token on a loopback address".to_string());
+        }
+        let token = wilkes_core::token_file::generate();
+        wilkes_core::token_file::write(&self.token_path, &token)
+            .map_err(|error| error.to_string())?;
+        if let Some(managed) = self.runtime.lock().await.as_ref() {
+            managed.runtime.set_token(token);
+        }
+        Ok(())
     }
 
     async fn stop(&self) {
@@ -932,55 +971,6 @@ fn lan_share_manager_state(app: &AppHandle) -> Arc<lan_share::LanShareManager> {
     app.state::<Arc<lan_share::LanShareManager>>()
         .inner()
         .clone()
-}
-
-fn generate_external_mcp_token() -> String {
-    format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
-}
-
-fn read_external_mcp_token(path: &std::path::Path) -> anyhow::Result<String> {
-    let mut file = OpenOptions::new().read(true).open(path)?;
-    let mut token = String::new();
-    file.read_to_string(&mut token)?;
-    let token = token.trim().to_string();
-    if token.is_empty() {
-        anyhow::bail!("External MCP token file is empty: {}", path.display());
-    }
-    Ok(token)
-}
-
-fn load_or_create_external_mcp_token(path: &std::path::Path) -> anyhow::Result<String> {
-    match read_external_mcp_token(path) {
-        Ok(token) => return Ok(token),
-        Err(error) if path.exists() => return Err(error),
-        Err(_) => {}
-    }
-    let token = generate_external_mcp_token();
-    write_external_mcp_token(path, &token)?;
-    Ok(token)
-}
-
-fn write_external_mcp_token(path: &std::path::Path, token: &str) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(token.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
 }
 
 /// Applies a settings patch, keeping the two network listeners in step with it.
@@ -1745,6 +1735,79 @@ async fn get_http_api_status(app: AppHandle) -> Result<HttpApiStatus, String> {
     Ok(http_api_manager_state(&app)
         .status(&settings.http_api)
         .await)
+}
+
+#[tauri::command]
+async fn rotate_http_api_token(app: AppHandle) -> Result<HttpApiStatus, String> {
+    let settings = app_context(&app).get_settings().await;
+    let manager = http_api_manager_state(&app);
+    manager.rotate_token(&settings.http_api).await?;
+    Ok(manager.status(&settings.http_api).await)
+}
+
+/// Where embeddings run, and whether the host there answers.
+#[derive(Clone, Debug, Serialize)]
+struct RemoteEmbeddingStatus {
+    enabled: bool,
+    address: String,
+    /// Whether a token for the host is stored. The token itself is not sent
+    /// back: it was typed here, and is the host's to show.
+    has_token: bool,
+    /// What the host answered when asked for its models, when it was asked.
+    error: Option<String>,
+}
+
+async fn remote_embedding_status(ctx: &Arc<AppContext>) -> RemoteEmbeddingStatus {
+    let settings = ctx.get_settings().await;
+    let has_token = matches!(
+        wilkes_core::token_file::read_if_present(&ctx.remote_embedding_token_path()),
+        Ok(Some(_))
+    );
+    let error = if settings.remote_embedding.enabled {
+        ctx.embedder_capabilities().await.err()
+    } else {
+        None
+    };
+    RemoteEmbeddingStatus {
+        enabled: settings.remote_embedding.enabled,
+        address: settings.remote_embedding.address,
+        has_token,
+        error,
+    }
+}
+
+/// Run embeddings on another Wilkes instance, or on this machine again.
+///
+/// `token` replaces the stored one when given, and an empty string removes
+/// it; `None` keeps what is stored, so the address can change without
+/// retyping it.
+#[tauri::command]
+async fn configure_remote_embedding(
+    enabled: bool,
+    address: String,
+    token: Option<String>,
+    app: AppHandle,
+) -> Result<RemoteEmbeddingStatus, String> {
+    if enabled {
+        wilkes_core::embed::engines::remote::normalize_address(&address)
+            .map_err(|error| format!("{error:#}"))?;
+    }
+    let workspaces = workspace_manager(&app);
+    workspaces
+        .configure_remote_embedding(
+            wilkes_core::types::RemoteEmbeddingSettings {
+                enabled,
+                address: address.trim().to_string(),
+            },
+            token,
+        )
+        .await?;
+    Ok(remote_embedding_status(&workspaces.active()).await)
+}
+
+#[tauri::command]
+async fn get_remote_embedding_status(app: AppHandle) -> Result<RemoteEmbeddingStatus, String> {
+    Ok(remote_embedding_status(&app_context(&app)).await)
 }
 
 /// Turns sharing with other Wilkes instances on the local network on or off.
@@ -2690,14 +2753,15 @@ pub fn run() {
             // Workspace-scoped, not context-scoped: the state resolves the
             // active workspace per request, so a workspace switch is followed
             // by the API without restarting the listener.
-            let http_api = Arc::new(HttpApiManager::new(Arc::new(
-                wilkes_server::http::state::AppState {
+            let http_api = Arc::new(HttpApiManager::new(
+                Arc::new(wilkes_server::http::state::AppState {
                     ctx: None,
                     workspaces: Some(Arc::clone(&workspaces)),
                     uploads_dir: ctx.data_dir.join("uploads"),
                     events_tx,
-                },
-            )));
+                }),
+                ctx.shared_data_dir.join(HTTP_API_TOKEN_FILENAME),
+            ));
 
             app.manage(Arc::clone(&workspaces));
             app.manage(Arc::new(ActiveSearches(Mutex::new(HashMap::new()))));
@@ -2801,6 +2865,9 @@ pub fn run() {
             get_external_mcp_status,
             set_active_document,
             rotate_external_mcp_token,
+            rotate_http_api_token,
+            configure_remote_embedding,
+            get_remote_embedding_status,
             configure_http_api,
             get_http_api_status,
             configure_lan_sharing,
@@ -3489,12 +3556,15 @@ mod tests {
     /// startup.
     fn http_api_manager(ctx: Arc<AppContext>) -> HttpApiManager {
         let (events_tx, _) = broadcast::channel(16);
-        HttpApiManager::new(Arc::new(wilkes_server::http::state::AppState {
-            ctx: Some(Arc::clone(&ctx)),
-            workspaces: None,
-            uploads_dir: ctx.data_dir.join("uploads"),
-            events_tx,
-        }))
+        HttpApiManager::new(
+            Arc::new(wilkes_server::http::state::AppState {
+                ctx: Some(Arc::clone(&ctx)),
+                workspaces: None,
+                uploads_dir: ctx.data_dir.join("uploads"),
+                events_tx,
+            }),
+            ctx.shared_data_dir.join(HTTP_API_TOKEN_FILENAME),
+        )
     }
 
     #[tokio::test]
@@ -3532,6 +3602,50 @@ mod tests {
 
         manager.stop().await;
         assert!(!manager.status(&enabled).await.running);
+    }
+
+    /// Bound beyond loopback, the API makes a token, keeps it across
+    /// restarts, refuses requests without it, and can replace it.
+    #[tokio::test]
+    async fn http_api_off_loopback_requires_a_token_it_can_rotate() {
+        let (_dir, ctx) = test_ctx();
+        let token_path = ctx.shared_data_dir.join(HTTP_API_TOKEN_FILENAME);
+        let manager = http_api_manager(ctx);
+        let probe = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let settings = HttpApiSettings {
+            enabled: true,
+            bind_address: "0.0.0.0".parse().unwrap(),
+            port,
+        };
+        manager.apply(&settings).await.unwrap();
+        let status = manager.status(&settings).await;
+        assert!(status.running && status.require_token);
+        let token = status.token.expect("a token off loopback");
+        assert_eq!(wilkes_core::token_file::read(&token_path).unwrap(), token);
+
+        let local = format!("http://127.0.0.1:{port}");
+        assert_eq!(reqwest_get(&format!("{local}/api/settings")).await, "401");
+        assert_eq!(reqwest_get(&format!("{local}/health")).await, "200");
+
+        manager.rotate_token(&settings).await.unwrap();
+        let rotated = manager.status(&settings).await.token.unwrap();
+        assert_ne!(rotated, token);
+        assert_eq!(wilkes_core::token_file::read(&token_path).unwrap(), rotated);
+
+        // Loopback needs none, shows none, and has none to rotate.
+        let loopback = HttpApiSettings {
+            enabled: true,
+            port,
+            ..HttpApiSettings::default()
+        };
+        manager.apply(&loopback).await.unwrap();
+        let status = manager.status(&loopback).await;
+        assert!(!status.require_token);
+        assert_eq!(status.token, None);
+        assert!(manager.rotate_token(&loopback).await.is_err());
+        manager.stop().await;
     }
 
     #[tokio::test]
@@ -3580,27 +3694,6 @@ mod tests {
             .nth(1)
             .expect("status line")
             .to_string()
-    }
-
-    #[test]
-    fn external_mcp_token_is_persistent() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join(EXTERNAL_MCP_TOKEN_FILENAME);
-        let first = load_or_create_external_mcp_token(&path).unwrap();
-        let second = load_or_create_external_mcp_token(&path).unwrap();
-
-        assert_eq!(first, second);
-        assert!(first.len() >= 64);
-        assert_eq!(read_external_mcp_token(&path).unwrap(), first);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
     }
 
     #[tokio::test]

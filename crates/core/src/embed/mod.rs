@@ -51,6 +51,30 @@ pub trait Embedder: Send + Sync {
     }
 }
 
+/// Texts embedded for a caller, with the identity it pins against.
+///
+/// The wire shape of `/api/embed/text` and `/api/embed/query`, kept here
+/// because both sides of it live in this workspace: the host serializes it and
+/// a remote embedder reads it back.
+///
+/// `embedding_space_id` is absent exactly when the addressed workspace holds
+/// no index — embedding text does not require one — and present whenever the
+/// caller pinned a space, since a pin implies an index. A request that names
+/// its model rather than an index is answered in that model's space.
+///
+/// `embedding_space_identity` is the full identity of the embedder that
+/// produced the vectors, which a caller creating an index of its own records.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct EmbeddedTexts {
+    pub embedding_space_id: Option<String>,
+    pub engine: String,
+    pub model_id: String,
+    pub dimension: usize,
+    pub vectors: Vec<Vec<f32>>,
+    #[serde(default)]
+    pub embedding_space_identity: Option<EmbeddingSpaceIdentity>,
+}
+
 /// The active embedder is stored as `Mutex<Option<Arc<dyn Embedder>>>` in app state.
 /// Only one embedder is live at a time because each model occupies significant memory.
 pub type ActiveEmbedder = std::sync::Mutex<Option<Arc<dyn Embedder>>>;

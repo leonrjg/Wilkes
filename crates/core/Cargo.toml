@@ -80,6 +80,8 @@ sqlite-vec = "0.1.9"
 strip-ansi-escapes = "0.2.1"
 which = "6"
 reqwest = { version = "0.12", features = ["json", "blocking", "rustls-tls-native-roots"] }
+# Cancelling a request to a remote embedding host.
+tokio-util = "0.7"
 urlencoding = "2"
 url = "2"
 toml = "0.8"

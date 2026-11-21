@@ -65,6 +65,10 @@ describe("SettingsModal", () => {
     getExternalMcpStatus: vi.fn(),
     configureExternalMcp: vi.fn(),
     rotateExternalMcpToken: vi.fn(),
+    getRemoteEmbeddingStatus: vi.fn(() =>
+      Promise.resolve({ enabled: false, address: "", has_token: false, error: null }),
+    ),
+    configureRemoteEmbedding: vi.fn(),
     writeClipboard: vi.fn(),
   } as any;
 
@@ -599,6 +603,50 @@ describe("SettingsModal", () => {
       expect.stringContaining('Authorization: Bearer secret-token'),
     );
     expect(screen.queryByText("secret-token")).not.toBeInTheDocument();
+  });
+
+  it("sends embeddings to another Wilkes with its address and token", async () => {
+    mockApi.configureRemoteEmbedding.mockResolvedValue({
+      enabled: true,
+      address: "http://mini.local:2020",
+      has_token: true,
+      error: null,
+    });
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Semantic Search Models" }));
+    expect(screen.getByText("On this computer")).toBeInTheDocument();
+    // No address, nothing to turn on.
+    expect(screen.getByLabelText("Embed on another Wilkes")).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("Embedding host address"), {
+      target: { value: " http://mini.local:2020 " },
+    });
+    fireEvent.change(screen.getByLabelText("Embedding host token"), {
+      target: { value: "secret" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Embed on another Wilkes"));
+    });
+
+    expect(mockApi.configureRemoteEmbedding).toHaveBeenCalledWith(
+      true,
+      "http://mini.local:2020",
+      "secret",
+    );
+    expect(await screen.findByText("On another Wilkes")).toBeInTheDocument();
+    // The typed token is not kept in the field once stored.
+    expect(screen.getByLabelText("Embedding host token")).toHaveValue("");
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Forget token" }));
+    });
+    expect(mockApi.configureRemoteEmbedding).toHaveBeenLastCalledWith(
+      true,
+      "http://mini.local:2020",
+      "",
+    );
   });
 
   it("preserves the custom instructions cursor while persisting an edit", async () => {

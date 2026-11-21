@@ -32,6 +32,10 @@ pub enum ConsumerErrorCode {
     /// no passage in it can be addressed. Its vectors remain usable by Wilkes
     /// locally; the remedy for a consumer is a rebuild.
     IndexIdentityUnverified,
+    /// An embedding was asked of a model this host does not have. Embedding
+    /// never downloads one on the way: a download is a separate request, so
+    /// that its progress can be reported and it can be cancelled.
+    ModelNotInstalled,
 }
 
 impl ConsumerErrorCode {
@@ -50,6 +54,7 @@ impl ConsumerErrorCode {
             Self::ChunkRefNotFound => "CHUNK_REF_NOT_FOUND",
             Self::IdempotencyKeyConflict => "IDEMPOTENCY_KEY_CONFLICT",
             Self::IndexIdentityUnverified => "INDEX_IDENTITY_UNVERIFIED",
+            Self::ModelNotInstalled => "MODEL_NOT_INSTALLED",
         }
     }
 }

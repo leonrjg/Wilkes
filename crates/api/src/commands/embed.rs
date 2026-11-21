@@ -7,16 +7,9 @@ use wilkes_core::embed::index::db::{BuildOptions, BuildScope};
 use wilkes_core::embed::index::{BuildReporter, SemanticIndex};
 use wilkes_core::embed::installer::EmbedderInstaller;
 use wilkes_core::embed::Embedder;
-use wilkes_core::models::progress::ProgressTx;
-use wilkes_core::types::{IndexStatus, RootCoverage, SelectedEmbedder};
+use wilkes_core::types::{IndexStatus, RootCoverage};
 
 pub struct BuildIndexOptions {
-    pub manager: Option<wilkes_core::worker::manager::WorkerManager>,
-    pub device: Option<String>,
-    /// Texts the embedding worker may put through the model at once. Required
-    /// alongside the device, and for the same reason: both say what the
-    /// machine running the build can afford, and neither has a safe guess.
-    pub batch_size: Option<usize>,
     /// Where model artefacts are cached. One directory for the whole
     /// installation; never the workspace's own directory, or every workspace
     /// downloads the same model again and derives its own embedding-space
@@ -58,29 +51,6 @@ pub fn collect_indexable_paths(root: &Path, supported_extensions: &[String]) -> 
         })
         .map(|e| e.path().to_path_buf())
         .collect()
-}
-
-/// Download and install the model into the installation-wide model cache.
-/// Reports progress via `tx`.
-pub async fn download_model(
-    selected: SelectedEmbedder,
-    manager: wilkes_core::worker::manager::WorkerManager,
-    device: String,
-    model_dir: PathBuf,
-    tx: ProgressTx,
-) -> anyhow::Result<()> {
-    let installer = wilkes_core::embed::dispatch::get_installer(
-        selected.engine,
-        selected.model,
-        manager,
-        device,
-        // Downloading artefacts runs no forward pass, so this installer never
-        // embeds anything and the value cannot matter. The default rather than
-        // a zero, so that an installer reused by mistake is slow rather than
-        // broken.
-        wilkes_core::types::SemanticSettings::default_embed_batch_size(),
-    );
-    installer.install(&model_dir, tx).await
 }
 
 /// Walk `root`, embed every file using `embedder`, and write a new `SemanticIndex`
@@ -138,9 +108,9 @@ pub async fn build_index_with_embedder(
     Ok(embedder)
 }
 
-/// Walk `root`, embed every file, and write a new `SemanticIndex` at `index_dir`.
-/// Returns the `Arc<dyn Embedder>` used during the build so the caller can store
-/// it in state without loading the model a second time.
+/// Install the model through `installer`, build the embedder, and index
+/// every file of `options` into a new `SemanticIndex` at `index_dir`. Returns
+/// the embedder so the caller can keep it without loading the model again.
 ///
 /// Every engine builds here, in the process that owns the settings. The
 /// subprocess owns model inference and nothing else: each engine's installer
@@ -156,34 +126,6 @@ pub async fn build_index_with_embedder(
 ///
 /// Cancellation is handled by the caller via `tokio::select!` on the returned
 /// future; this function runs to completion once started.
-pub async fn build_index(
-    root: PathBuf,
-    selected: SelectedEmbedder,
-    options: BuildIndexOptions,
-) -> anyhow::Result<Arc<dyn Embedder>> {
-    let manager = options
-        .manager
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("manager is required for build_index"))?;
-    let device = options
-        .device
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("device is required for build_index"))?;
-    let batch_size = options
-        .batch_size
-        .ok_or_else(|| anyhow::anyhow!("batch_size is required for build_index"))?;
-
-    let installer = wilkes_core::embed::dispatch::get_installer(
-        selected.engine,
-        selected.model,
-        manager,
-        device,
-        batch_size,
-    );
-
-    build_index_with_installer(root, installer, options).await
-}
-
 pub async fn build_index_with_installer(
     root: PathBuf,
     installer: Arc<dyn EmbedderInstaller>,
@@ -312,6 +254,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
+    use wilkes_core::models::progress::ProgressTx;
 
     #[tokio::test]
     async fn test_get_index_status_missing() {
@@ -403,9 +346,6 @@ mod tests {
         assert_eq!(documents.len(), 1, "the walk is the caller's now");
 
         let options = BuildIndexOptions {
-            batch_size: Some(16),
-            manager: None,
-            device: None,
             model_dir: model_dir.clone(),
             index_dir: index_dir.clone(),
             reporter: BuildReporter::without_journal(tx),
@@ -448,9 +388,6 @@ mod tests {
             root.clone(),
             Arc::new(TestEmbedder),
             BuildIndexOptions {
-                batch_size: Some(16),
-                manager: None,
-                device: None,
                 model_dir,
                 index_dir: index_dir.clone(),
                 reporter: BuildReporter::without_journal(tx),
@@ -534,9 +471,6 @@ mod tests {
             other.clone(),
             Arc::new(TestEmbedder),
             BuildIndexOptions {
-                batch_size: Some(16),
-                manager: None,
-                device: None,
                 model_dir,
                 index_dir: index_dir.clone(),
                 reporter: BuildReporter::without_journal(tx),
@@ -606,9 +540,6 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(10);
 
         let options = BuildIndexOptions {
-            batch_size: Some(16),
-            manager: None,
-            device: None,
             model_dir: model_dir.clone(),
             index_dir: index_dir.clone(),
             reporter: BuildReporter::without_journal(tx),
@@ -627,44 +558,6 @@ mod tests {
         assert_eq!(build_calls.load(Ordering::Relaxed), 1);
         assert!(index_dir.join("semantic_index.db").exists());
         assert!(!model_dir.join("semantic_index.db").exists());
-    }
-
-    #[tokio::test]
-    async fn test_build_index_missing_options() {
-        let dir = tempdir().unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let options = BuildIndexOptions {
-            batch_size: Some(16),
-            manager: None,
-            device: None,
-            model_dir: dir.path().to_path_buf(),
-            index_dir: dir.path().to_path_buf(),
-            reporter: BuildReporter::without_journal(tx),
-            cancel_flag: Arc::new(AtomicBool::new(false)),
-            documents: Vec::new(),
-            scope: BuildScope::WholeRoot,
-            chunk_size: 100,
-            chunk_overlap: 10,
-            supported_extensions: vec![],
-        };
-
-        let res = build_index(
-            dir.path().to_path_buf(),
-            wilkes_core::types::SelectedEmbedder {
-                engine: wilkes_core::types::EmbeddingEngine::Candle,
-                model: wilkes_core::types::EmbedderModel("m".to_string()),
-                dimension: 384,
-            },
-            options,
-        )
-        .await;
-
-        assert!(res.is_err());
-        assert!(res
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("manager is required"));
     }
 
     #[tokio::test]

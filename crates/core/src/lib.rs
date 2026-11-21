@@ -20,5 +20,6 @@ mod program;
 pub mod search;
 pub mod text_index;
 pub(crate) mod text_projection;
+pub mod token_file;
 pub mod types;
 pub mod worker;

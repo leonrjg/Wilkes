@@ -48,7 +48,8 @@ pub fn consumer_err(error: ConsumerError) -> (StatusCode, Json<ErrorBody>) {
             | ConsumerErrorCode::EmbeddingSpaceStale
             | ConsumerErrorCode::ExtractionRecipeMismatch
             | ConsumerErrorCode::IdempotencyKeyConflict
-            | ConsumerErrorCode::IndexIdentityUnverified,
+            | ConsumerErrorCode::IndexIdentityUnverified
+            | ConsumerErrorCode::ModelNotInstalled,
         ) => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     };

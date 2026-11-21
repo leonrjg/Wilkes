@@ -126,4 +126,6 @@ VOLUME /data
 EXPOSE 2000
 
 USER wilkes
+# Bound to every interface, so the server refuses to start without
+# WILKES_API_TOKEN: it would otherwise answer anyone who reaches the port.
 CMD ["/app/wilkes-server", "--host", "0.0.0.0", "--data-dir", "/data", "--dist-dir", "/app/dist", "--port", "2000"]

@@ -75,6 +75,7 @@ import type {
   SearchLogEntry,
   ExternalMcpStatus,
   HttpApiStatus,
+  RemoteEmbeddingStatus,
   LanFileReceived,
   LanPeer,
   LanSharingStatus,
@@ -277,6 +278,26 @@ export class TauriSearchApi implements SearchApi {
       enabled,
       bindAddress,
       port,
+    });
+  }
+
+  async rotateHttpApiToken(): Promise<HttpApiStatus> {
+    return invoke<HttpApiStatus>("rotate_http_api_token");
+  }
+
+  async getRemoteEmbeddingStatus(): Promise<RemoteEmbeddingStatus> {
+    return invoke<RemoteEmbeddingStatus>("get_remote_embedding_status");
+  }
+
+  async configureRemoteEmbedding(
+    enabled: boolean,
+    address: string,
+    token: string | null,
+  ): Promise<RemoteEmbeddingStatus> {
+    return invoke<RemoteEmbeddingStatus>("configure_remote_embedding", {
+      enabled,
+      address,
+      token,
     });
   }
 

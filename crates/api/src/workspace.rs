@@ -1095,6 +1095,45 @@ impl WorkspaceManager {
         Ok(ctx)
     }
 
+    /// Set where this installation embeds, and the host's token.
+    ///
+    /// `token` replaces the stored one when given — an empty one removes it —
+    /// and `None` leaves it as it is. Every open workspace drops its embedder
+    /// and loads it again from the new place: the setting is the
+    /// installation's, and a workspace still embedding at the old place would
+    /// be the second answer to "where does this run".
+    pub async fn configure_remote_embedding(
+        &self,
+        settings: wilkes_core::types::RemoteEmbeddingSettings,
+        token: Option<String>,
+    ) -> Result<(), String> {
+        let active = self.active();
+        let token_path = active.remote_embedding_token_path();
+        match token.as_deref().map(str::trim) {
+            Some("") => wilkes_core::token_file::remove(&token_path),
+            Some(token) => wilkes_core::token_file::write(&token_path, token),
+            None => Ok(()),
+        }
+        .map_err(|error| format!("Could not store the embedding host's token: {error:#}"))?;
+
+        let before = active.get_settings().await.remote_embedding;
+        // A changed setting reloads the active workspace's embedder as part
+        // of saving it; a token alone changes no setting, so that workspace is
+        // reloaded here instead.
+        active
+            .update_settings(serde_json::json!({ "remote_embedding": settings }))
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        if before == settings {
+            active.embedding_location_changed();
+        }
+        let scoped: Vec<Arc<AppContext>> = self.scoped.lock().values().cloned().collect();
+        for ctx in scoped {
+            ctx.embedding_location_changed();
+        }
+        Ok(())
+    }
+
     /// Shuts down every context this manager owns — the active one and any
     /// opened for other workspaces.
     ///

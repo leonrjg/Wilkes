@@ -339,7 +339,18 @@ async fn start_server(
     })
 }
 
-async fn require_bearer_token(
+/// The cookie a browser carries the HTTP API's token in. A page cannot set an
+/// `Authorization` header on an `EventSource` or an `<img src>`, so the web
+/// interface exchanges the token for this cookie once and the browser sends it
+/// with everything after.
+pub const TOKEN_COOKIE: &str = "wilkes_api_token";
+
+/// Admit a request that carries the current token, as a bearer header or as
+/// [`TOKEN_COOKIE`]; admit every request while no token is set.
+///
+/// Shared by the external MCP listener and the HTTP API, so the two cannot
+/// disagree about what a credential is.
+pub async fn require_bearer_token(
     State(token): State<Arc<RwLock<Option<String>>>>,
     request: Request,
     next: Next,
@@ -348,17 +359,25 @@ async fn require_bearer_token(
         let token = token
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        token.as_ref().map(|token| format!("Bearer {token}"))
+        token.clone()
     };
     let Some(expected) = expected else {
         return Ok(next.run(request).await);
     };
-    let authorized = request
-        .headers()
+    let headers = request.headers();
+    let bearer = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
         .is_some_and(|value| value == expected);
-    if authorized {
+    let cookie = headers
+        .get_all("cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .any(|(name, value)| name == TOKEN_COOKIE && value == expected);
+    if bearer || cookie {
         Ok(next.run(request).await)
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -4183,6 +4202,7 @@ mod tests {
             .unwrap();
         assert_eq!(old.status(), StatusCode::UNAUTHORIZED);
         let current = app
+            .clone()
             .oneshot(
                 Request::get("/")
                     .header("Authorization", "Bearer second-token")
@@ -4192,6 +4212,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(current.status(), StatusCode::OK);
+
+        // The browser's form of the same credential.
+        let cookie = app
+            .clone()
+            .oneshot(
+                Request::get("/")
+                    .header("Cookie", format!("theme=dark; {TOKEN_COOKIE}=second-token"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cookie.status(), StatusCode::OK);
+        let stale_cookie = app
+            .oneshot(
+                Request::get("/")
+                    .header("Cookie", format!("{TOKEN_COOKIE}=first-token"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_cookie.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

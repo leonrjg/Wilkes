@@ -4,6 +4,7 @@ import type {
   ExternalMcpStatus,
   HttpApiStatus,
   LanSharingStatus,
+  RemoteEmbeddingStatus,
   LiteratureProviderInfo,
   Settings,
 } from "../lib/types";
@@ -237,6 +238,14 @@ export default function SettingsModal({
   const [lanSharingStatus, setLanSharingStatus] = useState<LanSharingStatus | null>(null);
   const [lanSharingBusy, setLanSharingBusy] = useState(false);
   const [lanSharingError, setLanSharingError] = useState<string | null>(null);
+  const [remoteEmbeddingStatus, setRemoteEmbeddingStatus] = useState<RemoteEmbeddingStatus | null>(null);
+  const [remoteEmbeddingAddress, setRemoteEmbeddingAddress] = useState("");
+  const [remoteEmbeddingToken, setRemoteEmbeddingToken] = useState("");
+  const [remoteEmbeddingBusy, setRemoteEmbeddingBusy] = useState(false);
+  const [remoteEmbeddingError, setRemoteEmbeddingError] = useState<string | null>(null);
+  // Bumped whenever the place embeddings run changes, so the model list below
+  // is read again from there.
+  const [remoteEmbeddingRevision, setRemoteEmbeddingRevision] = useState(0);
   const customInstructionsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settingsSaveQueue = useRef<Promise<void> | null>(null);
   const darkPagesRevision = useRef(0);
@@ -288,6 +297,15 @@ export default function SettingsModal({
             setLanSharingError(status.error);
           })
           .catch((error) => setLanSharingError(error.toString()));
+      }
+      if (api.getRemoteEmbeddingStatus) {
+        api.getRemoteEmbeddingStatus()
+          .then((status) => {
+            setRemoteEmbeddingStatus(status);
+            setRemoteEmbeddingAddress(status.address);
+            setRemoteEmbeddingError(status.error);
+          })
+          .catch((error) => setRemoteEmbeddingError(error.toString()));
       }
     }
   }, [isOpen, api]);
@@ -530,6 +548,47 @@ export default function SettingsModal({
       setHttpApiError(error.toString());
     } finally {
       setHttpApiBusy(false);
+    }
+  };
+
+  const rotateHttpApiToken = async () => {
+    if (!api.rotateHttpApiToken) return;
+    setHttpApiBusy(true);
+    setHttpApiError(null);
+    try {
+      const status = await api.rotateHttpApiToken();
+      setHttpApiStatus(status);
+      setHttpApiError(status.error);
+    } catch (error: any) {
+      setHttpApiError(error.toString());
+    } finally {
+      setHttpApiBusy(false);
+    }
+  };
+
+  /** `token`: what to store — the typed one by default, `""` to forget the
+   *  stored one, `null` to keep it. */
+  const configureRemoteEmbedding = async (
+    enabled: boolean,
+    token: string | null = remoteEmbeddingToken.trim() === "" ? null : remoteEmbeddingToken.trim(),
+  ) => {
+    if (!api.configureRemoteEmbedding) return;
+    setRemoteEmbeddingBusy(true);
+    setRemoteEmbeddingError(null);
+    try {
+      const status = await api.configureRemoteEmbedding(enabled, remoteEmbeddingAddress.trim(), token);
+      setRemoteEmbeddingStatus(status);
+      setRemoteEmbeddingAddress(status.address);
+      setRemoteEmbeddingToken("");
+      const remote_embedding = { enabled: status.enabled, address: status.address };
+      setSettings((current) => current ? { ...current, remote_embedding } : current);
+      onSettingsUpdate?.({ remote_embedding });
+      setRemoteEmbeddingError(status.error);
+      setRemoteEmbeddingRevision((revision) => revision + 1);
+    } catch (error: any) {
+      setRemoteEmbeddingError(error.toString());
+    } finally {
+      setRemoteEmbeddingBusy(false);
     }
   };
 
@@ -1246,7 +1305,105 @@ export default function SettingsModal({
             </div>
 
             <div className={activeTab === "semantic-models" ? "block min-h-full" : "hidden"}>
+              {isTauri && api.configureRemoteEmbedding && (
+                <section className="mb-4 pb-4 border-b border-[var(--border-main)]">
+                  <div className="flex items-center justify-between mb-2">
+                    <div>
+                      <h3 className="text-[10px] font-medium text-[var(--text-dim)] uppercase tracking-wider">
+                        Where embeddings run
+                      </h3>
+                      <p className="text-[10px] text-[var(--text-dim)] mt-1">
+                        Use another Wilkes&apos;s computer to embed. The library and its index stay here.
+                      </p>
+                    </div>
+                    <span className="text-[10px] font-medium text-[var(--text-dim)]">
+                      {remoteEmbeddingStatus?.enabled ? "On another Wilkes" : "On this computer"}
+                    </span>
+                  </div>
+
+                  <div className="space-y-3">
+                    <label className="flex items-center gap-2.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        aria-label="Embed on another Wilkes"
+                        checked={remoteEmbeddingStatus?.enabled ?? settings?.remote_embedding?.enabled ?? false}
+                        disabled={
+                          remoteEmbeddingBusy
+                          || (!(remoteEmbeddingStatus?.enabled ?? false) && remoteEmbeddingAddress.trim().length === 0)
+                        }
+                        onChange={(event) => void configureRemoteEmbedding(event.target.checked)}
+                        className="w-3.5 h-3.5 accent-[var(--accent-blue)]"
+                      />
+                      <span className="text-xs text-[var(--text-muted)]">Embed on another Wilkes</span>
+                    </label>
+
+                    <div className="grid grid-cols-[minmax(0,3fr)_minmax(0,2fr)_auto] items-end gap-2">
+                      <label className="space-y-1">
+                        <span className="text-xs text-[var(--text-muted)]">Its HTTP API</span>
+                        <input
+                          aria-label="Embedding host address"
+                          type="text"
+                          value={remoteEmbeddingAddress}
+                          disabled={remoteEmbeddingBusy}
+                          spellCheck={false}
+                          onChange={(event) => setRemoteEmbeddingAddress(event.target.value)}
+                          placeholder="http://192.168.1.20:2020"
+                          className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs font-mono text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)]"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-xs text-[var(--text-muted)]">Token</span>
+                        <input
+                          aria-label="Embedding host token"
+                          type="password"
+                          value={remoteEmbeddingToken}
+                          disabled={remoteEmbeddingBusy}
+                          autoComplete="off"
+                          onChange={(event) => setRemoteEmbeddingToken(event.target.value)}
+                          placeholder={remoteEmbeddingStatus?.has_token ? "Stored" : "From its HTTP API settings"}
+                          className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs font-mono text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)]"
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        aria-label="Apply embedding host settings"
+                        disabled={remoteEmbeddingBusy || remoteEmbeddingAddress.trim().length === 0}
+                        onClick={() => void configureRemoteEmbedding(
+                          remoteEmbeddingStatus?.enabled ?? settings?.remote_embedding?.enabled ?? false,
+                        )}
+                        className="px-3 py-1.5 text-xs rounded border border-[var(--border-main)] bg-[var(--bg-active)] hover:bg-[var(--bg-hover)] disabled:opacity-50"
+                      >
+                        Apply
+                      </button>
+                    </div>
+
+                    {remoteEmbeddingStatus?.has_token && (
+                      <button
+                        type="button"
+                        disabled={remoteEmbeddingBusy}
+                        onClick={() => void configureRemoteEmbedding(remoteEmbeddingStatus.enabled, "")}
+                        className="px-2.5 py-1 text-[10px] rounded border border-red-900/50 text-red-400 hover:bg-red-900/20 disabled:opacity-50"
+                      >
+                        Forget token
+                      </button>
+                    )}
+
+                    <p className="text-[10px] text-[var(--text-dim)]">
+                      The other Wilkes serves its HTTP API on an address this computer can reach.
+                      Models download there, not here. While it cannot be reached, semantic search
+                      and indexing stop; nothing moves back to this computer on its own.
+                    </p>
+
+                    {remoteEmbeddingError && (
+                      <div role="alert" className="p-2 bg-red-900/20 border border-red-900/50 rounded text-[10px] text-red-400 break-all">
+                        {remoteEmbeddingError}
+                      </div>
+                    )}
+                  </div>
+                </section>
+              )}
               <SemanticPanel
+                key={remoteEmbeddingRevision}
                 api={api}
                 directory={directory}
                 refreshSemanticReady={refreshSemanticReady}
@@ -1542,14 +1699,37 @@ export default function SettingsModal({
                           >
                             {httpApiStatus.url}
                           </button>
+                          {httpApiStatus.require_token && httpApiStatus.token && (
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => void copyExternalMcpText(httpApiStatus.token!)}
+                                className="px-2.5 py-1 text-[10px] rounded border border-[var(--border-main)] hover:bg-[var(--bg-hover)]"
+                              >
+                                Copy token
+                              </button>
+                              <button
+                                type="button"
+                                disabled={httpApiBusy}
+                                onClick={() => void rotateHttpApiToken()}
+                                className="px-2.5 py-1 text-[10px] rounded border border-red-900/50 text-red-400 hover:bg-red-900/20 disabled:opacity-50"
+                              >
+                                Rotate token
+                              </button>
+                            </div>
+                          )}
                         </div>
                       )}
 
                       {httpApiBindAddress.trim() !== "::1" && !httpApiBindAddress.trim().startsWith("127.") && (
                         <div role="status" className="p-2 bg-[var(--accent-amber-muted)] border border-[var(--accent-amber-border)] rounded text-[10px] text-[var(--accent-amber)]">
-                          A non-loopback address exposes this API without authentication, and it
-                          can write as well as read — anyone who can reach the address can change
-                          settings and rebuild the index. Use host firewall rules to restrict access.
+                          A non-loopback address makes this API reachable from other machines, so
+                          every request must carry its token — including from another Wilkes
+                          embedding here. The API can write as well as read: keep the token
+                          private, and rotate it to cut off every client that has it.
+                          {(httpApiBindAddress.trim() === "0.0.0.0" || httpApiBindAddress.trim() === "::") && (
+                            <> Other machines reach it at this computer&apos;s own address, not the wildcard.</>
+                          )}
                         </div>
                       )}
 

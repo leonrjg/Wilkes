@@ -61,6 +61,20 @@ async fn main() -> anyhow::Result<()> {
 
     ctx.clone().spawn_background_tasks(event_rx, loop_fut);
 
+    // Decided before anything is served: a server that would answer on the
+    // network without a token does not start at all.
+    let addr = format!("{}:{}", config.host, config.port);
+    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&addr).await?.collect();
+    anyhow::ensure!(!resolved.is_empty(), "{addr} resolves to no address");
+    let loopback_only = resolved.iter().all(|socket| socket.ip().is_loopback());
+    let token = wilkes_server::http::auth::token_for_reach(
+        loopback_only,
+        &config.host,
+        config.api_token.clone(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}; set WILKES_API_TOKEN"))?;
+    let requires_token = token.is_some();
+
     let state = Arc::new(AppState {
         ctx: None,
         workspaces: Some(Arc::clone(&workspaces)),
@@ -72,12 +86,19 @@ async fn main() -> anyhow::Result<()> {
 
     // Assets sit behind the API rather than inside it: this is the only shell
     // that has to hand out the web UI, and the desktop app must not.
-    let app = wilkes_server::api_router(state).fallback_service(
-        ServeDir::new(&config.dist_dir).not_found_service(ServeFile::new(index_html)),
-    );
+    let app = wilkes_server::api_router(state, Arc::new(std::sync::RwLock::new(token)))
+        .fallback_service(
+            ServeDir::new(&config.dist_dir).not_found_service(ServeFile::new(index_html)),
+        );
 
-    let addr = format!("{}:{}", config.host, config.port);
-    info!("wilkes-server listening on {addr}");
+    info!(
+        "wilkes-server listening on {addr}{}",
+        if requires_token {
+            " (bearer token required)"
+        } else {
+            ""
+        }
+    );
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(shutdown_workspaces))

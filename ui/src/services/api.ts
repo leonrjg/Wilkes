@@ -66,6 +66,7 @@ import type {
   SearchResultsSummaryInput,
   ExternalMcpStatus,
   HttpApiStatus,
+  RemoteEmbeddingStatus,
   LanFileReceived,
   LanPeer,
   LanSharingStatus,
@@ -220,6 +221,16 @@ export interface SearchApi {
     bindAddress: string,
     port: number,
   ): Promise<HttpApiStatus>;
+  /** Replace the token the HTTP API requires off loopback, revoking the old one. */
+  rotateHttpApiToken?(): Promise<HttpApiStatus>;
+  /** Desktop-only: run embeddings on another Wilkes instance. `token` replaces
+   *  the stored one, `""` removes it, and `null` keeps it. */
+  getRemoteEmbeddingStatus?(): Promise<RemoteEmbeddingStatus>;
+  configureRemoteEmbedding?(
+    enabled: boolean,
+    address: string,
+    token: string | null,
+  ): Promise<RemoteEmbeddingStatus>;
   /** Desktop-only: sending files to other Wilkes instances on the local
    *  network. Off by default; the peer list is empty while it is off. */
   getLanSharingStatus?(): Promise<LanSharingStatus>;

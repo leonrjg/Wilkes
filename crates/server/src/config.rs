@@ -20,6 +20,11 @@ pub struct Config {
     /// settings are any client's to edit, so which programs run is the
     /// operator's to say here and not a setting. Unset allows none.
     pub allowed_programs: Vec<String>,
+    /// The bearer token the API requires, from `WILKES_API_TOKEN`. Required
+    /// when `host` reaches beyond loopback, and not read otherwise. An
+    /// environment variable rather than a flag, so it is not on display in
+    /// the process list.
+    pub api_token: Option<String>,
 }
 
 fn env_or_default(env: &dyn ConfigEnv, key: &str, default: &str) -> String {
@@ -43,6 +48,10 @@ pub fn parse_config_from(args: &[String], env: &dyn ConfigEnv) -> Config {
                 .collect()
         })
         .unwrap_or_default();
+    let api_token = env
+        .var("WILKES_API_TOKEN")
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty());
 
     let mut i = 1;
     while i < args.len() {
@@ -84,6 +93,7 @@ pub fn parse_config_from(args: &[String], env: &dyn ConfigEnv) -> Config {
         data_dir,
         dist_dir,
         allowed_programs,
+        api_token,
     }
 }
 
@@ -122,6 +132,26 @@ mod tests {
         assert_eq!(config.data_dir, PathBuf::from("/data"));
         assert_eq!(config.dist_dir, PathBuf::from("./dist"));
         assert!(config.allowed_programs.is_empty());
+        assert_eq!(config.api_token, None);
+    }
+
+    #[test]
+    fn the_api_token_comes_from_the_environment_only() {
+        let env = TestEnv(std::collections::HashMap::from([(
+            "WILKES_API_TOKEN".to_string(),
+            " secret \n".to_string(),
+        )]));
+        let config = parse_config_from(&["bin".to_string()], &env);
+        assert_eq!(config.api_token.as_deref(), Some("secret"));
+
+        let blank = TestEnv(std::collections::HashMap::from([(
+            "WILKES_API_TOKEN".to_string(),
+            "   ".to_string(),
+        )]));
+        assert_eq!(
+            parse_config_from(&["bin".to_string()], &blank).api_token,
+            None
+        );
     }
 
     #[cfg(unix)]
