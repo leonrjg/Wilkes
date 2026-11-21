@@ -271,11 +271,13 @@ export class TauriSearchApi implements SearchApi {
 
   async configureHttpApi(
     enabled: boolean,
+    requireToken: boolean,
     bindAddress: string,
     port: number,
   ): Promise<HttpApiStatus> {
     return invoke<HttpApiStatus>("configure_http_api", {
       enabled,
+      requireToken,
       bindAddress,
       port,
     });

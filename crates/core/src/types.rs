@@ -2752,6 +2752,11 @@ impl Default for ExternalMcpSettings {
 pub struct HttpApiSettings {
     #[serde(default)]
     pub enabled: bool,
+    /// Ask every request for a bearer token, stored apart from these
+    /// settings. Off by default, as the external MCP server's is: the API is
+    /// unauthenticated unless this is turned on.
+    #[serde(default)]
+    pub require_token: bool,
     #[serde(default = "default_http_api_bind_address")]
     pub bind_address: std::net::IpAddr,
     #[serde(default = "default_http_api_port")]
@@ -2773,6 +2778,7 @@ impl Default for HttpApiSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            require_token: false,
             bind_address: default_http_api_bind_address(),
             port: default_http_api_port(),
         }
@@ -2925,9 +2931,9 @@ pub struct Settings {
     /// and is intentionally never serialized as part of Settings.
     #[serde(default)]
     pub external_mcp: ExternalMcpSettings,
-    /// The read/write HTTP API, off by default. Open on loopback; bound to
-    /// any other address it requires a bearer token, which is stored apart
-    /// from these settings.
+    /// The read/write HTTP API, off by default. Unauthenticated like
+    /// `wilkes-server` itself, which is why it binds loopback by default,
+    /// unless `require_token` asks for a bearer token.
     #[serde(default)]
     pub http_api: HttpApiSettings,
     /// Sending files to other Wilkes instances on the local network.

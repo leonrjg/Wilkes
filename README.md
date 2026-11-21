@@ -35,21 +35,21 @@
 Docker allows you to run software in isolation from your system.
 
 ```shell
-docker run --rm -p 2000:2000 -v wilkes-data:/data \
-  -e WILKES_API_TOKEN="$(openssl rand -hex 32)" ghcr.io/leonrjg/wilkes:latest
-# Now you can visit localhost:2000, and enter the token once when asked
+docker run --rm -p 2000:2000 -v wilkes-data:/data ghcr.io/leonrjg/wilkes:latest
+# Now you can visit localhost:2000
 ```
 
-The container listens on every interface, so the server requires a token: every
-request carries it as `Authorization: Bearer <token>`, and the web interface asks
-for it once. A server bound to `127.0.0.1` needs none.
+The API is unauthenticated: anyone who can reach the port can read and change the
+library. To require a token, set `WILKES_API_TOKEN` (`-e WILKES_API_TOKEN=...`);
+every request then carries it as `Authorization: Bearer <token>`, and the web
+interface asks for it once.
 
 If you want to build locally instead:
 
 ```shell
 git clone https://github.com/leonrjg/Wilkes
 cd Wilkes
-WILKES_API_TOKEN="$(openssl rand -hex 32)" docker compose up
+docker compose up
 # Now you can visit localhost:2000
 ```
 
@@ -59,11 +59,12 @@ computer with a GPU doing the work for a laptop, say. The library, its index and
 reading stay on the laptop; only text goes out and vectors come back.
 
 1. On the computer doing the work, turn on Settings › Servers › HTTP API with a
-   bind address the laptop can reach (`0.0.0.0`, or its LAN or Tailscale address),
-   and copy its token. A `wilkes-server` works too, with `WILKES_API_TOKEN` set.
+   bind address the laptop can reach (`0.0.0.0`, or its LAN or Tailscale address).
+   *Require bearer token* there is optional; with it on, copy the token. A
+   `wilkes-server` works too.
 2. On the laptop, open Settings › Semantic Search › Models, turn on *Embed on another
    Wilkes*, and enter the other computer's address (`http://192.168.1.20:2020`)
-   and token.
+   and, if it requires one, its token.
 
 Models download on the computer doing the work, with progress shown on the laptop.
 An index built either way stays usable after switching back, as long as the model

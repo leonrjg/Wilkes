@@ -1,14 +1,12 @@
 //! Who may call the HTTP API.
 //!
-//! On loopback, anyone on this machine: that is what the API was for, and a
-//! process here can read the library's files directly anyway. On any other
-//! address, only a caller that presents the API's token — as a bearer header,
-//! or, from a browser, as the cookie [`TOKEN_COOKIE`] it was given in exchange
-//! for the token. Whether a token is required is decided by the address the
-//! listener binds, never by where a request comes from: a reverse proxy on the
-//! same machine would otherwise turn every outside request into a local one.
+//! Anyone who can reach it, unless a token is set: the API is unauthenticated
+//! by default, which is why it binds loopback by default, and an operator who
+//! exposes it further restricts it with firewall rules or by setting a token.
+//! With a token set, every route but `/health` and [`login`] requires it — as
+//! a bearer header, or, from a browser, as the cookie [`TOKEN_COOKIE`] it was
+//! given in exchange for the token.
 
-use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 
 use axum::http::{header, HeaderValue, StatusCode};
@@ -25,35 +23,6 @@ pub type ApiToken = Arc<RwLock<Option<String>>>;
 /// A year: the cookie is the token itself, so it lasts until the token is
 /// rotated, which is what invalidates it.
 const COOKIE_MAX_AGE_SECS: u64 = 365 * 24 * 60 * 60;
-
-/// The token a listener bound to `bind` must require.
-///
-/// Loopback needs none, and any token given for it is not required. Any
-/// other address refuses to serve without one: an API that can read and
-/// rewrite the library, open on the network to whoever finds the port, is the
-/// state this exists to rule out.
-pub fn token_for_bind(bind: IpAddr, token: Option<String>) -> anyhow::Result<Option<String>> {
-    token_for_reach(bind.is_loopback(), &bind.to_string(), token)
-}
-
-/// [`token_for_bind`] for a listener whose address is a name, decided by
-/// whether every address the name resolves to is loopback.
-pub fn token_for_reach(
-    loopback_only: bool,
-    bind: &str,
-    token: Option<String>,
-) -> anyhow::Result<Option<String>> {
-    if loopback_only {
-        return Ok(None);
-    }
-    match token.map(|token| token.trim().to_string()) {
-        Some(token) if !token.is_empty() => Ok(Some(token)),
-        _ => anyhow::bail!(
-            "The Wilkes API is bound to {bind}, which is reachable from other machines, and so \
-             requires a bearer token"
-        ),
-    }
-}
 
 #[derive(Deserialize)]
 pub struct LoginBody {
@@ -99,22 +68,6 @@ pub async fn login(token: ApiToken, body: LoginBody) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn loopback_needs_no_token_and_anything_else_does() {
-        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
-        let v6_loopback: IpAddr = "::1".parse().unwrap();
-        let any: IpAddr = "0.0.0.0".parse().unwrap();
-
-        assert_eq!(token_for_bind(loopback, None).unwrap(), None);
-        assert_eq!(token_for_bind(v6_loopback, Some("t".into())).unwrap(), None);
-        assert!(token_for_bind(any, None).is_err());
-        assert!(token_for_bind(any, Some("  ".into())).is_err());
-        assert_eq!(
-            token_for_bind(any, Some(" secret ".into())).unwrap(),
-            Some("secret".to_string())
-        );
-    }
 
     #[tokio::test]
     async fn login_sets_the_cookie_only_for_the_right_token() {

@@ -527,17 +527,19 @@ export default function SettingsModal({
     enabled: boolean,
     bindAddress = httpApiBindAddress,
     port = httpApiPort,
+    requireToken = httpApiStatus?.require_token ?? settings?.http_api?.require_token ?? false,
   ) => {
     if (!api.configureHttpApi) return;
     setHttpApiBusy(true);
     setHttpApiError(null);
     try {
-      const status = await api.configureHttpApi(enabled, bindAddress.trim(), port);
+      const status = await api.configureHttpApi(enabled, requireToken, bindAddress.trim(), port);
       setHttpApiStatus(status);
       setHttpApiBindAddress(status.bind_address);
       setHttpApiPort(status.port);
       const http_api = {
         enabled: status.enabled,
+        require_token: status.require_token,
         bind_address: status.bind_address,
         port: status.port,
       };
@@ -1360,7 +1362,7 @@ export default function SettingsModal({
                           disabled={remoteEmbeddingBusy}
                           autoComplete="off"
                           onChange={(event) => setRemoteEmbeddingToken(event.target.value)}
-                          placeholder={remoteEmbeddingStatus?.has_token ? "Stored" : "From its HTTP API settings"}
+                          placeholder={remoteEmbeddingStatus?.has_token ? "Stored" : "If it requires one"}
                           className="w-full bg-[var(--bg-input)] border border-[var(--border-main)] rounded px-2.5 py-1.5 text-xs font-mono text-[var(--text-main)] focus:outline-none focus:border-[var(--accent-blue)]"
                         />
                       </label>
@@ -1638,6 +1640,25 @@ export default function SettingsModal({
                         </span>
                       </label>
 
+                      <label className="flex items-center gap-2.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          aria-label="Require bearer token for the HTTP API"
+                          checked={httpApiStatus?.require_token ?? settings.http_api?.require_token ?? false}
+                          disabled={httpApiBusy}
+                          onChange={(event) => void configureHttpApi(
+                            httpApiStatus?.enabled ?? settings.http_api?.enabled ?? false,
+                            httpApiBindAddress,
+                            httpApiPort,
+                            event.target.checked,
+                          )}
+                          className="w-3.5 h-3.5 accent-[var(--accent-blue)]"
+                        />
+                        <span className="text-xs text-[var(--text-muted)]">
+                          Require bearer token
+                        </span>
+                      </label>
+
                       <div className="grid grid-cols-[minmax(0,2fr)_minmax(6rem,1fr)_auto] items-end gap-2">
                         <label className="space-y-1">
                           <span className="text-xs text-[var(--text-muted)]">Bind address</span>
@@ -1723,10 +1744,9 @@ export default function SettingsModal({
 
                       {httpApiBindAddress.trim() !== "::1" && !httpApiBindAddress.trim().startsWith("127.") && (
                         <div role="status" className="p-2 bg-[var(--accent-amber-muted)] border border-[var(--accent-amber-border)] rounded text-[10px] text-[var(--accent-amber)]">
-                          A non-loopback address makes this API reachable from other machines, so
-                          every request must carry its token — including from another Wilkes
-                          embedding here. The API can write as well as read: keep the token
-                          private, and rotate it to cut off every client that has it.
+                          {(httpApiStatus?.require_token ?? settings.http_api?.require_token ?? false)
+                            ? "A non-loopback address exposes this API to the network, and it can write as well as read. Keep the bearer token private, and use host firewall rules where appropriate; rotating the token cuts off every client that has it."
+                            : "A non-loopback address exposes this API without authentication, and it can write as well as read — anyone who can reach the address can change settings and rebuild the index. Use host firewall rules to restrict access, or require a bearer token."}
                           {(httpApiBindAddress.trim() === "0.0.0.0" || httpApiBindAddress.trim() === "::") && (
                             <> Other machines reach it at this computer&apos;s own address, not the wildcard.</>
                           )}

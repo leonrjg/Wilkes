@@ -20,10 +20,9 @@ pub struct Config {
     /// settings are any client's to edit, so which programs run is the
     /// operator's to say here and not a setting. Unset allows none.
     pub allowed_programs: Vec<String>,
-    /// The bearer token the API requires, from `WILKES_API_TOKEN`. Required
-    /// when `host` reaches beyond loopback, and not read otherwise. An
-    /// environment variable rather than a flag, so it is not on display in
-    /// the process list.
+    /// The bearer token the API requires, from `WILKES_API_TOKEN`. Unset, the
+    /// API is unauthenticated, as it is by default. An environment variable
+    /// rather than a flag, so it is not on display in the process list.
     pub api_token: Option<String>,
 }
 

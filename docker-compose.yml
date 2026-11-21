@@ -4,9 +4,9 @@ services:
     container_name: wilkes
     environment:
       WILKES_HOST: "0.0.0.0"
-      # Bound beyond loopback, the server answers only callers that present
-      # this token; the web interface asks for it once.
-      WILKES_API_TOKEN: "${WILKES_API_TOKEN:?set WILKES_API_TOKEN to a long random string}"
+      # Unset, the API is open to whoever reaches the port. Set, every request
+      # must carry it, and the web interface asks for it once.
+      WILKES_API_TOKEN: "${WILKES_API_TOKEN:-}"
     ports:
       - "2000:2000"
     volumes:

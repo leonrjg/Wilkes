@@ -3444,16 +3444,13 @@ impl ApiRuntime {
             .clone()
     }
 
-    /// Require `token` from now on, without dropping the listener. A listener
-    /// that requires none — one on loopback — keeps requiring none.
-    pub fn set_token(&self, token: String) {
-        let mut current = self
+    /// Require `token` from now on — or, given `None`, no token — without
+    /// dropping the listener.
+    pub fn set_token(&self, token: Option<String>) {
+        *self
             .token
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if current.is_some() {
-            *current = Some(token);
-        }
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = token;
     }
 
     /// Stops accepting, lets in-flight requests finish, and waits for the
@@ -3472,9 +3469,9 @@ impl ApiRuntime {
 ///
 /// Binding is awaited here rather than inside the spawned task so that "the
 /// port is taken" is returned to the caller as an error instead of surfacing
-/// as a listener that silently never came up. `token` is required off
-/// loopback, and refused there by an error rather than a listener nobody can
-/// trust; see [`auth::token_for_bind`].
+/// as a listener that silently never came up. With `token`, every route but
+/// `/health` and the login requires it; without, the API is open to whoever
+/// can reach `bind_address`.
 pub async fn start_api(
     bind_address: std::net::IpAddr,
     port: u16,
@@ -3482,10 +3479,7 @@ pub async fn start_api(
     token: Option<String>,
 ) -> anyhow::Result<ApiRuntime> {
     anyhow::ensure!(port != 0, "HTTP API port must be between 1 and 65535");
-    let token: ApiToken = Arc::new(std::sync::RwLock::new(auth::token_for_bind(
-        bind_address,
-        token,
-    )?));
+    let token: ApiToken = Arc::new(std::sync::RwLock::new(token));
     let listener = tokio::net::TcpListener::bind((bind_address, port)).await?;
     let addr = listener.local_addr()?;
     let (shutdown, rx) = tokio::sync::oneshot::channel::<()>();
@@ -3636,7 +3630,7 @@ mod tests {
         (dir, state)
     }
 
-    /// Off loopback, every route but the two that cannot need one requires
+    /// With a token set, every route but the two that cannot need one requires
     /// the token, as a header or as the cookie `/api/login` hands out.
     #[tokio::test]
     async fn a_token_gates_every_route_but_health_and_login() {

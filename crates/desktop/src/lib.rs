@@ -802,9 +802,9 @@ struct HttpApiManager {
     /// per request, so toggling the listener must not re-derive which
     /// workspace is current.
     state: Arc<wilkes_server::http::state::AppState>,
-    /// Where the token the API requires off loopback is kept. Created the
-    /// first time the API is bound beyond loopback, and kept across restarts
-    /// so the clients holding it keep working.
+    /// Where the token the API requires, when `require_token` is on, is kept.
+    /// Created the first time it is turned on, and kept across restarts so the
+    /// clients holding it keep working.
     token_path: PathBuf,
     runtime: tokio::sync::Mutex<Option<ManagedHttpApi>>,
     last_error: Mutex<Option<String>>,
@@ -817,8 +817,7 @@ struct HttpApiStatus {
     bind_address: std::net::IpAddr,
     port: u16,
     url: Option<String>,
-    /// Whether the bind address reaches beyond this machine, which is when
-    /// every request must carry `token`.
+    /// Whether every request must carry `token`.
     require_token: bool,
     /// The token the running listener requires, shown so it can be copied to
     /// the machines that call it.
@@ -855,9 +854,24 @@ impl HttpApiManager {
             return Ok(());
         }
 
-        if runtime.as_ref().is_some_and(|managed| {
+        let token = if settings.require_token {
+            match wilkes_core::token_file::load_or_create(&self.token_path) {
+                Ok(token) => Some(token),
+                Err(error) => {
+                    let message = format!("Could not load the HTTP API's token: {error:#}");
+                    error!("{message}");
+                    *self.last_error.lock().unwrap() = Some(message.clone());
+                    return Err(message);
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(managed) = runtime.as_ref().filter(|managed| {
             managed.bind_address == settings.bind_address && managed.port == settings.port
         }) {
+            managed.runtime.set_token(token);
             *self.last_error.lock().unwrap() = None;
             return Ok(());
         }
@@ -881,20 +895,6 @@ impl HttpApiManager {
                 uploads_dir.display()
             );
         }
-
-        let token = if settings.bind_address.is_loopback() {
-            None
-        } else {
-            match wilkes_core::token_file::load_or_create(&self.token_path) {
-                Ok(token) => Some(token),
-                Err(error) => {
-                    let message = format!("Could not load the HTTP API's token: {error:#}");
-                    error!("{message}");
-                    *self.last_error.lock().unwrap() = Some(message.clone());
-                    return Err(message);
-                }
-            }
-        };
 
         match wilkes_server::start_api(
             settings.bind_address,
@@ -934,23 +934,23 @@ impl HttpApiManager {
             bind_address: settings.bind_address,
             port: settings.port,
             url: runtime.as_ref().map(|managed| managed.runtime.url()),
-            require_token: !settings.bind_address.is_loopback(),
+            require_token: settings.require_token,
             token: runtime.as_ref().and_then(|managed| managed.runtime.token()),
             error: self.last_error.lock().unwrap().clone(),
         }
     }
 
-    /// Replace the token, revoking the old one at once. Only meaningful off
-    /// loopback, where a token is required at all.
+    /// Replace the token, revoking the old one at once. Only meaningful with
+    /// `require_token` on, when a token is required at all.
     async fn rotate_token(&self, settings: &HttpApiSettings) -> Result<(), String> {
-        if settings.bind_address.is_loopback() {
-            return Err("The HTTP API requires no token on a loopback address".to_string());
+        if !settings.require_token {
+            return Err("The HTTP API does not require a token".to_string());
         }
         let token = wilkes_core::token_file::generate();
         wilkes_core::token_file::write(&self.token_path, &token)
             .map_err(|error| error.to_string())?;
         if let Some(managed) = self.runtime.lock().await.as_ref() {
-            managed.runtime.set_token(token);
+            managed.runtime.set_token(Some(token));
         }
         Ok(())
     }
@@ -1703,6 +1703,7 @@ async fn configure_external_mcp(
 #[tauri::command]
 async fn configure_http_api(
     enabled: bool,
+    require_token: bool,
     bind_address: String,
     port: u16,
     app: AppHandle,
@@ -1720,6 +1721,7 @@ async fn configure_http_api(
         serde_json::json!({
             "http_api": {
                 "enabled": enabled,
+                "require_token": require_token,
                 "bind_address": bind_address,
                 "port": port,
             }
@@ -3604,47 +3606,55 @@ mod tests {
         assert!(!manager.status(&enabled).await.running);
     }
 
-    /// Bound beyond loopback, the API makes a token, keeps it across
-    /// restarts, refuses requests without it, and can replace it.
+    /// The API is open until a token is asked for. Asked for, it makes one,
+    /// keeps it, refuses requests without it and can replace it — all on the
+    /// listener already running — and turned off again it is open again.
     #[tokio::test]
-    async fn http_api_off_loopback_requires_a_token_it_can_rotate() {
+    async fn http_api_requires_a_token_only_when_asked_and_can_rotate_it() {
         let (_dir, ctx) = test_ctx();
         let token_path = ctx.shared_data_dir.join(HTTP_API_TOKEN_FILENAME);
         let manager = http_api_manager(ctx);
-        let probe = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
-        let settings = HttpApiSettings {
-            enabled: true,
-            bind_address: "0.0.0.0".parse().unwrap(),
-            port,
-        };
-        manager.apply(&settings).await.unwrap();
-        let status = manager.status(&settings).await;
-        assert!(status.running && status.require_token);
-        let token = status.token.expect("a token off loopback");
-        assert_eq!(wilkes_core::token_file::read(&token_path).unwrap(), token);
+        let url = format!("http://127.0.0.1:{port}");
 
-        let local = format!("http://127.0.0.1:{port}");
-        assert_eq!(reqwest_get(&format!("{local}/api/settings")).await, "401");
-        assert_eq!(reqwest_get(&format!("{local}/health")).await, "200");
-
-        manager.rotate_token(&settings).await.unwrap();
-        let rotated = manager.status(&settings).await.token.unwrap();
-        assert_ne!(rotated, token);
-        assert_eq!(wilkes_core::token_file::read(&token_path).unwrap(), rotated);
-
-        // Loopback needs none, shows none, and has none to rotate.
-        let loopback = HttpApiSettings {
+        let open = HttpApiSettings {
             enabled: true,
             port,
             ..HttpApiSettings::default()
         };
-        manager.apply(&loopback).await.unwrap();
-        let status = manager.status(&loopback).await;
-        assert!(!status.require_token);
+        manager.apply(&open).await.unwrap();
+        let status = manager.status(&open).await;
+        assert!(status.running && !status.require_token);
         assert_eq!(status.token, None);
-        assert!(manager.rotate_token(&loopback).await.is_err());
+        assert_eq!(reqwest_get(&format!("{url}/api/settings")).await, "200");
+        assert!(manager.rotate_token(&open).await.is_err());
+        assert!(
+            !token_path.exists(),
+            "no token is made until one is asked for"
+        );
+
+        let guarded = HttpApiSettings {
+            require_token: true,
+            ..open.clone()
+        };
+        manager.apply(&guarded).await.unwrap();
+        let status = manager.status(&guarded).await;
+        assert!(status.running && status.require_token);
+        let token = status.token.expect("a token once required");
+        assert_eq!(wilkes_core::token_file::read(&token_path).unwrap(), token);
+        assert_eq!(reqwest_get(&format!("{url}/api/settings")).await, "401");
+        assert_eq!(reqwest_get(&format!("{url}/health")).await, "200");
+
+        manager.rotate_token(&guarded).await.unwrap();
+        let rotated = manager.status(&guarded).await.token.unwrap();
+        assert_ne!(rotated, token);
+        assert_eq!(wilkes_core::token_file::read(&token_path).unwrap(), rotated);
+
+        manager.apply(&open).await.unwrap();
+        assert_eq!(manager.status(&open).await.token, None);
+        assert_eq!(reqwest_get(&format!("{url}/api/settings")).await, "200");
         manager.stop().await;
     }
 

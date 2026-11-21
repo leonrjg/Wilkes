@@ -61,18 +61,8 @@ async fn main() -> anyhow::Result<()> {
 
     ctx.clone().spawn_background_tasks(event_rx, loop_fut);
 
-    // Decided before anything is served: a server that would answer on the
-    // network without a token does not start at all.
     let addr = format!("{}:{}", config.host, config.port);
-    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&addr).await?.collect();
-    anyhow::ensure!(!resolved.is_empty(), "{addr} resolves to no address");
-    let loopback_only = resolved.iter().all(|socket| socket.ip().is_loopback());
-    let token = wilkes_server::http::auth::token_for_reach(
-        loopback_only,
-        &config.host,
-        config.api_token.clone(),
-    )
-    .map_err(|error| anyhow::anyhow!("{error}; set WILKES_API_TOKEN"))?;
+    let token = config.api_token.clone();
     let requires_token = token.is_some();
 
     let state = Arc::new(AppState {

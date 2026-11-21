@@ -1396,7 +1396,7 @@ export class HttpSourceApi implements WebSourceApi {
 
 /**
  * Whether this browser may call the server: true unless the server requires a
- * token this browser has not presented. A server bound beyond loopback
+ * token this browser has not presented. A server with `WILKES_API_TOKEN` set
  * requires one; it is exchanged once for a cookie the browser then sends with
  * every request, including the ones a page cannot add a header to.
  */

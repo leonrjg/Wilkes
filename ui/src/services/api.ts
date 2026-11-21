@@ -218,10 +218,11 @@ export interface SearchApi {
   getHttpApiStatus?(): Promise<HttpApiStatus>;
   configureHttpApi?(
     enabled: boolean,
+    requireToken: boolean,
     bindAddress: string,
     port: number,
   ): Promise<HttpApiStatus>;
-  /** Replace the token the HTTP API requires off loopback, revoking the old one. */
+  /** Replace the token the HTTP API requires, when it requires one, revoking the old one. */
   rotateHttpApiToken?(): Promise<HttpApiStatus>;
   /** Desktop-only: run embeddings on another Wilkes instance. `token` replaces
    *  the stored one, `""` removes it, and `null` keeps it. */

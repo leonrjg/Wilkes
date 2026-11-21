@@ -11,8 +11,8 @@ type Gate = { kind: "checking" } | { kind: "open" } | { kind: "locked" } | { kin
 
 /**
  * Asks for the server's token before the web interface starts, when the server
- * requires one. A `wilkes-server` reachable from other machines does; one on
- * loopback, and the desktop app, never do.
+ * requires one. A `wilkes-server` does when `WILKES_API_TOKEN` is set; by
+ * default it does not, and the desktop app has no web interface to guard.
  */
 export default function ApiLoginGate({ children }: Props) {
   const [gate, setGate] = useState<Gate>(isTauri ? { kind: "open" } : { kind: "checking" });
@@ -72,8 +72,7 @@ export default function ApiLoginGate({ children }: Props) {
         {gate.kind === "locked" && (
           <form onSubmit={(event) => void submit(event)} className="space-y-3 p-4">
             <p className="text-xs text-[var(--text-muted)]">
-              It is reachable from other machines, so every visitor presents the token set as
-              WILKES_API_TOKEN on the server.
+              Enter the token set as WILKES_API_TOKEN on the server.
             </p>
             <input
               aria-label="API token"

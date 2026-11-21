@@ -1485,6 +1485,9 @@ export interface ExternalMcpStatus extends ExternalMcpSettings {
 
 export interface HttpApiSettings {
   enabled: boolean;
+  /** Ask every request for a bearer token. Off by default: the API is
+   *  unauthenticated unless this is on. */
+  require_token: boolean;
   bind_address: string;
   port: number;
 }
@@ -1492,9 +1495,6 @@ export interface HttpApiSettings {
 export interface HttpApiStatus extends HttpApiSettings {
   running: boolean;
   url: string | null;
-  /** Whether the bind address reaches beyond this machine, which is when every
-   *  request must carry `token`. */
-  require_token: boolean;
   /** The token the running listener requires, for copying to its clients. */
   token: string | null;
   error: string | null;

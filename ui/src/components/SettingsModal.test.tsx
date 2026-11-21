@@ -65,6 +65,9 @@ describe("SettingsModal", () => {
     getExternalMcpStatus: vi.fn(),
     configureExternalMcp: vi.fn(),
     rotateExternalMcpToken: vi.fn(),
+    getHttpApiStatus: vi.fn(),
+    configureHttpApi: vi.fn(),
+    rotateHttpApiToken: vi.fn(),
     getRemoteEmbeddingStatus: vi.fn(() =>
       Promise.resolve({ enabled: false, address: "", has_token: false, error: null }),
     ),
@@ -143,6 +146,16 @@ describe("SettingsModal", () => {
       port: 39217,
       url: "http://127.0.0.1:39217/mcp",
       token: "rotated-token",
+      error: null,
+    });
+    mockApi.getHttpApiStatus.mockResolvedValue({
+      enabled: false,
+      running: false,
+      require_token: false,
+      bind_address: "127.0.0.1",
+      port: 2020,
+      url: null,
+      token: null,
       error: null,
     });
     mockApi.writeClipboard.mockResolvedValue(undefined);
@@ -578,6 +591,38 @@ describe("SettingsModal", () => {
       39217,
     );
     expect(await screen.findByText("http://0.0.0.0:39217/mcp")).toBeInTheDocument();
+  });
+
+  it("serves the HTTP API without a token unless one is asked for", async () => {
+    mockApi.configureHttpApi.mockResolvedValue({
+      enabled: true,
+      running: true,
+      require_token: true,
+      bind_address: "0.0.0.0",
+      port: 2020,
+      url: "http://0.0.0.0:2020",
+      token: "api-token",
+      error: null,
+    });
+    await act(async () => {
+      render(<SettingsModal {...defaultProps} />);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "MCP and HTTP API servers" }));
+    const requireToken = await screen.findByLabelText("Require bearer token for the HTTP API");
+    expect(requireToken).not.toBeChecked();
+
+    fireEvent.change(screen.getByLabelText("HTTP API bind address"), {
+      target: { value: "0.0.0.0" },
+    });
+    expect(screen.getByText(/exposes this API without authentication/)).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(requireToken);
+    });
+    expect(mockApi.configureHttpApi).toHaveBeenCalledWith(false, true, "0.0.0.0", 2020);
+    expect(requireToken).toBeChecked();
+    expect(screen.queryByText(/exposes this API without authentication/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rotate token" })).toBeInTheDocument();
   });
 
   it("copies client setup commands without exposing the token as text", async () => {
