@@ -4,8 +4,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Serialize;
 use wilkes_core::types::{
-    DocumentMetadata, FileListResponse, FileMatches, IntegrationsSettings, LiteratureSearchResult,
-    RelatedDocument, RelatedDocumentsQuery, SearchQuery, SearchStats, SmartCollection,
+    CitationGraph, CitationGraphQuery, DocumentMetadata, FileListResponse, FileMatches,
+    IntegrationsSettings, LiteratureSearchResult, RelatedDocument, RelatedDocumentsQuery,
+    SearchQuery, SearchStats, SmartCollection,
 };
 
 /// How long a search started by an agent may run before it answers with what
@@ -158,6 +159,16 @@ pub trait SearchService: Send + Sync {
         self: Arc<Self>,
         query: RelatedDocumentsQuery,
     ) -> Result<Vec<RelatedDocument>, String>;
+
+    /// The citation graph of a root, or of every library root when
+    /// `query.root` is absent. Backs the `get_citation_graph` MCP tool.
+    async fn citation_graph(
+        self: Arc<Self>,
+        query: CitationGraphQuery,
+    ) -> Result<CitationGraph, String> {
+        let _ = query;
+        Err("Citation graphs are not available in this session.".to_string())
+    }
 
     /// List the documents under `root`, each carrying the same cache-enriched
     /// bibliographic fields (title, author, DOI, publication date, citation

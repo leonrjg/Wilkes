@@ -55,6 +55,8 @@ import type {
   NewSavedWork,
   SavedWork,
   PreviewData,
+  CitationGraph,
+  CitationGraphQuery,
   CitationLinks,
   CitationLinksQuery,
   RelatedDocument,
@@ -194,6 +196,14 @@ export class TauriSearchApi implements SearchApi {
 
   async citationLinks(query: CitationLinksQuery): Promise<CitationLinks> {
     return invoke<CitationLinks>("citation_links", { query });
+  }
+
+  async citationGraph(query: CitationGraphQuery): Promise<CitationGraph> {
+    return invoke<CitationGraph>("citation_graph", { query });
+  }
+
+  async fetchMissingCitations(query: CitationGraphQuery): Promise<number> {
+    return invoke<number>("fetch_missing_citations", { query });
   }
 
   async preview(matchRef: MatchRef): Promise<PreviewData> {

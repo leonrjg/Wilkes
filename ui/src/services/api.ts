@@ -41,6 +41,8 @@ import type {
   MatchRef,
   DocumentMetadata,
   EmbedderCapabilityManifest,
+  CitationGraph,
+  CitationGraphQuery,
   CitationLinks,
   CitationLinksQuery,
   NewBookmark,
@@ -154,6 +156,11 @@ export interface SearchApi {
   cancelSearch(searchId: string): Promise<void>;
   relatedDocuments(query: RelatedDocumentsQuery): Promise<RelatedDocument[]>;
   citationLinks(query: CitationLinksQuery): Promise<CitationLinks>;
+  citationGraph(query: CitationGraphQuery): Promise<CitationGraph>;
+  /** Asks the providers again for references no provider has answered for in
+   *  the scope; resolves to how many documents were queued. Progress arrives
+   *  as file-metadata updates. */
+  fetchMissingCitations(query: CitationGraphQuery): Promise<number>;
   preview(matchRef: MatchRef): Promise<PreviewData>;
   getSettings(): Promise<Settings>;
   updateSettings(patch: Partial<Settings>): Promise<Settings>;

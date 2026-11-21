@@ -13,6 +13,7 @@ import { useSearchStore } from "./useSearchStore";
 import { useSemanticStore } from "./useSemanticStore";
 import { useSettingsStore } from "./useSettingsStore";
 import { useTopicsStore } from "./useTopicsStore";
+import { useCitationsStore } from "./useCitationsStore";
 import { useViewerStore } from "./useViewerStore";
 
 interface WorkspaceStore {
@@ -62,6 +63,7 @@ function clearWorkspaceUi() {
     coverageRoots: [],
   });
   useTopicsStore.getState().resetForWorkspace();
+  useCitationsStore.getState().resetForWorkspace();
   useChatStore.getState().resetForWorkspace();
 }
 

@@ -5,7 +5,8 @@ import type { FileMatches, SearchQuery, SearchStats } from "../lib/types";
 
 export type ResultContext =
   | { kind: "search"; subject: string }
-  | { kind: "topic"; topicKey: string; subject: string | null };
+  | { kind: "topic"; topicKey: string; subject: string | null }
+  | { kind: "citations"; subject: string };
 
 interface SearchStore {
   results: FileMatches[];

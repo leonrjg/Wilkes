@@ -21,7 +21,7 @@ use super::doi::normalize_doi;
 use super::MetadataField;
 use crate::types::{CitationReference, DocumentMetadata, MetadataSourcePreference, ProviderWork};
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 const FIELD_TITLE: &str = MetadataField::Title.as_str();
@@ -227,7 +227,8 @@ impl MetadataCache {
 
         if stored_version != Some(SCHEMA_VERSION) {
             conn.execute_batch(
-                "DROP TABLE IF EXISTS cited_works;
+                "DROP TABLE IF EXISTS citation_fetches;
+                 DROP TABLE IF EXISTS cited_works;
                  DROP TABLE IF EXISTS document_citations;
                  DROP TABLE IF EXISTS file_metadata;
                  DROP TABLE IF EXISTS files;
@@ -276,6 +277,11 @@ impl MetadataCache {
             );
             CREATE INDEX IF NOT EXISTS idx_document_citations_target
                 ON document_citations(target_doi);
+            CREATE TABLE IF NOT EXISTS citation_fetches (
+                source_doi    TEXT PRIMARY KEY,
+                provider      TEXT NOT NULL,
+                fetched_at_ms INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS cited_works (
                 doi     TEXT PRIMARY KEY,
                 title   TEXT,
@@ -996,14 +1002,30 @@ impl MetadataCache {
     /// moment that paper is added. A cited work's fields are keyed by its DOI
     /// alone, since they describe the work and not the edge: the latest
     /// provider answer for that DOI replaces any earlier one.
+    ///
+    /// Records that `provider` answered for `source_doi`, so a work that cites
+    /// nothing is told apart from one whose references were never fetched.
     pub fn replace_citations(
         &self,
         source_doi: &str,
+        provider: &str,
         targets: &[CitationReference],
     ) -> anyhow::Result<usize> {
         let Some(source) = normalize_doi(source_doi) else {
             return Ok(0);
         };
+        let fetched_at_ms = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock is before the Unix epoch")?
+                .as_millis(),
+        )
+        .context("system clock is past the millisecond range")?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO citation_fetches (source_doi, provider, fetched_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![source, provider, fetched_at_ms],
+        )?;
         self.conn.execute(
             "DELETE FROM document_citations WHERE source_doi = ?1 COLLATE NOCASE",
             params![source],
@@ -1088,6 +1110,27 @@ impl MetadataCache {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(references)
+    }
+
+    /// Which of `dois` a provider has answered references for. A DOI that is
+    /// not normalizable is never fetched.
+    pub fn citations_fetched(
+        &self,
+        dois: &[String],
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let mut fetched = std::collections::HashSet::new();
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT 1 FROM citation_fetches WHERE source_doi = ?1")?;
+        for doi in dois {
+            let Some(normalized) = normalize_doi(doi) else {
+                continue;
+            };
+            if stmt.exists(params![normalized])? {
+                fetched.insert(doi.clone());
+            }
+        }
+        Ok(fetched)
     }
 
     fn linked_paths(&self, sql: &str, doi: &str) -> anyhow::Result<Vec<PathBuf>> {
@@ -1184,7 +1227,11 @@ mod tests {
         // A cites B (and a paper not in the library, which is stored but does
         // not resolve to a path).
         cache
-            .replace_citations("10.1/a", &[cited("10.1/b"), cited("10.1/absent")])
+            .replace_citations(
+                "10.1/a",
+                "openalex",
+                &[cited("10.1/b"), cited("10.1/absent")],
+            )
             .unwrap();
 
         let from_a = cache.citation_links("10.1/a").unwrap();
@@ -1269,7 +1316,7 @@ mod tests {
         );
 
         cache
-            .replace_citations("10.1/a", &[cited("10.1/C")])
+            .replace_citations("10.1/a", "openalex", &[cited("10.1/C")])
             .unwrap();
         let stored = cache
             .conn
@@ -1297,7 +1344,7 @@ mod tests {
             .unwrap();
 
         cache
-            .replace_citations("10.1/a", &[cited("10.1/b"), cited("10.1/b")])
+            .replace_citations("10.1/a", "openalex", &[cited("10.1/b"), cited("10.1/b")])
             .unwrap();
         assert_eq!(
             cache.citation_links("10.1/a").unwrap().references,
@@ -1306,13 +1353,25 @@ mod tests {
 
         // Re-running with an empty list clears the edge; a self-edge is ignored.
         cache
-            .replace_citations("10.1/a", &[cited("10.1/a")])
+            .replace_citations("10.1/a", "openalex", &[cited("10.1/a")])
             .unwrap();
         assert!(cache
             .citation_links("10.1/a")
             .unwrap()
             .references
             .is_empty());
+    }
+
+    #[test]
+    fn a_fetch_is_recorded_even_when_the_work_cites_nothing() {
+        let dir = tempdir().unwrap();
+        let cache = MetadataCache::open(dir.path()).unwrap();
+        cache.replace_citations("10.1/A", "openalex", &[]).unwrap();
+        let fetched = cache
+            .citations_fetched(&["10.1/a".into(), "10.1/never".into(), "not a doi".into()])
+            .unwrap();
+        assert_eq!(fetched, ["10.1/a".to_string()].into_iter().collect());
+        assert!(cache.citation_references("10.1/a").unwrap().is_empty());
     }
 
     #[test]
@@ -1327,7 +1386,7 @@ mod tests {
             venue: Some("Scientific Memoirs".into()),
         };
         cache
-            .replace_citations("10.1/a", &[described.clone(), cited("10.1/c")])
+            .replace_citations("10.1/a", "openalex", &[described.clone(), cited("10.1/c")])
             .unwrap();
 
         assert_eq!(
@@ -1347,7 +1406,9 @@ mod tests {
             title: Some("A cited work, revised".into()),
             ..described
         };
-        cache.replace_citations("10.1/z", &[renamed]).unwrap();
+        cache
+            .replace_citations("10.1/z", "openalex", &[renamed])
+            .unwrap();
         assert_eq!(
             cache.citation_references("10.1/a").unwrap()[0]
                 .title

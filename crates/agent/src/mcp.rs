@@ -64,6 +64,7 @@ pub(crate) const WILKES_MCP_TOOL_NAMES: &[&str] = &[
     "get_document_text",
     "get_document_outline",
     "get_related_documents",
+    "get_citation_graph",
     "get_file_metadata",
     "list_documents",
     "search",
@@ -970,6 +971,61 @@ struct ListDocumentsParams {
     workspace: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GetCitationGraphParams {
+    /// Graph location. Use all for the whole library; omit for the current root only.
+    scope: Option<SearchScopeParam>,
+    /// Corpus/library root to read. Omit for the current root. Ignored with scope all.
+    root: Option<String>,
+    /// List an outside work only when at least this many documents cite it (default 2).
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
+    #[schemars(with = "Option<usize>")]
+    min_external_citations: Option<usize>,
+    /// Maximum outside works to return, most cited first (1-200, default 25).
+    #[serde(default, deserialize_with = "deserialize_optional_integer")]
+    #[schemars(with = "Option<usize>")]
+    limit: Option<usize>,
+    /// Workspace id to read, from list_context. Omit for the workspace that is
+    /// active in Wilkes. Naming one does not switch the app to it.
+    workspace: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GetCitationGraphResponse {
+    scope: SearchScopeParamResponse,
+    root: Option<String>,
+    coverage: wilkes_core::types::CitationCoverage,
+    /// Documents in scope with a DOI, most cited within the scope first.
+    documents: Vec<CitationGraphDocumentSummary>,
+    /// `[citing, cited]` pairs of indices into `documents`.
+    edges: Vec<[usize; 2]>,
+    external: Vec<ExternalCitedWorkSummary>,
+    external_total: usize,
+    external_returned: usize,
+    without_doi: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct CitationGraphDocumentSummary {
+    doi: String,
+    title: Option<String>,
+    publication_date: Option<String>,
+    paths: Vec<String>,
+    cited_by_in_scope: usize,
+    cites_in_scope: usize,
+    references_fetched: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ExternalCitedWorkSummary {
+    #[serde(flatten)]
+    reference: wilkes_core::types::CitationReference,
+    cited_by_in_scope: usize,
+    /// Set when the work is in the library, under another root.
+    library_path: Option<String>,
+}
+
 /// The most downloads one `download` call takes.
 const MAX_DOWNLOADS_PER_CALL: usize = 20;
 
@@ -1571,6 +1627,20 @@ impl WilkesMcp {
         Parameters(params): Parameters<GetRelatedDocumentsParams>,
     ) -> CallToolResult {
         match get_related_documents_for_mcp(self, params).await {
+            Ok(response) => structured(response),
+            Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        }
+    }
+
+    #[tool(
+        description = "Read the citation graph of the documents in Wilkes: which documents cite which, by DOI, and which works outside the scope its documents cite most (with title, authors, year and venue), for finding key papers and gaps in a library. Reads the current root of the active workspace unless workspace names another; scope='all' reads that workspace's whole library. coverage says how many documents have a DOI and how many have had their references fetched: a document whose references_fetched is false has unknown, not zero, outgoing citations.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_citation_graph(
+        &self,
+        Parameters(params): Parameters<GetCitationGraphParams>,
+    ) -> CallToolResult {
+        match get_citation_graph_for_mcp(self, params).await {
             Ok(response) => structured(response),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
         }
@@ -2444,6 +2514,110 @@ async fn list_documents_for_mcp(
         },
         documents,
         truncated,
+    })
+}
+
+async fn get_citation_graph_for_mcp(
+    mcp: &WilkesMcp,
+    params: GetCitationGraphParams,
+) -> Result<GetCitationGraphResponse, String> {
+    let limit = params.limit.unwrap_or(25);
+    if !(1..=200).contains(&limit) {
+        return Err("limit must be 1..200".into());
+    }
+    let scope = mcp.scope(params.workspace.as_deref()).await?;
+    let search = scope.require_search("Wilkes citation graphs are not available.")?;
+    let root = match params.scope {
+        Some(SearchScopeParam::All) => None,
+        None => {
+            let root = match params.root.as_ref() {
+                Some(root) if !root.trim().is_empty() => PathBuf::from(root),
+                Some(_) => return Err("Citation graph root cannot be empty.".to_string()),
+                None => mcp.current_root(&scope).await?,
+            };
+            if !is_within_roots(&root, &mcp.library_roots(&scope).await) {
+                return Err(mcp_access_error(&root, &scope));
+            }
+            Some(root)
+        }
+    };
+    let graph = search
+        .citation_graph(wilkes_core::types::CitationGraphQuery {
+            root: root.clone(),
+            min_external_citations: params.min_external_citations.unwrap_or(2),
+        })
+        .await?;
+
+    let mut cites = vec![0usize; graph.documents.len()];
+    for edge in &graph.edges {
+        cites[edge.source] += 1;
+    }
+    let mut order: Vec<usize> = (0..graph.documents.len()).collect();
+    order.sort_by(|&a, &b| {
+        graph.documents[b]
+            .cited_by
+            .len()
+            .cmp(&graph.documents[a].cited_by.len())
+            .then_with(|| graph.documents[a].doi.cmp(&graph.documents[b].doi))
+    });
+    let mut position = vec![0usize; graph.documents.len()];
+    for (new, &old) in order.iter().enumerate() {
+        position[old] = new;
+    }
+    let documents = order
+        .iter()
+        .map(|&index| {
+            let document = &graph.documents[index];
+            let first = &document.entries[0];
+            CitationGraphDocumentSummary {
+                doi: document.doi.clone(),
+                title: first.title.clone(),
+                publication_date: document
+                    .entries
+                    .iter()
+                    .find_map(|entry| entry.publication_date.clone()),
+                paths: document
+                    .entries
+                    .iter()
+                    .map(|entry| entry.path.to_string_lossy().into_owned())
+                    .collect(),
+                cited_by_in_scope: document.cited_by.len(),
+                cites_in_scope: cites[index],
+                references_fetched: document.references_fetched,
+            }
+        })
+        .collect();
+    let edges = graph
+        .edges
+        .iter()
+        .map(|edge| [position[edge.source], position[edge.target]])
+        .collect();
+    let external: Vec<ExternalCitedWorkSummary> = graph
+        .external
+        .into_iter()
+        .take(limit)
+        .map(|work| ExternalCitedWorkSummary {
+            cited_by_in_scope: work.cited_by.len(),
+            library_path: work
+                .library_entry
+                .map(|entry| entry.path.to_string_lossy().into_owned()),
+            reference: work.reference,
+        })
+        .collect();
+    Ok(GetCitationGraphResponse {
+        scope: if root.is_some() {
+            SearchScopeParamResponse::CurrentRoot
+        } else {
+            SearchScopeParamResponse::All
+        },
+        root: root.map(|root| root.to_string_lossy().into_owned()),
+        coverage: graph.coverage,
+        documents,
+        edges,
+        external_returned: external.len(),
+        external,
+        external_total: graph.external_total,
+        without_doi: graph.without_doi.len(),
     })
 }
 

@@ -44,6 +44,8 @@ import type {
   MatchRef,
   DocumentMetadata,
   EmbedderCapabilityManifest,
+  CitationGraph,
+  CitationGraphQuery,
   CitationLinks,
   CitationLinksQuery,
   NewBookmark,
@@ -204,6 +206,27 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw new Error(`citationLinks failed: ${res.status}`);
     return res.json() as Promise<CitationLinks>;
+  }
+
+  async citationGraph(query: CitationGraphQuery): Promise<CitationGraph> {
+    const res = await fetch("/api/citation-graph", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(query),
+    });
+    if (!res.ok) throw await responseError(res, "citationGraph");
+    return res.json() as Promise<CitationGraph>;
+  }
+
+  async fetchMissingCitations(query: CitationGraphQuery): Promise<number> {
+    const res = await fetch("/api/citation-graph/fetch-missing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(query),
+    });
+    if (!res.ok) throw await responseError(res, "fetchMissingCitations");
+    const body = (await res.json()) as { queued: number };
+    return body.queued;
   }
 
   async clusterBookmarks(query: BookmarkClustersQuery): Promise<BookmarkClustersResult> {

@@ -1,12 +1,14 @@
 import { useState, useCallback, useRef, useEffect, type ReactNode } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { BookOpen, Bookmark, Cloud, Cpu, Globe, MessageSquare, Settings as SettingsIcon, ChevronDown, ChevronLeft, ChevronRight, Loader, Plus } from "react-feather";
+import { BookOpen, Bookmark, Cloud, Cpu, Share2, Globe, MessageSquare, Settings as SettingsIcon, ChevronDown, ChevronLeft, ChevronRight, Loader, Plus } from "react-feather";
 import SearchBar from "./components/SearchBar";
 import ResultList from "./components/ResultList";
 import PreviewPane from "./components/PreviewPane";
 import BookmarksPane from "./components/BookmarksPane";
 import ChatPane from "./components/ChatPane";
 import TopicCloudPane from "./components/TopicCloudPane";
+import LibraryCitationsPane from "./components/LibraryCitationsPane";
+import { useCitationsStore } from "./stores/useCitationsStore";
 import DirectoryPicker from "./components/DirectoryPicker";
 import WorkspacePicker from "./components/WorkspacePicker";
 import UploadZone from "./components/UploadZone";
@@ -99,6 +101,9 @@ export default function App() {
   const topicsPaneOpen = useTopicsStore((s) => s.paneOpen);
   const openTopicsPane = useTopicsStore((s) => s.openPane);
   const closeTopicsPane = useTopicsStore((s) => s.closePane);
+  const citationsPaneOpen = useCitationsStore((s) => s.paneOpen);
+  const openCitationsPane = useCitationsStore((s) => s.openPane);
+  const closeCitationsPane = useCitationsStore((s) => s.closePane);
 
   const chatPanesVisible = useChatStore((s) => s.panesVisible);
   const chatPanes = useChatStore((s) => s.panes);
@@ -624,6 +629,25 @@ export default function App() {
           <Cloud size={14} fill={topicsPaneOpen ? "currentColor" : "none"} />
         </button>
       </Tooltip>
+      <Tooltip content="Citations in this folder or library">
+        <button
+          type="button"
+          disabled={!directory}
+          onClick={() => {
+            if (citationsPaneOpen) closeCitationsPane();
+            else openCitationsPane();
+          }}
+          aria-label="Library citations"
+          aria-pressed={citationsPaneOpen}
+          className={`flex h-[32px] w-[32px] items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] transition-all disabled:opacity-40 ${
+            citationsPaneOpen
+              ? "text-[var(--accent-blue)] shadow-inner"
+              : "text-[var(--text-muted)] hover:border-[var(--border-strong)] hover:text-[var(--text-main)]"
+          }`}
+        >
+          <Share2 size={14} />
+        </button>
+      </Tooltip>
       <div className="inline-flex rounded border border-[var(--border-main)] overflow-hidden">
         <Tooltip content="Catalogues & literature">
           <button
@@ -764,6 +788,16 @@ export default function App() {
       minWidth: 260,
       maxWidth: window.innerWidth * 0.55,
       children: <TopicCloudPane />,
+    });
+  }
+  if (citationsPaneOpen) {
+    dockedPanes.push({
+      key: "citations",
+      label: "citations",
+      side: bookmarksDock,
+      minWidth: 280,
+      maxWidth: window.innerWidth * 0.6,
+      children: <LibraryCitationsPane />,
     });
   }
   // Right-dock only, like chat: the left dock is bookmarks' and the pane is a

@@ -47,11 +47,11 @@ use wilkes_core::consumer::{ConsumerError, ConsumerErrorCode};
 use wilkes_core::embed::ChunkRef;
 use wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryInput;
 use wilkes_core::types::{
-    AddOutcome, BookmarkClustersQuery, ChunkTopicsQuery, CitationLinksQuery, CitationResult,
-    CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbeddingEngine, IntegrationStatus,
-    LiteratureSearchResult, MatchRef, NewBookmark, NewSavedWork, NewSmartCollection, NewTag,
-    RelatedDocumentsQuery, SearchLogEntry, SearchQuery, SelectedEmbedder, SmartCollection, Tag,
-    UpdateSmartCollection, UpdateTag,
+    AddOutcome, BookmarkClustersQuery, ChunkTopicsQuery, CitationGraphQuery, CitationLinksQuery,
+    CitationResult, CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbeddingEngine,
+    IntegrationStatus, LiteratureSearchResult, MatchRef, NewBookmark, NewSavedWork,
+    NewSmartCollection, NewTag, RelatedDocumentsQuery, SearchLogEntry, SearchQuery,
+    SelectedEmbedder, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 #[cfg(test)]
 use wilkes_core::worker::manager::WorkerPaths;
@@ -128,6 +128,47 @@ async fn citation_links_handler(
         .await
         .map_err(server_err)?;
     Ok(Json(links))
+}
+
+/// A citation graph is read from the workspace's library roots; a named root
+/// is confined like any other search root.
+async fn confine_citation_graph_query(
+    state: &AppState,
+    query: &mut CitationGraphQuery,
+) -> Result<Arc<AppContext>, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    if let Some(root) = query.root.take() {
+        query.root = Some(
+            crate::http::state::confined_root_for_search(
+                &root.to_string_lossy(),
+                &uploads_dir,
+                &TokioServerFs,
+            )
+            .await?,
+        );
+    }
+    Ok(ctx)
+}
+
+async fn citation_graph_handler(
+    State(state): State<Arc<AppState>>,
+    Json(mut query): Json<CitationGraphQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let ctx = confine_citation_graph_query(&state, &mut query).await?;
+    let graph = ctx.citation_graph(query).await.map_err(server_err)?;
+    Ok(Json(graph))
+}
+
+async fn fetch_missing_citations_handler(
+    State(state): State<Arc<AppState>>,
+    Json(mut query): Json<CitationGraphQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let ctx = confine_citation_graph_query(&state, &mut query).await?;
+    let queued = ctx
+        .fetch_missing_citations(query)
+        .await
+        .map_err(server_err)?;
+    Ok(Json(serde_json::json!({ "queued": queued })))
 }
 
 // ── Preview ───────────────────────────────────────────────────────────────────
@@ -2975,6 +3016,11 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/search", post(search_handler))
         .route("/api/related-documents", post(related_documents_handler))
         .route("/api/citation-links", post(citation_links_handler))
+        .route("/api/citation-graph", post(citation_graph_handler))
+        .route(
+            "/api/citation-graph/fetch-missing",
+            post(fetch_missing_citations_handler),
+        )
         .route("/api/preview", post(preview_handler))
         .route("/api/surrogate", get(surrogate_handler))
         .route("/api/pdf-edit/font", post(resolve_pdf_font_handler))

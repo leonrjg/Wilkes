@@ -1406,6 +1406,22 @@ async fn citation_links(
     app_context(&app).citation_links(query).await
 }
 
+#[tauri::command]
+async fn citation_graph(
+    query: wilkes_core::types::CitationGraphQuery,
+    app: AppHandle,
+) -> Result<wilkes_core::types::CitationGraph, String> {
+    app_context(&app).citation_graph(query).await
+}
+
+#[tauri::command]
+async fn fetch_missing_citations(
+    query: wilkes_core::types::CitationGraphQuery,
+    app: AppHandle,
+) -> Result<usize, String> {
+    app_context(&app).fetch_missing_citations(query).await
+}
+
 // ── Delegating commands ───────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -2756,6 +2772,8 @@ pub fn run() {
             cancel_search,
             related_documents,
             citation_links,
+            citation_graph,
+            fetch_missing_citations,
             preview,
             surrogate_bytes,
             resolve_pdf_font,

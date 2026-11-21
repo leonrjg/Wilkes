@@ -44,16 +44,19 @@ use wilkes_core::integrations::zotero::model::ZoteroItem;
 use wilkes_core::integrations::zotero::ZoteroClient;
 use wilkes_core::integrations::{IntegrationRegistry, LiteratureSource};
 use wilkes_core::metadata::cache::{FileIdentity, MetadataCache, MetadataSource};
+use wilkes_core::metadata::doi::normalize_doi;
 use wilkes_core::models::progress::EmbedProgress;
 use wilkes_core::types::{
     Bookmark, BookmarkCluster, BookmarkClustersQuery, BookmarkClustersResult, ChunkTopic,
-    ChunkTopicMember, ChunkTopicsQuery, ChunkTopicsResult, CitationLinks, CitationLinksQuery,
-    CollectionValidation, DocumentMetadata, DocumentTagUpdate, FileEntry, FileListResponse,
-    FileType, IndexStatus, IndexingConfig, MetadataConflictValue, MetadataSourcePreference,
-    NewBookmark, NewSmartCollection, NewTag, OmittedFileReason, PreviewData, RelatedDocument,
-    RelatedDocumentsQuery, RootCoverage, SearchDocument, SearchLogEntry, SearchMode, SearchQuery,
-    SearchScope, SelectedEmbedder, SemanticSettings, Settings, SmartCollection, Tag,
-    TopicLibraryCoverage, UpdateSmartCollection, UpdateTag,
+    ChunkTopicMember, ChunkTopicsQuery, ChunkTopicsResult, CitationCoverage, CitationGraph,
+    CitationGraphDocument, CitationGraphEdge, CitationGraphQuery, CitationLinks,
+    CitationLinksQuery, CollectionValidation, DocumentMetadata, DocumentTagUpdate,
+    ExternalCitedWork, FileEntry, FileListResponse, FileType, IndexStatus, IndexingConfig,
+    MetadataConflictValue, MetadataSourcePreference, NewBookmark, NewSmartCollection, NewTag,
+    OmittedFileReason, PreviewData, RelatedDocument, RelatedDocumentsQuery, RootCoverage,
+    SearchDocument, SearchLogEntry, SearchMode, SearchQuery, SearchScope, SelectedEmbedder,
+    SemanticSettings, Settings, SmartCollection, Tag, TopicLibraryCoverage, UpdateSmartCollection,
+    UpdateTag,
 };
 use wilkes_core::types::{
     GenerationSettings, GenerationStreamEvent, GenerationTask, GeneratorDescriptor,
@@ -346,6 +349,13 @@ impl wilkes_agent::search::SearchService for AppContext {
 
     async fn list_documents(self: Arc<Self>, root: PathBuf) -> Result<FileListResponse, String> {
         self.list_files(root).await.map_err(|e| e.to_string())
+    }
+
+    async fn citation_graph(
+        self: Arc<Self>,
+        query: CitationGraphQuery,
+    ) -> Result<CitationGraph, String> {
+        AppContext::citation_graph(self, query).await
     }
 
     async fn document_metadata(self: Arc<Self>, path: PathBuf) -> Result<DocumentMetadata, String> {
@@ -5636,7 +5646,9 @@ impl AppContext {
                             match source.references(&doi).await {
                                 Ok(targets) => {
                                     if let Ok(guard) = cache.lock() {
-                                        if let Err(e) = guard.replace_citations(&doi, &targets) {
+                                        if let Err(e) =
+                                            guard.replace_citations(&doi, &provider, &targets)
+                                        {
                                             error!(
                                                 "metadata cache citations {}: {e:#}",
                                                 path.display()
@@ -7846,6 +7858,200 @@ impl AppContext {
         })
     }
 
+    /// The citation graph of every document under `query.root`, or under
+    /// every library root when it is absent. Built from the same DOI-keyed
+    /// edges as [`Self::citation_links`]; documents are listed the way the
+    /// file list lists them, so a node carries the same enriched entry.
+    pub async fn citation_graph(
+        self: Arc<Self>,
+        query: CitationGraphQuery,
+    ) -> Result<CitationGraph, String> {
+        let settings = self.settings().await;
+        let scope = self
+            .citation_scope(&settings, query.root.as_deref())
+            .await?;
+        let cache = self
+            .metadata_cache()
+            .ok_or_else(|| "Metadata cache is unavailable".to_string())?;
+        let guard = cache
+            .lock()
+            .map_err(|_| "Metadata cache lock failed".to_string())?;
+
+        let mut coverage = CitationCoverage {
+            files: scope.files.len(),
+            references_provider: references_provider_enabled(&settings),
+            ..CitationCoverage::default()
+        };
+        let mut index_by_doi: HashMap<String, usize> = HashMap::new();
+        let mut documents: Vec<CitationGraphDocument> = Vec::new();
+        let mut without_doi = Vec::new();
+        for entry in scope.files {
+            if let Some(doi) = entry.doi.as_deref().and_then(normalize_doi) {
+                let index = *index_by_doi.entry(doi.clone()).or_insert_with(|| {
+                    documents.push(CitationGraphDocument {
+                        doi,
+                        entries: Vec::new(),
+                        cited_by: Vec::new(),
+                        references_fetched: false,
+                    });
+                    documents.len() - 1
+                });
+                documents[index].entries.push(entry);
+                continue;
+            }
+            let Some(identity) = FileIdentity::from_entry(&entry) else {
+                coverage.metadata_unavailable += 1;
+                continue;
+            };
+            match guard.get_valid(&entry.path, identity) {
+                Ok(Some(_)) => without_doi.push(entry),
+                Ok(None) => coverage.pending_metadata += 1,
+                Err(e) => return Err(format!("Metadata cache read failed: {e:#}")),
+            }
+        }
+
+        let dois: Vec<String> = documents.iter().map(|d| d.doi.clone()).collect();
+        let fetched = guard.citations_fetched(&dois).map_err(|e| e.to_string())?;
+        let mut edges = Vec::new();
+        let mut external: HashMap<String, ExternalCitedWork> = HashMap::new();
+        for (source, doi) in dois.iter().enumerate() {
+            if !fetched.contains(doi) {
+                continue;
+            }
+            documents[source].references_fetched = true;
+            for reference in guard.citation_references(doi).map_err(|e| e.to_string())? {
+                match index_by_doi.get(&reference.doi) {
+                    Some(&target) => {
+                        edges.push(CitationGraphEdge { source, target });
+                        documents[target].cited_by.push(source);
+                    }
+                    None => external
+                        .entry(reference.doi.clone())
+                        .or_insert_with(|| ExternalCitedWork {
+                            library_entry: scope.library.get(&reference.doi).cloned(),
+                            reference,
+                            cited_by: Vec::new(),
+                        })
+                        .cited_by
+                        .push(source),
+                }
+            }
+        }
+        drop(guard);
+        coverage.with_doi = documents.len();
+        coverage.references_fetched = fetched.len();
+
+        let external_total = external.len();
+        let threshold = query.min_external_citations.max(1);
+        let mut external: Vec<ExternalCitedWork> = external
+            .into_values()
+            .filter(|work| work.cited_by.len() >= threshold)
+            .collect();
+        external.sort_by(|a, b| {
+            b.cited_by
+                .len()
+                .cmp(&a.cited_by.len())
+                .then_with(|| a.reference.doi.cmp(&b.reference.doi))
+        });
+
+        Ok(CitationGraph {
+            documents,
+            edges,
+            external,
+            external_total,
+            without_doi,
+            coverage,
+        })
+    }
+
+    /// Ask the enabled providers again for the references of every document
+    /// in the scope whose references none has answered for. Runs the same
+    /// metadata fill a listing runs, in the background; its progress arrives
+    /// as `file-metadata-updated`. Returns how many documents were queued.
+    pub async fn fetch_missing_citations(
+        self: Arc<Self>,
+        query: CitationGraphQuery,
+    ) -> Result<usize, String> {
+        let settings = self.settings().await;
+        if !references_provider_enabled(&settings) {
+            return Err("No enabled integration fetches references".to_string());
+        }
+        let scope = self
+            .citation_scope(&settings, query.root.as_deref())
+            .await?;
+        let cache = self
+            .metadata_cache()
+            .ok_or_else(|| "Metadata cache is unavailable".to_string())?;
+        // One file per DOI: references are keyed by the work, not the copy.
+        let mut path_by_doi: HashMap<String, PathBuf> = HashMap::new();
+        for entry in scope.files {
+            if let Some(doi) = entry.doi.as_deref().and_then(normalize_doi) {
+                path_by_doi.entry(doi).or_insert(entry.path);
+            }
+        }
+        let dois: Vec<String> = path_by_doi.keys().cloned().collect();
+        let fetched = cache
+            .lock()
+            .map_err(|_| "Metadata cache lock failed".to_string())?
+            .citations_fetched(&dois)
+            .map_err(|e| e.to_string())?;
+        let mut missing: Vec<PathBuf> = path_by_doi
+            .into_iter()
+            .filter(|(doi, _)| !fetched.contains(doi))
+            .map(|(_, path)| path)
+            .collect();
+        missing.sort();
+        let queued = missing.len();
+        if queued > 0 {
+            self.spawn_metadata_fill(missing, settings, cache);
+        }
+        Ok(queued)
+    }
+
+    /// The files a citation graph covers, and every library file by DOI for
+    /// works the scope cites that live in another root. Lists every library
+    /// root, as [`Self::citation_links`] does.
+    async fn citation_scope(
+        &self,
+        settings: &Settings,
+        root: Option<&Path>,
+    ) -> Result<CitationScope, String> {
+        let (library_roots, _) = library_roots(settings);
+        let root = match root {
+            Some(root) => {
+                let root = Self::canonicalize_search_root(root)?;
+                Self::ensure_path_in_library(&root, &library_roots, "Citation graph root")?;
+                Some(root)
+            }
+            None => None,
+        };
+        let mut seen = HashSet::new();
+        let mut files = Vec::new();
+        let mut library: HashMap<String, FileEntry> = HashMap::new();
+        for listing_root in library_roots {
+            let listed = self
+                .list_files(listing_root)
+                .await
+                .map_err(|e| e.to_string())?;
+            for entry in listed.files {
+                if !seen.insert(entry.path.clone()) {
+                    continue;
+                }
+                let in_scope = root
+                    .as_ref()
+                    .is_none_or(|root| entry.path.starts_with(root));
+                if let Some(doi) = entry.doi.as_deref().and_then(normalize_doi) {
+                    library.entry(doi).or_insert_with(|| entry.clone());
+                }
+                if in_scope {
+                    files.push(entry);
+                }
+            }
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(CitationScope { files, library })
+    }
+
     /// One lifecycle and event contract for every user-facing token stream.
     /// Task closures own input preparation, prompts, and verification.
     async fn run_generation_stream<F>(
@@ -9934,6 +10140,18 @@ fn bookmark_embedding_input(bookmark: &Bookmark) -> String {
 enum FillOutcome {
     Extracted(DocumentMetadata),
     Renamed(DocumentMetadata),
+}
+
+struct CitationScope {
+    files: Vec<FileEntry>,
+    library: HashMap<String, FileEntry>,
+}
+
+/// Whether any enabled provider can be asked for a work's references.
+fn references_provider_enabled(settings: &Settings) -> bool {
+    IntegrationRegistry::from_settings(&settings.integrations, None)
+        .literature_sources()
+        .any(|entry| entry.enabled && entry.source().capabilities().references)
 }
 
 /// JSON payload entry for the `file-metadata-updated` event.
@@ -15701,6 +15919,166 @@ exit 0
     }
 
     #[tokio::test]
+    async fn test_citation_graph_joins_a_scope_by_doi_and_says_what_it_covers() {
+        let (dir, ctx) = test_ctx();
+        let library = std::fs::canonicalize(dir.path()).unwrap().join("library");
+        let sub = library.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let a = library.join("a.txt");
+        let a_copy = library.join("a-copy.txt");
+        let b = library.join("b.txt");
+        let no_doi = library.join("no-doi.txt");
+        let d = sub.join("d.txt");
+        for (path, text) in [
+            (&a, "a"),
+            (&a_copy, "a copy"),
+            (&b, "b"),
+            (&no_doi, "none"),
+            (&d, "d"),
+        ] {
+            std::fs::write(path, text).unwrap();
+        }
+
+        let cache = ctx.metadata_cache().expect("cache opens");
+        {
+            let guard = cache.lock().unwrap();
+            for (path, doi) in [
+                (&a, Some("10.1000/A")),
+                (&a_copy, Some("10.1000/a")),
+                (&b, Some("10.1000/b")),
+                (&no_doi, None),
+                (&d, Some("10.1000/d")),
+            ] {
+                guard
+                    .upsert(
+                        path,
+                        FileIdentity::for_path(path).unwrap(),
+                        &DocumentMetadata {
+                            title: Some(path.file_name().unwrap().to_string_lossy().into()),
+                            doi: doi.map(str::to_string),
+                            ..DocumentMetadata::default()
+                        },
+                        wilkes_core::metadata::cache::MetadataSource::File,
+                    )
+                    .unwrap();
+            }
+            let cited = |doi: &str, title: Option<&str>| CitationReference {
+                doi: doi.into(),
+                title: title.map(str::to_string),
+                ..CitationReference::default()
+            };
+            guard
+                .replace_citations(
+                    "10.1000/a",
+                    "openalex",
+                    &[
+                        cited("10.1000/b", None),
+                        cited("10.1000/x", Some("Outside work")),
+                        cited("10.1000/y", None),
+                        cited("10.1000/d", None),
+                    ],
+                )
+                .unwrap();
+            guard
+                .replace_citations(
+                    "10.1000/b",
+                    "openalex",
+                    &[cited("10.1000/x", Some("Outside work"))],
+                )
+                .unwrap();
+        }
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": library }),
+        )
+        .await
+        .unwrap();
+
+        let graph = ctx
+            .clone()
+            .citation_graph(CitationGraphQuery {
+                root: None,
+                min_external_citations: 2,
+            })
+            .await
+            .unwrap();
+        let dois: Vec<&str> = graph.documents.iter().map(|d| d.doi.as_str()).collect();
+        assert_eq!(dois, ["10.1000/a", "10.1000/b", "10.1000/d"]);
+        // Two copies of one paper are one node.
+        assert_eq!(graph.documents[0].entries.len(), 2);
+        let edges: Vec<(usize, usize)> = graph.edges.iter().map(|e| (e.source, e.target)).collect();
+        assert_eq!(edges, [(0, 1), (0, 2)]);
+        assert_eq!(graph.documents[1].cited_by, [0]);
+        // d's references were never fetched: unknown, not none.
+        assert!(graph.documents[0].references_fetched);
+        assert!(!graph.documents[2].references_fetched);
+        // x is cited twice and listed; y once and only counted.
+        assert_eq!(graph.external_total, 2);
+        assert_eq!(graph.external.len(), 1);
+        assert_eq!(graph.external[0].reference.doi, "10.1000/x");
+        assert_eq!(
+            graph.external[0].reference.title.as_deref(),
+            Some("Outside work")
+        );
+        assert_eq!(graph.external[0].cited_by, [0, 1]);
+        assert!(graph.external[0].library_entry.is_none());
+        assert_eq!(
+            graph
+                .without_doi
+                .iter()
+                .map(|e| e.path.clone())
+                .collect::<Vec<_>>(),
+            [no_doi.clone()]
+        );
+        assert_eq!(
+            graph.coverage,
+            CitationCoverage {
+                files: 5,
+                pending_metadata: 0,
+                metadata_unavailable: 0,
+                with_doi: 3,
+                references_fetched: 2,
+                references_provider: graph.coverage.references_provider,
+            }
+        );
+
+        // Scoped to a folder, a work in another folder of the library is
+        // outside the scope but still found in the library.
+        let graph = ctx
+            .clone()
+            .citation_graph(CitationGraphQuery {
+                root: Some(library.clone()),
+                min_external_citations: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(graph.documents.len(), 3);
+        let graph = ctx
+            .clone()
+            .citation_graph(CitationGraphQuery {
+                root: Some(sub.clone()),
+                min_external_citations: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(graph.documents.len(), 1);
+        assert_eq!(graph.documents[0].doi, "10.1000/d");
+        assert!(graph.edges.is_empty());
+        assert!(graph.external.is_empty());
+        assert_eq!(graph.coverage.files, 1);
+
+        // A root outside the library is refused.
+        let outside = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(ctx
+            .citation_graph(CitationGraphQuery {
+                root: Some(outside),
+                min_external_citations: 1,
+            })
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn test_citation_links_resolves_library_edges() {
         let (dir, ctx) = test_ctx();
         let library = std::fs::canonicalize(dir.path()).unwrap().join("library");
@@ -15744,6 +16122,7 @@ exit 0
             guard
                 .replace_citations(
                     "10.1000/source",
+                    "openalex",
                     &[
                         CitationReference {
                             doi: "10.1000/cited".into(),

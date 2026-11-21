@@ -223,6 +223,52 @@ export interface CitationLinks {
   all_references: CitationReference[];
 }
 
+/** Where a citation graph reaches: one root, or the whole library when
+ *  `root` is null. */
+export interface CitationGraphQuery {
+  root: string | null;
+  /** Outside works are listed only when at least this many documents in the
+   *  scope cite them. */
+  min_external_citations: number;
+}
+
+export interface CitationGraphDocument {
+  doi: string;
+  /** Every file in the scope with this DOI; never empty. */
+  entries: FileEntry[];
+  /** Indices into `documents` of the documents in the scope citing it. */
+  cited_by: number[];
+  /** False means its outgoing citations are unknown, not that it has none. */
+  references_fetched: boolean;
+}
+
+export interface ExternalCitedWork {
+  reference: CitationReference;
+  cited_by: number[];
+  /** The file, when the work is in the library outside this scope. */
+  library_entry: FileEntry | null;
+}
+
+export interface CitationCoverage {
+  files: number;
+  pending_metadata: number;
+  metadata_unavailable: number;
+  with_doi: number;
+  references_fetched: number;
+  references_provider: boolean;
+}
+
+/** The citation graph of a root or the library, joined by DOI. */
+export interface CitationGraph {
+  documents: CitationGraphDocument[];
+  /** `source` cites `target`; both index `documents`. */
+  edges: { source: number; target: number }[];
+  external: ExternalCitedWork[];
+  external_total: number;
+  without_doi: FileEntry[];
+  coverage: CitationCoverage;
+}
+
 export interface MatchRef {
   path: string;
   origin: SourceOrigin;
