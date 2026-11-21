@@ -14,6 +14,7 @@ import { useSemanticStore } from "./useSemanticStore";
 import { useSettingsStore } from "./useSettingsStore";
 import { useTopicsStore } from "./useTopicsStore";
 import { useCitationsStore } from "./useCitationsStore";
+import { useReadingOrderStore } from "./useReadingOrderStore";
 import { useViewerStore } from "./useViewerStore";
 
 interface WorkspaceStore {
@@ -64,6 +65,7 @@ function clearWorkspaceUi() {
   });
   useTopicsStore.getState().resetForWorkspace();
   useCitationsStore.getState().resetForWorkspace();
+  useReadingOrderStore.getState().resetForWorkspace();
   useChatStore.getState().resetForWorkspace();
 }
 

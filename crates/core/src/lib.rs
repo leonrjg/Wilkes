@@ -17,6 +17,7 @@ pub mod network;
 pub mod path;
 pub mod pdf_edit;
 mod program;
+pub mod reading_order;
 pub mod search;
 pub mod text_index;
 pub(crate) mod text_projection;

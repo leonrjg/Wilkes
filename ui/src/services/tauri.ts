@@ -58,6 +58,8 @@ import type {
   PreviewData,
   CitationGraph,
   CitationGraphQuery,
+  ReadingOrder,
+  ReadingOrderQuery,
   CitationLinks,
   CitationLinksQuery,
   RelatedDocument,
@@ -203,6 +205,10 @@ export class TauriSearchApi implements SearchApi {
 
   async citationGraph(query: CitationGraphQuery): Promise<CitationGraph> {
     return invoke<CitationGraph>("citation_graph", { query });
+  }
+
+  async readingOrder(query: ReadingOrderQuery): Promise<ReadingOrder> {
+    return invoke<ReadingOrder>("reading_order", { query });
   }
 
   async fetchMissingCitations(query: CitationGraphQuery): Promise<number> {

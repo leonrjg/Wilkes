@@ -16,6 +16,7 @@ import { useGenerationStore } from "../stores/useGenerationStore";
 import { useChatStore } from "../stores/useChatStore";
 import { useTopicsStore } from "../stores/useTopicsStore";
 import { useCatalogueStore } from "../stores/useCatalogueStore";
+import { useReadingOrderStore } from "../stores/useReadingOrderStore";
 import type { FileEntry, GenerationStreamEvent, LiteratureProviderInfo } from "../lib/types";
 
 const {
@@ -34,6 +35,7 @@ const {
   mockOnGenerationStream,
   mockOpenChatPaneAndSend,
   mockCoversVisible,
+  mockReadingOrder,
 } = vi.hoisted(() => ({
   mockOpenPath: vi.fn(),
   mockRevealPath: vi.fn(),
@@ -50,6 +52,7 @@ const {
   mockOnGenerationStream: vi.fn(),
   mockOpenChatPaneAndSend: vi.fn().mockResolvedValue(undefined),
   mockCoversVisible: { value: false },
+  mockReadingOrder: vi.fn(),
 }));
 
 vi.mock("../lib/covers", () => ({
@@ -72,6 +75,7 @@ vi.mock("../services", () => ({
     updateSettings: mockUpdateSettings,
     summarizeSearchResults: mockSummarizeSearchResults,
     onGenerationStream: mockOnGenerationStream,
+    readingOrder: mockReadingOrder,
   },
   source: {
     type: "desktop",
@@ -174,6 +178,7 @@ describe("ResultList", () => {
       openPaneAndSend: mockOpenChatPaneAndSend,
     });
     useTopicsStore.setState({ selectedTopicKey: null });
+    useReadingOrderStore.getState().resetForWorkspace();
   });
 
   it("renders empty state when no query", () => {
@@ -556,6 +561,83 @@ describe("ResultList", () => {
     expect(
       alpha.compareDocumentPosition(gamma) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+  });
+
+  it("lists a folder in the reading order the backend gives, and says why", async () => {
+    const file = (name: string, title: string): FileEntry => ({
+      path: `/test/${name}.txt`,
+      size_bytes: 10,
+      file_type: "PlainText",
+      extension: "txt",
+      title,
+      created_at_ms: 1,
+      modified_at_ms: 1,
+    });
+    mockReadingOrder.mockResolvedValue({
+      root: "/test",
+      theme: null,
+      subjects: [{ name: "algebra", documents: 2 }],
+      documents: [
+        { path: "/test/zeta.txt", placement: "foundation", subjects: ["algebra"], after: [], needed_by: 1, theme_share: null },
+        {
+          path: "/test/alpha.txt",
+          placement: "specialised",
+          subjects: ["calculus"],
+          after: [{ path: "/test/zeta.txt", reasons: [{ kind: "names", subjects: ["algebra"] }] }],
+          needed_by: 0,
+          theme_share: null,
+        },
+        { path: "/test/mid.txt", placement: "standalone", subjects: ["topology"], after: [], needed_by: 0, theme_share: null },
+        { path: "/test/beta.txt", placement: "no_text", subjects: [], after: [], needed_by: 0, theme_share: null },
+      ],
+    });
+    const files = [
+      file("alpha", "Calculus"),
+      file("beta", "Scanned"),
+      file("mid", "Topology"),
+      file("zeta", "Algebra"),
+    ];
+    // The list may be fetched again while the order is awaited.
+    mockListFiles.mockResolvedValue({ files, omitted: [] });
+    useSettingsStore.setState({
+      directory: "/test",
+      fileSortKey: "reading_order",
+      fileList: files,
+    });
+
+    renderWithToasts();
+
+    await waitFor(() =>
+      expect(mockReadingOrder).toHaveBeenCalledWith({ root: "/test", theme: null }),
+    );
+    expect(await screen.findByText("2 in order · 1 at any time · 1 not placed")).toBeInTheDocument();
+    const rows = ["zeta", "alpha", "mid", "beta"].map((name) =>
+      screen.getByRole("button", { name: new RegExp(`${name}\\.txt`, "i") }),
+    );
+    for (let at = 1; at < rows.length; at += 1) {
+      expect(
+        rows[at - 1].compareDocumentPosition(rows[at]) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    }
+    expect(within(rows[0]).getByText("Foundation · 1 builds on it")).toBeInTheDocument();
+    // What it builds on is named by its title.
+    expect(within(rows[1]).getByText("Specialised · after Algebra")).toBeInTheDocument();
+    expect(within(rows[3]).getByText("Not placed · text not read")).toBeInTheDocument();
+    // The parts that have no order are set apart.
+    expect(screen.getByRole("heading", { name: "Read at any time" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Not placed" })).toBeInTheDocument();
+  });
+
+  it("offers reading order as a sort with no column of its own", () => {
+    renderWithToasts();
+    fireEvent.click(screen.getByRole("button", { name: "Sort and column visibility" }));
+    const menu = screen.getByRole("menu", { name: "Sort and column visibility" });
+
+    expect(within(menu).getByRole("checkbox", { name: "Show Reading order column" })).toBeDisabled();
+    // Any other sort leaves the backend alone.
+    expect(mockReadingOrder).not.toHaveBeenCalled();
+    fireEvent.click(within(menu).getByText("Reading order"));
+    expect(mockUpdateSettings).toHaveBeenCalledWith({ file_sort_key: "reading_order" });
   });
 
   it("toggles a metadata column's visibility via checkbox without changing the sort", () => {

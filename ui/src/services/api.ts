@@ -44,6 +44,8 @@ import type {
   EmbedderCapabilityManifest,
   CitationGraph,
   CitationGraphQuery,
+  ReadingOrder,
+  ReadingOrderQuery,
   CitationLinks,
   CitationLinksQuery,
   NewBookmark,
@@ -160,6 +162,8 @@ export interface SearchApi {
   relatedDocuments(query: RelatedDocumentsQuery): Promise<RelatedDocument[]>;
   citationLinks(query: CitationLinksQuery): Promise<CitationLinks>;
   citationGraph(query: CitationGraphQuery): Promise<CitationGraph>;
+  /** A folder's documents in the order they build on one another. */
+  readingOrder(query: ReadingOrderQuery): Promise<ReadingOrder>;
   /** Asks the providers again for references no provider has answered for in
    *  the scope; resolves to how many documents were queued. Progress arrives
    *  as file-metadata updates. */

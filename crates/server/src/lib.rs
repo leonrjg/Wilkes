@@ -52,8 +52,8 @@ use wilkes_core::types::{
     AddOutcome, BookmarkClustersQuery, ChunkTopicsQuery, CitationGraphQuery, CitationLinksQuery,
     CitationResult, CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbeddingEngine,
     IntegrationStatus, LiteratureSearchResult, MatchRef, NewBookmark, NewSavedWork,
-    NewSmartCollection, NewTag, RelatedDocumentsQuery, SearchLogEntry, SearchQuery,
-    SelectedEmbedder, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
+    NewSmartCollection, NewTag, ReadingOrderQuery, RelatedDocumentsQuery, SearchLogEntry,
+    SearchQuery, SelectedEmbedder, SmartCollection, Tag, UpdateSmartCollection, UpdateTag,
 };
 #[cfg(test)]
 use wilkes_core::worker::manager::WorkerPaths;
@@ -130,6 +130,23 @@ async fn citation_links_handler(
         .await
         .map_err(server_err)?;
     Ok(Json(links))
+}
+
+/// A reading order is of one library folder, confined like any other search
+/// root.
+async fn reading_order_handler(
+    State(state): State<Arc<AppState>>,
+    Json(mut query): Json<ReadingOrderQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    query.root = crate::http::state::confined_root_for_search(
+        &query.root.to_string_lossy(),
+        &uploads_dir,
+        &TokioServerFs,
+    )
+    .await?;
+    let order = ctx.reading_order(query).await.map_err(server_err)?;
+    Ok(Json(order))
 }
 
 /// A citation graph is read from the workspace's library roots; a named root
@@ -3098,6 +3115,7 @@ pub fn api_router(state: Arc<AppState>, token: ApiToken) -> Router {
         .route("/api/search", post(search_handler))
         .route("/api/related-documents", post(related_documents_handler))
         .route("/api/citation-links", post(citation_links_handler))
+        .route("/api/reading-order", post(reading_order_handler))
         .route("/api/citation-graph", post(citation_graph_handler))
         .route(
             "/api/citation-graph/fetch-missing",

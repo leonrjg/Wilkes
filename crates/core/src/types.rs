@@ -334,6 +334,100 @@ pub struct TidyPlacement {
     pub score: f32,
 }
 
+/// Which folder to put in reading order, and optionally a theme to rank its
+/// documents by instead.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadingOrderQuery {
+    /// A library root or a folder beneath one.
+    pub root: PathBuf,
+    /// One to four words. When given, every document with text also says how
+    /// much of it discusses the theme.
+    #[serde(default)]
+    pub theme: Option<String>,
+}
+
+/// The documents of a folder in the order they build on one another, as
+/// [`crate::reading_order`] reads it off their text.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadingOrder {
+    pub root: PathBuf,
+    /// Every document of the folder: first to last, then the ones to read at
+    /// any time, then the ones that could not be placed.
+    pub documents: Vec<ReadingOrderDocument>,
+    /// The subjects the folder's documents are named by, with how many of
+    /// them have or name each, most first.
+    pub subjects: Vec<ReadingOrderSubject>,
+    /// The theme as it was read, when one was asked for.
+    #[serde(default)]
+    pub theme: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadingOrderDocument {
+    pub path: PathBuf,
+    pub placement: ReadingPlacement,
+    /// The subjects its title, file name and folders name it by and its own
+    /// text uses.
+    pub subjects: Vec<String>,
+    /// The documents it builds on, earliest in the order first.
+    pub after: Vec<ReadingOrderLink>,
+    /// How many documents of the folder build on it.
+    pub needed_by: usize,
+    /// The share of its passages that use the theme. `None` without a theme,
+    /// and for a document with no text.
+    #[serde(default)]
+    pub theme_share: Option<f32>,
+}
+
+/// Where a document stands among the others of its folder.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadingPlacement {
+    /// Others build on it and it builds on none of them.
+    Foundation,
+    /// It builds on some and others build on it.
+    Bridge,
+    /// It builds on others and none builds on it.
+    Specialised,
+    /// It has a subject, and nothing ties it to another document: read it at
+    /// any time.
+    Standalone,
+    /// Not placed: its title and folders name nothing its text uses, and it
+    /// names no other document's subject.
+    NoSubject,
+    /// Not placed: its text has not been read, or it has none.
+    NoText,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadingOrderLink {
+    pub path: PathBuf,
+    /// Never empty.
+    pub reasons: Vec<ReadingOrderReason>,
+}
+
+/// Why a document comes after another.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReadingOrderReason {
+    /// Its text names these subjects of the other.
+    Names { subjects: Vec<String> },
+    /// Same subject, and its title or folder puts it at a higher level.
+    Level,
+    /// Same subject, and it is a later volume.
+    Volume,
+    /// Its subject is a narrower case of the other's.
+    Narrower,
+    /// It cites the other.
+    Cites,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReadingOrderSubject {
+    pub name: String,
+    pub documents: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CitationLinksQuery {
     pub root: PathBuf,
@@ -3202,6 +3296,9 @@ pub enum FileSortKey {
     Size,
     Publication,
     Citations,
+    /// The order [`crate::reading_order`] gives the listed folder. Not a
+    /// field of a file: the list asks for it.
+    ReadingOrder,
 }
 
 /// Optional document-metadata field that can be shown as a column in the file

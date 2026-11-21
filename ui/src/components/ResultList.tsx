@@ -9,6 +9,7 @@ import {
   CheckSquare,
   ChevronDown,
   Clock,
+  Compass,
   File,
   FileText,
   Folder,
@@ -35,6 +36,16 @@ import { isPagedPath } from "../lib/documentFormats";
 import { useGenerationStore } from "../stores/useGenerationStore";
 import { useTopicsStore } from "../stores/useTopicsStore";
 import { useTidyStore } from "../stores/useTidyStore";
+import { useReadingOrderStore } from "../stores/useReadingOrderStore";
+import ReadingOrderStrip from "./ReadingOrderStrip";
+import {
+  READING_GROUP_LABELS,
+  describeReadingPlacement,
+  indexReadingOrder,
+  readingGroup,
+  sortByReadingOrder,
+  type ReadingOrderIndex,
+} from "../lib/readingOrder";
 import { FileScopeControls } from "./FileScopeControls";
 import { MetadataField } from "../lib/types";
 import type {
@@ -193,7 +204,9 @@ const FILE_DETAIL_ICONS: Record<FileDisplayField, DetailIcon> = {
   size: HardDrive,
 };
 
-const SORT_KEYS: FileSortKey[] = ["filename", "title", "author", "created", "modified", "publication", "citations", "size"];
+const SORT_KEYS: FileSortKey[] = ["filename", "title", "author", "created", "modified", "publication", "citations", "size", "reading_order"];
+/** Sort keys that are not a column of the list, so have none to show or hide. */
+const COLUMNLESS_SORT_KEYS: FileSortKey[] = ["filename", "reading_order"];
 const SORT_KEY_LABELS: Record<FileSortKey, string> = {
   filename: "Name",
   title: "Title",
@@ -203,6 +216,7 @@ const SORT_KEY_LABELS: Record<FileSortKey, string> = {
   publication: "Publication date",
   citations: "Citations",
   size: "Size",
+  reading_order: "Reading order",
 };
 
 const FIELD_MATCH_LABELS: Record<SearchField, string> = {
@@ -335,7 +349,18 @@ function sortFileEntries<T extends FileEntry>(
   entries: T[],
   key: FileSortKey,
   direction: FileSortDirection,
+  /** The folder's reading order, when the list has it. Until it arrives the
+   *  files are listed by name. */
+  reading: ReadingOrderIndex | null = null,
 ): T[] {
+  if (key === "reading_order") {
+    return sortByReadingOrder(
+      entries,
+      reading,
+      direction,
+      (a, b) => compareFileNames(a, b) || a.localeCompare(b),
+    );
+  }
   return [...entries].sort((a, b) => {
     let result = 0;
     if (key === "filename") {
@@ -507,11 +532,69 @@ export default function ResultList({
 
   const displayedFileList = documents ?? fileList;
   const displayedOmittedFileList = documents ? [] : omittedFileList;
+
+  // Reading order is the backend's to work out: the list asks for it when it
+  // is sorted that way, and again when the folder's files change.
+  const readingOrderActive = !documents && fileSortKey === "reading_order" && !!directory;
+  const readingOrder = useReadingOrderStore((s) => s.order);
+  const loadReadingOrder = useReadingOrderStore((s) => s.load);
+  const readingListing = React.useMemo(
+    () => readingOrderActive
+      ? fileList
+        .map((entry) => `${entry.path}|${entry.modified_at_ms}|${entry.size_bytes}|${entry.title ?? ""}`)
+        .join("\n")
+      : "",
+    [fileList, readingOrderActive],
+  );
+  useEffect(() => {
+    if (readingOrderActive && directory) void loadReadingOrder(directory, readingListing);
+  }, [directory, loadReadingOrder, readingListing, readingOrderActive]);
+  const readingIndex = React.useMemo(
+    () => readingOrderActive && readingOrder && pathsEqual(readingOrder.root, directory)
+      ? indexReadingOrder(readingOrder)
+      : null,
+    [directory, readingOrder, readingOrderActive],
+  );
+  const readingNames = React.useMemo(
+    () => new Map(fileList.map((entry) => [entry.path, normalizedDetailValue(entry.title) ?? fileName(entry.path)])),
+    [fileList],
+  );
+  const readingDetails = (entry: FileEntry): DocumentDetail[] => {
+    const placed = readingIndex?.byPath.get(entry.path);
+    if (!placed) return [];
+    const { value, title } = describeReadingPlacement(
+      placed.document,
+      (path) => readingNames.get(path) ?? fileName(path),
+      readingIndex?.theme ?? null,
+    );
+    return [{
+      key: "reading_order",
+      label: "Reading order",
+      value,
+      valueTitle: title,
+      icon: Compass,
+      fullWidth: true,
+      monospace: false,
+    }];
+  };
+  /** The part of the order a row opens, when it is not the ordered part: what
+   *  a flat list puts a heading over. */
+  const readingHeading = (entries: FileEntry[], at: number): string | null => {
+    if (!readingIndex || readingIndex.theme) return null;
+    const group = (entry: FileEntry | undefined) => {
+      const placed = entry && readingIndex.byPath.get(entry.path);
+      return placed ? readingGroup(placed.document.placement) : null;
+    };
+    const own = group(entries[at]);
+    if (!own || own === "ordered" || own === group(entries[at - 1])) return null;
+    return READING_GROUP_LABELS[own];
+  };
+
   const sortedFileList = React.useMemo(
     () => preserveDocumentOrder
       ? displayedFileList
-      : sortFileEntries(displayedFileList, fileSortKey, fileSortDirection),
-    [displayedFileList, fileSortDirection, fileSortKey, preserveDocumentOrder],
+      : sortFileEntries(displayedFileList, fileSortKey, fileSortDirection, readingIndex),
+    [displayedFileList, fileSortDirection, fileSortKey, preserveDocumentOrder, readingIndex],
   );
   const sortedOmittedFileList = React.useMemo(
     () => sortFileEntries(displayedOmittedFileList, fileSortKey, fileSortDirection),
@@ -742,6 +825,7 @@ export default function ResultList({
             </button>
           </Tooltip>
         </div>
+        {readingOrderActive && <ReadingOrderStrip />}
         {selectionMode && (
           <BulkActionsBar
             selected={filteredVisibleFiles
@@ -771,7 +855,7 @@ export default function ResultList({
               renderFile={(entry, drag) => (
                 <FileEntryRowAdapter
                   entry={entry}
-                  leadingDetails={documentDetails?.(entry) ?? []}
+                  leadingDetails={[...(documentDetails?.(entry) ?? []), ...readingDetails(entry)]}
                   accessory={documentAccessory?.(entry)}
                   displayFields={fileDisplayFields}
                   additionalRoots={additionalRootsForPath(entry.path)}
@@ -789,11 +873,20 @@ export default function ResultList({
                 />
               )}
             />
-          ) : filteredVisibleFiles.map((entry) => (
+          ) : filteredVisibleFiles.map((entry, at) => (
+            <React.Fragment key={entry.path}>
+              {readingHeading(filteredVisibleFiles, at) && (
+                <div
+                  role="heading"
+                  aria-level={3}
+                  className="mt-2 border-t border-[var(--border-main)] px-3 pb-0.5 pt-2 text-[10px] uppercase tracking-wider text-[var(--text-dim)]"
+                >
+                  {readingHeading(filteredVisibleFiles, at)}
+                </div>
+              )}
               <FileEntryRowAdapter
-                key={entry.path}
                 entry={entry}
-                leadingDetails={documentDetails?.(entry) ?? []}
+                leadingDetails={[...(documentDetails?.(entry) ?? []), ...readingDetails(entry)]}
                 accessory={documentAccessory?.(entry)}
                 displayFields={fileDisplayFields}
                 additionalRoots={additionalRootsForPath(entry.path)}
@@ -808,6 +901,7 @@ export default function ResultList({
                     open: () => onFileClick(entry.path),
                   })}
               />
+            </React.Fragment>
             ))}
           {filteredVisibleFiles.length === 0 && sortedFileList.length > 0 && (
             <div className="px-3 py-8 text-center text-xs text-[var(--text-dim)] italic">
@@ -1293,7 +1387,7 @@ function SortVisibilityMenu({
       }}
     >
       {SORT_KEYS.map((key) => {
-        const isFilename = key === "filename";
+        const isFilename = COLUMNLESS_SORT_KEYS.includes(key);
         const checked = isFilename || displayFields.includes(key as FileDisplayField);
         return (
           <div

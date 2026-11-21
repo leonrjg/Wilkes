@@ -1397,6 +1397,14 @@ async fn tidy_folder(
 }
 
 #[tauri::command]
+async fn reading_order(
+    query: wilkes_core::types::ReadingOrderQuery,
+    app: AppHandle,
+) -> Result<wilkes_core::types::ReadingOrder, String> {
+    app_context(&app).reading_order(query).await
+}
+
+#[tauri::command]
 async fn citation_links(
     query: wilkes_core::types::CitationLinksQuery,
     app: AppHandle,
@@ -2846,6 +2854,7 @@ pub fn run() {
             cancel_search,
             related_documents,
             tidy_folder,
+            reading_order,
             citation_links,
             citation_graph,
             fetch_missing_citations,

@@ -47,6 +47,8 @@ import type {
   EmbedderCapabilityManifest,
   CitationGraph,
   CitationGraphQuery,
+  ReadingOrder,
+  ReadingOrderQuery,
   CitationLinks,
   CitationLinksQuery,
   NewBookmark,
@@ -217,6 +219,16 @@ export class HttpSearchApi implements SearchApi {
     });
     if (!res.ok) throw await responseError(res, "citationGraph");
     return res.json() as Promise<CitationGraph>;
+  }
+
+  async readingOrder(query: ReadingOrderQuery): Promise<ReadingOrder> {
+    const res = await fetch("/api/reading-order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(query),
+    });
+    if (!res.ok) throw await responseError(res, "readingOrder");
+    return res.json() as Promise<ReadingOrder>;
   }
 
   async fetchMissingCitations(query: CitationGraphQuery): Promise<number> {

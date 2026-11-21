@@ -56,11 +56,12 @@ use wilkes_core::types::{
     CitationLinksQuery, CollectionValidation, DocumentMetadata, DocumentTagUpdate, EmbeddingEngine,
     ExternalCitedWork, FileEntry, FileListResponse, FileType, IndexStatus, IndexingConfig,
     MetadataConflictValue, MetadataSourcePreference, NewBookmark, NewSmartCollection, NewTag,
-    OmittedFileReason, PreviewData, RelatedDocument, RelatedDocumentsQuery,
-    RemoteEmbeddingSettings, RootCoverage, SearchDocument, SearchLogEntry, SearchMode, SearchQuery,
-    SearchScope, SelectedEmbedder, SemanticSettings, Settings, SmartCollection, Tag,
-    TidyDestination, TidyPlacement, TidyPlan, TidySuggestion, TopicLibraryCoverage,
-    UpdateSmartCollection, UpdateTag,
+    OmittedFileReason, PreviewData, ReadingOrder, ReadingOrderDocument, ReadingOrderLink,
+    ReadingOrderQuery, ReadingOrderReason, ReadingOrderSubject, ReadingPlacement, RelatedDocument,
+    RelatedDocumentsQuery, RemoteEmbeddingSettings, RootCoverage, SearchDocument, SearchLogEntry,
+    SearchMode, SearchQuery, SearchScope, SelectedEmbedder, SemanticSettings, Settings,
+    SmartCollection, Tag, TidyDestination, TidyPlacement, TidyPlan, TidySuggestion,
+    TopicLibraryCoverage, UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::types::{
     GenerationSettings, GenerationStreamEvent, GenerationTask, GeneratorDescriptor,
@@ -652,6 +653,57 @@ impl TextIndexRequests {
 
 /// The document text index's single writer: queued requests, whether the
 /// runner is running, and the cancel flag of the pass in progress.
+/// One library document as reading order takes it.
+struct ReadingOrderSource {
+    /// The library root it was listed under: its folders are named from here.
+    library_root: PathBuf,
+    entry: FileEntry,
+}
+
+impl ReadingOrderSource {
+    fn labels(&self) -> wilkes_core::reading_order::Labels {
+        let path = &self.entry.path;
+        let folders = path
+            .parent()
+            .and_then(|parent| parent.strip_prefix(&self.library_root).ok())
+            .map(|below| {
+                below
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        wilkes_core::reading_order::Labels {
+            title: self.entry.title.clone(),
+            file_stem: path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            folders,
+        }
+    }
+}
+
+/// What reading order keeps between requests.
+#[derive(Default)]
+struct ReadingOrderState {
+    /// Counts requests. A request that finds a later one has started stops
+    /// reading: only the latest answer is wanted.
+    generation: AtomicU64,
+    cache: PLMutex<ReadingOrderCache>,
+}
+
+/// Each document's text as read against one lexicon. Reading is the costly
+/// part of an order (every document of the library, once), and it depends
+/// only on the document and on the phrases looked for.
+#[derive(Default)]
+struct ReadingOrderCache {
+    /// Which lexicon the readings were taken against.
+    lexicon: u64,
+    /// By path, with the size and modification time the file had when read.
+    readings: HashMap<PathBuf, ((u64, i64), Arc<wilkes_core::reading_order::Reading>)>,
+}
+
 #[derive(Default)]
 struct TextIndexUpkeep {
     requests: PLMutex<TextIndexRequests>,
@@ -1729,6 +1781,7 @@ pub struct AppContext {
     /// [`wilkes_core::text_index`].
     text_index: PLMutex<Option<Arc<DocumentTextIndex>>>,
     text_index_upkeep: TextIndexUpkeep,
+    reading_order: ReadingOrderState,
     /// The feeds' refresh runner, its request gate and its timer.
     feed_upkeep: feeds::FeedUpkeep,
     directory_watcher: PLMutex<Option<DirectoryWatcher>>,
@@ -1884,6 +1937,7 @@ impl AppContext {
             research_store: PLMutex::new(None),
             text_index: PLMutex::new(None),
             text_index_upkeep: TextIndexUpkeep::default(),
+            reading_order: ReadingOrderState::default(),
             feed_upkeep: feeds::FeedUpkeep::default(),
             directory_watcher: PLMutex::new(None),
             embed_task: PLMutex::new(None),
@@ -8353,6 +8407,318 @@ impl AppContext {
             references: resolve(paths.references),
             cited_by: resolve(paths.cited_by),
             all_references,
+        })
+    }
+
+    /// The documents of one library folder in the order they build on one
+    /// another, read off their text ([`wilkes_core::reading_order`]). Runs no
+    /// model and needs no semantic index.
+    ///
+    /// Every document of the library is read, not only the folder's: which
+    /// single words are ordinary vocabulary is a fact about the library. A
+    /// document's reading is kept, so the next order reads only what changed.
+    /// Paged documents are read from the document text index, which fills in
+    /// the background: one it has not reached yet is reported as having no
+    /// text rather than being extracted here.
+    pub async fn reading_order(
+        self: Arc<Self>,
+        query: ReadingOrderQuery,
+    ) -> Result<ReadingOrder, String> {
+        use wilkes_core::reading_order as reading;
+
+        let settings = self.settings().await;
+        let (library_roots, _) = library_roots(&settings);
+        let root = std::fs::canonicalize(&query.root).map_err(|err| {
+            format!(
+                "Folder does not exist or cannot be accessed: {} ({err})",
+                query.root.display()
+            )
+        })?;
+        Self::ensure_path_in_library(&root, &library_roots, "Folder to order")?;
+        let theme = match query
+            .theme
+            .as_deref()
+            .map(str::trim)
+            .filter(|theme| !theme.is_empty())
+        {
+            Some(theme) => Some(reading::theme_key(theme).ok_or_else(|| {
+                format!(
+                    "A theme is one to {} words: {theme}",
+                    reading::MAX_SUBJECT_WORDS
+                )
+            })?),
+            None => None,
+        };
+
+        let mut documents: Vec<ReadingOrderSource> = Vec::new();
+        let mut seen = HashSet::new();
+        for library_root in &library_roots {
+            let listed = self
+                .list_files(library_root.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+            for entry in listed.files {
+                if seen.insert(entry.path.clone()) {
+                    documents.push(ReadingOrderSource {
+                        library_root: library_root.clone(),
+                        entry,
+                    });
+                }
+            }
+        }
+        documents.sort_by(|a, b| a.entry.path.cmp(&b.entry.path));
+
+        let metadata = self
+            .metadata_cache()
+            .ok_or_else(|| "Metadata cache is unavailable".to_string())?;
+        let texts = self
+            .text_index()
+            .ok_or_else(|| "The document text index is unavailable".to_string())?;
+        let generation = self.reading_order.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let ctx = Arc::clone(&self);
+        let asked = query.root;
+        tokio::task::spawn_blocking(move || {
+            ctx.reading_order_blocking(asked, root, theme, documents, &metadata, &texts, generation)
+        })
+        .await
+        .map_err(|e| format!("Reading order task panicked: {e}"))?
+    }
+
+    /// `asked` is the folder as the caller named it and `root` its canonical
+    /// path. Documents are answered under `asked`, the way a listing of that
+    /// folder names them, so the two can be joined by path.
+    #[allow(clippy::too_many_arguments)]
+    fn reading_order_blocking(
+        &self,
+        asked: PathBuf,
+        root: PathBuf,
+        theme: Option<String>,
+        documents: Vec<ReadingOrderSource>,
+        metadata: &Mutex<MetadataCache>,
+        texts: &DocumentTextIndex,
+        generation: u64,
+    ) -> Result<ReadingOrder, String> {
+        use std::hash::{Hash, Hasher};
+        use wilkes_core::reading_order as reading;
+
+        let described: Vec<reading::Described> = documents
+            .iter()
+            .map(|document| reading::Described::from_labels(&document.labels()))
+            .collect();
+        let mut candidates: Vec<String> = described
+            .iter()
+            .flat_map(reading::Described::candidates)
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        candidates.hash(&mut hasher);
+        let lexicon_id = hasher.finish();
+        let lexicon = reading::Lexicon::new(candidates);
+        let theme_lexicon = theme
+            .as_ref()
+            .map(|key| reading::Lexicon::new([key.clone()]));
+
+        let known = {
+            let mut cache = self.reading_order.cache.lock();
+            if cache.lexicon != lexicon_id {
+                cache.lexicon = lexicon_id;
+                cache.readings.clear();
+            }
+            cache.readings.clone()
+        };
+
+        let in_scope: Vec<bool> = documents
+            .iter()
+            .map(|document| document.entry.path.starts_with(&root))
+            .collect();
+        let mut readings: Vec<Option<Arc<reading::Reading>>> = Vec::with_capacity(documents.len());
+        let mut theme_shares: Vec<Option<f32>> = vec![None; documents.len()];
+        let mut fresh = Vec::new();
+        for (index, document) in documents.iter().enumerate() {
+            if self.reading_order.generation.load(Ordering::Acquire) != generation {
+                return Err("A newer reading order was asked for".to_string());
+            }
+            let entry = &document.entry;
+            let stamp = entry
+                .modified_at_ms
+                .map(|modified| (entry.size_bytes, modified));
+            let kept = stamp.and_then(|stamp| {
+                known
+                    .get(&entry.path)
+                    .filter(|(read_at, _)| *read_at == stamp)
+                    .map(|(_, reading)| Arc::clone(reading))
+            });
+            let themed = theme_lexicon.as_ref().filter(|_| in_scope[index]);
+            if kept.is_some() && themed.is_none() {
+                readings.push(kept);
+                continue;
+            }
+            let text = match entry.file_type {
+                FileType::Paged => texts.text_for_path(&entry.path).map_err(|e| {
+                    format!(
+                        "Stored text of {} could not be read: {e:#}",
+                        entry.path.display()
+                    )
+                })?,
+                FileType::PlainText => match std::fs::read(&entry.path) {
+                    Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+                    Err(e) => {
+                        tracing::warn!(
+                            "reading order: {} could not be read: {e}",
+                            entry.path.display()
+                        );
+                        None
+                    }
+                },
+            };
+            let Some(text) = text else {
+                readings.push(kept);
+                continue;
+            };
+            if let Some(theme_lexicon) = themed {
+                let read = reading::read_text(&text, theme_lexicon);
+                theme_shares[index] = theme.as_deref().map(|key| read.share(key));
+            }
+            let read = match kept {
+                Some(read) => read,
+                None => {
+                    let read = Arc::new(reading::read_text(&text, &lexicon));
+                    if let Some(stamp) = stamp {
+                        fresh.push((entry.path.clone(), (stamp, Arc::clone(&read))));
+                    }
+                    read
+                }
+            };
+            readings.push(Some(read));
+        }
+        {
+            let mut cache = self.reading_order.cache.lock();
+            if cache.lexicon == lexicon_id {
+                cache.readings.extend(fresh);
+            }
+        }
+
+        // Citations between the folder's documents, where a provider has
+        // answered for the citing one.
+        let mut cites = Vec::new();
+        {
+            let guard = metadata
+                .lock()
+                .map_err(|_| "Metadata cache lock failed".to_string())?;
+            let mut index_by_doi: HashMap<String, usize> = HashMap::new();
+            for (index, document) in documents.iter().enumerate() {
+                if !in_scope[index] {
+                    continue;
+                }
+                if let Some(doi) = document.entry.doi.as_deref().and_then(normalize_doi) {
+                    index_by_doi.entry(doi).or_insert(index);
+                }
+            }
+            let dois: Vec<String> = index_by_doi.keys().cloned().collect();
+            let fetched = guard.citations_fetched(&dois).map_err(|e| e.to_string())?;
+            for doi in &dois {
+                if !fetched.contains(doi) {
+                    continue;
+                }
+                for reference in guard.citation_references(doi).map_err(|e| e.to_string())? {
+                    if let Some(&cited) = index_by_doi.get(&reference.doi) {
+                        cites.push((index_by_doi[doi], cited));
+                    }
+                }
+            }
+        }
+
+        let names: Vec<String> = documents
+            .iter()
+            .map(|document| {
+                document
+                    .entry
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let entries: Vec<reading::Entry<'_>> = (0..documents.len())
+            .map(|index| reading::Entry {
+                described: &described[index],
+                reading: readings[index].as_deref(),
+                in_scope: in_scope[index],
+                publication: documents[index].entry.publication_date.as_deref(),
+                name: &names[index],
+            })
+            .collect();
+        let outcome = reading::order(&entries, &cites);
+
+        let path_of = |index: usize| {
+            let path = &documents[index].entry.path;
+            match path.strip_prefix(&root) {
+                Ok(below) => asked.join(below),
+                Err(_) => path.clone(),
+            }
+        };
+        let ordered = outcome
+            .sequence
+            .iter()
+            .map(|&index| {
+                let placed = &outcome.documents[index];
+                ReadingOrderDocument {
+                    path: path_of(index),
+                    placement: match placed.placement {
+                        reading::Placement::Foundation => ReadingPlacement::Foundation,
+                        reading::Placement::Bridge => ReadingPlacement::Bridge,
+                        reading::Placement::Specialised => ReadingPlacement::Specialised,
+                        reading::Placement::Standalone => ReadingPlacement::Standalone,
+                        reading::Placement::NoSubject => ReadingPlacement::NoSubject,
+                        reading::Placement::NoText => ReadingPlacement::NoText,
+                    },
+                    subjects: placed
+                        .subjects
+                        .iter()
+                        .map(|subject| subject.name.clone())
+                        .collect(),
+                    after: placed
+                        .after
+                        .iter()
+                        .map(|link| ReadingOrderLink {
+                            path: path_of(link.document),
+                            reasons: link
+                                .reasons
+                                .iter()
+                                .map(|reason| match reason {
+                                    reading::Reason::Names(subjects) => ReadingOrderReason::Names {
+                                        subjects: subjects
+                                            .iter()
+                                            .map(|subject| subject.name.clone())
+                                            .collect(),
+                                    },
+                                    reading::Reason::Level => ReadingOrderReason::Level,
+                                    reading::Reason::Volume => ReadingOrderReason::Volume,
+                                    reading::Reason::Narrower => ReadingOrderReason::Narrower,
+                                    reading::Reason::Cites => ReadingOrderReason::Cites,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                    needed_by: placed.needed_by,
+                    theme_share: theme_shares[index],
+                }
+            })
+            .collect();
+
+        Ok(ReadingOrder {
+            root: asked.clone(),
+            documents: ordered,
+            subjects: outcome
+                .subjects
+                .into_iter()
+                .map(|(subject, documents)| ReadingOrderSubject {
+                    name: subject.name,
+                    documents,
+                })
+                .collect(),
+            theme,
         })
     }
 
@@ -16542,6 +16908,169 @@ exit 0
         assert!(links.references.is_empty());
         assert!(links.cited_by.is_empty());
         assert!(links.all_references.is_empty());
+    }
+
+    /// A text of `passages` passages of reading order's length, each phrase
+    /// appearing in the first so many of them.
+    fn reading_order_book(passages: usize, uses: &[(&str, usize)]) -> String {
+        (0..passages)
+            .map(|passage| {
+                let said: String = uses
+                    .iter()
+                    .filter(|(_, count)| *count > passage)
+                    .map(|(phrase, _)| format!("{phrase}. "))
+                    .collect();
+                format!(
+                    "{said:<width$}",
+                    width = wilkes_core::reading_order::PASSAGE_CHARS
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_reading_order_orders_a_folder_by_the_subjects_its_documents_name() {
+        let (dir, ctx) = test_ctx();
+        let library = std::fs::canonicalize(dir.path()).unwrap().join("library");
+        let algebra_folder = library.join("Algebra");
+        std::fs::create_dir_all(&algebra_folder).unwrap();
+        let arithmetic = library.join("arithmetic.txt");
+        // Named by its folder, not by its file.
+        let algebra = algebra_folder.join("notes-2.txt");
+        let calculus = library.join("calculus.txt");
+        let scan = library.join("scan.pdf");
+        std::fs::write(&arithmetic, reading_order_book(20, &[("arithmetic", 20)])).unwrap();
+        std::fs::write(
+            &algebra,
+            reading_order_book(20, &[("algebra", 20), ("arithmetic", 3)]),
+        )
+        .unwrap();
+        std::fs::write(
+            &calculus,
+            reading_order_book(
+                20,
+                &[
+                    ("calculus", 20),
+                    ("algebra", 4),
+                    ("arithmetic", 2),
+                    ("limits", 5),
+                ],
+            ),
+        )
+        .unwrap();
+        // A paged document the text index has not read.
+        std::fs::write(&scan, "%PDF-1.7").unwrap();
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": library }),
+        )
+        .await
+        .unwrap();
+
+        let order = ctx
+            .clone()
+            .reading_order(ReadingOrderQuery {
+                root: library.clone(),
+                theme: None,
+            })
+            .await
+            .unwrap();
+
+        let paths: Vec<&Path> = order.documents.iter().map(|d| d.path.as_path()).collect();
+        assert_eq!(paths, [&arithmetic, &algebra, &calculus, &scan]);
+        let placements: Vec<ReadingPlacement> =
+            order.documents.iter().map(|d| d.placement).collect();
+        assert_eq!(
+            placements,
+            [
+                ReadingPlacement::Foundation,
+                ReadingPlacement::Bridge,
+                ReadingPlacement::Specialised,
+                ReadingPlacement::NoText,
+            ]
+        );
+        assert_eq!(order.documents[1].subjects, ["algebra"]);
+        assert_eq!(order.documents[1].after.len(), 1);
+        assert_eq!(order.documents[1].after[0].path, arithmetic);
+        assert_eq!(
+            order.documents[1].after[0].reasons,
+            [ReadingOrderReason::Names {
+                subjects: vec!["arithmetic".into()]
+            }]
+        );
+        assert_eq!(order.documents[0].needed_by, 2);
+        assert!(order.documents.iter().all(|d| d.theme_share.is_none()));
+        let subjects: Vec<(&str, usize)> = order
+            .subjects
+            .iter()
+            .map(|s| (s.name.as_str(), s.documents))
+            .collect();
+        assert_eq!(
+            subjects,
+            [("arithmetic", 3), ("algebra", 2), ("calculus", 1)]
+        );
+
+        // A theme says how much of each document discusses it, in the same
+        // order.
+        let themed = ctx
+            .clone()
+            .reading_order(ReadingOrderQuery {
+                root: library.clone(),
+                theme: Some(" Limits ".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(themed.theme.as_deref(), Some("limit"));
+        let shares: Vec<Option<f32>> = themed.documents.iter().map(|d| d.theme_share).collect();
+        assert_eq!(shares, [Some(0.0), Some(0.0), Some(0.25), None]);
+
+        // A document that changed is read again: algebra no longer names
+        // arithmetic, so nothing ties the two.
+        std::fs::write(&algebra, reading_order_book(21, &[("algebra", 21)])).unwrap();
+        let reread = ctx
+            .clone()
+            .reading_order(ReadingOrderQuery {
+                root: library.clone(),
+                theme: None,
+            })
+            .await
+            .unwrap();
+        let algebra_now = reread.documents.iter().find(|d| d.path == algebra).unwrap();
+        assert!(algebra_now.after.iter().all(|link| link.path != arithmetic));
+
+        // A subfolder is ordered on its own, and a folder outside the library
+        // is refused.
+        let folder_only = ctx
+            .clone()
+            .reading_order(ReadingOrderQuery {
+                root: algebra_folder.clone(),
+                theme: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(folder_only.documents.len(), 1);
+        assert_eq!(
+            folder_only.documents[0].placement,
+            ReadingPlacement::Standalone
+        );
+        let outside = ctx
+            .clone()
+            .reading_order(ReadingOrderQuery {
+                root: std::fs::canonicalize(dir.path()).unwrap(),
+                theme: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(outside.contains("not in the library"), "{outside}");
+        let wordy = ctx
+            .clone()
+            .reading_order(ReadingOrderQuery {
+                root: library.clone(),
+                theme: Some("one two three four five".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(wordy.contains("one to 4 words"), "{wordy}");
     }
 
     #[tokio::test]

@@ -254,6 +254,60 @@ export interface CitationLinks {
   all_references: CitationReference[];
 }
 
+/** Which folder to put in reading order, and optionally a theme (one to four
+ *  words) to rank its documents by instead. */
+export interface ReadingOrderQuery {
+  root: string;
+  theme: string | null;
+}
+
+/** Where a document stands among the others of its folder. The last two are
+ *  not placed, and say why. */
+export type ReadingPlacement =
+  | "foundation"
+  | "bridge"
+  | "specialised"
+  | "standalone"
+  | "no_subject"
+  | "no_text";
+
+export type ReadingOrderReason =
+  | { kind: "names"; subjects: string[] }
+  | { kind: "level" }
+  | { kind: "volume" }
+  | { kind: "narrower" }
+  | { kind: "cites" };
+
+export interface ReadingOrderLink {
+  path: string;
+  reasons: ReadingOrderReason[];
+}
+
+export interface ReadingOrderDocument {
+  path: string;
+  placement: ReadingPlacement;
+  subjects: string[];
+  /** The documents it builds on, earliest in the order first. */
+  after: ReadingOrderLink[];
+  needed_by: number;
+  /** Share of its passages that use the theme; null without a theme or text. */
+  theme_share: number | null;
+}
+
+export interface ReadingOrderSubject {
+  name: string;
+  documents: number;
+}
+
+/** A folder's documents: first to last, then the ones to read at any time,
+ *  then the ones that could not be placed. */
+export interface ReadingOrder {
+  root: string;
+  documents: ReadingOrderDocument[];
+  subjects: ReadingOrderSubject[];
+  theme: string | null;
+}
+
 /** Where a citation graph reaches: one root, or the whole library when
  *  `root` is null. */
 export interface CitationGraphQuery {
@@ -632,7 +686,10 @@ export type FileSortKey =
   | "modified"
   | "size"
   | "publication"
-  | "citations";
+  | "citations"
+  /** The order the backend reads off the listed folder's text; not a field of
+   *  a file. */
+  | "reading_order";
 /** Optional document-metadata field that can be shown as a column in the file
  *  list. Extend alongside FILE_DISPLAY_FIELDS as FileEntry gains more fields. */
 export type FileDisplayField =

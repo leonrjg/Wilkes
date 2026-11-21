@@ -247,6 +247,37 @@ impl DocumentTextIndex {
         Ok(Some(StoredDocument { text, source_map }))
     }
 
+    /// The document's stored text alone, under the same conditions as
+    /// [`Self::document_for_path`]. For a reader that wants the words and not
+    /// where on the page they are: the source map is neither read nor decoded.
+    pub fn text_for_path(&self, path: &Path) -> anyhow::Result<Option<String>> {
+        let key = Self::key_string(path);
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT size_bytes, modified_at_ms, full_text FROM documents WHERE path = ?1",
+                params![key],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((size_bytes, modified_at_ms, Some(text))) = row else {
+            return Ok(None);
+        };
+        let Some(identity) = FileIdentity::for_path(path) else {
+            return Ok(None);
+        };
+        if identity.size_bytes != size_bytes || identity.modified_at_ms != modified_at_ms {
+            return Ok(None);
+        }
+        Ok(Some(text))
+    }
+
     /// Every row's stamp, by key.
     pub fn stamps(&self) -> anyhow::Result<HashMap<PathBuf, StoredStamp>> {
         let conn = self.conn();
@@ -856,6 +887,10 @@ pub(crate) mod tests {
         let served = store.document_for_path(&pdf).unwrap().unwrap();
         assert_eq!(served.text, "alpha beta");
         assert_eq!(served.source_map.segments.len(), 1);
+        assert_eq!(
+            store.text_for_path(&pdf).unwrap().as_deref(),
+            Some("alpha beta")
+        );
 
         let stamp = store.stamp(&pdf).unwrap().unwrap();
         assert_eq!(stamp.identity, identity);
@@ -865,6 +900,7 @@ pub(crate) mod tests {
         // A different size is a different file.
         std::fs::write(&pdf, "%PDF-1.7 different bytes").unwrap();
         assert!(store.document_for_path(&pdf).unwrap().is_none());
+        assert!(store.text_for_path(&pdf).unwrap().is_none());
     }
 
     #[test]
@@ -880,6 +916,7 @@ pub(crate) mod tests {
             .unwrap();
 
         assert!(store.document_for_path(&pdf).unwrap().is_none());
+        assert!(store.text_for_path(&pdf).unwrap().is_none());
         assert!(store.stamp(&pdf).unwrap().unwrap().failed);
     }
 
