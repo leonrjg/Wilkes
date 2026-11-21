@@ -6,7 +6,7 @@ import type { Settings } from "./types";
 import { isTauri } from "../services";
 import { useChatStore } from "../stores/useChatStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
-import { Copy, Edit2, ExternalLink, Folder, FolderPlus, MessageSquare, Paperclip, RefreshCw, Send, Tag, Trash2 } from "react-feather";
+import { Copy, Edit2, ExternalLink, Folder, FolderPlus, Layers, MessageSquare, Paperclip, RefreshCw, Send, Tag, Trash2 } from "react-feather";
 import { useResearchStore } from "../stores/useResearchStore";
 import { useEditorStore } from "../stores/useEditorStore";
 import { activeWorkspaceIsReadOnly } from "../stores/useWorkspaceStore";
@@ -27,6 +27,8 @@ interface BuildFileContextMenuItemsArgs {
   settings?: Settings | null;
   onToast: (message: string, type: "success" | "error") => void;
   onRenameRequest?: (path: string) => void;
+  /** Opens the tidy-up of a directory: suggested homes for its documents. */
+  onTidyRequest?: (path: string) => void;
   /** Other known root directories the file could be moved into. */
   availableRoots?: string[];
   onMoveRequest?: (path: string) => void;
@@ -43,6 +45,7 @@ export function buildFileContextMenuItems({
   settings,
   onToast,
   onRenameRequest,
+  onTidyRequest,
   availableRoots = [],
   onMoveRequest,
   deletionKind,
@@ -121,6 +124,14 @@ export function buildFileContextMenuItems({
         icon: Edit2,
         dividerBefore: true,
         run: () => onRenameRequest(target.path),
+      });
+    }
+    if (isTauri && onTidyRequest && !readOnly) {
+      primaryItems.push({
+        id: "tidy-up",
+        label: "Tidy up…",
+        icon: Layers,
+        run: () => onTidyRequest(target.path),
       });
     }
     return primaryItems;

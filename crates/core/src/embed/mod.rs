@@ -3,6 +3,7 @@ pub mod engines;
 pub mod identity;
 pub mod index;
 pub mod installer;
+pub mod tidy;
 
 pub use engines::dispatch;
 

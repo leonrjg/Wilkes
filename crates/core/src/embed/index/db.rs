@@ -2936,6 +2936,68 @@ mod tests {
     }
 
     #[test]
+    fn document_vectors_average_normalised_chunks_across_roots_and_omit_unindexed_files() {
+        let dir = tempdir().unwrap();
+        let first_root = dir.path().join("first");
+        let second_root = dir.path().join("second");
+        fs::create_dir_all(&first_root).unwrap();
+        fs::create_dir_all(&second_root).unwrap();
+        let two_chunks = first_root.join("two.txt");
+        let elsewhere = second_root.join("elsewhere.txt");
+        let unindexed = second_root.join("unindexed.txt");
+        for path in [&two_chunks, &elsewhere, &unindexed] {
+            fs::write(path, "text").unwrap();
+        }
+        let chunk = |path: &Path, vector: Vec<f32>| {
+            (
+                Chunk {
+                    file_path: path.to_path_buf(),
+                    text: "text".to_string(),
+                    byte_range: ByteRange { start: 0, end: 4 },
+                    origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                },
+                vector,
+            )
+        };
+        let mut idx = SemanticIndex::create(
+            dir.path(),
+            "m",
+            2,
+            EmbeddingEngine::Candle,
+            Some(&first_root),
+        )
+        .unwrap();
+        // A long chunk and a short one count the same once normalised.
+        idx.write_file(PreparedFile {
+            retained: Default::default(),
+            full_text: String::new(),
+            path: two_chunks.clone(),
+            chunks: vec![
+                chunk(&two_chunks, vec![4.0, 0.0]),
+                chunk(&two_chunks, vec![0.0, 0.5]),
+            ],
+        })
+        .unwrap();
+        idx.activate_root(&second_root).unwrap();
+        idx.write_file(PreparedFile {
+            retained: Default::default(),
+            full_text: String::new(),
+            path: elsewhere.clone(),
+            chunks: vec![chunk(&elsewhere, vec![0.0, 2.0])],
+        })
+        .unwrap();
+
+        let vectors = idx
+            .document_vectors(&[two_chunks.clone(), elsewhere.clone(), unindexed.clone()])
+            .unwrap();
+
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[&two_chunks], vec![0.5, 0.5]);
+        assert_eq!(vectors[&elsewhere], vec![0.0, 1.0]);
+        assert!(!vectors.contains_key(&unindexed));
+    }
+
+    #[test]
     fn test_query_dimension_mismatch() {
         let dir = tempdir().unwrap();
         let idx = SemanticIndex::create(dir.path(), "m", 1, EmbeddingEngine::Candle, None).unwrap();
@@ -8167,34 +8229,8 @@ impl SemanticIndex {
             let embedding_blob: Vec<u8> = row.get(1)?;
             Ok((file_path, embedding_blob))
         })?;
-
-        #[derive(Default)]
-        struct Accumulator {
-            sum: Vec<f32>,
-            chunks: usize,
-        }
-
-        let mut by_file: HashMap<String, Accumulator> = HashMap::new();
-        for row in rows {
-            let (file_path, embedding_blob) = row?;
-            let embedding = f32_slice_from_bytes(&embedding_blob)?;
-            anyhow::ensure!(
-                embedding.len() == self.dimension,
-                "Stored embedding dimension mismatch for {}. Expected {}, received {}.",
-                file_path,
-                self.dimension,
-                embedding.len()
-            );
-            let normalized = normalized_vector(&embedding);
-            let entry = by_file.entry(file_path).or_insert_with(|| Accumulator {
-                sum: vec![0.0; self.dimension],
-                chunks: 0,
-            });
-            for (total, value) in entry.sum.iter_mut().zip(normalized) {
-                *total += value;
-            }
-            entry.chunks += 1;
-        }
+        let mut by_file = HashMap::new();
+        self.accumulate_document_vectors(rows, &mut by_file)?;
 
         let Some(source_acc) = by_file.get(&source_key) else {
             anyhow::bail!(
@@ -8202,7 +8238,7 @@ impl SemanticIndex {
                 source_path.display()
             );
         };
-        let source_centroid = centroid(&source_acc.sum, source_acc.chunks);
+        let source_centroid = source_acc.centroid();
 
         let mut related = Vec::new();
         for (file_path, acc) in by_file {
@@ -8216,7 +8252,7 @@ impl SemanticIndex {
             let Some(file_type) = FileType::detect(&abs_path, supported_extensions) else {
                 continue;
             };
-            let candidate_centroid = centroid(&acc.sum, acc.chunks);
+            let candidate_centroid = acc.centroid();
             let score = cosine_similarity(&source_centroid, &candidate_centroid);
             let metadata = match std::fs::metadata(&abs_path) {
                 Ok(metadata) => metadata,
@@ -8277,6 +8313,78 @@ impl SemanticIndex {
         });
         related.truncate(limit);
         Ok(related)
+    }
+
+    /// The document vector of each of `paths` that the index holds: the mean
+    /// of its normalised chunk vectors, as [`Self::related_documents`] compares
+    /// documents by. A path the index does not hold is absent from the answer,
+    /// so the caller can say which documents it could not place.
+    pub fn document_vectors(
+        &self,
+        paths: &[PathBuf],
+    ) -> anyhow::Result<HashMap<PathBuf, Vec<f32>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.file_path, v.embedding
+             FROM files f
+             JOIN chunks c ON c.file_id = f.id
+             JOIN vec_chunks v ON v.rowid = c.id
+             WHERE f.file_path = ?1",
+        )?;
+        let mut by_file = HashMap::new();
+        let mut requested = HashMap::with_capacity(paths.len());
+        for path in paths {
+            let key = self
+                .path_key_for_existing_path(path)
+                .to_string_lossy()
+                .into_owned();
+            let rows = stmt.query_map([&key], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            self.accumulate_document_vectors(rows, &mut by_file)?;
+            requested.insert(key, path.clone());
+        }
+        Ok(by_file
+            .into_iter()
+            .filter(|(_, acc)| acc.chunks > 0)
+            .filter_map(|(key, acc)| {
+                requested
+                    .remove(&key)
+                    .map(|path| (path, acc.centroid()))
+            })
+            .collect())
+    }
+
+    /// Sum each file's normalised chunk vectors into `by_file`, checking every
+    /// stored vector has the index's width. The one place a document's vector
+    /// is assembled from its chunks.
+    fn accumulate_document_vectors(
+        &self,
+        rows: impl Iterator<Item = rusqlite::Result<(String, Vec<u8>)>>,
+        by_file: &mut HashMap<String, DocumentVectorSum>,
+    ) -> anyhow::Result<()> {
+        for row in rows {
+            let (file_path, embedding_blob) = row?;
+            let embedding = f32_slice_from_bytes(&embedding_blob)?;
+            anyhow::ensure!(
+                embedding.len() == self.dimension,
+                "Stored embedding dimension mismatch for {}. Expected {}, received {}.",
+                file_path,
+                self.dimension,
+                embedding.len()
+            );
+            let normalized = normalized_vector(&embedding);
+            let entry = by_file
+                .entry(file_path)
+                .or_insert_with(|| DocumentVectorSum {
+                    sum: vec![0.0; self.dimension],
+                    chunks: 0,
+                });
+            for (total, value) in entry.sum.iter_mut().zip(normalized) {
+                *total += value;
+            }
+            entry.chunks += 1;
+        }
+        Ok(())
     }
 
     fn query_corpus(&self, embedding: &[f32], top_k: usize) -> anyhow::Result<Vec<IndexedChunk>> {
@@ -10830,6 +10938,18 @@ fn normalized_vector(v: &[f32]) -> Vec<f32> {
         return vec![0.0; v.len()];
     }
     v.iter().map(|value| value / norm).collect()
+}
+
+/// A document's normalised chunk vectors, summed as they are read.
+struct DocumentVectorSum {
+    sum: Vec<f32>,
+    chunks: usize,
+}
+
+impl DocumentVectorSum {
+    fn centroid(&self) -> Vec<f32> {
+        centroid(&self.sum, self.chunks)
+    }
 }
 
 fn centroid(sum: &[f32], count: usize) -> Vec<f32> {

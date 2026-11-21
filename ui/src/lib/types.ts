@@ -199,6 +199,37 @@ export interface RelatedDocument extends FileEntry {
   score: number;
 }
 
+/** Suggested homes for the documents directly inside one library folder. */
+export interface TidyPlan {
+  folder: string;
+  /** Every folder a document could go to, in path order. */
+  destinations: TidyDestination[];
+  /** One per document the semantic index holds, in path order. */
+  suggestions: TidySuggestion[];
+  /** Documents the semantic index does not hold; they get no suggestion. */
+  unindexed: FileEntry[];
+}
+
+export interface TidyDestination {
+  path: string;
+  documents: number;
+  /** Only these say what the folder is used for; with none it is judged by its name. */
+  indexed_documents: number;
+}
+
+export interface TidySuggestion {
+  entry: FileEntry;
+  /** The best few destinations, best first. Never empty. */
+  ranking: TidyPlacement[];
+  /** The best destination barely leads the next. */
+  close_call: boolean;
+}
+
+export interface TidyPlacement {
+  destination: string;
+  score: number;
+}
+
 export interface CitationLinksQuery {
   root: string;
   path: string;

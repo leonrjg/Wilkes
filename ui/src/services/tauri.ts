@@ -61,6 +61,7 @@ import type {
   CitationLinksQuery,
   RelatedDocument,
   RelatedDocumentsQuery,
+  TidyPlan,
   SelectedEmbedder,
   SearchQuery,
   SearchStats,
@@ -1022,6 +1023,10 @@ export class TauriSourceApi implements DesktopSourceApi {
 
   async moveFile(path: string, targetRoot: string): Promise<string> {
     return invoke<string>("move_file", { path, targetRoot });
+  }
+
+  async tidyFolder(folder: string): Promise<TidyPlan> {
+    return invoke<TidyPlan>("tidy_folder", { folder });
   }
 
   async listDirectories(path: string): Promise<string[]> {

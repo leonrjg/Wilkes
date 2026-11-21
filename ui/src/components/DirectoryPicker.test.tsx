@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import DirectoryPicker, { describeCoverage } from "./DirectoryPicker";
 import { useFileDragStore } from "../stores/useFileDragStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
+import { useTidyStore } from "../stores/useTidyStore";
 import { ToastProvider } from "./Toast";
 
 const { mockOpenPath, mockIsTauri, mockCreateDirectory, mockListDirectories, mockRenameFile } =
@@ -243,6 +244,23 @@ describe("DirectoryPicker", () => {
 
     fireEvent.contextMenu(screen.getByText("other"));
     expect(screen.queryByRole("menuitem", { name: "Rename" })).not.toBeInTheDocument();
+  });
+
+  it("opens the tidy-up of a root from its context menu", () => {
+    mockIsTauri.value = true;
+    useTidyStore.setState({ folder: null });
+    renderWithToasts();
+
+    fireEvent.contextMenu(screen.getByText("other"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Tidy up…" }));
+
+    expect(useTidyStore.getState().folder).toBe("/home/user/other");
+  });
+
+  it("offers no tidy-up outside the desktop app, which alone can move files", () => {
+    renderWithToasts();
+    fireEvent.contextMenu(screen.getByText("other"));
+    expect(screen.queryByRole("menuitem", { name: "Tidy up…" })).not.toBeInTheDocument();
   });
 
   it("does not show the new-folder button when there are no roots", () => {

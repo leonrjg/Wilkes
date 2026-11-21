@@ -1389,6 +1389,14 @@ async fn related_documents(
 }
 
 #[tauri::command]
+async fn tidy_folder(
+    folder: String,
+    app: AppHandle,
+) -> Result<wilkes_core::types::TidyPlan, String> {
+    app_context(&app).tidy_folder(folder.into()).await
+}
+
+#[tauri::command]
 async fn citation_links(
     query: wilkes_core::types::CitationLinksQuery,
     app: AppHandle,
@@ -2837,6 +2845,7 @@ pub fn run() {
             search,
             cancel_search,
             related_documents,
+            tidy_folder,
             citation_links,
             citation_graph,
             fetch_missing_citations,

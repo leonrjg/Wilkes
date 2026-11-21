@@ -52,6 +52,7 @@ import type {
   PreviewData,
   RelatedDocument,
   RelatedDocumentsQuery,
+  TidyPlan,
   SelectedEmbedder,
   SearchQuery,
   SearchStats,
@@ -602,6 +603,9 @@ export interface DesktopSourceApi extends SourceApi {
   ): Promise<string[]>;
   readClipboardFiles(): Promise<string[]>;
   moveFile(path: string, targetRoot: string): Promise<string>;
+  /** Where each document directly inside `folder` would sit better among the
+   *  library's other folders. Moves nothing; the moves are `moveFile`'s. */
+  tidyFolder(folder: string): Promise<TidyPlan>;
   listDirectories(path: string): Promise<string[]>;
   /** Classify paths (in the order given) so a drop can route folders and files apart. */
   pathKinds(paths: string[]): Promise<PathKind[]>;

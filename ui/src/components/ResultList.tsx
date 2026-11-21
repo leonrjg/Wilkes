@@ -34,6 +34,7 @@ import { sourceLabel } from "../lib/integrations/names";
 import { isPagedPath } from "../lib/documentFormats";
 import { useGenerationStore } from "../stores/useGenerationStore";
 import { useTopicsStore } from "../stores/useTopicsStore";
+import { useTidyStore } from "../stores/useTidyStore";
 import { FileScopeControls } from "./FileScopeControls";
 import { MetadataField } from "../lib/types";
 import type {
@@ -764,6 +765,9 @@ export default function ResultList({
               expandAll={filterText.trim().length > 0}
               onMove={moveTreeFile}
               onCreateFolder={isTauri && !readOnly ? createTreeFolder : undefined}
+              onTidyFolder={isTauri && !readOnly
+                ? (folder) => useTidyStore.getState().open(folder)
+                : undefined}
               renderFile={(entry, drag) => (
                 <FileEntryRowAdapter
                   entry={entry}

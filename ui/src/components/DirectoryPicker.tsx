@@ -9,6 +9,7 @@ import { buildFileContextMenuItems, type ContextMenuTarget } from "../lib/fileAc
 import { useFileDragStore } from "../stores/useFileDragStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useSemanticStore } from "../stores/useSemanticStore";
+import { useTidyStore } from "../stores/useTidyStore";
 import { useActiveWorkspaceReadOnly } from "../stores/useWorkspaceStore";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { DirectoryTree, isStrictAncestor, parentPath } from "./DirectoryTree";
@@ -346,6 +347,7 @@ export default function DirectoryPicker({
                       onRenameRequest: onRenameDirectory && !readOnly
                         ? (path) => setRenameTarget({ path, name: baseName(path) })
                         : undefined,
+                      onTidyRequest: (path) => useTidyStore.getState().open(path),
                     }),
                   })}
               >

@@ -15,6 +15,7 @@ import UploadZone from "./components/UploadZone";
 import CataloguePane from "./components/CataloguePane";
 import BrowserPane from "./components/BrowserPane";
 import SettingsModal from "./components/SettingsModal";
+import TidyUpDialog from "./components/TidyUpDialog";
 import { useToasts } from "./components/Toast";
 import { useContextMenu, ContextMenu } from "./components/ContextMenu";
 import { Tooltip } from "@leonrjg/wilkes-reader";
@@ -1113,6 +1114,7 @@ export default function App() {
 
         {dockSide("Right")}
       </div>
+      {isTauri && <TidyUpDialog />}
     </div>
   );
 }

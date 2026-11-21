@@ -1,10 +1,10 @@
 import React, { forwardRef, useEffect, useImperativeHandle, useMemo, useRef } from "react";
-import { ChevronDown, ChevronRight, Folder, FolderPlus } from "react-feather";
+import { ChevronDown, ChevronRight, Folder, FolderPlus, Layers } from "react-feather";
 import type { FileEntry } from "../lib/types";
 import { pathIsWithinRoot, pathsEqual } from "../lib/configuredRoots";
 import { useFileDragStore } from "../stores/useFileDragStore";
 import { useFolderStateStore } from "../stores/useFolderStateStore";
-import { ContextMenu, useContextMenu } from "./ContextMenu";
+import { ContextMenu, useContextMenu, type ContextMenuItem } from "./ContextMenu";
 
 export type FileTreeDragProps = Pick<React.ButtonHTMLAttributes<HTMLButtonElement>,
   "draggable" | "onDragStart" | "onPointerDown" | "onClickCapture" | "style"
@@ -75,6 +75,9 @@ interface Props {
   /** Create a folder named `name` inside `directory`. Absent where the tree may
    *  not be rearranged, and then the tree offers no menu of its own. */
   onCreateFolder?: (directory: string, name: string) => Promise<void>;
+  /** Open the tidy-up of `directory`. Absent where the tree may not be
+   *  rearranged, as `onCreateFolder` is. */
+  onTidyFolder?: (directory: string) => void;
 }
 
 function normalized(path: string): string {
@@ -205,6 +208,7 @@ function FileTree({
   renderFile,
   onMove,
   onCreateFolder,
+  onTidyFolder,
 }: Props, ref: React.ForwardedRef<FileTreeHandle>) {
   const tree = useMemo(
     () => buildFileTree(root, files, directories),
@@ -348,14 +352,13 @@ function FileTree({
    *  A file row opens its own menu and prevents the default, which is what
    *  says the click has been answered; the tree does not answer it twice. */
   const openTreeMenu = (event: React.MouseEvent) => {
-    if (!onCreateFolder || event.defaultPrevented) return;
+    if ((!onCreateFolder && !onTidyFolder) || event.defaultPrevented) return;
     const element = event.target instanceof Element ? event.target : null;
     const folder = element?.closest<HTMLElement>("[data-file-tree-folder-path]");
     const directory = folder?.dataset.fileTreeFolderPath ?? tree.path;
-    openMenu({
-      event,
-      target: directory,
-      items: [{
+    const items: ContextMenuItem[] = [];
+    if (onCreateFolder) {
+      items.push({
         id: "new-folder",
         label: `New folder in ${baseName(directory)}`,
         icon: FolderPlus,
@@ -368,8 +371,17 @@ function FileTree({
             expand(directory);
           },
         },
-      }],
-    });
+      });
+    }
+    if (onTidyFolder) {
+      items.push({
+        id: "tidy-up",
+        label: `Tidy up ${baseName(directory)}…`,
+        icon: Layers,
+        run: () => onTidyFolder(directory),
+      });
+    }
+    openMenu({ event, target: directory, items });
   };
 
   const dragProps = (entry: FileEntry): FileTreeDragProps => ({

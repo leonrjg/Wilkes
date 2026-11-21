@@ -522,6 +522,25 @@ describe("FileTree", () => {
       expect(screen.queryByRole("menu")).toBeNull();
     });
 
+    it("opens the tidy-up of the folder whose row was clicked", () => {
+      const tidy = vi.fn();
+      render(
+        <FileTree
+          root="/library"
+          files={[file("/library/parent/inside.txt")]}
+          movable
+          onMove={vi.fn()}
+          onTidyFolder={tidy}
+          renderFile={(entry) => <span>{entry.path.split("/").pop()}</span>}
+        />,
+      );
+      fireEvent.contextMenu(screen.getByRole("button", { name: "Collapse folder parent" }));
+      // Without a way to create folders the menu still offers the tidy-up.
+      expect(screen.queryByRole("group", { name: /New folder/ })).toBeNull();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Tidy up parent…" }));
+      expect(tidy).toHaveBeenCalledWith("/library/parent");
+    });
+
     it("offers nothing where folders may not be created", () => {
       render(
         <FileTree

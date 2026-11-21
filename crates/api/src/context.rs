@@ -59,7 +59,8 @@ use wilkes_core::types::{
     OmittedFileReason, PreviewData, RelatedDocument, RelatedDocumentsQuery,
     RemoteEmbeddingSettings, RootCoverage, SearchDocument, SearchLogEntry, SearchMode, SearchQuery,
     SearchScope, SelectedEmbedder, SemanticSettings, Settings, SmartCollection, Tag,
-    TopicLibraryCoverage, UpdateSmartCollection, UpdateTag,
+    TidyDestination, TidyPlacement, TidyPlan, TidySuggestion, TopicLibraryCoverage,
+    UpdateSmartCollection, UpdateTag,
 };
 use wilkes_core::types::{
     GenerationSettings, GenerationStreamEvent, GenerationTask, GeneratorDescriptor,
@@ -8077,6 +8078,163 @@ impl AppContext {
             }
         }
         Ok(related)
+    }
+
+    /// Where each document directly inside `folder` would sit better, among
+    /// the other folders of the library. Moves nothing: the plan is the
+    /// user's to review, and moving is the existing move's job.
+    ///
+    /// A destination is judged by its indexed documents and by its name (see
+    /// [`wilkes_core::embed::tidy`]); documents are compared by the same
+    /// whole-document vectors as [`Self::related_documents`].
+    pub async fn tidy_folder(self: Arc<Self>, folder: PathBuf) -> Result<TidyPlan, String> {
+        use std::collections::{BTreeMap, BTreeSet};
+        use wilkes_core::embed::tidy::{
+            folder_centroid, is_close_call, rank_folders, FolderProfile,
+        };
+        /// The few best destinations offered for each document. Past these
+        /// the ranking is noise, and the existing move reaches any folder.
+        const OFFERED: usize = 5;
+
+        let settings = self.settings().await;
+        let (library_roots, _) = library_roots(&settings);
+        let folder = std::fs::canonicalize(&folder).map_err(|err| {
+            format!(
+                "Folder does not exist or cannot be accessed: {} ({err})",
+                folder.display()
+            )
+        })?;
+        Self::ensure_path_in_library(&folder, &library_roots, "Folder to tidy")?;
+
+        // Every folder of the library, and the documents directly in each.
+        let mut folders: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut documents: BTreeMap<PathBuf, Vec<FileEntry>> = BTreeMap::new();
+        let mut seen = HashSet::new();
+        for root in &library_roots {
+            let listed = self
+                .list_files(root.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+            folders.insert(root.clone());
+            folders.extend(listed.directories);
+            for entry in listed.files {
+                if !seen.insert(entry.path.clone()) {
+                    continue;
+                }
+                let Some(parent) = entry.path.parent() else {
+                    continue;
+                };
+                documents
+                    .entry(parent.to_path_buf())
+                    .or_default()
+                    .push(entry);
+            }
+        }
+        // A folder that holds only folders is a shelf, not a place to file a
+        // document; the folders on it are offered instead.
+        let destinations: Vec<PathBuf> = folders
+            .iter()
+            .filter(|candidate| **candidate != folder)
+            .filter(|candidate| {
+                documents.contains_key(*candidate)
+                    || !folders
+                        .iter()
+                        .any(|other| other.parent() == Some(candidate.as_path()))
+            })
+            .cloned()
+            .collect();
+        let sources = documents.remove(&folder).unwrap_or_default();
+        if sources.is_empty() {
+            return Err(format!(
+                "There are no documents directly in {} to tidy",
+                folder.display()
+            ));
+        }
+        if destinations.is_empty() {
+            return Err(
+                "There is no other folder in the library to sort these documents into".to_string(),
+            );
+        }
+
+        let runtime = self.prepare_global_semantic_runtime(&settings).await?;
+        let mut wanted: Vec<PathBuf> = sources.iter().map(|entry| entry.path.clone()).collect();
+        for destination in &destinations {
+            if let Some(entries) = documents.get(destination) {
+                wanted.extend(entries.iter().map(|entry| entry.path.clone()));
+            }
+        }
+        let index = Arc::clone(&runtime.index);
+        let vectors = tokio::task::spawn_blocking(move || {
+            let guard = index.lock().unwrap_or_else(|p| p.into_inner());
+            let idx = guard
+                .as_ref()
+                .ok_or_else(|| "No semantic index found. Build the index first.".to_string())?;
+            idx.document_vectors(&wanted).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("Tidy-up task panicked: {e}"))??;
+
+        // Names are embedded in one call, as a query is: a name describes
+        // what belongs in the folder.
+        let names: Vec<String> = destinations
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .ok_or_else(|| format!("Folder has no name: {}", path.display()))
+            })
+            .collect::<Result<_, _>>()?;
+        let name_vectors = Self::embed_with(Arc::clone(&runtime.embedder), names, EmbedRole::Query)
+            .await?
+            .vectors;
+
+        let mut profiles = Vec::with_capacity(destinations.len());
+        let mut plan_destinations = Vec::with_capacity(destinations.len());
+        for (path, name) in destinations.iter().zip(name_vectors) {
+            let members = documents.get(path).map(Vec::as_slice).unwrap_or_default();
+            let indexed: Vec<&[f32]> = members
+                .iter()
+                .filter_map(|entry| vectors.get(&entry.path).map(Vec::as_slice))
+                .collect();
+            plan_destinations.push(TidyDestination {
+                path: path.clone(),
+                documents: members.len(),
+                indexed_documents: indexed.len(),
+            });
+            profiles.push(FolderProfile {
+                name,
+                content: folder_centroid(indexed),
+            });
+        }
+
+        let mut suggestions = Vec::new();
+        let mut unindexed = Vec::new();
+        for entry in sources {
+            let Some(vector) = vectors.get(&entry.path) else {
+                unindexed.push(entry);
+                continue;
+            };
+            let ranking = rank_folders(vector, &profiles);
+            let close_call = is_close_call(&ranking);
+            suggestions.push(TidySuggestion {
+                entry,
+                ranking: ranking
+                    .into_iter()
+                    .take(OFFERED)
+                    .map(|placement| TidyPlacement {
+                        destination: destinations[placement.folder].clone(),
+                        score: placement.score,
+                    })
+                    .collect(),
+                close_call,
+            });
+        }
+        Ok(TidyPlan {
+            folder,
+            destinations: plan_destinations,
+            suggestions,
+            unindexed,
+        })
     }
 
     /// Citation neighbours of a document that are present in the library,
@@ -16557,6 +16715,170 @@ exit 0
 
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].entry.path, std::fs::canonicalize(related).unwrap());
+    }
+
+    /// Names a folder by an axis of its own, so a test can say which folder a
+    /// name embedding points at.
+    struct FolderNameEmbedder;
+
+    impl Embedder for FolderNameEmbedder {
+        fn embedding_space_identity(&self) -> wilkes_core::embed::EmbeddingSpaceIdentity {
+            wilkes_core::embed::EmbeddingSpaceIdentity::for_test(
+                self.engine(),
+                self.model_id(),
+                self.dimension(),
+            )
+        }
+
+        fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("tidy-up embeds folder names in the query role only")
+        }
+
+        fn embed_query(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            texts
+                .iter()
+                .map(|text| match *text {
+                    "Recommendation" => Ok(vec![1.0, 0.0, 0.0]),
+                    "Law" => Ok(vec![0.0, 1.0, 0.0]),
+                    "Inner" => Ok(vec![0.0, 0.0, 1.0]),
+                    other => anyhow::bail!("unexpected folder name {other}"),
+                })
+                .collect()
+        }
+
+        fn model_id(&self) -> &str {
+            "folder-name-test"
+        }
+
+        fn dimension(&self) -> usize {
+            3
+        }
+
+        fn engine(&self) -> EmbeddingEngine {
+            EmbeddingEngine::Candle
+        }
+    }
+
+    #[tokio::test]
+    async fn tidy_folder_suggests_a_home_for_each_indexed_document() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let inbox = dir.path().join("inbox");
+        let library = dir.path().join("library");
+        let recommendation = library.join("Recommendation");
+        let law = library.join("Law");
+        let shelf = library.join("Shelf");
+        let inner = shelf.join("Inner");
+        for path in [&data_dir, &inbox, &recommendation, &law, &inner] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let write = |path: PathBuf| {
+            std::fs::write(&path, "text").unwrap();
+            std::fs::canonicalize(path).unwrap()
+        };
+        let recsys = write(inbox.join("recsys.txt"));
+        let legal = write(inbox.join("legal.txt"));
+        let unindexed = write(inbox.join("unindexed.txt"));
+        let precedent = write(law.join("precedent.txt"));
+        let nested = write(inner.join("nested.txt"));
+        let (ctx, _rx, _loop) = AppContext::new(
+            data_dir.clone(),
+            dir.path().join("settings.json"),
+            WorkerPaths::resolve(&data_dir),
+            Arc::new(MockEmitter {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+        *ctx.embedder.lock() = Some(Arc::new(FolderNameEmbedder));
+        let mut idx = SemanticIndex::create(
+            &data_dir,
+            "folder-name-test",
+            3,
+            EmbeddingEngine::Candle,
+            Some(&inbox),
+        )
+        .unwrap();
+        let prepared =
+            |path: &Path, vector: Vec<f32>| wilkes_core::embed::index::db::PreparedFile {
+                retained: Default::default(),
+                full_text: String::new(),
+                path: path.to_path_buf(),
+                chunks: vec![(
+                    wilkes_core::embed::index::chunk::Chunk {
+                        file_path: path.to_path_buf(),
+                        text: "text".to_string(),
+                        byte_range: ByteRange { start: 0, end: 4 },
+                        origin: SourceOrigin::TextFile { line: 1, col: 1 },
+                    },
+                    vector,
+                )],
+            };
+        idx.write_file(prepared(&recsys, vec![1.0, 0.1, 0.0]))
+            .unwrap();
+        idx.write_file(prepared(&legal, vec![0.1, 1.0, 0.0]))
+            .unwrap();
+        idx.activate_root(&library).unwrap();
+        idx.write_file(prepared(&precedent, vec![0.0, 1.0, 0.1]))
+            .unwrap();
+        idx.write_file(prepared(&nested, vec![0.0, 0.1, 1.0]))
+            .unwrap();
+        *ctx.index.lock() = Arc::new(Mutex::new(Some(idx)));
+        crate::commands::settings::update_settings(
+            &ctx.settings_path,
+            serde_json::json!({ "last_directory": inbox.clone(), "favorites": [library.clone()] }),
+        )
+        .await
+        .unwrap();
+
+        let plan = ctx.clone().tidy_folder(inbox.clone()).await.unwrap();
+
+        // The root holding only folders, and the folder holding only "Inner",
+        // are shelves; the folder being tidied is not its own destination.
+        let destinations: Vec<(&Path, usize, usize)> = plan
+            .destinations
+            .iter()
+            .map(|d| (d.path.as_path(), d.documents, d.indexed_documents))
+            .collect();
+        let law = std::fs::canonicalize(&law).unwrap();
+        let recommendation = std::fs::canonicalize(&recommendation).unwrap();
+        let inner = std::fs::canonicalize(&inner).unwrap();
+        assert_eq!(
+            destinations,
+            vec![
+                (law.as_path(), 1, 1),
+                (recommendation.as_path(), 0, 0),
+                (inner.as_path(), 1, 1),
+            ]
+        );
+        let suggested: Vec<(&Path, &Path)> = plan
+            .suggestions
+            .iter()
+            .map(|s| (s.entry.path.as_path(), s.ranking[0].destination.as_path()))
+            .collect();
+        assert_eq!(
+            suggested,
+            vec![
+                (legal.as_path(), law.as_path()),
+                (recsys.as_path(), recommendation.as_path()),
+            ]
+        );
+        assert!(plan.suggestions.iter().all(|s| s.ranking.len() == 3));
+        assert_eq!(
+            plan.unindexed
+                .iter()
+                .map(|e| e.path.clone())
+                .collect::<Vec<_>>(),
+            vec![unindexed]
+        );
+
+        let err = ctx.clone().tidy_folder(recommendation).await.unwrap_err();
+        assert!(err.contains("no documents directly in"), "{err}");
+        let err = ctx
+            .clone()
+            .tidy_folder(dir.path().to_path_buf())
+            .await
+            .unwrap_err();
+        assert!(err.contains("not in the library"), "{err}");
     }
 
     #[tokio::test]

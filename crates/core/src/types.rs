@@ -291,6 +291,49 @@ pub struct RelatedDocument {
     pub score: f32,
 }
 
+/// Suggested homes for the documents directly inside one library folder.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TidyPlan {
+    pub folder: PathBuf,
+    /// Every folder a document could be moved to, in path order: each library
+    /// root and folder beneath one, except the folder being tidied and any
+    /// folder that holds only folders.
+    pub destinations: Vec<TidyDestination>,
+    /// One per document of the folder that the semantic index holds, in path
+    /// order.
+    pub suggestions: Vec<TidySuggestion>,
+    /// Documents of the folder the semantic index does not hold. With nothing
+    /// to compare them by, they get no suggestion.
+    pub unindexed: Vec<FileEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TidyDestination {
+    pub path: PathBuf,
+    /// Documents directly in the folder.
+    pub documents: usize,
+    /// How many of those the semantic index holds. Only these say what the
+    /// folder is used for; a folder with none is judged by its name alone.
+    pub indexed_documents: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TidySuggestion {
+    pub entry: FileEntry,
+    /// The best few destinations, best first. Never empty.
+    pub ranking: Vec<TidyPlacement>,
+    /// The best destination barely leads the next: the document fits both.
+    pub close_call: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TidyPlacement {
+    pub destination: PathBuf,
+    /// Standard deviations above the other destinations, averaged over the
+    /// signals the destination has. Comparable within one suggestion only.
+    pub score: f32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CitationLinksQuery {
     pub root: PathBuf,
