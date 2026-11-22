@@ -40,6 +40,9 @@ export interface PreviewState {
   gutterClasses: RangeSet<GutterMarker>;
   /** Line spans replaced by a block widget, for keyboard navigation into them. */
   blocks: readonly Span[];
+  /** Start positions of the blank lines drawn as the margin between two
+   *  blocks, which vertical cursor motion passes over. */
+  margins: ReadonlySet<number>;
 }
 
 const INLINE_MARKS = new Set([
@@ -227,6 +230,8 @@ export function buildPreview(state: EditorState, host: PreviewHost): PreviewStat
   const spacedHeadings = new Map<number, number>();
   /** Line numbers inside verbatim blocks. */
   const verbatimLines = new Set<number>();
+  /** Line numbers whose indentation a list item has already claimed. */
+  const indentedLines = new Set<number>();
   const isBlank = (number: number) => /^\s*$/.test(doc.line(number).text);
 
   const slice = (node: { from: number; to: number }) => state.sliceDoc(node.from, node.to);
@@ -356,6 +361,16 @@ export function buildPreview(state: EditorState, host: PreviewHost): PreviewStat
           if (node.prevSibling?.name === "ListItem" && line > 1 && !isBlank(line - 1)) {
             lineClass(node.from, node.from, "cm-md-item-next");
           }
+          // The indentation that nests an item is set as wide as the reader
+          // indents a nested list (see `.cm-md-indent`), on every line the
+          // item holds.
+          const last = doc.lineAt(node.to).number;
+          for (let number = line; number <= last; number++) {
+            if (indentedLines.has(number)) continue;
+            indentedLines.add(number);
+            const { from, text } = doc.line(number);
+            mark(from, from + (text.length - text.trimStart().length), "cm-md-indent");
+          }
           return;
         }
         case "Blockquote":
@@ -366,9 +381,16 @@ export function buildPreview(state: EditorState, host: PreviewHost): PreviewStat
           return false;
         case "ListMark": {
           const item = node.parent;
-          if (!item || lineActive(node.from, node.to)) return false;
+          if (!item) return false;
+          const bullet = item.parent?.name === "BulletList" && !item.getChild("Task");
+          if (lineActive(node.from, node.to)) {
+            // The bullet's source keeps the bullet's width, so the item's
+            // text stays put when the caret comes to its line.
+            if (bullet) mark(node.from, node.to, "cm-md-bullet");
+            return false;
+          }
           if (item.getChild("Task")) hide(node.from, spaceAfter(node.to));
-          else if (item.parent?.name === "BulletList") replaceWith(node.from, node.to, new BulletWidget());
+          else if (bullet) replaceWith(node.from, node.to, new BulletWidget());
           else mark(node.from, node.to, "cm-md-list-number");
           return false;
         }
@@ -455,29 +477,35 @@ export function buildPreview(state: EditorState, host: PreviewHost): PreviewStat
     },
   });
 
-  blockSpacing(state, isBlank, spacedHeadings, verbatimLines, classLine);
-  return { decorations: Decoration.set(ranges, true), gutterClasses: RangeSet.of(gutterRanges, true), blocks };
+  const margins = blockSpacing(state, isBlank, spacedHeadings, verbatimLines, classLine);
+  return { decorations: Decoration.set(ranges, true), gutterClasses: RangeSet.of(gutterRanges, true), blocks, margins };
 }
 
-/** The reader's vertical rhythm. A run of blank lines between two blocks is
- *  the margin the reader puts between them, not a line of text: it shrinks to
- *  that margin (taller before a heading, whose top margin is larger) and any
- *  further blank lines in the run to nothing. A blank line holding the caret
- *  keeps its full height, so there is a line to type on. A heading that
- *  touches a neighbour without a blank line keeps its own margin on that side. */
+/** The reader's vertical rhythm. One blank line between two blocks is the
+ *  margin the reader puts there, not a line of text: it shrinks to that
+ *  margin (taller before a heading, whose top margin is larger). Every other
+ *  blank line is a line, drawn at its full height, so that what Enter adds
+ *  can be seen and what Backspace removes was visible. The margin is the last
+ *  line of the run that does not hold the caret: the caret keeps a line to
+ *  type on, each Enter moves it down by a whole line, and the text below
+ *  stays where it is while the caret moves through a run of several. Before
+ *  the first block the reader has no margin, so the blank lines there are all
+ *  lines. A heading that touches a neighbour without a blank line keeps its
+ *  own margin on that side. Returns where the margins start. */
 function blockSpacing(
   state: EditorState,
   isBlank: (number: number) => boolean,
   spacedHeadings: ReadonlyMap<number, number>,
   verbatimLines: ReadonlySet<number>,
   classLine: (position: number, className: string) => void,
-) {
+): Set<number> {
   const { doc } = state;
   const caretLines = new Set(
     state.selection.ranges.filter((range) => range.empty).map((range) => doc.lineAt(range.head).number),
   );
   const gap = (number: number) => isBlank(number) && !verbatimLines.has(number);
   const lineClass = (number: number, className: string) => classLine(doc.line(number).from, className);
+  const margins = new Set<number>();
 
   for (const [first, last] of spacedHeadings) {
     if (first > 1 && !isBlank(first - 1)) lineClass(first, "cm-md-space-above");
@@ -492,13 +520,16 @@ function blockSpacing(
     }
     let end = number;
     while (end < doc.lines && gap(end + 1)) end++;
-    // Before the first block and after the last there is no margin at all.
-    const between = number > 1 && end < doc.lines;
-    const size = spacedHeadings.has(end + 1) ? "cm-md-gap-heading" : "cm-md-gap-block";
-    for (let line = number; line <= end; line++) {
-      if (caretLines.has(line)) continue;
-      lineClass(line, between && line === number ? `cm-md-gap ${size}` : "cm-md-gap");
+    if (number > 1) {
+      const size = spacedHeadings.has(end + 1) ? "cm-md-gap-heading" : "cm-md-gap-block";
+      for (let line = end; line >= number; line--) {
+        if (caretLines.has(line)) continue;
+        lineClass(line, `cm-md-gap ${size}`);
+        margins.add(doc.line(line).from);
+        break;
+      }
     }
     number = end + 1;
   }
+  return margins;
 }

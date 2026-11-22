@@ -1,8 +1,9 @@
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { LanguageSupport, syntaxTree } from "@codemirror/language";
 import { Prec, StateField, type Extension } from "@codemirror/state";
-import { EditorView, gutterLineClass, keymap, type Command } from "@codemirror/view";
+import { EditorView, gutterLineClass, keymap } from "@codemirror/view";
 import { getLanguageExtension } from "@leonrjg/wilkes-reader";
+import { indentListItem, insertLink, moveByLine, toggleInline } from "./commands";
 import { buildPreview, type PreviewState } from "./decorations";
 import { mathSyntax } from "./mathSyntax";
 import { classifyReference } from "./references";
@@ -114,7 +115,7 @@ const previewTheme = () => EditorView.theme({
   ".cm-gutterElement.cm-md-h1": { lineHeight: "calc(1.15 * 16px * 1.25)" },
   ".cm-gutterElement.cm-md-h2": { lineHeight: "calc(1.08 * 16px * 1.25)" },
   ".cm-gutterElement.cm-md-h3, .cm-gutterElement.cm-md-h4": { lineHeight: "calc(16px * 1.25)" },
-  // A run of blank lines is the margin between two blocks (see
+  // One blank line between two blocks is the margin between them (see
   // `blockSpacing`); a line with no height of its own is all margin.
   ".cm-line.cm-md-gap": { lineHeight: "0" },
   ".cm-line.cm-md-gap-block": { paddingTop: BLOCK_MARGIN },
@@ -197,8 +198,12 @@ const previewTheme = () => EditorView.theme({
     verticalAlign: "middle",
     borderTop: "1px solid var(--border-strong)",
   },
-  // List markers in the text's own colour, as the reader's.
+  // List markers in the text's own colour, as the reader's. A bullet and the
+  // source it stands for take the same room.
   ".cm-md-bullet": { display: "inline-block", minWidth: "0.9em" },
+  // A list's indentation in the monospace face: two spaces of it are within
+  // a pixel of the 1.25rem the reader indents a nested list by.
+  ".cm-md-indent": { fontFamily: MONO },
   ".cm-md-list-number, .cm-md-list-number *": { color: "var(--text-main)" },
   ".cm-md-checkbox": { margin: "0 6px 0 0", verticalAlign: "middle", cursor: "pointer" },
   ".cm-md-task-done": { color: "var(--text-dim)", textDecoration: "line-through" },
@@ -211,25 +216,6 @@ const previewTheme = () => EditorView.theme({
   },
   ".cm-md-mermaid svg": { maxWidth: "100%", height: "auto" },
 });
-
-/** Arrow keys step into a construct drawn as a block widget, which the cursor
- *  would otherwise move straight past without ever revealing its source. */
-function stepIntoBlock(field: StateField<PreviewState>, forward: boolean): Command {
-  return (view) => {
-    const { state } = view;
-    const main = state.selection.main;
-    if (!main.empty) return false;
-    const line = state.doc.lineAt(main.head);
-    const neighbour = forward ? line.number + 1 : line.number - 1;
-    if (neighbour < 1 || neighbour > state.doc.lines) return false;
-    const target = state.doc.line(neighbour);
-    const block = state.field(field).blocks.find((span) => (forward ? span.from === target.from : span.to === target.to));
-    if (!block) return false;
-    const anchor = forward ? block.from : state.doc.lineAt(block.to).from;
-    view.dispatch({ selection: { anchor }, scrollIntoView: true });
-    return true;
-  };
-}
 
 /** Markdown that shows formatted while it is edited: headings, emphasis,
  *  links, lists, tasks, quotes, code blocks, images, tables, TeX math and
@@ -279,8 +265,14 @@ export function markdownLivePreview(options: LivePreviewOptions): Extension {
     field,
     previewTheme(),
     Prec.high(keymap.of([
-      { key: "ArrowDown", run: stepIntoBlock(field, true) },
-      { key: "ArrowUp", run: stepIntoBlock(field, false) },
+      { key: "ArrowDown", run: moveByLine(field, true) },
+      { key: "ArrowUp", run: moveByLine(field, false) },
+      { key: "Tab", run: indentListItem(true) },
+      { key: "Shift-Tab", run: indentListItem(false) },
+      { key: "Mod-b", run: toggleInline("**", "StrongEmphasis", "EmphasisMark") },
+      // Over the editor's "select parent syntax", which prose has no use for.
+      { key: "Mod-i", run: toggleInline("*", "Emphasis", "EmphasisMark") },
+      { key: "Mod-k", run: insertLink },
     ])),
     EditorView.domEventHandlers({
       mousedown(event) {

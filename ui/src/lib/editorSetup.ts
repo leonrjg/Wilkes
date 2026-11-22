@@ -1,5 +1,5 @@
 import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
-import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
+import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import {
   bracketMatching,
   defaultHighlightStyle,
@@ -75,6 +75,9 @@ export function editorSetup({ lineNumbers, prose }: EditorSetupOptions): EditorS
         ...foldKeymap,
         ...completionKeymap,
         ...lintKeymap,
+        // Tab indents rather than leaving the editor for the next control.
+        // Escape, then Tab, still moves focus on: CodeMirror's own way out.
+        indentWithTab,
       ]),
     ],
     setLineNumbers(view, show) {
