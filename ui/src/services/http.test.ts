@@ -117,7 +117,7 @@ describe("HttpSearchApi", () => {
   it("uses workspace registry endpoints", async () => {
     (fetch as any).mockResolvedValue({
       ok: true,
-      json: () => Promise.resolve({ active_workspace_id: "a", workspaces: [] }),
+      json: () => Promise.resolve({ active_workspace_id: "a", workspaces: [], open_elsewhere: [] }),
     });
 
     await api.listWorkspaces();

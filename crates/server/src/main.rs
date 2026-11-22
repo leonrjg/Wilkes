@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
     wilkes_core::integrations::fix_allowed_programs(config.allowed_programs.clone())?;
 
     let (events_tx, _) = broadcast::channel::<(String, serde_json::Value)>(1024);
-    let emitter: Arc<dyn wilkes_api::context::EventEmitter> = Arc::new(BroadcastEmitter {
+    let emitter: Arc<dyn wilkes_api::context::ViewEventSink> = Arc::new(BroadcastEmitter {
         tx: events_tx.clone(),
     });
     let (workspaces, event_rx, loop_fut) =

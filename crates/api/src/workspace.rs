@@ -14,7 +14,9 @@ use wilkes_core::consumer::{consumer_error, ConsumerError, ConsumerErrorCode};
 use wilkes_core::{consumer_bail, consumer_ensure};
 
 use crate::commands::settings::get_scoped_settings;
-use crate::context::{AppContext, EventEmitter, IndexSpace, ManagedCorpusBackup};
+use crate::context::{
+    AppContext, EventAudience, EventEmitter, IndexSpace, ManagedCorpusBackup, ViewEventSink,
+};
 
 const REGISTRY_VERSION: u32 = 1;
 const MANIFEST_VERSION: u32 = 1;
@@ -57,8 +59,14 @@ pub struct WorkspaceSummary {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceState {
+    /// The workspace the asker shows: a window's own, or the default for a
+    /// request that comes from no window.
     pub active_workspace_id: String,
     pub workspaces: Vec<WorkspaceSummary>,
+    /// Workspaces other windows show. Switching to one of these is refused;
+    /// the asker brings that window forward instead.
+    #[serde(default)]
+    pub open_elsewhere: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -395,6 +403,8 @@ impl WorkspaceManifest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct WorkspaceRegistryFile {
     version: u32,
+    /// The default workspace: the one shown by the window focused last, and
+    /// the one a request naming no workspace is answered from.
     active_workspace_id: String,
     workspace_ids: Vec<String>,
 }
@@ -865,25 +875,93 @@ pub async fn read_workspace_state(
     Ok(WorkspaceState {
         active_workspace_id: registry.active_workspace_id,
         workspaces,
+        open_elsewhere: Vec::new(),
     })
+}
+
+/// The label of the view a manager starts with: the desktop app's main
+/// window, or the web UI in front of `wilkes-server`.
+pub const PRIMARY_VIEW: &str = "main";
+
+/// A view asked for a workspace another view already shows.
+///
+/// Refused rather than allowed because a window keeps state of its own per
+/// workspace — open editors, viewer tabs, folder state — and two windows on
+/// one workspace would each write over the other's. The shell's remedy is to
+/// bring `view` forward instead.
+#[derive(Debug)]
+pub struct WorkspaceShownElsewhere {
+    pub workspace_id: String,
+    pub view: String,
+}
+
+impl std::fmt::Display for WorkspaceShownElsewhere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "This workspace is already open in another window")
+    }
+}
+
+impl std::error::Error for WorkspaceShownElsewhere {}
+
+/// Which workspace each view shows, and which is the default.
+///
+/// Its own lock, shared with every context's event emitter, because routing
+/// an event needs exactly this and nothing else. Whenever both this and the
+/// manager's map of contexts are taken, this is taken first.
+struct Views {
+    /// The workspace answering whatever names none: the HTTP API, an MCP
+    /// tool given no workspace, a window that shows none (the standalone
+    /// reader). The workspace of the view focused last, persisted as the
+    /// registry's `active_workspace_id`. Its context is always open.
+    default: String,
+    /// The workspace each view shows, by view label. One view per workspace:
+    /// see [`WorkspaceShownElsewhere`].
+    ///
+    /// Not persisted: a window other than the primary one is not reopened at
+    /// launch. Reopening them would open a context per window in a loop, and
+    /// a context's restore loads the models its settings enable — starting
+    /// workers in a loop.
+    shown: std::collections::HashMap<String, String>,
+}
+
+impl Views {
+    fn viewer_of(&self, workspace_id: &str) -> Option<&str> {
+        self.shown
+            .iter()
+            .find(|(_, shown)| shown.as_str() == workspace_id)
+            .map(|(view, _)| view.as_str())
+    }
+
+    /// Whether anything still needs this workspace's context open.
+    fn holds(&self, workspace_id: &str) -> bool {
+        self.default == workspace_id || self.viewer_of(workspace_id).is_some()
+    }
+
+    fn bind(&mut self, view: &str, workspace_id: &str) {
+        self.shown
+            .insert(view.to_string(), workspace_id.to_string());
+    }
+
+    fn unbind(&mut self, view: &str) -> Option<String> {
+        self.shown.remove(view)
+    }
 }
 
 pub struct WorkspaceManager {
     app_data_dir: PathBuf,
     settings_path: PathBuf,
-    events: Arc<dyn EventEmitter>,
-    active_event_workspace_id: Arc<RwLock<String>>,
-    active: RwLock<Arc<AppContext>>,
-    /// Contexts opened for workspaces that are *not* active, so a request can
-    /// name one without the registry — and the user's window — moving.
+    events: Arc<dyn ViewEventSink>,
+    views: Arc<RwLock<Views>>,
+    /// Every context this manager has open, one per workspace: those shown
+    /// in a view, the default's, and those a request opened by naming a
+    /// workspace ([`Self::context_for`]).
     ///
-    /// Kept rather than opened per request because a context owns the index
-    /// and metadata handles for its workspace: reopening them for every
-    /// exported document would pay that cost per file. The invariant that
-    /// makes the map safe is that a workspace appears here only while it is
-    /// not active — [`Self::switch`] retires the entry for the workspace it
-    /// activates, so its databases are never held by two contexts at once.
-    scoped: PLMutex<std::collections::HashMap<String, Arc<AppContext>>>,
+    /// One map, so "a workspace's databases are held by one context" is what
+    /// the structure says rather than something two maps are kept in step to
+    /// mean. Kept rather than opened per request because a context owns the
+    /// index and metadata handles for its workspace: reopening them for every
+    /// exported document would pay that cost per file.
+    contexts: PLMutex<std::collections::HashMap<String, Arc<AppContext>>>,
     registry_lock: PLMutex<()>,
     switch_lock: Mutex<()>,
     /// Projection builds in flight, keyed by projection workspace id. See
@@ -928,26 +1006,47 @@ impl Drop for ProjectionBuildSlot {
 
 struct WorkspaceEventEmitter {
     workspace_id: String,
-    active_workspace_id: Arc<RwLock<String>>,
-    inner: Arc<dyn EventEmitter>,
+    views: Arc<RwLock<Views>>,
+    inner: Arc<dyn ViewEventSink>,
 }
 
 impl EventEmitter for WorkspaceEventEmitter {
     fn emit(&self, name: &str, payload: serde_json::Value) {
-        if *self.active_workspace_id.read() == self.workspace_id {
-            self.inner.emit(name, payload);
+        let (views, default) = {
+            let views = self.views.read();
+            (
+                views
+                    .viewer_of(&self.workspace_id)
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                views.default == self.workspace_id,
+            )
+        };
+        // A workspace nobody is looking at — one the HTTP API or an MCP tool
+        // opened by naming it — reports to no one, as it always has.
+        if views.is_empty() && !default {
+            return;
         }
+        self.inner.emit_to(
+            EventAudience {
+                views: &views,
+                default,
+            },
+            name,
+            payload,
+        );
     }
 }
 
 fn scoped_events(
     workspace_id: &str,
-    active_workspace_id: Arc<RwLock<String>>,
-    events: Arc<dyn EventEmitter>,
+    views: Arc<RwLock<Views>>,
+    events: Arc<dyn ViewEventSink>,
 ) -> Arc<dyn EventEmitter> {
     Arc::new(WorkspaceEventEmitter {
         workspace_id: workspace_id.to_string(),
-        active_workspace_id,
+        views,
         inner: events,
     })
 }
@@ -992,7 +1091,7 @@ impl WorkspaceManager {
     pub fn new(
         app_data_dir: PathBuf,
         settings_path: PathBuf,
-        events: Arc<dyn EventEmitter>,
+        events: Arc<dyn ViewEventSink>,
     ) -> anyhow::Result<(
         Arc<Self>,
         mpsc::Receiver<ManagerEvent>,
@@ -1002,30 +1101,27 @@ impl WorkspaceManager {
         // be turned away before it can touch the registry it would share.
         let installation = crate::installation::InstallationLock::acquire(&app_data_dir)?;
         let id = initialize_workspace_registry(&app_data_dir, &settings_path)?;
-        let active_event_workspace_id = Arc::new(RwLock::new(id.clone()));
-        let data_dir = workspace_root(&app_data_dir, &id);
-        let manifest_path = workspace_manifest_path(&app_data_dir, &id);
-        let paths = WorkerPaths::resolve(&app_data_dir);
+        // The primary view shows the default workspace: the one shown by the
+        // window focused last when the installation was last open.
+        let views = Arc::new(RwLock::new(Views {
+            default: id.clone(),
+            shown: std::collections::HashMap::from([(PRIMARY_VIEW.to_string(), id.clone())]),
+        }));
         let (ctx, event_rx, loop_fut) = AppContext::new_scoped(
-            data_dir,
+            workspace_root(&app_data_dir, &id),
             app_data_dir.clone(),
             settings_path.clone(),
-            manifest_path,
-            paths,
-            scoped_events(
-                &id,
-                Arc::clone(&active_event_workspace_id),
-                Arc::clone(&events),
-            ),
+            workspace_manifest_path(&app_data_dir, &id),
+            WorkerPaths::resolve(&app_data_dir),
+            scoped_events(&id, Arc::clone(&views), Arc::clone(&events)),
         );
         Ok((
             Arc::new(Self {
                 app_data_dir,
                 settings_path,
                 events,
-                active_event_workspace_id,
-                active: RwLock::new(ctx),
-                scoped: PLMutex::new(std::collections::HashMap::new()),
+                views,
+                contexts: PLMutex::new(std::collections::HashMap::from([(id, ctx)])),
                 registry_lock: PLMutex::new(()),
                 switch_lock: Mutex::new(()),
                 projection_builds: PLMutex::new(std::collections::HashMap::new()),
@@ -1037,10 +1133,45 @@ impl WorkspaceManager {
         ))
     }
 
+    /// The default workspace's context: what answers a request that names no
+    /// workspace and comes from no window.
     pub fn active(&self) -> Arc<AppContext> {
-        Arc::clone(&self.active.read())
+        let views = self.views.read();
+        Arc::clone(
+            self.contexts
+                .lock()
+                .get(&views.default)
+                .expect("the default workspace's context is open while it is the default"),
+        )
     }
 
+    /// The context of the workspace `view` shows. A view that shows none —
+    /// the standalone reader, or a window not yet bound — is answered from
+    /// the default workspace, as every such window was before there was more
+    /// than one.
+    pub fn view_context(&self, view: &str) -> Arc<AppContext> {
+        let views = self.views.read();
+        let id = views.shown.get(view).unwrap_or(&views.default);
+        Arc::clone(
+            self.contexts
+                .lock()
+                .get(id)
+                .expect("a shown workspace's context is open while it is shown"),
+        )
+    }
+
+    /// The workspace `view` shows, if it shows one.
+    pub fn view_workspace_id(&self, view: &str) -> Option<String> {
+        self.views.read().shown.get(view).cloned()
+    }
+
+    /// The view showing workspace `id`, if one does.
+    pub fn view_showing(&self, id: &str) -> Option<String> {
+        self.views.read().viewer_of(id).map(str::to_string)
+    }
+
+    /// The installation's listing: `active_workspace_id` is the default
+    /// workspace. For a request that comes from no view.
     pub async fn state(&self) -> anyhow::Result<WorkspaceState> {
         // The registry snapshot is taken under the lock and the manifests are
         // read after it: `read_workspace_state` awaits, and this lock must not
@@ -1052,55 +1183,162 @@ impl WorkspaceManager {
         read_workspace_state(&self.app_data_dir, &self.settings_path).await
     }
 
-    /// The context serving one workspace, opening it if it is not the active
-    /// one. Activating nothing: the registry, the desktop window and the
-    /// active context are left exactly as they were.
+    /// The listing as one view sees it: `active_workspace_id` is the
+    /// workspace that view shows, and `open_elsewhere` the ones other views
+    /// show.
+    pub async fn state_for_view(&self, view: &str) -> anyhow::Result<WorkspaceState> {
+        let mut state = self.state().await?;
+        let views = self.views.read();
+        state.active_workspace_id = views.shown.get(view).unwrap_or(&views.default).clone();
+        state.open_elsewhere = views
+            .shown
+            .iter()
+            .filter(|(label, _)| label.as_str() != view)
+            .map(|(_, id)| id.clone())
+            .collect();
+        Ok(state)
+    }
+
+    /// The context serving one workspace, opening it if none is open. Moves
+    /// nothing: no view, the default workspace and the registry are left
+    /// exactly as they were.
     ///
     /// This is what lets a caller work across workspaces at all. Every
     /// document endpoint reads the index of the context it is given, and each
     /// workspace has its own — so before this, reaching a document meant
-    /// [`Self::switch`], which rewrites the registry on disk, shuts the
-    /// previous context down and moves the user's window. A read had to
-    /// perform a write to happen.
+    /// switching, which rewrites the registry on disk, shuts the previous
+    /// context down and moves the user's window. A read had to perform a
+    /// write to happen.
     pub async fn context_for(&self, id: &str) -> anyhow::Result<Arc<AppContext>> {
-        // The same lock `switch` takes: while this decides whether `id` is
-        // active and opens a context for it, the active workspace cannot move
-        // out from under the decision.
+        // The same lock every view change takes: while this decides whether
+        // a context for `id` is open and opens one, none can be retired.
         let _guard = self.switch_lock.lock().await;
-        {
-            let _registry_guard = self.registry_lock.lock();
-            let registry = load_registry(&self.app_data_dir)?;
-            anyhow::ensure!(
-                registry.workspace_ids.iter().any(|item| item == id),
-                "Unknown workspace"
-            );
-            if registry.active_workspace_id == id {
-                return Ok(self.active());
-            }
-        }
-        if let Some(ctx) = self.scoped.lock().get(id) {
-            return Ok(Arc::clone(ctx));
-        }
+        self.ensure_registered(id)?;
+        Ok(self.context_or_open(id))
+    }
 
+    fn ensure_registered(&self, id: &str) -> anyhow::Result<()> {
+        let _registry_guard = self.registry_lock.lock();
+        let registry = load_registry(&self.app_data_dir)?;
+        anyhow::ensure!(
+            registry.workspace_ids.iter().any(|item| item == id),
+            "Unknown workspace"
+        );
+        Ok(())
+    }
+
+    /// The open context for `id`, or a new one. The caller holds
+    /// `switch_lock`, so no other caller can open a second one meanwhile.
+    fn context_or_open(&self, id: &str) -> Arc<AppContext> {
+        if let Some(ctx) = self.contexts.lock().get(id) {
+            return Arc::clone(ctx);
+        }
         let (ctx, event_rx, loop_fut) = AppContext::new_scoped(
             workspace_root(&self.app_data_dir, id),
             self.app_data_dir.clone(),
             self.settings_path.clone(),
             workspace_manifest_path(&self.app_data_dir, id),
             WorkerPaths::resolve(&self.app_data_dir),
-            // The same scoped emitter the active context gets: it drops every
-            // event while its workspace is not active, so opening one of these
-            // cannot make the window report progress from a workspace the user
-            // is not looking at.
-            scoped_events(
-                id,
-                Arc::clone(&self.active_event_workspace_id),
-                Arc::clone(&self.events),
-            ),
+            // Routed by what the views show: a context no view shows reports
+            // to no window, so opening one cannot make a window report
+            // progress from a workspace the user is not looking at.
+            scoped_events(id, Arc::clone(&self.views), Arc::clone(&self.events)),
         );
         ctx.clone().spawn_background_tasks(event_rx, loop_fut);
-        self.scoped.lock().insert(id.to_string(), Arc::clone(&ctx));
-        Ok(ctx)
+        self.contexts
+            .lock()
+            .insert(id.to_string(), Arc::clone(&ctx));
+        ctx
+    }
+
+    /// Shuts down `id`'s context if no view shows it and it is not the
+    /// default. The caller holds `switch_lock`.
+    async fn retire_if_unheld(&self, id: &str) {
+        let retired = {
+            let views = self.views.read();
+            if views.holds(id) {
+                None
+            } else {
+                self.contexts.lock().remove(id)
+            }
+        };
+        if let Some(ctx) = retired {
+            ctx.shutdown().await;
+        }
+    }
+
+    /// Writes the default workspace to the registry, before the views take
+    /// it on: a failure leaves memory and disk agreeing. The caller holds
+    /// `switch_lock`, so no other change lands between this and the views
+    /// being updated.
+    fn persist_default(&self, default: &str) -> anyhow::Result<()> {
+        let _registry_guard = self.registry_lock.lock();
+        let mut registry = load_registry(&self.app_data_dir)?;
+        anyhow::ensure!(
+            registry.workspace_ids.iter().any(|item| item == default),
+            "Unknown workspace"
+        );
+        if registry.active_workspace_id == default {
+            return Ok(());
+        }
+        registry.active_workspace_id = default.to_string();
+        atomic_write_json(&registry_path(&self.app_data_dir), &registry)
+    }
+
+    /// Shows workspace `id` in a new view. The default does not move: the
+    /// window that opens takes it when it is focused ([`Self::focus_view`]).
+    pub async fn open_view(&self, view: &str, id: &str) -> anyhow::Result<()> {
+        let _guard = self.switch_lock.lock().await;
+        self.ensure_registered(id)?;
+        {
+            let views = self.views.read();
+            anyhow::ensure!(
+                !views.shown.contains_key(view),
+                "A window named {view} already shows a workspace"
+            );
+            if let Some(other) = views.viewer_of(id) {
+                return Err(WorkspaceShownElsewhere {
+                    workspace_id: id.to_string(),
+                    view: other.to_string(),
+                }
+                .into());
+            }
+        }
+        self.context_or_open(id);
+        self.views.write().bind(view, id);
+        Ok(())
+    }
+
+    /// Makes the workspace `view` shows the default, as the user moving to
+    /// that window does. A view that shows none leaves the default where it
+    /// is.
+    pub async fn focus_view(&self, view: &str) -> anyhow::Result<()> {
+        let _guard = self.switch_lock.lock().await;
+        let (previous, next) = {
+            let views = self.views.read();
+            let Some(next) = views.shown.get(view) else {
+                return Ok(());
+            };
+            if *next == views.default {
+                return Ok(());
+            }
+            (views.default.clone(), next.clone())
+        };
+        self.persist_default(&next)?;
+        self.views.write().default = next;
+        self.retire_if_unheld(&previous).await;
+        Ok(())
+    }
+
+    /// Forgets a view that has closed, and shuts down the workspace it showed
+    /// unless something else still holds it.
+    pub async fn close_view(&self, view: &str) -> anyhow::Result<()> {
+        let _guard = self.switch_lock.lock().await;
+        let shown = self.views.write().unbind(view);
+        if let Some(shown) = shown {
+            self.retire_if_unheld(&shown).await;
+        }
+        Ok(())
     }
 
     /// Set where this installation embeds, and the host's token.
@@ -1125,9 +1363,9 @@ impl WorkspaceManager {
         .map_err(|error| format!("Could not store the embedding host's token: {error:#}"))?;
 
         let before = active.get_settings().await.remote_embedding;
-        // A changed setting reloads the active workspace's embedder as part
-        // of saving it; a token alone changes no setting, so that workspace is
-        // reloaded here instead.
+        // A changed setting reloads the default workspace's embedder as part
+        // of saving it; a token alone changes no setting, so that workspace
+        // is reloaded here instead.
         active
             .update_settings(serde_json::json!({ "remote_embedding": settings }))
             .await
@@ -1135,29 +1373,47 @@ impl WorkspaceManager {
         if before == settings {
             active.embedding_location_changed();
         }
-        let scoped: Vec<Arc<AppContext>> = self.scoped.lock().values().cloned().collect();
-        for ctx in scoped {
+        let others: Vec<Arc<AppContext>> = self
+            .contexts
+            .lock()
+            .values()
+            .filter(|ctx| !Arc::ptr_eq(ctx, &active))
+            .cloned()
+            .collect();
+        for ctx in others {
             ctx.embedding_location_changed();
         }
         Ok(())
     }
 
-    /// Shuts down every context this manager owns — the active one and any
-    /// opened for other workspaces.
+    /// Shuts down every context this manager owns — those the views show and
+    /// any opened for other workspaces.
     ///
-    /// Exists because `active()` is no longer the whole answer: a context
-    /// opened by [`Self::context_for`] owns worker processes, a directory
-    /// watcher and index handles exactly like the active one, so shutting only
-    /// the active workspace down at exit leaves those running past the signal
-    /// that asked the process to stop.
+    /// The default's context is shut down but stays in the map: a request
+    /// still arriving during exit is answered by a context that refuses it,
+    /// not by a manager with no default to give it.
     pub async fn shutdown_all(&self) {
-        let scoped: Vec<Arc<AppContext>> = self.scoped.lock().drain().map(|(_, ctx)| ctx).collect();
-        for ctx in scoped {
+        let (others, default) = {
+            let views = self.views.read();
+            let mut contexts = self.contexts.lock();
+            let default = contexts.get(&views.default).cloned();
+            let others: Vec<Arc<AppContext>> = contexts
+                .drain()
+                .filter(|(id, _)| *id != views.default)
+                .map(|(_, ctx)| ctx)
+                .collect();
+            if let Some(default) = &default {
+                contexts.insert(views.default.clone(), Arc::clone(default));
+            }
+            (others, default)
+        };
+        for ctx in others {
             ctx.shutdown().await;
         }
-        self.active().shutdown().await;
+        if let Some(default) = default {
+            default.shutdown().await;
+        }
     }
-
     pub async fn create(&self, name: String) -> anyhow::Result<WorkspaceSummary> {
         let (manifest, manifest_path) = {
             let _guard = self.registry_lock.lock();
@@ -1203,69 +1459,54 @@ impl WorkspaceManager {
         Ok(manifest.summary(settings.semantic.selected))
     }
 
-    pub async fn switch(self: &Arc<Self>, id: &str) -> anyhow::Result<WorkspaceState> {
-        let _guard = self.switch_lock.lock().await;
-        let mut already_active = false;
-        let mut retired: Option<Arc<AppContext>> = None;
+    /// Shows workspace `id` in `view`, and makes it the default: the user
+    /// switching a window is the user working in it.
+    ///
+    /// Refused with [`WorkspaceShownElsewhere`] when another view shows `id`.
+    pub async fn switch_view(&self, view: &str, id: &str) -> anyhow::Result<WorkspaceState> {
         {
-            let _registry_guard = self.registry_lock.lock();
-            let registry = load_registry(&self.app_data_dir)?;
-            anyhow::ensure!(
-                registry.workspace_ids.iter().any(|item| item == id),
-                "Unknown workspace"
-            );
-            if registry.active_workspace_id == id {
-                already_active = true;
+            let _guard = self.switch_lock.lock().await;
+            self.ensure_registered(id)?;
+            let change = {
+                let views = self.views.read();
+                if let Some(other) = views.viewer_of(id) {
+                    if other != view {
+                        return Err(WorkspaceShownElsewhere {
+                            workspace_id: id.to_string(),
+                            view: other.to_string(),
+                        }
+                        .into());
+                    }
+                }
+                let previous_shown = views.shown.get(view).cloned();
+                if previous_shown.as_deref() == Some(id) && views.default == id {
+                    None
+                } else {
+                    Some((previous_shown, views.default.clone()))
+                }
+            };
+            let Some((previous_shown, previous_default)) = change else {
+                drop(_guard);
+                return self.state_for_view(view).await;
+            };
+            self.context_or_open(id);
+            self.persist_default(id)?;
+            {
+                let mut views = self.views.write();
+                views.default = id.to_string();
+                views.bind(view, id);
             }
+            if let Some(previous_shown) = previous_shown {
+                self.retire_if_unheld(&previous_shown).await;
+            }
+            self.retire_if_unheld(&previous_default).await;
         }
-        if already_active {
-            return read_workspace_state(&self.app_data_dir, &self.settings_path).await;
-        }
-        // A workspace this manager opened as a non-active context is retired
-        // before it becomes the active one: its databases must be held by one
-        // context, and from here on that is the context installed below.
-        if let Some(previous_scoped) = self.scoped.lock().remove(id) {
-            retired = Some(previous_scoped);
-        }
-        if let Some(previous_scoped) = retired {
-            previous_scoped.shutdown().await;
-        }
-
-        let data_dir = workspace_root(&self.app_data_dir, id);
-        let manifest_path = workspace_manifest_path(&self.app_data_dir, id);
-        let paths = WorkerPaths::resolve(&self.app_data_dir);
-        let (ctx, event_rx, loop_fut) = AppContext::new_scoped(
-            data_dir,
-            self.app_data_dir.clone(),
-            self.settings_path.clone(),
-            manifest_path,
-            paths,
-            scoped_events(
-                id,
-                Arc::clone(&self.active_event_workspace_id),
-                Arc::clone(&self.events),
-            ),
-        );
-        let previous = {
-            let _registry_guard = self.registry_lock.lock();
-            let mut registry = load_registry(&self.app_data_dir)?;
-            anyhow::ensure!(
-                registry.workspace_ids.iter().any(|item| item == id),
-                "Unknown workspace"
-            );
-            registry.active_workspace_id = id.to_string();
-            atomic_write_json(&registry_path(&self.app_data_dir), &registry)?;
-            *self.active_event_workspace_id.write() = id.to_string();
-            ctx.clone().spawn_background_tasks(event_rx, loop_fut);
-            std::mem::replace(&mut *self.active.write(), ctx)
-        };
-        previous.shutdown().await;
         let state = self.state().await?;
         self.events.emit(
             "workspace-changed",
             serde_json::to_value(&state).unwrap_or_default(),
         );
-        Ok(state)
+        self.state_for_view(view).await
     }
 
     /// Removes a workspace from the registry and deletes everything it owns
@@ -1289,9 +1530,9 @@ impl WorkspaceManager {
     /// and one that does not would be surprised to find the window somewhere
     /// else because it deleted a workspace it was not looking at.
     pub async fn delete(&self, id: &str) -> anyhow::Result<WorkspaceState> {
-        // The same lock `switch` and `context_for` take: no workspace may
-        // become active, and no context may be opened for one, between the
-        // decision below and the removal that follows it.
+        // The same lock every view change and `context_for` take: no view may
+        // move to a workspace, and no context may be opened for one, between
+        // the decision below and the removal that follows it.
         let _switch_guard = self.switch_lock.lock().await;
         let removals = {
             let _registry_guard = self.registry_lock.lock();
@@ -1315,10 +1556,13 @@ impl WorkspaceManager {
                     removals.push(candidate.clone());
                 }
             }
-            anyhow::ensure!(
-                !removals.contains(&registry.active_workspace_id),
-                "The active workspace cannot be deleted. Switch to another workspace first."
-            );
+            {
+                let views = self.views.read();
+                anyhow::ensure!(
+                    !removals.iter().any(|removal| views.holds(removal)),
+                    "A workspace open in a window cannot be deleted. Switch that window to another workspace, or close it, first."
+                );
+            }
             removals
         };
 
@@ -1329,8 +1573,8 @@ impl WorkspaceManager {
         // the opposite order would leave the registry naming a workspace
         // whose manifest is gone — and every listing reads every manifest.
         for removal in &removals {
-            let scoped = { self.scoped.lock().remove(removal) };
-            if let Some(context) = scoped {
+            let context = { self.contexts.lock().remove(removal) };
+            if let Some(context) = context {
                 context.shutdown().await;
             }
         }
@@ -2335,8 +2579,14 @@ impl WorkspaceManager {
                 );
                 return Ok(status);
             }
-            let scoped_context = { self.scoped.lock().remove(existing_id) };
-            if let Some(context) = scoped_context {
+            // Its directory is about to be replaced: a window showing it, or
+            // the default, would be left reading files that are gone.
+            anyhow::ensure!(
+                !self.views.read().holds(existing_id),
+                "the corpus being restored over is open in a window"
+            );
+            let context = { self.contexts.lock().remove(existing_id) };
+            if let Some(context) = context {
                 context.shutdown().await;
             }
             std::fs::remove_dir_all(&root)?;
@@ -2473,6 +2723,10 @@ mod tests {
         fn emit(&self, _name: &str, _payload: serde_json::Value) {}
     }
 
+    impl ViewEventSink for NoopEmitter {
+        fn emit_to(&self, _audience: EventAudience<'_>, _name: &str, _payload: serde_json::Value) {}
+    }
+
     struct RecordingEmitter(Arc<StdMutex<Vec<String>>>);
 
     #[tokio::test]
@@ -2516,6 +2770,18 @@ mod tests {
         }
     }
 
+    /// A workspace's event is recorded as `name@view,view` (`*` marking the
+    /// default), so a test can say where it went.
+    impl ViewEventSink for RecordingEmitter {
+        fn emit_to(&self, audience: EventAudience<'_>, name: &str, _payload: serde_json::Value) {
+            self.0.lock().unwrap().push(format!(
+                "{name}@{}{}",
+                audience.views.join(","),
+                if audience.default { "*" } else { "" }
+            ));
+        }
+    }
+
     /// Deleting is not writing into a corpus, so a managed one is deletable
     /// exactly like a user workspace — and its hidden projections go with it,
     /// because a projection of a corpus that no longer exists is nothing.
@@ -2523,7 +2789,7 @@ mod tests {
     async fn deleting_a_managed_corpus_removes_its_projections_and_its_files() {
         let dir = tempfile::tempdir().unwrap();
         let settings = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
         let corpus = manager
@@ -2584,14 +2850,14 @@ mod tests {
     async fn the_active_workspace_is_refused_and_left_intact() {
         let dir = tempfile::tempdir().unwrap();
         let settings = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
         let active = manager.active_workspace_id().unwrap();
 
         let error = manager.delete(&active).await.unwrap_err().to_string();
         assert!(
-            error.contains("active workspace cannot be deleted"),
+            error.contains("open in a window cannot be deleted"),
             "unexpected refusal: {error}"
         );
         assert!(workspace_root(dir.path(), &active).exists());
@@ -2610,16 +2876,16 @@ mod tests {
     async fn deleting_a_workspace_retires_the_context_opened_for_it() {
         let dir = tempfile::tempdir().unwrap();
         let settings = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
         let created = manager.create("Second".to_string()).await.unwrap();
         manager.context_for(&created.id).await.unwrap();
-        assert!(manager.scoped.lock().contains_key(&created.id));
+        assert!(manager.contexts.lock().contains_key(&created.id));
 
         manager.delete(&created.id).await.unwrap();
 
-        assert!(!manager.scoped.lock().contains_key(&created.id));
+        assert!(!manager.contexts.lock().contains_key(&created.id));
         assert!(!workspace_root(dir.path(), &created.id).exists());
         assert!(
             manager.context_for(&created.id).await.is_err(),
@@ -2641,7 +2907,7 @@ mod tests {
     async fn the_canonical_corpus_opens_an_index_and_loads_no_model() {
         let dir = tempfile::tempdir().unwrap();
         let settings = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
         let corpus = manager
@@ -2688,7 +2954,7 @@ mod tests {
     async fn a_corpus_without_an_index_reports_no_embedding_space() {
         let dir = tempfile::tempdir().unwrap();
         let settings = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings, Arc::clone(&events)).unwrap();
         let embedding = SelectedEmbedder::default();
@@ -2792,7 +3058,7 @@ mod tests {
     #[tokio::test]
     async fn a_projection_is_internal_and_may_not_serve_membership_it_lacks() {
         let dir = tempfile::tempdir().unwrap();
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) = WorkspaceManager::new(
             dir.path().to_path_buf(),
             dir.path().join("global-settings.json"),
@@ -3025,7 +3291,7 @@ mod tests {
     #[tokio::test]
     async fn ensuring_a_level_space_sweeps_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) = WorkspaceManager::new(
             dir.path().to_path_buf(),
             dir.path().join("global-settings.json"),
@@ -3176,7 +3442,7 @@ mod tests {
     #[tokio::test]
     async fn a_pin_the_corpus_lacks_is_refused_with_the_step_that_creates_one() {
         let dir = tempfile::tempdir().unwrap();
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) = WorkspaceManager::new(
             dir.path().to_path_buf(),
             dir.path().join("global-settings.json"),
@@ -3220,7 +3486,7 @@ mod tests {
     #[tokio::test]
     async fn a_projection_build_outlives_the_request_that_started_it() {
         let dir = tempfile::tempdir().unwrap();
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) = WorkspaceManager::new(
             dir.path().to_path_buf(),
             dir.path().join("global-settings.json"),
@@ -3326,7 +3592,7 @@ mod tests {
     #[tokio::test]
     async fn catching_up_a_level_corpus_loads_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) = WorkspaceManager::new(
             dir.path().to_path_buf(),
             dir.path().join("global-settings.json"),
@@ -3378,7 +3644,7 @@ mod tests {
     async fn managed_backup_restores_over_only_an_empty_same_store_corpus() {
         let source = tempfile::tempdir().unwrap();
         let source_settings = source.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (source_manager, _events, _worker_loop) = WorkspaceManager::new(
             source.path().to_path_buf(),
             source_settings,
@@ -3505,19 +3771,37 @@ mod tests {
     }
 
     #[test]
-    fn retired_workspace_events_are_suppressed() {
-        let active = Arc::new(RwLock::new("a".to_string()));
+    fn a_workspace_event_reaches_only_the_view_showing_it() {
+        let views = Arc::new(RwLock::new(Views {
+            default: "a".to_string(),
+            shown: std::collections::HashMap::from([("main".to_string(), "a".to_string())]),
+        }));
         let names = Arc::new(StdMutex::new(Vec::new()));
-        let inner: Arc<dyn EventEmitter> = Arc::new(RecordingEmitter(Arc::clone(&names)));
-        let a = scoped_events("a", Arc::clone(&active), Arc::clone(&inner));
-        let b = scoped_events("b", Arc::clone(&active), inner);
+        let inner: Arc<dyn ViewEventSink> = Arc::new(RecordingEmitter(Arc::clone(&names)));
+        let a = scoped_events("a", Arc::clone(&views), Arc::clone(&inner));
+        let b = scoped_events("b", Arc::clone(&views), Arc::clone(&inner));
+        let c = scoped_events("c", Arc::clone(&views), inner);
 
         a.emit("a-live", serde_json::Value::Null);
-        *active.write() = "b".to_string();
-        a.emit("a-late", serde_json::Value::Null);
-        b.emit("b-live", serde_json::Value::Null);
+        // Nobody shows b yet: its events go nowhere.
+        b.emit("b-hidden", serde_json::Value::Null);
+        views.write().bind("second", "b");
+        b.emit("b-shown", serde_json::Value::Null);
+        // The second window is focused: b is now the default.
+        views.write().default = "b".to_string();
+        b.emit("b-default", serde_json::Value::Null);
+        a.emit("a-still-shown", serde_json::Value::Null);
+        c.emit("c-hidden", serde_json::Value::Null);
 
-        assert_eq!(*names.lock().unwrap(), vec!["a-live", "b-live"]);
+        assert_eq!(
+            *names.lock().unwrap(),
+            vec![
+                "a-live@main*",
+                "b-shown@second",
+                "b-default@second*",
+                "a-still-shown@main",
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3547,7 +3831,7 @@ mod tests {
     async fn managed_workspace_is_idempotent_listed_and_protected() {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings_path, events).unwrap();
         let request = EnsureManagedWorkspace {
@@ -3590,7 +3874,10 @@ mod tests {
 
         // Activation is what makes it searchable: every read path the UI has
         // answers for the active workspace.
-        let switched = manager.switch(&first.corpus_id).await.unwrap();
+        let switched = manager
+            .switch_view(PRIMARY_VIEW, &first.corpus_id)
+            .await
+            .unwrap();
         assert_eq!(switched.active_workspace_id, first.corpus_id);
         assert!(manager.active().is_read_only());
         assert_eq!(
@@ -3755,7 +4042,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("settings.json");
         std::fs::write(dir.path().join("research.db"), b"legacy").unwrap();
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
 
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings_path, events).unwrap();
@@ -3772,7 +4059,7 @@ mod tests {
     async fn renaming_a_workspace_persists_its_manifest_name() {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings_path, events).unwrap();
         let id = manager.state().await.unwrap().active_workspace_id;
@@ -3800,7 +4087,7 @@ mod tests {
     async fn switching_restores_workspace_roots_and_database_directory() {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings_path, events).unwrap();
         let first = manager.state().await.unwrap().active_workspace_id;
@@ -3832,12 +4119,12 @@ mod tests {
         .unwrap();
 
         let second = manager.create("Second".to_string()).await.unwrap();
-        manager.switch(&second.id).await.unwrap();
+        manager.switch_view(PRIMARY_VIEW, &second.id).await.unwrap();
         assert!(manager.active().get_settings().await.favorites.is_empty());
         assert!(!manager.active().data_dir.join("research.db").exists());
         assert!(!manager.active().data_dir.join("semantic_index.db").exists());
 
-        manager.switch(&first).await.unwrap();
+        manager.switch_view(PRIMARY_VIEW, &first).await.unwrap();
         let restored = manager.active().get_settings().await;
         assert_eq!(restored.favorites, vec![first_root.clone()]);
         assert_eq!(restored.last_directory, Some(first_root));
@@ -3857,7 +4144,7 @@ mod tests {
     async fn a_non_active_workspace_is_reachable_without_activating_it() {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings_path, events).unwrap();
         let first = manager.state().await.unwrap().active_workspace_id;
@@ -3890,15 +4177,19 @@ mod tests {
         let active = manager.context_for(&first).await.unwrap();
         assert!(Arc::ptr_eq(&active, &manager.active()));
 
-        // Activating the workspace retires the context opened for it, leaving
-        // the installed one as its only owner.
-        manager.switch(&second.id).await.unwrap();
-        assert!(!Arc::ptr_eq(&manager.active(), &scoped));
+        // Showing the workspace takes on the context already open for it —
+        // one context per workspace — and retires the one it leaves.
+        manager.switch_view(PRIMARY_VIEW, &second.id).await.unwrap();
+        assert!(Arc::ptr_eq(&manager.active(), &scoped));
+        assert!(active.is_shutting_down());
         assert_eq!(
             manager.active().data_dir,
             workspace_root(dir.path(), &second.id)
         );
-        assert!(manager.scoped.lock().is_empty());
+        assert_eq!(
+            manager.contexts.lock().keys().cloned().collect::<Vec<_>>(),
+            vec![second.id.clone()]
+        );
 
         manager.active().shutdown().await;
     }
@@ -3907,7 +4198,7 @@ mod tests {
     async fn shutting_down_releases_every_workspace_this_manager_opened() {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings_path, events).unwrap();
         let second = manager.create("Second".to_string()).await.unwrap();
@@ -3919,14 +4210,15 @@ mod tests {
         // workspace owns workers and watchers of its own.
         assert!(scoped.is_shutting_down());
         assert!(manager.active().is_shutting_down());
-        assert!(manager.scoped.lock().is_empty());
+        // The default's context stays as the one a late request is given.
+        assert_eq!(manager.contexts.lock().len(), 1);
     }
 
     #[tokio::test]
     async fn an_unknown_workspace_is_an_error_rather_than_a_new_one() {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings_path, events).unwrap();
 
@@ -3945,7 +4237,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings_path, events).unwrap();
         let active_id = manager.state().await.unwrap().active_workspace_id;
@@ -4000,7 +4292,7 @@ mod tests {
     async fn an_unnamed_scope_answers_from_the_active_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let settings = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
         let active = manager.state().await.unwrap().active_workspace_id;
@@ -4025,7 +4317,7 @@ mod tests {
     async fn a_pin_no_index_can_prove_is_refused_rather_than_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let settings = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
 
@@ -4048,7 +4340,7 @@ mod tests {
     async fn an_unknown_id_names_no_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let settings = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
 
@@ -4085,7 +4377,7 @@ mod tests {
     async fn a_canonical_corpus_answers_unpinned_because_it_names_no_space() {
         let dir = tempfile::tempdir().unwrap();
         let settings = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
         let embedding = SelectedEmbedder::default();
@@ -4137,7 +4429,7 @@ mod tests {
     async fn an_internal_projection_is_not_addressable_as_a_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let settings = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings, events).unwrap();
         let embedding = SelectedEmbedder::default();
@@ -4192,17 +4484,17 @@ mod tests {
     async fn switching_away_frees_the_retired_context() {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("global-settings.json");
-        let events: Arc<dyn EventEmitter> = Arc::new(NoopEmitter);
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
         let (manager, _events, _worker_loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings_path, events).unwrap();
         let first = manager.state().await.unwrap().active_workspace_id;
         let second = manager.create("Second".to_string()).await.unwrap().id;
-        manager.switch(&second).await.unwrap();
+        manager.switch_view(PRIMARY_VIEW, &second).await.unwrap();
         // Open a database, as the interface does on arrival.
         manager.active().list_bookmarks().await.unwrap();
         let retired = Arc::downgrade(&manager.active());
 
-        manager.switch(&first).await.unwrap();
+        manager.switch_view(PRIMARY_VIEW, &first).await.unwrap();
 
         // Its restore task may still be finishing; nothing else should hold it.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -4214,6 +4506,164 @@ mod tests {
             0,
             "the retired workspace's context is still alive after the switch"
         );
+        manager.shutdown_all().await;
+    }
+
+    async fn manager_with_two_workspaces(dir: &Path) -> (Arc<WorkspaceManager>, String, String) {
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) =
+            WorkspaceManager::new(dir.to_path_buf(), dir.join("global-settings.json"), events)
+                .unwrap();
+        let first = manager.state().await.unwrap().active_workspace_id;
+        let second = manager.create("Second".to_string()).await.unwrap().id;
+        (manager, first, second)
+    }
+
+    /// Two windows, two workspaces: each window's requests reach its own
+    /// workspace, and each window is told which one is its own.
+    #[tokio::test]
+    async fn two_views_show_two_workspaces_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, first, second) = manager_with_two_workspaces(dir.path()).await;
+
+        manager.open_view("second-window", &second).await.unwrap();
+
+        assert_eq!(
+            manager.view_context(PRIMARY_VIEW).data_dir,
+            workspace_root(dir.path(), &first)
+        );
+        assert_eq!(
+            manager.view_context("second-window").data_dir,
+            workspace_root(dir.path(), &second)
+        );
+        // A window that shows no workspace (the standalone reader) is
+        // answered from the default, which opening a window does not move.
+        assert!(Arc::ptr_eq(
+            &manager.view_context("document"),
+            &manager.active()
+        ));
+        assert_eq!(manager.active_workspace_id().unwrap(), first);
+
+        let own = manager.state_for_view("second-window").await.unwrap();
+        assert_eq!(own.active_workspace_id, second);
+        assert_eq!(own.open_elsewhere, vec![first.clone()]);
+        let main = manager.state_for_view(PRIMARY_VIEW).await.unwrap();
+        assert_eq!(main.active_workspace_id, first);
+        assert_eq!(main.open_elsewhere, vec![second.clone()]);
+
+        manager.shutdown_all().await;
+    }
+
+    /// A workspace is shown by one window at most: the other window's own
+    /// editors and tabs for it would be written over.
+    #[tokio::test]
+    async fn a_workspace_shown_in_one_view_is_refused_to_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, first, second) = manager_with_two_workspaces(dir.path()).await;
+        manager.open_view("second-window", &second).await.unwrap();
+
+        let error = manager
+            .switch_view(PRIMARY_VIEW, &second)
+            .await
+            .unwrap_err();
+        let shown = error.downcast_ref::<WorkspaceShownElsewhere>().unwrap();
+        assert_eq!(shown.view, "second-window");
+        let error = manager.open_view("third-window", &first).await.unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<WorkspaceShownElsewhere>()
+                .unwrap()
+                .view,
+            PRIMARY_VIEW
+        );
+        // Nothing moved.
+        assert_eq!(
+            manager.view_workspace_id(PRIMARY_VIEW).as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(
+            manager.view_showing(&second).as_deref(),
+            Some("second-window")
+        );
+
+        manager.shutdown_all().await;
+    }
+
+    /// Focusing a window moves the default to its workspace; a workspace
+    /// nothing holds any more is shut down when its window closes.
+    #[tokio::test]
+    async fn focus_moves_the_default_and_closing_retires_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, first, second) = manager_with_two_workspaces(dir.path()).await;
+        manager.open_view("second-window", &second).await.unwrap();
+        let second_ctx = manager.view_context("second-window");
+
+        manager.focus_view("second-window").await.unwrap();
+        assert_eq!(manager.active_workspace_id().unwrap(), second);
+        assert!(Arc::ptr_eq(&manager.active(), &second_ctx));
+        // Still shown by the main window, so still open.
+        let first_ctx = manager.view_context(PRIMARY_VIEW);
+        assert!(!first_ctx.is_shutting_down());
+
+        // The default's window closing leaves its context open: it is still
+        // what a request naming no workspace is answered from.
+        manager.close_view("second-window").await.unwrap();
+        assert!(!second_ctx.is_shutting_down());
+        assert_eq!(manager.view_showing(&second), None);
+
+        // Until another window is focused.
+        manager.focus_view(PRIMARY_VIEW).await.unwrap();
+        assert!(second_ctx.is_shutting_down());
+        assert!(!manager.contexts.lock().contains_key(&second));
+        assert_eq!(manager.active_workspace_id().unwrap(), first);
+
+        manager.shutdown_all().await;
+    }
+
+    /// A workspace a window shows cannot be deleted from under it, though it
+    /// is not the default.
+    #[tokio::test]
+    async fn a_workspace_shown_in_a_window_is_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, _first, second) = manager_with_two_workspaces(dir.path()).await;
+        manager.open_view("second-window", &second).await.unwrap();
+
+        let error = manager.delete(&second).await.unwrap_err().to_string();
+        assert!(error.contains("open in a window"), "{error}");
+        assert!(workspace_root(dir.path(), &second).exists());
+
+        manager.close_view("second-window").await.unwrap();
+        manager.delete(&second).await.unwrap();
+        assert!(!workspace_root(dir.path(), &second).exists());
+
+        manager.shutdown_all().await;
+    }
+
+    /// The default workspace is what the primary view shows at the next
+    /// launch; other windows are not reopened.
+    #[tokio::test]
+    async fn the_focused_workspace_is_shown_again_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, _first, second) = manager_with_two_workspaces(dir.path()).await;
+        manager.open_view("second-window", &second).await.unwrap();
+        manager.focus_view("second-window").await.unwrap();
+        manager.shutdown_all().await;
+        drop(manager);
+
+        let events: Arc<dyn ViewEventSink> = Arc::new(NoopEmitter);
+        let (manager, _events, _worker_loop) = WorkspaceManager::new(
+            dir.path().to_path_buf(),
+            dir.path().join("global-settings.json"),
+            events,
+        )
+        .unwrap();
+        assert_eq!(manager.active_workspace_id().unwrap(), second);
+        assert_eq!(
+            manager.view_workspace_id(PRIMARY_VIEW).as_deref(),
+            Some(second.as_str())
+        );
+        assert_eq!(manager.view_showing(&second).as_deref(), Some(PRIMARY_VIEW));
+
         manager.shutdown_all().await;
     }
 }

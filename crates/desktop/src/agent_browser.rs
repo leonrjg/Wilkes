@@ -543,7 +543,7 @@ impl DesktopAgentBrowser {
             .file_name()
             .ok_or_else(|| format!("The page's name is not a file name: {name}"))?
             .to_os_string();
-        let dir = staging_dir(&self.app)?;
+        let dir = staging_dir(&self.app, AGENT_OWNER)?;
         let file = dir.join(&name);
         let staged = StagedDownload::new(dir, file.clone(), name.to_string_lossy().into_owned());
         tokio::fs::write(&file, data)

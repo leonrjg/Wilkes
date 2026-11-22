@@ -1,11 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useWorkspaceStore } from "./useWorkspaceStore";
 
-const { deleteWorkspace } = vi.hoisted(() => ({ deleteWorkspace: vi.fn() }));
+const { deleteWorkspace, openWorkspaceWindow, switchWorkspace } = vi.hoisted(() => ({
+  deleteWorkspace: vi.fn(),
+  openWorkspaceWindow: vi.fn(),
+  switchWorkspace: vi.fn(),
+}));
 
 vi.mock("../services", () => ({
-  api: { deleteWorkspace },
+  api: { deleteWorkspace, openWorkspaceWindow, switchWorkspace },
 }));
+
+// Some tests below replace `switchTo` with a mock; the real one is put back
+// for the tests that exercise it.
+const realSwitchTo = useWorkspaceStore.getState().switchTo;
 
 function workspace(id: string, name: string) {
   return { id, name, roots: [], active_root: null, read_only: false, managed_by: null };
@@ -18,6 +26,7 @@ describe("useWorkspaceStore.remove", () => {
     useWorkspaceStore.setState({
       workspaces: [workspace("a", "First"), workspace("b", "Second")],
       activeWorkspaceId: "a",
+      openElsewhere: [],
       loading: false,
       switching: false,
     });
@@ -31,6 +40,7 @@ describe("useWorkspaceStore.remove", () => {
     deleteWorkspace.mockResolvedValue({
       active_workspace_id: "a",
       workspaces: [workspace("a", "First")],
+      open_elsewhere: [],
     });
 
     await expect(useWorkspaceStore.getState().remove("b")).resolves.toBe(true);
@@ -53,6 +63,7 @@ describe("useWorkspaceStore.remove", () => {
     deleteWorkspace.mockResolvedValue({
       active_workspace_id: "b",
       workspaces: [workspace("b", "Second")],
+      open_elsewhere: [],
     });
 
     await expect(useWorkspaceStore.getState().remove("a")).resolves.toBe(true);
@@ -81,6 +92,55 @@ describe("useWorkspaceStore.remove", () => {
 
     await expect(useWorkspaceStore.getState().remove("a")).rejects.toThrow(
       "The last workspace cannot be deleted.",
+    );
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+  });
+});
+
+describe("workspaces shown in another window", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useWorkspaceStore.setState({
+      workspaces: [workspace("a", "First"), workspace("b", "Second"), workspace("c", "Third")],
+      activeWorkspaceId: "a",
+      openElsewhere: ["b"],
+      loading: false,
+      switching: false,
+      switchTo: realSwitchTo,
+    });
+  });
+
+  // A workspace is shown by one window at most. Choosing one another window
+  // shows brings that window forward; this window keeps its own workspace.
+  it("brings the other window forward instead of switching this one", async () => {
+    await useWorkspaceStore.getState().switchTo("b");
+
+    expect(openWorkspaceWindow).toHaveBeenCalledWith("b");
+    expect(switchWorkspace).not.toHaveBeenCalled();
+    expect(useWorkspaceStore.getState().activeWorkspaceId).toBe("a");
+  });
+
+  it("does not move to a workspace another window shows to delete this one", async () => {
+    const switchTo = vi.fn(async (id: string) => {
+      useWorkspaceStore.setState({ activeWorkspaceId: id });
+    });
+    useWorkspaceStore.setState({ switchTo });
+    deleteWorkspace.mockResolvedValue({
+      active_workspace_id: "c",
+      workspaces: [workspace("b", "Second"), workspace("c", "Third")],
+      open_elsewhere: ["b"],
+    });
+
+    await expect(useWorkspaceStore.getState().remove("a")).resolves.toBe(true);
+
+    expect(switchTo).toHaveBeenCalledWith("c");
+  });
+
+  it("refuses to delete when every other workspace is in another window", async () => {
+    useWorkspaceStore.setState({ openElsewhere: ["b", "c"] });
+
+    await expect(useWorkspaceStore.getState().remove("a")).rejects.toThrow(
+      "Every other workspace is open in another window",
     );
     expect(deleteWorkspace).not.toHaveBeenCalled();
   });

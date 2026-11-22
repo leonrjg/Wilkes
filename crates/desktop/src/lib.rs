@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 use wilkes_api::commands::integrations::custom::ManifestSummary;
-use wilkes_api::context::{AppContext, EventEmitter};
+use wilkes_api::context::{AppContext, EventAudience, EventEmitter, ViewEventSink};
 use wilkes_api::startup::StartupStatus;
 use wilkes_api::workspace::{WorkspaceManager, WorkspaceState, WorkspaceSummary};
 use wilkes_core::embed::index::IndexActivity;
@@ -165,12 +165,16 @@ fn collect_startup_status(
     Ok(StartupStatus::ready())
 }
 
-pub(crate) fn app_context(app: &AppHandle) -> Arc<AppContext> {
-    if let Some(manager) = app.try_state::<Arc<WorkspaceManager>>() {
-        manager.inner().active()
-    } else {
-        app.state::<Arc<AppContext>>().inner().clone()
-    }
+/// The context the view labelled `view` works in: the workspace that window
+/// shows, or the default workspace for a window that shows none (the
+/// standalone reader).
+pub(crate) fn view_context(app: &AppHandle, view: &str) -> Arc<AppContext> {
+    workspace_manager(app).view_context(view)
+}
+
+/// The context a command works in: the workspace of the window it came from.
+pub(crate) fn window_context(window: &tauri::WebviewWindow) -> Arc<AppContext> {
+    view_context(window.app_handle(), window.label())
 }
 
 pub(crate) fn workspace_manager(app: &AppHandle) -> Arc<WorkspaceManager> {
@@ -1054,6 +1058,107 @@ async fn update_settings_with_listeners(
     }
 }
 
+/// The native menu's File → New Window.
+const NEW_WINDOW_MENU_ID: &str = "new-window";
+/// What File → New Window asks the window in front to do: let the user pick
+/// the workspace the new window shows.
+const NEW_WINDOW_EVENT: &str = "menu-new-window";
+
+/// The platform's default menu, with File → New Window added.
+///
+/// macOS and Windows only: Tauri's default menu has no File menu elsewhere,
+/// and there the workspace picker's own button is the way to a new window.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn install_menu(app: &AppHandle) -> anyhow::Result<()> {
+    use tauri::menu::{Menu, MenuItem, MenuItemKind};
+    let menu = Menu::default(app)?;
+    let file = menu
+        .items()?
+        .into_iter()
+        .find_map(|item| match item {
+            MenuItemKind::Submenu(submenu) if submenu.text().is_ok_and(|text| text == "File") => {
+                Some(submenu)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("the default menu has no File menu"))?;
+    let new_window = MenuItem::with_id(
+        app,
+        NEW_WINDOW_MENU_ID,
+        "New Window…",
+        true,
+        Some("CmdOrCtrl+Shift+N"),
+    )?;
+    file.prepend(&new_window)?;
+    app.set_menu(menu)?;
+    Ok(())
+}
+
+/// Sends File → New Window to the workspace window in front, or — when the
+/// standalone reader is in front — to the window showing the default
+/// workspace, since the reader has no workspace to choose from.
+fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
+    if event.id() != NEW_WINDOW_MENU_ID {
+        return;
+    }
+    let Some(manager) = app.try_state::<Arc<WorkspaceManager>>() else {
+        return;
+    };
+    let focused = app
+        .webview_windows()
+        .into_values()
+        .find(|window| matches!(window.is_focused(), Ok(true)))
+        .map(|window| window.label().to_string())
+        .filter(|label| manager.view_workspace_id(label).is_some());
+    let target = match focused {
+        Some(label) => Some(label),
+        None => match manager.active_workspace_id() {
+            Ok(id) => manager.view_showing(&id),
+            Err(error) => {
+                error!("New Window: could not read the default workspace: {error:#}");
+                None
+            }
+        },
+    };
+    let Some(target) = target else {
+        error!("New Window was chosen with no workspace window to ask");
+        return;
+    };
+    if let Err(error) = Emitter::emit_to(app, target.as_str(), NEW_WINDOW_EVENT, ()) {
+        error!("could not send New Window to window {target}: {error}");
+    }
+}
+
+/// Keeps the manager's views in step with the windows: the focused window's
+/// workspace becomes the default, and a closed window's is let go.
+fn track_workspace_window(window: &tauri::Window, event: &tauri::WindowEvent) {
+    let app = window.app_handle();
+    // Before startup finished there is no manager, and no view to track.
+    let Some(manager) = app.try_state::<Arc<WorkspaceManager>>() else {
+        return;
+    };
+    let manager = manager.inner().clone();
+    let view = window.label().to_string();
+    match event {
+        tauri::WindowEvent::Focused(true) => {
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = manager.focus_view(&view).await {
+                    error!("could not make window {view}'s workspace the default: {error:#}");
+                }
+            });
+        }
+        tauri::WindowEvent::Destroyed => {
+            active_searches_state(app).cancel_view(&view);
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = manager.close_view(&view).await {
+                    error!("could not let go of window {view}'s workspace: {error:#}");
+                }
+            });
+        }
+        _ => {}
+    }
+}
+
 fn handle_exit_event(app_handle: &AppHandle, event: tauri::RunEvent) {
     // macOS delivers both kinds through `application:openURLs:` -- files the
     // user opened with Wilkes, and `wilkes://` links clicked elsewhere -- so
@@ -1139,15 +1244,38 @@ impl EventEmitter for WorkspaceEmitter {
     }
 }
 
+/// One workspace's event goes to the windows showing it, and to the HTTP
+/// stream when it is the default workspace — the one the API answers from.
+impl ViewEventSink for WorkspaceEmitter {
+    fn emit_to(&self, audience: EventAudience<'_>, name: &str, payload: serde_json::Value) {
+        if audience.default {
+            let _ = self.http.send((name.to_string(), payload.clone()));
+        }
+        for view in audience.views {
+            if let Err(error) = Emitter::emit_to(&self.webview.0, view.as_str(), name, &payload) {
+                error!("could not send {name} to window {view}: {error}");
+            }
+        }
+    }
+}
+
 // ── Chat (ACP) state ─────────────────────────────────────────────────────────
 
-struct ActiveSearches(Mutex<HashMap<String, JoinHandle<()>>>);
+/// Searches in flight, by search id, with the window each was started from.
+struct ActiveSearches(Mutex<HashMap<String, (String, JoinHandle<()>)>>);
 
 impl ActiveSearches {
-    fn cancel_all(&self) {
-        for (_, handle) in self.0.lock().unwrap().drain() {
-            handle.abort();
-        }
+    /// Stops the searches one window started, as that window leaves its
+    /// workspace or closes. Another window's searches are its own.
+    fn cancel_view(&self, view: &str) {
+        self.0.lock().unwrap().retain(|_, (owner, handle)| {
+            if owner == view {
+                handle.abort();
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -1164,6 +1292,7 @@ impl SearchEventSink for AppHandle {
 async fn search_for_ctx<E>(
     ctx: Arc<AppContext>,
     active_searches: Arc<ActiveSearches>,
+    view: String,
     emitter: E,
     query: wilkes_core::types::SearchQuery,
     search_id: Option<String>,
@@ -1203,7 +1332,7 @@ where
         .0
         .lock()
         .unwrap()
-        .insert(search_id.clone(), forwarder);
+        .insert(search_id.clone(), (view, forwarder));
 
     Ok(search_id)
 }
@@ -1221,7 +1350,7 @@ where
 }
 
 fn cancel_search_for_ctx(active_searches: Arc<ActiveSearches>, search_id: &str) {
-    if let Some(handle) = active_searches.0.lock().unwrap().remove(search_id) {
+    if let Some((_, handle)) = active_searches.0.lock().unwrap().remove(search_id) {
         handle.abort();
     }
 }
@@ -1229,18 +1358,20 @@ fn cancel_search_for_ctx(active_searches: Arc<ActiveSearches>, search_id: &str) 
 // ── Desktop-only commands ─────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn get_data_paths(app: AppHandle) -> Result<DataPaths, String> {
-    let ctx = app_context(&app);
+async fn get_data_paths(window: tauri::WebviewWindow) -> Result<DataPaths, String> {
+    let ctx = window_context(&window);
     Ok(data_paths_from(
         ctx.shared_data_dir.display().to_string(),
         ctx.data_dir.display().to_string(),
     ))
 }
 
+/// The listing as the calling window sees it: its own workspace as the
+/// active one, and the workspaces other windows show.
 #[tauri::command]
-async fn list_workspaces(app: AppHandle) -> Result<WorkspaceState, String> {
-    workspace_manager(&app)
-        .state()
+async fn list_workspaces(window: tauri::WebviewWindow) -> Result<WorkspaceState, String> {
+    workspace_manager(window.app_handle())
+        .state_for_view(window.label())
         .await
         .map_err(|error| error.to_string())
 }
@@ -1259,27 +1390,121 @@ async fn rename_workspace(
     workspace_id: String,
     name: String,
 ) -> Result<WorkspaceSummary, String> {
-    workspace_manager(&app)
+    let manager = workspace_manager(&app);
+    let renamed = manager
         .rename(&workspace_id, name)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if let Some(view) = manager.view_showing(&workspace_id) {
+        title_window(&app, &view, &renamed.name);
+    }
+    Ok(renamed)
 }
 
 #[tauri::command]
-async fn delete_workspace(app: AppHandle, workspace_id: String) -> Result<WorkspaceState, String> {
+async fn delete_workspace(
+    window: tauri::WebviewWindow,
+    workspace_id: String,
+) -> Result<WorkspaceState, String> {
     // No search cancellation and no chat teardown, unlike `switch_workspace`:
-    // the manager refuses to delete the active workspace, so nothing this
-    // window is showing belongs to the one going away.
-    workspace_manager(&app)
+    // the manager refuses to delete a workspace any window shows, so nothing
+    // on screen belongs to the one going away.
+    let manager = workspace_manager(window.app_handle());
+    manager
         .delete(&workspace_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    manager
+        .state_for_view(window.label())
         .await
         .map_err(|error| error.to_string())
 }
 
+/// Titles a workspace window with the workspace it shows, so the Window menu
+/// and the window switcher tell two windows apart.
+fn title_window(app: &AppHandle, view: &str, workspace_name: &str) {
+    let Some(window) = app.get_webview_window(view) else {
+        return;
+    };
+    if let Err(error) = window.set_title(&format!("Wilkes — {workspace_name}")) {
+        error!("could not title window {view}: {error}");
+    }
+}
+
+/// Titles `view` with the name of the workspace it shows.
+async fn title_window_for_view(app: &AppHandle, view: &str) -> Result<(), String> {
+    let manager = workspace_manager(app);
+    let Some(id) = manager.view_workspace_id(view) else {
+        return Ok(());
+    };
+    let state = manager.state().await.map_err(|error| error.to_string())?;
+    let workspace = state
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == id)
+        .ok_or_else(|| format!("The workspace window {view} shows is not listed"))?;
+    title_window(app, view, &workspace.name);
+    Ok(())
+}
+
+/// Brings forward the window showing `workspace_id`, or opens a new one on
+/// it. One command for both because to the user they are one act: "show me
+/// that workspace in a window of its own".
 #[tauri::command]
-async fn switch_workspace(app: AppHandle, workspace_id: String) -> Result<WorkspaceState, String> {
+async fn open_workspace_window(app: AppHandle, workspace_id: String) -> Result<(), String> {
+    show_workspace_in_window(&app, &workspace_id)
+        .await
+        .map(|_| ())
+}
+
+/// The label of the window showing `workspace_id`, brought forward — or of a
+/// new window opened on it.
+pub(crate) async fn show_workspace_in_window(
+    app: &AppHandle,
+    workspace_id: &str,
+) -> Result<String, String> {
+    let manager = workspace_manager(app);
+    if let Some(view) = manager.view_showing(workspace_id) {
+        native_open::focus_window(app, &view)?;
+        return Ok(view);
+    }
+    let label = format!("workspace-{}", uuid::Uuid::new_v4().simple());
+    // Bound before the window exists, so the first command its interface
+    // sends already resolves to this workspace.
+    manager
+        .open_view(&label, workspace_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let built =
+        tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::App("index.html".into()))
+            .title("Wilkes")
+            .inner_size(1200.0, 800.0)
+            .min_inner_size(800.0, 200.0)
+            .title_bar_style(tauri::TitleBarStyle::Transparent)
+            .build();
+    if let Err(error) = built {
+        manager
+            .close_view(&label)
+            .await
+            .map_err(|close| format!("{close:#}"))?;
+        return Err(format!("Could not open a window: {error}"));
+    }
+    title_window_for_view(app, &label).await?;
+    Ok(label)
+}
+
+#[tauri::command]
+async fn switch_workspace(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    workspace_id: String,
+) -> Result<WorkspaceState, String> {
     let manager = workspace_manager(&app);
-    let current = manager.state().await.map_err(|error| error.to_string())?;
+    let view = window.label();
+    let current = manager
+        .state_for_view(view)
+        .await
+        .map_err(|error| error.to_string())?;
     if current.active_workspace_id == workspace_id {
         return Ok(current);
     }
@@ -1290,44 +1515,55 @@ async fn switch_workspace(app: AppHandle, workspace_id: String) -> Result<Worksp
     {
         return Err("Unknown workspace".to_string());
     }
+    // Shown in another window: that window is brought forward and this one
+    // stays where it is. The interface checks first; this is the answer to
+    // a listing that went stale between its check and this call.
+    if let Some(other) = manager.view_showing(&workspace_id) {
+        native_open::focus_window(&app, &other)?;
+        return Err("This workspace is already open in another window".to_string());
+    }
 
     // Open chats are left alone: a session is the window's, and its MCP server
     // resolves the workspace on every call rather than holding the one it
     // started in.
-    active_searches_state(&app).cancel_all();
+    active_searches_state(&app).cancel_view(view);
 
     // The external MCP listener is not stopped and restarted around the
     // switch: it resolves its workspace through the manager on every call, so
-    // it follows the active workspace on its own. Restarting it here would
+    // it follows the default workspace on its own. Restarting it here would
     // only drop connected clients.
-    manager
-        .switch(&workspace_id)
+    let state = manager
+        .switch_view(view, &workspace_id)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    title_window_for_view(&app, view).await?;
+    Ok(state)
 }
 
 #[tauri::command]
 async fn get_python_envs(
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_core::worker::PythonEnvInventory, String> {
-    app_context(&app)
+    window_context(&window)
         .python_environments()
         .await
         .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
-async fn remove_python_envs(app: AppHandle, ids: Vec<String>) -> Result<(), String> {
-    app_context(&app).remove_python_environments(ids).await
+async fn remove_python_envs(ids: Vec<String>, window: tauri::WebviewWindow) -> Result<(), String> {
+    window_context(&window)
+        .remove_python_environments(ids)
+        .await
 }
 
 #[tauri::command]
 async fn remove_custom_model(
-    app: AppHandle,
     engine: wilkes_core::types::EmbeddingEngine,
     model_id: String,
+    window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    app_context(&app)
+    window_context(&window)
         .remove_custom_model(engine, model_id)
         .await
 }
@@ -1347,11 +1583,11 @@ async fn reveal_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn trash_file(path: String, app: AppHandle) -> Result<(), String> {
+async fn trash_file(path: String, window: tauri::WebviewWindow) -> Result<(), String> {
     // Path-based rather than routed through the context, so the read-only gate
     // has to be asked for here: the workspace it would delete from is the
     // active one either way.
-    app_context(&app)
+    window_context(&window)
         .ensure_writable()
         .map_err(|error| error.to_string())?;
     trash_file_for_path(path).await
@@ -1380,10 +1616,19 @@ async fn search(
     query: wilkes_core::types::SearchQuery,
     search_id: Option<String>,
     app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<String, String> {
-    let ctx = app_context(&app);
+    let ctx = window_context(&window);
     let active_searches = active_searches_state(&app);
-    search_for_ctx(ctx, active_searches, app.clone(), query, search_id).await
+    search_for_ctx(
+        ctx,
+        active_searches,
+        window.label().to_string(),
+        app.clone(),
+        query,
+        search_id,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1395,59 +1640,59 @@ async fn cancel_search(search_id: String, app: AppHandle) -> Result<(), String> 
 #[tauri::command]
 async fn related_documents(
     query: wilkes_core::types::RelatedDocumentsQuery,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<Vec<wilkes_core::types::RelatedDocument>, String> {
-    app_context(&app).related_documents(query).await
+    window_context(&window).related_documents(query).await
 }
 
 #[tauri::command]
 async fn tidy_folder(
     folder: String,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_core::types::TidyPlan, String> {
-    app_context(&app).tidy_folder(folder.into()).await
+    window_context(&window).tidy_folder(folder.into()).await
 }
 
 #[tauri::command]
 async fn reading_order(
     query: wilkes_core::types::ReadingOrderQuery,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_core::types::ReadingOrder, String> {
-    app_context(&app).reading_order(query).await
+    window_context(&window).reading_order(query).await
 }
 
 #[tauri::command]
 async fn citation_links(
     query: wilkes_core::types::CitationLinksQuery,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_core::types::CitationLinks, String> {
-    app_context(&app).citation_links(query).await
+    window_context(&window).citation_links(query).await
 }
 
 #[tauri::command]
 async fn citation_graph(
     query: wilkes_core::types::CitationGraphQuery,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_core::types::CitationGraph, String> {
-    app_context(&app).citation_graph(query).await
+    window_context(&window).citation_graph(query).await
 }
 
 #[tauri::command]
 async fn fetch_missing_citations(
     query: wilkes_core::types::CitationGraphQuery,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<usize, String> {
-    app_context(&app).fetch_missing_citations(query).await
+    window_context(&window).fetch_missing_citations(query).await
 }
 
 // ── Delegating commands ───────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn preview(
-    app: AppHandle,
     match_ref: wilkes_core::types::MatchRef,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_core::types::PreviewData, String> {
-    app_context(&app)
+    window_context(&window)
         .preview(match_ref)
         .await
         .map_err(|e| e.to_string())
@@ -1456,11 +1701,11 @@ async fn preview(
 /// One comic page as an image and its native geometry.
 #[tauri::command]
 async fn comic_page(
-    app: AppHandle,
     path: String,
     page: u32,
+    window: tauri::WebviewWindow,
 ) -> Result<tauri::ipc::Response, String> {
-    let bytes = app_context(&app)
+    let bytes = window_context(&window)
         .comic_page(std::path::PathBuf::from(path), page)
         .await
         .map_err(|e| e.to_string())?;
@@ -1474,11 +1719,11 @@ async fn comic_page(
 /// reach dot-directories, which is where Linux keeps application data.
 #[tauri::command]
 async fn file_cover(
-    app: AppHandle,
     path: String,
     max_edge: u32,
+    window: tauri::WebviewWindow,
 ) -> Result<tauri::ipc::Response, String> {
-    app_context(&app)
+    window_context(&window)
         .file_cover(std::path::PathBuf::from(path), max_edge)
         .await
         .map(tauri::ipc::Response::new)
@@ -1492,8 +1737,11 @@ async fn file_cover(
 /// from a layout it chose. `tauri::ipc::Response` sends them raw, so a 6 MB
 /// book does not become 8 MB of base64 on the way.
 #[tauri::command]
-async fn surrogate_bytes(app: AppHandle, path: String) -> Result<tauri::ipc::Response, String> {
-    app_context(&app)
+async fn surrogate_bytes(
+    path: String,
+    window: tauri::WebviewWindow,
+) -> Result<tauri::ipc::Response, String> {
+    window_context(&window)
         .surrogate_bytes(std::path::PathBuf::from(path))
         .await
         .map(tauri::ipc::Response::new)
@@ -1502,10 +1750,10 @@ async fn surrogate_bytes(app: AppHandle, path: String) -> Result<tauri::ipc::Res
 
 #[tauri::command]
 async fn resolve_pdf_font(
-    app: AppHandle,
     request: wilkes_core::pdf_edit::fonts::FontRequest,
+    window: tauri::WebviewWindow,
 ) -> Result<String, String> {
-    app_context(&app)
+    window_context(&window)
         .resolve_pdf_font(request)
         .await
         .map_err(|e| e.to_string())
@@ -1513,8 +1761,11 @@ async fn resolve_pdf_font(
 
 /// A font file, raw: the interface registers it as a `FontFace`.
 #[tauri::command]
-async fn pdf_font_bytes(app: AppHandle, id: String) -> Result<tauri::ipc::Response, String> {
-    app_context(&app)
+async fn pdf_font_bytes(
+    id: String,
+    window: tauri::WebviewWindow,
+) -> Result<tauri::ipc::Response, String> {
+    window_context(&window)
         .pdf_font_bytes(id)
         .await
         .map(tauri::ipc::Response::new)
@@ -1523,12 +1774,12 @@ async fn pdf_font_bytes(app: AppHandle, id: String) -> Result<tauri::ipc::Respon
 
 #[tauri::command]
 async fn save_pdf_edits(
-    app: AppHandle,
     source: String,
     destination: String,
     export: wilkes_core::pdf_edit::EditExport,
+    window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    app_context(&app)
+    window_context(&window)
         .save_pdf_edits(
             std::path::PathBuf::from(source),
             std::path::PathBuf::from(destination),
@@ -1546,10 +1797,10 @@ async fn list_files(
     collection_id: Option<String>,
     tag_ids: Option<Vec<String>>,
     collection_expression: Option<String>,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<FileListResponse, String> {
     list_files_for_ctx(
-        app_context(&app),
+        window_context(&window),
         root,
         collection_id,
         tag_ids.unwrap_or_default(),
@@ -1561,14 +1812,18 @@ async fn list_files(
 #[tauri::command]
 async fn open_file(
     path: String,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_core::types::PreviewData, String> {
-    open_file_for_ctx(app_context(&app), path).await
+    open_file_for_ctx(window_context(&window), path).await
 }
 
 #[tauri::command]
-async fn rename_file(path: String, new_name: String, app: AppHandle) -> Result<String, String> {
-    rename_file_for_path(app_context(&app), path, new_name).await
+async fn rename_file(
+    path: String,
+    new_name: String,
+    window: tauri::WebviewWindow,
+) -> Result<String, String> {
+    rename_file_for_path(window_context(&window), path, new_name).await
 }
 
 /// Imports files into the current root, or into `folder` beneath it — created
@@ -1582,9 +1837,9 @@ async fn import_files(
     root: String,
     folder: Option<String>,
     mode: wilkes_api::commands::files::FileImportMode,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<Vec<String>, String> {
-    import_files_into_current_root_for_ctx(app_context(&app), paths, root, folder, mode).await
+    import_files_into_current_root_for_ctx(window_context(&window), paths, root, folder, mode).await
 }
 
 #[tauri::command]
@@ -1608,13 +1863,21 @@ async fn read_clipboard_files() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-async fn move_file(path: String, target_root: String, app: AppHandle) -> Result<String, String> {
-    move_file_to_root_for_ctx(app_context(&app), path, target_root).await
+async fn move_file(
+    path: String,
+    target_root: String,
+    window: tauri::WebviewWindow,
+) -> Result<String, String> {
+    move_file_to_root_for_ctx(window_context(&window), path, target_root).await
 }
 
 #[tauri::command]
-async fn create_directory(parent: String, name: String, app: AppHandle) -> Result<String, String> {
-    app_context(&app)
+async fn create_directory(
+    parent: String,
+    name: String,
+    window: tauri::WebviewWindow,
+) -> Result<String, String> {
+    window_context(&window)
         .ensure_writable()
         .map_err(|error| error.to_string())?;
     wilkes_api::commands::files::create_directory(parent.into(), name)
@@ -1673,19 +1936,26 @@ async fn path_kinds(paths: Vec<String>) -> Result<Vec<PathKind>, String> {
 }
 
 #[tauri::command]
-async fn get_file_metadata(path: String, app: AppHandle) -> Result<DocumentMetadata, String> {
-    get_file_metadata_for_path(app_context(&app), path).await
+async fn get_file_metadata(
+    path: String,
+    window: tauri::WebviewWindow,
+) -> Result<DocumentMetadata, String> {
+    get_file_metadata_for_path(window_context(&window), path).await
 }
 
 #[tauri::command]
-async fn get_settings(app: AppHandle) -> Result<Settings, String> {
-    get_settings_for_ctx(app_context(&app)).await
+async fn get_settings(window: tauri::WebviewWindow) -> Result<Settings, String> {
+    get_settings_for_ctx(window_context(&window)).await
 }
 
 #[tauri::command]
-async fn update_settings(patch: serde_json::Value, app: AppHandle) -> Result<Settings, String> {
+async fn update_settings(
+    patch: serde_json::Value,
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<Settings, String> {
     update_settings_with_listeners(
-        app_context(&app),
+        window_context(&window),
         workspace_manager(&app),
         external_mcp_manager_state(&app),
         http_api_manager_state(&app),
@@ -1702,11 +1972,12 @@ async fn configure_external_mcp(
     bind_address: String,
     port: u16,
     app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<ExternalMcpStatus, String> {
     let bind_address = bind_address.parse::<std::net::IpAddr>().map_err(|_| {
         "External MCP bind address must be a valid IPv4 or IPv6 address".to_string()
     })?;
-    let ctx = app_context(&app);
+    let ctx = window_context(&window);
     let manager = external_mcp_manager_state(&app);
     let settings = update_settings_with_listeners(
         Arc::clone(&ctx),
@@ -1735,13 +2006,14 @@ async fn configure_http_api(
     bind_address: String,
     port: u16,
     app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<HttpApiStatus, String> {
     let bind_address = bind_address
         .parse::<std::net::IpAddr>()
         .map_err(|_| "HTTP API bind address must be a valid IPv4 or IPv6 address".to_string())?;
     let manager = http_api_manager_state(&app);
     let settings = update_settings_with_listeners(
-        app_context(&app),
+        window_context(&window),
         workspace_manager(&app),
         external_mcp_manager_state(&app),
         Arc::clone(&manager),
@@ -1760,16 +2032,22 @@ async fn configure_http_api(
 }
 
 #[tauri::command]
-async fn get_http_api_status(app: AppHandle) -> Result<HttpApiStatus, String> {
-    let settings = app_context(&app).get_settings().await;
+async fn get_http_api_status(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<HttpApiStatus, String> {
+    let settings = window_context(&window).get_settings().await;
     Ok(http_api_manager_state(&app)
         .status(&settings.http_api)
         .await)
 }
 
 #[tauri::command]
-async fn rotate_http_api_token(app: AppHandle) -> Result<HttpApiStatus, String> {
-    let settings = app_context(&app).get_settings().await;
+async fn rotate_http_api_token(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<HttpApiStatus, String> {
+    let settings = window_context(&window).get_settings().await;
     let manager = http_api_manager_state(&app);
     manager.rotate_token(&settings.http_api).await?;
     Ok(manager.status(&settings.http_api).await)
@@ -1836,8 +2114,10 @@ async fn configure_remote_embedding(
 }
 
 #[tauri::command]
-async fn get_remote_embedding_status(app: AppHandle) -> Result<RemoteEmbeddingStatus, String> {
-    Ok(remote_embedding_status(&app_context(&app)).await)
+async fn get_remote_embedding_status(
+    window: tauri::WebviewWindow,
+) -> Result<RemoteEmbeddingStatus, String> {
+    Ok(remote_embedding_status(&window_context(&window)).await)
 }
 
 /// Turns sharing with other Wilkes instances on the local network on or off.
@@ -1845,10 +2125,11 @@ async fn get_remote_embedding_status(app: AppHandle) -> Result<RemoteEmbeddingSt
 async fn configure_lan_sharing(
     enabled: bool,
     app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<lan_share::LanSharingStatus, String> {
     let manager = lan_share_manager_state(&app);
     let settings = update_settings_with_listeners(
-        app_context(&app),
+        window_context(&window),
         workspace_manager(&app),
         external_mcp_manager_state(&app),
         http_api_manager_state(&app),
@@ -1860,8 +2141,11 @@ async fn configure_lan_sharing(
 }
 
 #[tauri::command]
-async fn get_lan_sharing_status(app: AppHandle) -> Result<lan_share::LanSharingStatus, String> {
-    let settings = app_context(&app).get_settings().await;
+async fn get_lan_sharing_status(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<lan_share::LanSharingStatus, String> {
+    let settings = window_context(&window).get_settings().await;
     Ok(lan_share_manager_state(&app)
         .status(&settings.lan_sharing)
         .await)
@@ -1884,8 +2168,11 @@ async fn send_files_to_lan_peer(
 }
 
 #[tauri::command]
-async fn get_external_mcp_status(app: AppHandle) -> Result<ExternalMcpStatus, String> {
-    let settings = app_context(&app).get_settings().await;
+async fn get_external_mcp_status(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<ExternalMcpStatus, String> {
+    let settings = window_context(&window).get_settings().await;
     Ok(external_mcp_manager_state(&app)
         .status(&settings.external_mcp)
         .await)
@@ -1897,8 +2184,11 @@ fn set_active_document(path: Option<String>, page: Option<u32>, app: AppHandle) 
 }
 
 #[tauri::command]
-async fn rotate_external_mcp_token(app: AppHandle) -> Result<ExternalMcpStatus, String> {
-    let ctx = app_context(&app);
+async fn rotate_external_mcp_token(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<ExternalMcpStatus, String> {
+    let ctx = window_context(&window);
     let settings = ctx.get_settings().await;
     let manager = external_mcp_manager_state(&app);
     manager.rotate_token(&settings.external_mcp).await?;
@@ -1906,68 +2196,76 @@ async fn rotate_external_mcp_token(app: AppHandle) -> Result<ExternalMcpStatus, 
 }
 
 #[tauri::command]
-async fn list_bookmarks(app: AppHandle) -> Result<Vec<Bookmark>, String> {
-    list_bookmarks_for_ctx(app_context(&app)).await
+async fn list_bookmarks(window: tauri::WebviewWindow) -> Result<Vec<Bookmark>, String> {
+    list_bookmarks_for_ctx(window_context(&window)).await
 }
 
 #[tauri::command]
-async fn add_bookmark(bookmark: NewBookmark, app: AppHandle) -> Result<Bookmark, String> {
-    add_bookmark_for_ctx(app_context(&app), bookmark).await
+async fn add_bookmark(
+    bookmark: NewBookmark,
+    window: tauri::WebviewWindow,
+) -> Result<Bookmark, String> {
+    add_bookmark_for_ctx(window_context(&window), bookmark).await
 }
 
 #[tauri::command]
-async fn remove_bookmark(id: String, app: AppHandle) -> Result<(), String> {
-    remove_bookmark_for_ctx(app_context(&app), id).await
+async fn remove_bookmark(id: String, window: tauri::WebviewWindow) -> Result<(), String> {
+    remove_bookmark_for_ctx(window_context(&window), id).await
 }
 
 #[tauri::command]
 async fn update_bookmark_note(
     id: String,
     note: Option<String>,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<Bookmark, String> {
-    update_bookmark_note_for_ctx(app_context(&app), id, note).await
+    update_bookmark_note_for_ctx(window_context(&window), id, note).await
 }
 
 #[tauri::command]
 async fn cluster_bookmarks(
     query: BookmarkClustersQuery,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<BookmarkClustersResult, String> {
-    cluster_bookmarks_for_ctx(app_context(&app), query).await
+    cluster_bookmarks_for_ctx(window_context(&window), query).await
 }
 
 #[tauri::command]
 async fn chunk_topics(
     request_id: String,
     query: ChunkTopicsQuery,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<ChunkTopicsResult, String> {
-    chunk_topics_for_ctx(app_context(&app), request_id, query).await
+    chunk_topics_for_ctx(window_context(&window), request_id, query).await
 }
 
 #[tauri::command]
-async fn cancel_chunk_topics(request_id: String, app: AppHandle) -> Result<(), String> {
-    cancel_chunk_topics_for_ctx(app_context(&app), &request_id);
+async fn cancel_chunk_topics(
+    request_id: String,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    cancel_chunk_topics_for_ctx(window_context(&window), &request_id);
     Ok(())
 }
 
 #[tauri::command]
-async fn list_saved_works(app: AppHandle) -> Result<Vec<SavedWork>, String> {
-    app_context(&app)
+async fn list_saved_works(window: tauri::WebviewWindow) -> Result<Vec<SavedWork>, String> {
+    window_context(&window)
         .list_saved_works()
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn save_work(work: NewSavedWork, app: AppHandle) -> Result<SavedWork, String> {
-    app_context(&app).save_work(work).map_err(|e| e.to_string())
+async fn save_work(work: NewSavedWork, window: tauri::WebviewWindow) -> Result<SavedWork, String> {
+    window_context(&window)
+        .save_work(work)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn remove_saved_work(id: String, app: AppHandle) -> Result<(), String> {
-    app_context(&app)
+async fn remove_saved_work(id: String, window: tauri::WebviewWindow) -> Result<(), String> {
+    window_context(&window)
         .remove_saved_work(&id)
         .map_err(|e| e.to_string())
 }
@@ -1976,9 +2274,9 @@ async fn remove_saved_work(id: String, app: AppHandle) -> Result<(), String> {
 async fn update_saved_work_note(
     id: String,
     note: Option<String>,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<SavedWork, String> {
-    app_context(&app)
+    window_context(&window)
         .update_saved_work_note(&id, note)
         .map_err(|e| e.to_string())
 }
@@ -1988,45 +2286,60 @@ async fn mark_saved_work_acquired(
     provider: String,
     work: LiteratureSearchResult,
     path: PathBuf,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<Option<SavedWork>, String> {
-    app_context(&app)
+    window_context(&window)
         .mark_saved_work_acquired(&provider, &work, path)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn list_tags(app: AppHandle) -> Result<Vec<Tag>, String> {
-    app_context(&app).list_tags().map_err(|e| e.to_string())
+async fn list_tags(window: tauri::WebviewWindow) -> Result<Vec<Tag>, String> {
+    window_context(&window)
+        .list_tags()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn create_tag(tag: NewTag, app: AppHandle) -> Result<Tag, String> {
-    app_context(&app).create_tag(tag).map_err(|e| e.to_string())
+async fn create_tag(tag: NewTag, window: tauri::WebviewWindow) -> Result<Tag, String> {
+    window_context(&window)
+        .create_tag(tag)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn update_tag(id: String, tag: UpdateTag, app: AppHandle) -> Result<Tag, String> {
-    app_context(&app)
+async fn update_tag(
+    id: String,
+    tag: UpdateTag,
+    window: tauri::WebviewWindow,
+) -> Result<Tag, String> {
+    window_context(&window)
         .update_tag(&id, tag)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn delete_tag(id: String, app: AppHandle) -> Result<(), String> {
-    app_context(&app).delete_tag(&id).map_err(|e| e.to_string())
+async fn delete_tag(id: String, window: tauri::WebviewWindow) -> Result<(), String> {
+    window_context(&window)
+        .delete_tag(&id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn update_document_tags(update: DocumentTagUpdate, app: AppHandle) -> Result<(), String> {
-    app_context(&app)
+async fn update_document_tags(
+    update: DocumentTagUpdate,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    window_context(&window)
         .update_document_tags(update)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn list_smart_collections(app: AppHandle) -> Result<Vec<SmartCollection>, String> {
-    app_context(&app)
+async fn list_smart_collections(
+    window: tauri::WebviewWindow,
+) -> Result<Vec<SmartCollection>, String> {
+    window_context(&window)
         .list_collections()
         .map_err(|e| e.to_string())
 }
@@ -2034,9 +2347,9 @@ async fn list_smart_collections(app: AppHandle) -> Result<Vec<SmartCollection>, 
 #[tauri::command]
 async fn create_smart_collection(
     collection: NewSmartCollection,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<SmartCollection, String> {
-    app_context(&app)
+    window_context(&window)
         .create_collection(collection)
         .map_err(|e| e.to_string())
 }
@@ -2045,16 +2358,16 @@ async fn create_smart_collection(
 async fn update_smart_collection(
     id: String,
     collection: UpdateSmartCollection,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<SmartCollection, String> {
-    app_context(&app)
+    window_context(&window)
         .update_collection(&id, collection)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn delete_smart_collection(id: String, app: AppHandle) -> Result<(), String> {
-    app_context(&app)
+async fn delete_smart_collection(id: String, window: tauri::WebviewWindow) -> Result<(), String> {
+    window_context(&window)
         .delete_collection(&id)
         .map_err(|e| e.to_string())
 }
@@ -2069,60 +2382,72 @@ async fn validate_smart_collection(expression: String) -> Result<CollectionValid
 #[tauri::command]
 async fn list_search_log(
     limit: Option<usize>,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<Vec<SearchLogEntry>, String> {
-    app_context(&app)
+    window_context(&window)
         .list_search_log(limit.unwrap_or(100))
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn delete_search_log(id: String, app: AppHandle) -> Result<(), String> {
-    app_context(&app)
+async fn delete_search_log(id: String, window: tauri::WebviewWindow) -> Result<(), String> {
+    window_context(&window)
         .delete_search_log(&id)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn clear_search_log(app: AppHandle) -> Result<(), String> {
-    app_context(&app)
+async fn clear_search_log(window: tauri::WebviewWindow) -> Result<(), String> {
+    window_context(&window)
         .clear_search_log()
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn zotero_status(app: AppHandle) -> Result<IntegrationStatus, String> {
-    zotero_status_for_ctx(app_context(&app)).await
+async fn zotero_status(window: tauri::WebviewWindow) -> Result<IntegrationStatus, String> {
+    zotero_status_for_ctx(window_context(&window)).await
 }
 
 #[tauri::command]
-async fn resolve_file_metadata(path: String, app: AppHandle) -> Result<DocumentMetadata, String> {
-    resolve_file_metadata_for_ctx(app_context(&app), path).await
+async fn resolve_file_metadata(
+    path: String,
+    window: tauri::WebviewWindow,
+) -> Result<DocumentMetadata, String> {
+    resolve_file_metadata_for_ctx(window_context(&window), path).await
 }
 
 #[tauri::command]
-async fn refresh_file_metadata(path: Option<String>, app: AppHandle) -> Result<(), String> {
-    refresh_file_metadata_for_ctx(app_context(&app), path).await
+async fn refresh_file_metadata(
+    path: Option<String>,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    refresh_file_metadata_for_ctx(window_context(&window), path).await
 }
 
 #[tauri::command]
-async fn zotero_add_item(path: String, app: AppHandle) -> Result<AddOutcome, String> {
-    zotero_add_item_for_ctx(app_context(&app), path).await
+async fn zotero_add_item(path: String, window: tauri::WebviewWindow) -> Result<AddOutcome, String> {
+    zotero_add_item_for_ctx(window_context(&window), path).await
 }
 
 #[tauri::command]
-async fn zotero_generate_citation(path: String, app: AppHandle) -> Result<CitationResult, String> {
-    zotero_generate_citation_for_ctx(app_context(&app), path).await
+async fn zotero_generate_citation(
+    path: String,
+    window: tauri::WebviewWindow,
+) -> Result<CitationResult, String> {
+    zotero_generate_citation_for_ctx(window_context(&window), path).await
 }
 
 #[tauri::command]
-async fn custom_integration_summary(manifest: String, app: AppHandle) -> ManifestSummary {
-    custom_integration_summary_for_ctx(app_context(&app), manifest).await
+async fn custom_integration_summary(
+    manifest: String,
+    window: tauri::WebviewWindow,
+) -> ManifestSummary {
+    custom_integration_summary_for_ctx(window_context(&window), manifest).await
 }
 
 #[tauri::command]
-fn custom_integration_authoring_prompt(app: AppHandle) -> String {
-    app_context(&app).custom_integration_authoring_prompt()
+fn custom_integration_authoring_prompt(window: tauri::WebviewWindow) -> String {
+    window_context(&window).custom_integration_authoring_prompt()
 }
 
 #[tauri::command]
@@ -2130,14 +2455,14 @@ async fn custom_integration_probe(
     manifest: String,
     secrets: HashMap<String, String>,
     query: String,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<ProbeReport, String> {
-    custom_integration_probe_for_ctx(app_context(&app), manifest, secrets, query).await
+    custom_integration_probe_for_ctx(window_context(&window), manifest, secrets, query).await
 }
 
 #[tauri::command]
-fn is_semantic_ready(app: AppHandle) -> bool {
-    is_semantic_ready_for_ctx(app_context(&app))
+fn is_semantic_ready(window: tauri::WebviewWindow) -> bool {
+    is_semantic_ready_for_ctx(window_context(&window))
 }
 
 #[tauri::command]
@@ -2164,59 +2489,70 @@ async fn clear_logs() -> Result<(), String> {
 // ── Embed commands (delegating to AppContext) ─────────────────────────────────
 
 #[tauri::command]
-async fn download_model(selected: SelectedEmbedder, app: AppHandle) -> Result<(), String> {
-    download_model_for_ctx(app_context(&app), selected).await
+async fn download_model(
+    selected: SelectedEmbedder,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    download_model_for_ctx(window_context(&window), selected).await
 }
 
 #[tauri::command]
 async fn build_index(
     root: String,
     selected: SelectedEmbedder,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    build_index_for_ctx(app_context(&app), root, selected).await
+    build_index_for_ctx(window_context(&window), root, selected).await
 }
 
 #[tauri::command]
-async fn index_activity(app: AppHandle, root: String) -> Result<IndexActivity, String> {
-    index_activity_for_ctx(app_context(&app), root).await
+async fn index_activity(
+    root: String,
+    window: tauri::WebviewWindow,
+) -> Result<IndexActivity, String> {
+    index_activity_for_ctx(window_context(&window), root).await
 }
 
 #[tauri::command]
-async fn index_coverage(app: AppHandle, roots: Vec<String>) -> Result<Vec<RootCoverage>, String> {
-    index_coverage_for_ctx(app_context(&app), roots).await
+async fn index_coverage(
+    roots: Vec<String>,
+    window: tauri::WebviewWindow,
+) -> Result<Vec<RootCoverage>, String> {
+    index_coverage_for_ctx(window_context(&window), roots).await
 }
 
 #[tauri::command]
 async fn continue_index_job(
     root: String,
     selected: SelectedEmbedder,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    continue_index_job_for_ctx(app_context(&app), root, selected).await
+    continue_index_job_for_ctx(window_context(&window), root, selected).await
 }
 
 #[tauri::command]
 async fn index_missing_documents(
     root: String,
     selected: SelectedEmbedder,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    index_missing_documents_for_ctx(app_context(&app), root, selected).await
+    index_missing_documents_for_ctx(window_context(&window), root, selected).await
 }
 
 #[tauri::command]
 async fn retry_failed_documents(
     root: String,
     selected: SelectedEmbedder,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    retry_failed_documents_for_ctx(app_context(&app), root, selected).await
+    retry_failed_documents_for_ctx(window_context(&window), root, selected).await
 }
 
 #[tauri::command]
-async fn embedder_capabilities(app: AppHandle) -> Result<EmbedderCapabilityManifest, String> {
-    embedder_capabilities_for_ctx(app_context(&app)).await
+async fn embedder_capabilities(
+    window: tauri::WebviewWindow,
+) -> Result<EmbedderCapabilityManifest, String> {
+    embedder_capabilities_for_ctx(window_context(&window)).await
 }
 
 #[tauri::command]
@@ -2238,48 +2574,54 @@ async fn search_custom_models(
 }
 
 #[tauri::command]
-async fn cancel_embed(app: AppHandle) -> Result<(), String> {
-    cancel_embed_for_ctx(app_context(&app)).await
+async fn cancel_embed(window: tauri::WebviewWindow) -> Result<(), String> {
+    cancel_embed_for_ctx(window_context(&window)).await
 }
 
 #[tauri::command]
-async fn get_index_status(app: AppHandle, root: Option<String>) -> Result<IndexStatus, String> {
-    get_index_status_for_ctx(app_context(&app), root).await
+async fn get_index_status(
+    root: Option<String>,
+    window: tauri::WebviewWindow,
+) -> Result<IndexStatus, String> {
+    get_index_status_for_ctx(window_context(&window), root).await
 }
 
 #[tauri::command]
-async fn delete_index(app: AppHandle, root: Option<String>) -> Result<(), String> {
-    delete_index_for_ctx(app_context(&app), root).await
+async fn delete_index(root: Option<String>, window: tauri::WebviewWindow) -> Result<(), String> {
+    delete_index_for_ctx(window_context(&window), root).await
 }
 
 #[tauri::command]
-fn get_worker_status(app: AppHandle) -> WorkerStatus {
-    get_worker_status_for_ctx(app_context(&app))
+fn get_worker_status(window: tauri::WebviewWindow) -> WorkerStatus {
+    get_worker_status_for_ctx(window_context(&window))
 }
 
 #[tauri::command]
-fn get_worker_statuses(app: AppHandle) -> Vec<WorkerStatus> {
-    get_worker_statuses_for_ctx(app_context(&app))
+fn get_worker_statuses(window: tauri::WebviewWindow) -> Vec<WorkerStatus> {
+    get_worker_statuses_for_ctx(window_context(&window))
 }
 
 #[tauri::command]
-async fn is_generation_ready(app: AppHandle) -> bool {
-    app_context(&app).is_generation_ready().await
+async fn is_generation_ready(window: tauri::WebviewWindow) -> bool {
+    window_context(&window).is_generation_ready().await
 }
 
 #[tauri::command]
 async fn list_generation_models(
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<Vec<wilkes_core::types::GeneratorDescriptor>, String> {
-    app_context(&app)
+    window_context(&window)
         .list_generation_models()
         .await
         .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
-async fn get_generation_model_size(app: AppHandle, model_id: String) -> Result<u64, String> {
-    app_context(&app)
+async fn get_generation_model_size(
+    model_id: String,
+    window: tauri::WebviewWindow,
+) -> Result<u64, String> {
+    window_context(&window)
         .fetch_generation_model_size(&model_id)
         .await
         .map_err(|e| format!("{e:#}"))
@@ -2289,8 +2631,8 @@ async fn get_generation_model_size(app: AppHandle, model_id: String) -> Result<u
 /// arrives on the generation-progress event stream, terminated by
 /// generation-done or generation-error.
 #[tauri::command]
-async fn load_generation_model(app: AppHandle) -> Result<bool, String> {
-    app_context(&app)
+async fn load_generation_model(window: tauri::WebviewWindow) -> Result<bool, String> {
+    window_context(&window)
         .load_generator()
         .await
         .map(|outcome| outcome.attached())
@@ -2311,19 +2653,19 @@ fn catalogue_failed(error: wilkes_api::commands::catalogue::CatalogueError) -> S
 /// comes back.
 #[tauri::command]
 async fn catalogue_remove(
-    app: AppHandle,
     provider: String,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_api::commands::catalogue::CatalogueRemoveResponse, String> {
-    wilkes_api::commands::catalogue::remove(&app_context(&app).catalogue_dir, provider)
+    wilkes_api::commands::catalogue::remove(&window_context(&window).catalogue_dir, provider)
         .map_err(catalogue_failed)
 }
 
 /// Every literature provider this installation knows, switched on or not.
 #[tauri::command]
 async fn literature_providers(
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Vec<wilkes_api::commands::integrations::literature::LiteratureProviderInfo> {
-    app_context(&app).literature_providers().await
+    window_context(&window).literature_providers().await
 }
 
 /// Every enabled literature provider asked at once — or only those named by
@@ -2331,13 +2673,13 @@ async fn literature_providers(
 /// the ones that did not.
 #[tauri::command]
 async fn literature_search(
-    app: AppHandle,
     query: String,
     limit: Option<usize>,
     providers: Option<Vec<String>>,
     page: Option<usize>,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_api::commands::integrations::literature::LiteratureSearchResponse, String> {
-    app_context(&app)
+    window_context(&window)
         .literature_search(query, limit, providers, page)
         .await
         .map_err(|error| error.to_string())
@@ -2349,11 +2691,11 @@ async fn literature_search(
 /// area. A download's bytes arrive on `catalogue-download-progress`.
 #[tauri::command]
 async fn literature_acquire(
-    app: AppHandle,
     provider: String,
     result: wilkes_core::types::LiteratureSearchResult,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_core::acquire::AcquiredFiles, String> {
-    app_context(&app)
+    window_context(&window)
         .literature_acquire(provider, result)
         .await
         .map_err(|error| error.to_string())
@@ -2363,8 +2705,10 @@ async fn literature_acquire(
 
 /// Every feed with its status, flags and inbox count.
 #[tauri::command]
-async fn feeds_list(app: AppHandle) -> Result<Vec<wilkes_api::research::FeedRecord>, String> {
-    app_context(&app)
+async fn feeds_list(
+    window: tauri::WebviewWindow,
+) -> Result<Vec<wilkes_api::research::FeedRecord>, String> {
+    window_context(&window)
         .feeds_list()
         .map_err(|error| format!("{error:#}"))
 }
@@ -2372,10 +2716,10 @@ async fn feeds_list(app: AppHandle) -> Result<Vec<wilkes_api::research::FeedReco
 /// The feeds an address offers, each read to be sure it is one.
 #[tauri::command]
 async fn feed_discover(
-    app: AppHandle,
     address: String,
+    window: tauri::WebviewWindow,
 ) -> Result<Vec<wilkes_api::context::feeds::OfferedFeed>, String> {
-    app_context(&app)
+    window_context(&window)
         .feed_discover(&address)
         .await
         .map_err(|error| format!("{error:#}"))
@@ -2384,10 +2728,10 @@ async fn feed_discover(
 /// Add a feed and refresh it. "Follow this" calls it with the listing on screen.
 #[tauri::command]
 async fn feed_add(
-    app: AppHandle,
     feed: wilkes_api::context::feeds::NewFeed,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_api::research::FeedRecord, String> {
-    app_context(&app)
+    window_context(&window)
         .feed_add(feed)
         .await
         .map_err(|error| format!("{error:#}"))
@@ -2395,11 +2739,11 @@ async fn feed_add(
 
 #[tauri::command]
 async fn feed_update(
-    app: AppHandle,
     id: String,
     update: wilkes_api::context::feeds::FeedUpdate,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_api::research::FeedRecord, String> {
-    app_context(&app)
+    window_context(&window)
         .feed_update(&id, update)
         .await
         .map_err(|error| format!("{error:#}"))
@@ -2407,33 +2751,37 @@ async fn feed_update(
 
 /// Remove a feed and its items; `delete_files` deletes what it imported too.
 #[tauri::command]
-async fn feed_remove(app: AppHandle, id: String, delete_files: bool) -> Result<(), String> {
-    app_context(&app)
+async fn feed_remove(
+    id: String,
+    delete_files: bool,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    window_context(&window)
         .feed_remove(&id, delete_files)
         .await
         .map_err(|error| format!("{error:#}"))
 }
 
 #[tauri::command]
-async fn feeds_refresh(app: AppHandle) -> Result<(), String> {
-    app_context(&app)
+async fn feeds_refresh(window: tauri::WebviewWindow) -> Result<(), String> {
+    window_context(&window)
         .feeds_refresh()
         .map_err(|error| format!("{error:#}"))
 }
 
 #[tauri::command]
-async fn feeds_refresh_cancel(app: AppHandle) -> Result<(), String> {
-    app_context(&app).feeds_refresh_cancel();
+async fn feeds_refresh_cancel(window: tauri::WebviewWindow) -> Result<(), String> {
+    window_context(&window).feeds_refresh_cancel();
     Ok(())
 }
 
 /// Items by status and feed, newest first, paged.
 #[tauri::command]
 async fn feed_items(
-    app: AppHandle,
     query: wilkes_api::context::feeds::FeedItemsQuery,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_api::context::feeds::FeedItemsPage, String> {
-    app_context(&app)
+    window_context(&window)
         .feed_items(query)
         .map_err(|error| format!("{error:#}"))
 }
@@ -2441,11 +2789,11 @@ async fn feed_items(
 /// Import or dismiss one item.
 #[tauri::command]
 async fn feed_item_set_status(
-    app: AppHandle,
     id: String,
     action: wilkes_api::context::feeds::FeedItemAction,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_api::research::FeedItemRecord, String> {
-    app_context(&app)
+    window_context(&window)
         .feed_item_set_status(&id, action)
         .await
         .map_err(|error| format!("{error:#}"))
@@ -2455,11 +2803,11 @@ async fn feed_item_set_status(
 /// allow comes back inside the answer, beside the provider's name.
 #[tauri::command]
 async fn literature_browse(
-    app: AppHandle,
     provider: String,
     request: wilkes_core::types::BrowseRequest,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_api::commands::integrations::literature::LiteratureProviderAnswer, String> {
-    app_context(&app)
+    window_context(&window)
         .literature_browse(provider, request)
         .await
         .map_err(|error| error.to_string())
@@ -2468,12 +2816,12 @@ async fn literature_browse(
 /// What a provider suggests for one of its filters as the user types.
 #[tauri::command]
 async fn literature_filter_suggest(
-    app: AppHandle,
     provider: String,
     filter: String,
     text: String,
+    window: tauri::WebviewWindow,
 ) -> Result<Vec<wilkes_core::types::FilterSuggestion>, String> {
-    app_context(&app)
+    window_context(&window)
         .literature_filter_suggest(provider, filter, text)
         .await
         .map_err(|error| error.to_string())
@@ -2483,12 +2831,12 @@ async fn literature_filter_suggest(
 /// provider. `request_id` is the caller's, for `literature_compose_cancel`.
 #[tauri::command]
 async fn literature_compose(
-    app: AppHandle,
     request_id: String,
     text: String,
     providers: Vec<String>,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_api::commands::integrations::literature::LiteratureComposition, String> {
-    app_context(&app)
+    window_context(&window)
         .literature_compose(request_id, text, providers)
         .await
         .map_err(|error| error.to_string())
@@ -2497,8 +2845,11 @@ async fn literature_compose(
 /// Stops a composition in flight; the request it belongs to answers that it
 /// was cancelled.
 #[tauri::command]
-async fn literature_compose_cancel(app: AppHandle, request_id: String) -> Result<(), String> {
-    app_context(&app).literature_compose_cancel(&request_id);
+async fn literature_compose_cancel(
+    request_id: String,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    window_context(&window).literature_compose_cancel(&request_id);
     Ok(())
 }
 
@@ -2507,18 +2858,18 @@ async fn literature_compose_cancel(app: AppHandle, request_id: String) -> Result
 #[tauri::command]
 async fn literature_provider_status(
     provider: String,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<IntegrationStatus, String> {
-    literature_provider_status_for_ctx(app_context(&app), provider).await
+    literature_provider_status_for_ctx(window_context(&window), provider).await
 }
 
 #[tauri::command]
 async fn literature_provider_lookup(
     provider: String,
     doi: String,
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_core::types::ProviderWork, String> {
-    literature_provider_lookup_for_ctx(app_context(&app), provider, doi).await
+    literature_provider_lookup_for_ctx(window_context(&window), provider, doi).await
 }
 
 /// Refreshes the named providers, or all of them when none is named. Minutes,
@@ -2526,10 +2877,10 @@ async fn literature_provider_lookup(
 /// and each page lands on `catalogue-sync-progress` as it arrives.
 #[tauri::command]
 async fn catalogue_sync(
-    app: AppHandle,
     providers: Option<Vec<String>>,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_api::commands::catalogue::CatalogueSyncResponse, String> {
-    app_context(&app)
+    window_context(&window)
         .catalogue_sync(providers)
         .await
         .map_err(catalogue_failed)
@@ -2543,10 +2894,10 @@ async fn catalogue_sync(
 /// `catalogue-download-progress`.
 #[tauri::command]
 async fn catalogue_acquire_course(
-    app: AppHandle,
     course_url: String,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_api::commands::catalogue::CatalogueCourseResponse, String> {
-    app_context(&app)
+    window_context(&window)
         .catalogue_acquire_course(course_url)
         .await
         .map_err(catalogue_failed)
@@ -2555,9 +2906,9 @@ async fn catalogue_acquire_course(
 /// Every recognizer this build can read with, and the engines it compiled in.
 #[tauri::command]
 async fn image_recognizer_catalogue(
-    app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> wilkes_core::extract::image::dispatch::RecognizerCatalogue {
-    app_context(&app).image_recognizer_catalogue()
+    window_context(&window).image_recognizer_catalogue()
 }
 
 /// What the named image recognizer is, where it came from, and under what
@@ -2565,11 +2916,11 @@ async fn image_recognizer_catalogue(
 /// and the point of it is to be readable before the download rather than after.
 #[tauri::command]
 async fn image_recognizer_inventory(
-    app: AppHandle,
     engine: wilkes_core::extract::image::dispatch::RecognitionEngine,
     model_id: String,
+    window: tauri::WebviewWindow,
 ) -> Result<wilkes_core::types::RecognizerInventory, String> {
-    app_context(&app)
+    window_context(&window)
         .image_recognizer_inventory(engine, &model_id)
         .map_err(|e| format!("{e:#}"))
 }
@@ -2580,11 +2931,11 @@ async fn image_recognizer_inventory(
 /// image-analysis-error.
 #[tauri::command]
 async fn install_image_recognizer(
-    app: AppHandle,
     engine: wilkes_core::extract::image::dispatch::RecognitionEngine,
     model_id: String,
+    window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    app_context(&app)
+    window_context(&window)
         .install_image_recognizer(engine, model_id)
         .await
         .map_err(|e| format!("{e:#}"))
@@ -2595,8 +2946,8 @@ async fn install_image_recognizer(
 /// image-analysis-error.
 #[cfg(feature = "recognize-onnx")]
 #[tauri::command]
-async fn install_layout_detector(app: AppHandle) -> Result<(), String> {
-    app_context(&app)
+async fn install_layout_detector(window: tauri::WebviewWindow) -> Result<(), String> {
+    window_context(&window)
         .install_layout_detector()
         .await
         .map_err(|e| format!("{e:#}"))
@@ -2613,88 +2964,94 @@ async fn install_layout_detector(_app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn explain_related_document(
-    app: AppHandle,
     request_id: String,
     anchor_path: String,
     path: String,
+    window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    app_context(&app)
+    window_context(&window)
         .explain_related_document(request_id, anchor_path.into(), path.into())
         .await
 }
 
 #[tauri::command]
 async fn summarize_document(
-    app: AppHandle,
     request_id: String,
     path: String,
+    window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    app_context(&app)
+    window_context(&window)
         .summarize_document(request_id, path.into())
         .await
 }
 
 #[tauri::command]
 async fn summarize_search_results(
-    app: AppHandle,
     request_id: String,
     input: wilkes_core::generate::tasks::search_results_summary::SearchResultsSummaryInput,
+    window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    app_context(&app)
+    window_context(&window)
         .summarize_search_results(request_id, input)
         .await
 }
 
 #[tauri::command]
 async fn request_completion(
-    app: AppHandle,
     completion_id: String,
     request: wilkes_core::completion::CompletionRequest,
+    window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    app_context(&app)
+    window_context(&window)
         .request_completion(completion_id, request)
         .await
 }
 
 #[tauri::command]
-fn cancel_completion(app: AppHandle, completion_id: String) {
-    app_context(&app).cancel_completion(&completion_id);
+fn cancel_completion(completion_id: String, window: tauri::WebviewWindow) {
+    window_context(&window).cancel_completion(&completion_id);
 }
 
 #[tauri::command]
 async fn completion_feedback(
-    app: AppHandle,
     completion_id: String,
     feedback: wilkes_core::completion::CompletionFeedback,
+    window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    app_context(&app)
+    window_context(&window)
         .completion_feedback(&completion_id, feedback)
         .await
 }
 
 #[tauri::command]
-fn get_session_steering(app: AppHandle) -> wilkes_core::completion::SessionSteering {
-    app_context(&app).get_session_steering()
+fn get_session_steering(window: tauri::WebviewWindow) -> wilkes_core::completion::SessionSteering {
+    window_context(&window).get_session_steering()
 }
 
 #[tauri::command]
-fn reset_session_steering(app: AppHandle) {
-    app_context(&app).reset_session_steering();
+fn reset_session_steering(window: tauri::WebviewWindow) {
+    window_context(&window).reset_session_steering();
 }
 
 #[tauri::command]
-async fn save_document(app: AppHandle, path: String, text: String) -> Result<(), String> {
-    app_context(&app).save_document(path.into(), text).await
+async fn save_document(
+    path: String,
+    text: String,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    window_context(&window)
+        .save_document(path.into(), text)
+        .await
 }
 
 #[tauri::command]
-async fn kill_worker(app: AppHandle) -> Result<(), String> {
-    kill_worker_for_ctx(app_context(&app)).await
+async fn kill_worker(window: tauri::WebviewWindow) -> Result<(), String> {
+    kill_worker_for_ctx(window_context(&window)).await
 }
 
 #[tauri::command]
-async fn set_worker_timeout(secs: u64, app: AppHandle) -> Result<(), String> {
-    set_worker_timeout_for_ctx(app_context(&app), secs).await
+async fn set_worker_timeout(secs: u64, window: tauri::WebviewWindow) -> Result<(), String> {
+    set_worker_timeout_for_ctx(window_context(&window), secs).await
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -2727,6 +3084,8 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .on_window_event(track_workspace_window)
+        .on_menu_event(handle_menu_event)
         .manage(NativeOpenState::default())
         .manage(browser_pane::DarkFilters::default())
         .manage(browser_pane::Downloads::default())
@@ -2765,7 +3124,7 @@ pub fn run() {
             }
 
             let (events_tx, _) = broadcast::channel::<(String, serde_json::Value)>(1024);
-            let emitter: Arc<dyn EventEmitter> = Arc::new(WorkspaceEmitter {
+            let emitter: Arc<dyn ViewEventSink> = Arc::new(WorkspaceEmitter {
                 webview: TauriEmitter(handle.clone()),
                 http: events_tx.clone(),
             });
@@ -2811,6 +3170,18 @@ pub fn run() {
 
             app.manage(Arc::clone(&workspaces));
             app.manage(Arc::new(ActiveSearches(Mutex::new(HashMap::new()))));
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            if let Err(error) = install_menu(&handle) {
+                error!("could not add New Window to the menu: {error:#}");
+            }
+            let title_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) =
+                    title_window_for_view(&title_handle, wilkes_api::workspace::PRIMARY_VIEW).await
+                {
+                    error!("could not title the main window: {error}");
+                }
+            });
             // Saved chats are the installation's, not a workspace's: one
             // store beside the workspaces, gathered here from the per-workspace
             // stores earlier builds kept. Then conversations written before
@@ -2875,6 +3246,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_startup_status,
             native_open_ready,
+            open_workspace_window,
             get_global_settings,
             preview_standalone,
             get_standalone_file_metadata,
@@ -3109,6 +3481,10 @@ mod tests {
 
     impl EventEmitter for MockEmitter {
         fn emit(&self, _name: &str, _payload: serde_json::Value) {}
+    }
+
+    impl ViewEventSink for MockEmitter {
+        fn emit_to(&self, _audience: EventAudience<'_>, _name: &str, _payload: serde_json::Value) {}
     }
 
     #[test]
@@ -3494,14 +3870,45 @@ mod tests {
         let active = Arc::new(ActiveSearches(Mutex::new(HashMap::new())));
         active.0.lock().unwrap().insert(
             "search-1".to_string(),
-            tokio::spawn(async {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-            }),
+            (
+                "main".to_string(),
+                tokio::spawn(async {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                }),
+            ),
         );
 
         cancel_search_for_ctx(Arc::clone(&active), "search-1");
 
         assert!(active.0.lock().unwrap().is_empty());
+    }
+
+    /// A window leaving its workspace stops its own searches, not another
+    /// window's.
+    #[tokio::test]
+    async fn cancelling_a_view_leaves_other_windows_searches_running() {
+        let active = ActiveSearches(Mutex::new(HashMap::new()));
+        let sleeper = || {
+            tokio::spawn(async {
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            })
+        };
+        active
+            .0
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), ("main".to_string(), sleeper()));
+        active
+            .0
+            .lock()
+            .unwrap()
+            .insert("b".to_string(), ("workspace-2".to_string(), sleeper()));
+
+        active.cancel_view("main");
+
+        let remaining = active.0.lock().unwrap();
+        assert_eq!(remaining.keys().collect::<Vec<_>>(), vec!["b"]);
+        assert!(!remaining["b"].1.is_finished());
     }
 
     /// A workspace manager over a temporary data directory, for the listener
@@ -3510,7 +3917,7 @@ mod tests {
     fn test_workspaces() -> (tempfile::TempDir, Arc<WorkspaceManager>) {
         let dir = tempdir().unwrap();
         let settings_path = dir.path().join("settings.json");
-        let emitter: Arc<dyn wilkes_api::context::EventEmitter> = Arc::new(MockEmitter);
+        let emitter: Arc<dyn ViewEventSink> = Arc::new(MockEmitter);
         let (workspaces, _rx, _loop) =
             WorkspaceManager::new(dir.path().to_path_buf(), settings_path, emitter).unwrap();
         (dir, workspaces)

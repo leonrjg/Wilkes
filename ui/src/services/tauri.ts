@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import type { PdfEditExport, PdfFontRequest, ResolvedPdfFont } from "@leonrjg/wilkes-reader";
 import { editedCopyPath } from "../lib/editedCopy";
-import { listen } from "@tauri-apps/api/event";
+import { listen as listenToAnyWindow, type EventCallback, type Options } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -138,6 +138,18 @@ function inTurn<T>(change: () => Promise<T>): Promise<T> {
   return landed;
 }
 
+/**
+ * Listens for an event addressed to this window, or to every window.
+ *
+ * The host sends one workspace's events only to the windows showing that
+ * workspace. A listener given no target hears events addressed to any window,
+ * so without one each window would also report the other workspaces'
+ * progress as its own.
+ */
+function listen<T>(event: string, handler: EventCallback<T>, options?: Options) {
+  return listenToAnyWindow<T>(event, handler, options ?? { target: getCurrentWebview().label });
+}
+
 export class TauriSearchApi implements SearchApi {
   async getStartupStatus(): Promise<StartupStatus> {
     return invoke<StartupStatus>("get_startup_status");
@@ -245,6 +257,14 @@ export class TauriSearchApi implements SearchApi {
 
   async deleteWorkspace(workspaceId: string): Promise<WorkspaceState> {
     return invoke<WorkspaceState>("delete_workspace", { workspaceId });
+  }
+
+  async openWorkspaceWindow(workspaceId: string): Promise<void> {
+    await invoke("open_workspace_window", { workspaceId });
+  }
+
+  async onNewWindowRequested(handler: () => void): Promise<() => void> {
+    return listen("menu-new-window", () => handler());
   }
 
   async getExternalMcpStatus(): Promise<ExternalMcpStatus> {

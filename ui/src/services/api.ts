@@ -176,6 +176,12 @@ export interface SearchApi {
   renameWorkspace(workspaceId: string, name: string): Promise<WorkspaceSummary>;
   switchWorkspace(workspaceId: string): Promise<WorkspaceState>;
   deleteWorkspace(workspaceId: string): Promise<WorkspaceState>;
+  /** Desktop-only: brings forward the window showing the workspace, or opens
+   *  a new window on it. */
+  openWorkspaceWindow?(workspaceId: string): Promise<void>;
+  /** Desktop-only: the native File → New Window command, chosen while this
+   *  window was in front. */
+  onNewWindowRequested?(handler: () => void): Promise<() => void>;
   /** Desktop-only: the native window's appearance, which every webview in it
    *  follows (null follows the OS), and the colour it paints where the page
    *  does not reach -- its title bar -- as a `#rrggbb` hex. */

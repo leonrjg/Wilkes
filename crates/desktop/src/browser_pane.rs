@@ -310,8 +310,8 @@ pub(crate) fn is_web_page(path: &Path) -> std::io::Result<bool> {
 }
 
 /// A directory of its own beside the library for one download to arrive in.
-pub(crate) fn staging_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let staging = crate::app_context(app)
+pub(crate) fn staging_dir(app: &AppHandle, view: &str) -> Result<PathBuf, String> {
+    let staging = crate::view_context(app, view)
         .data_dir
         .join("page-staging")
         .join(uuid::Uuid::new_v4().to_string());
@@ -355,7 +355,7 @@ async fn finish_download(
         return;
     }
     let outcome: Result<PathBuf, String> = async {
-        let ctx = crate::app_context(&app);
+        let ctx = crate::view_context(&app, &pane.owner);
         ctx.ensure_writable().map_err(|e| e.to_string())?;
         let root = ctx
             .get_settings()
@@ -398,12 +398,12 @@ async fn finish_download(
     }
 }
 
-/// The library root a download from the pane is saved into: the active
-/// workspace's open root, when the workspace may be written to. A download is
-/// the user's own act of putting a file there -- unlike a catalogue fetch,
-/// which Wilkes makes and keeps in its uploads directory.
-fn download_root(app: &AppHandle) -> Result<PathBuf, String> {
-    let ctx = crate::app_context(app);
+/// The library root a download from the pane is saved into: the open root of
+/// the workspace the pane's window shows, when the workspace may be written
+/// to. A download is the user's own act of putting a file there -- unlike a
+/// catalogue fetch, which Wilkes makes and keeps in its uploads directory.
+fn download_root(app: &AppHandle, view: &str) -> Result<PathBuf, String> {
+    let ctx = crate::view_context(app, view);
     ctx.ensure_writable().map_err(|e| e.to_string())?;
     tauri::async_runtime::block_on(ctx.get_settings())
         .last_directory
@@ -433,11 +433,11 @@ pub(crate) fn route_download(app: &AppHandle, pane: &PaneId, event: DownloadEven
             // The agent stores what it fetched in the library its call names,
             // so only a download for the open library needs one open.
             if !agents {
-                if let Err(reason) = download_root(app) {
+                if let Err(reason) = download_root(app, &pane.owner) {
                     return refuse(reason);
                 }
             }
-            let path = match staging_dir(app) {
+            let path = match staging_dir(app, &pane.owner) {
                 Ok(staging) => staging.join(&name),
                 Err(reason) => return refuse(reason),
             };
@@ -570,7 +570,11 @@ pub(crate) fn create_pane(
     #[cfg(target_os = "macos")]
     let builder = builder.data_store_identifier(DATA_STORE);
     #[cfg(not(target_os = "macos"))]
-    let builder = builder.data_directory(crate::app_context(&app).shared_data_dir.join("browser"));
+    let builder = builder.data_directory(
+        crate::view_context(&app, window.label())
+            .shared_data_dir
+            .join("browser"),
+    );
 
     let (position, size) = match bounds {
         Some(bounds) => (

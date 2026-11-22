@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { api } from "../services";
 import { confirmDialog } from "../lib/utils/dialog";
-import type { WorkspaceSummary } from "../lib/types";
+import type { WorkspaceState, WorkspaceSummary } from "../lib/types";
 import { useBookmarksStore } from "./useBookmarksStore";
 import { useSavedWorksStore } from "./useSavedWorksStore";
 import { useFeedsStore } from "./useFeedsStore";
@@ -20,6 +20,9 @@ import { useViewerStore } from "./useViewerStore";
 interface WorkspaceStore {
   workspaces: WorkspaceSummary[];
   activeWorkspaceId: string | null;
+  /** Workspaces other windows show. A workspace is shown by one window at
+   *  most, so choosing one of these brings its window forward. */
+  openElsewhere: string[];
   loading: boolean;
   switching: boolean;
   load: () => Promise<void>;
@@ -32,6 +35,8 @@ interface WorkspaceStore {
   createAndSwitch: (name: string) => Promise<void>;
   rename: (workspaceId: string, name: string) => Promise<void>;
   switchTo: (workspaceId: string) => Promise<void>;
+  /** Brings forward the window showing the workspace, or opens one on it. */
+  openInWindow: (workspaceId: string) => Promise<void>;
   /**
    * Deletes a workspace and everything it owns, activating another one first
    * when the target is the active workspace. Resolves to `false` when the
@@ -69,6 +74,15 @@ function clearWorkspaceUi() {
   useChatStore.getState().resetForWorkspace();
 }
 
+/** The store's view of one listing, as this window sees it. */
+function fromListing(state: WorkspaceState) {
+  return {
+    workspaces: state.workspaces,
+    activeWorkspaceId: state.active_workspace_id,
+    openElsewhere: state.open_elsewhere,
+  };
+}
+
 /**
  * The active workspace, or null before the registry has been read.
  */
@@ -101,6 +115,7 @@ export function useActiveWorkspaceName(): string | null {
 export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   workspaces: [],
   activeWorkspaceId: null,
+  openElsewhere: [],
   loading: false,
   switching: false,
 
@@ -108,10 +123,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({ loading: true });
     try {
       const state = await api.listWorkspaces();
-      set({
-        workspaces: state.workspaces,
-        activeWorkspaceId: state.active_workspace_id,
-      });
+      set(fromListing(state));
       useEditorStore.getState().switchWorkspace(state.active_workspace_id);
       useFolderStateStore.getState().switchWorkspace(state.active_workspace_id);
       await useViewerStore.getState().switchWorkspace(state.active_workspace_id);
@@ -122,10 +134,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
   refreshList: async () => {
     const state = await api.listWorkspaces();
-    set({
-      workspaces: state.workspaces,
-      activeWorkspaceId: state.active_workspace_id,
-    });
+    set(fromListing(state));
   },
 
   createAndSwitch: async (name) => {
@@ -148,9 +157,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // one path that already does all of it — and if the user declines it (the
     // unsaved-editor prompt), nothing is deleted.
     if (workspaceId === get().activeWorkspaceId) {
-      const successor = get().workspaces.find((workspace) => workspace.id !== workspaceId);
+      // Not one another window shows: a workspace is shown by one window.
+      const successor = get().workspaces.find(
+        (workspace) => workspace.id !== workspaceId && !get().openElsewhere.includes(workspace.id),
+      );
       if (!successor) {
-        throw new Error("The last workspace cannot be deleted.");
+        throw new Error(
+          get().workspaces.length > 1
+            ? "Every other workspace is open in another window. Close one of those windows first."
+            : "The last workspace cannot be deleted.",
+        );
       }
       await get().switchTo(successor.id);
       if (get().activeWorkspaceId === workspaceId) return false;
@@ -159,15 +175,25 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     useEditorStore.getState().forgetWorkspace(workspaceId);
     useFolderStateStore.getState().forgetWorkspace(workspaceId);
     useViewerStore.getState().forgetWorkspace(workspaceId);
-    set({
-      workspaces: state.workspaces,
-      activeWorkspaceId: state.active_workspace_id,
-    });
+    set(fromListing(state));
     return true;
+  },
+
+  openInWindow: async (workspaceId) => {
+    if (!api.openWorkspaceWindow) {
+      throw new Error("Opening a workspace in a window of its own needs the desktop app");
+    }
+    await api.openWorkspaceWindow(workspaceId);
   },
 
   switchTo: async (workspaceId) => {
     if (workspaceId === get().activeWorkspaceId || get().switching) return;
+    // Another window shows it: that window is where it is, and this one
+    // keeps its own workspace and its unsaved work.
+    if (get().openElsewhere.includes(workspaceId)) {
+      await get().openInWindow(workspaceId);
+      return;
+    }
     const hasDirtyEditors = Object.values(useEditorStore.getState().buffers)
       .some((buffer) => buffer.dirty);
     if (
@@ -184,10 +210,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       useEditorStore.getState().switchWorkspace(workspaceId);
       useFolderStateStore.getState().switchWorkspace(workspaceId);
       await useViewerStore.getState().switchWorkspace(workspaceId);
-      set({
-        workspaces: state.workspaces,
-        activeWorkspaceId: state.active_workspace_id,
-      });
+      set(fromListing(state));
       await Promise.all([
         useSettingsStore.getState().load(),
         useBookmarksStore.getState().load(),
@@ -204,10 +227,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         useEditorStore.getState().switchWorkspace(state.active_workspace_id);
         useFolderStateStore.getState().switchWorkspace(state.active_workspace_id);
         await useViewerStore.getState().switchWorkspace(state.active_workspace_id);
-        set({
-          workspaces: state.workspaces,
-          activeWorkspaceId: state.active_workspace_id,
-        });
+        set(fromListing(state));
         await Promise.all([
           useSettingsStore.getState().load(),
           useBookmarksStore.getState().load(),

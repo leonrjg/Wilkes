@@ -525,6 +525,17 @@ mod tests {
         }
     }
 
+    impl wilkes_api::context::ViewEventSink for RecordingEmitter {
+        fn emit_to(
+            &self,
+            _audience: wilkes_api::context::EventAudience<'_>,
+            name: &str,
+            payload: serde_json::Value,
+        ) {
+            self.0.lock().unwrap().push((name.to_string(), payload));
+        }
+    }
+
     /// A receiver served on loopback without mDNS, and a manager that knows it
     /// as a peer: the transfer itself, end to end, with discovery left out.
     struct Harness {
@@ -543,7 +554,7 @@ mod tests {
             let data = tempdir().unwrap();
             let root = tempdir().unwrap();
             let events = Arc::new(RecordingEmitter::default());
-            let emitter: Arc<dyn EventEmitter> = events.clone();
+            let emitter: Arc<dyn wilkes_api::context::ViewEventSink> = events.clone();
             let (workspaces, _rx, _loop) = WorkspaceManager::new(
                 data.path().to_path_buf(),
                 data.path().join("settings.json"),

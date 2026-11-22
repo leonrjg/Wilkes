@@ -20,10 +20,12 @@
 //! file and nothing else, so it is shown in the standalone reader — the same
 //! window the operating system's own file opens land in, which has no
 //! workspace, no roots and no search. With it the request names a file *in a
-//! library*, and it is shown in the main window, which switches to that
-//! workspace and opens the document exactly as a click in the file list would.
-//! That is the whole of the routing rule, and it is decided here rather than
-//! in the frontend so that the queue below can name one window per request.
+//! library*, and it is shown in the window showing that workspace — a new
+//! window on it when none does — which opens the document exactly as a click
+//! in the file list would. A workspace the link names but no library is
+//! called goes to the main window, which says so. That is the whole of the
+//! routing rule, and it is decided here rather than in the frontend so that
+//! the queue below can name one window per request.
 //!
 //! `page` and `line` are the place within the document, resolved to the
 //! [`SourceOrigin`] the viewer already navigates by. Only a request naming a
@@ -74,14 +76,6 @@ pub(crate) struct NativeOpenRequest {
 impl NativeOpenRequest {
     fn is_empty(&self) -> bool {
         self.paths.is_empty() && self.errors.is_empty()
-    }
-
-    /// Which window has to show this. The one routing decision, taken once.
-    fn window_label(&self) -> &'static str {
-        match self.workspace {
-            Some(_) => MAIN_WINDOW_LABEL,
-            None => DOCUMENT_WINDOW_LABEL,
-        }
     }
 
     /// Abandon the open and say why. A request that cannot be honoured as
@@ -356,7 +350,7 @@ pub(crate) fn requests_from_args(args: Vec<OsString>, cwd: &Path) -> Vec<NativeO
     requests
 }
 
-fn focus_window(app: &AppHandle, label: &str) -> Result<(), String> {
+pub(crate) fn focus_window(app: &AppHandle, label: &str) -> Result<(), String> {
     let window = app
         .get_webview_window(label)
         .ok_or_else(|| format!("The {label} window was not created"))?;
@@ -365,12 +359,13 @@ fn focus_window(app: &AppHandle, label: &str) -> Result<(), String> {
     window.set_focus().map_err(|error| error.to_string())
 }
 
-/// The window a request is addressed to, brought forward. The main window is
-/// created by the configuration and is never built here: a request that finds
-/// it missing has arrived during shutdown, and saying so is better than
-/// resurrecting a window whose workspace is already gone.
+/// The window a request is addressed to, brought forward. Only the
+/// standalone reader is built here: a workspace window is opened by
+/// [`crate::show_workspace_in_window`] before its request is delivered, and
+/// a request that finds one missing has arrived as it closed — saying so is
+/// better than resurrecting a window whose workspace is already let go.
 fn ensure_window(app: &AppHandle, label: &str) -> Result<(), String> {
-    if label == MAIN_WINDOW_LABEL || app.get_webview_window(label).is_some() {
+    if label != DOCUMENT_WINDOW_LABEL || app.get_webview_window(label).is_some() {
         return focus_window(app, label);
     }
 
@@ -389,21 +384,75 @@ fn ensure_window(app: &AppHandle, label: &str) -> Result<(), String> {
     focus_window(app, label)
 }
 
+/// The workspace a link names, by id or else by name ignoring case — the
+/// spelling a person writing a link by hand would use.
+pub(crate) fn resolve_named_workspace<'a>(
+    state: &'a wilkes_api::workspace::WorkspaceState,
+    named: &str,
+) -> Option<&'a wilkes_api::workspace::WorkspaceSummary> {
+    state
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == named)
+        .or_else(|| {
+            state
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.name.to_lowercase() == named.to_lowercase())
+        })
+}
+
+/// The window that shows the workspace a link names, opened if none does.
+async fn window_for_workspace(app: &AppHandle, named: &str) -> Result<String, String> {
+    let state = crate::workspace_manager(app)
+        .state()
+        .await
+        .map_err(|error| error.to_string())?;
+    match resolve_named_workspace(&state, named) {
+        Some(workspace) => crate::show_workspace_in_window(app, &workspace.id).await,
+        // The main window reports a name no library has; no window is opened
+        // on a guess.
+        None => Ok(MAIN_WINDOW_LABEL.to_string()),
+    }
+}
+
 pub(crate) fn deliver(app: &AppHandle, request: NativeOpenRequest) -> Result<(), String> {
     if request.is_empty() {
         return Ok(());
     }
-    let label = request.window_label();
+    match request.workspace.clone() {
+        None => deliver_to(app, DOCUMENT_WINDOW_LABEL, request),
+        // Which window shows a workspace is the manager's to say, and
+        // opening one is async: the delivery continues on its own task, and
+        // reports its own failure.
+        Some(named) => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let delivered = match window_for_workspace(&app, &named).await {
+                    Ok(label) => deliver_to(&app, &label, request),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = delivered {
+                    tracing::error!("open request delivery failed: {error}");
+                }
+            });
+            Ok(())
+        }
+    }
+}
+
+fn deliver_to(app: &AppHandle, label: &str, request: NativeOpenRequest) -> Result<(), String> {
     ensure_window(app, label)?;
     let ready = app
         .state::<NativeOpenState>()
         .enqueue(label, request.clone());
     if ready {
-        let window = app
-            .get_webview_window(label)
-            .ok_or_else(|| format!("The {label} window disappeared before delivery"))?;
-        window
-            .emit(NATIVE_OPEN_EVENT, request)
+        if app.get_webview_window(label).is_none() {
+            return Err(format!("The {label} window disappeared before delivery"));
+        }
+        // To that window alone: `emit` from a window still reaches every
+        // window, and a workspace link would open in each of them.
+        app.emit_to(label, NATIVE_OPEN_EVENT, request)
             .map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -508,11 +557,10 @@ mod tests {
         assert_eq!(request.paths, vec![canonical.to_str().unwrap()]);
         assert_eq!(request.errors, Vec::<String>::new());
         assert_eq!(request.workspace, None);
-        assert_eq!(request.window_label(), DOCUMENT_WINDOW_LABEL);
     }
 
     #[test]
-    fn a_link_naming_a_workspace_and_a_page_opens_the_main_window_there() {
+    fn a_link_naming_a_workspace_and_a_page_carries_both() {
         let directory = tempdir().unwrap();
         let file = directory.path().join("book.pdf");
         std::fs::write(&file, b"pdf").unwrap();
@@ -527,7 +575,6 @@ mod tests {
         );
 
         assert_eq!(request.workspace.as_deref(), Some("Corpus One"));
-        assert_eq!(request.window_label(), MAIN_WINDOW_LABEL);
         assert_eq!(
             request.origin,
             Some(SourceOrigin::PdfPage {
@@ -636,5 +683,33 @@ mod tests {
                 other => format!("%{other:02X}"),
             })
             .collect()
+    }
+
+    /// A link names a workspace by id, or by name in any case; an id wins
+    /// over a name that happens to spell another workspace's id.
+    #[test]
+    fn a_named_workspace_resolves_by_id_then_by_name() {
+        let summary = |id: &str, name: &str| wilkes_api::workspace::WorkspaceSummary {
+            id: id.to_string(),
+            name: name.to_string(),
+            roots: Vec::new(),
+            active_root: None,
+            embedding: Default::default(),
+            read_only: false,
+            managed_by: None,
+        };
+        let state = wilkes_api::workspace::WorkspaceState {
+            active_workspace_id: "a".to_string(),
+            workspaces: vec![summary("a", "Corpus One"), summary("b", "a")],
+            open_elsewhere: Vec::new(),
+        };
+
+        assert_eq!(resolve_named_workspace(&state, "a").unwrap().id, "a");
+        assert_eq!(
+            resolve_named_workspace(&state, "corpus one").unwrap().id,
+            "a"
+        );
+        assert_eq!(resolve_named_workspace(&state, "b").unwrap().id, "b");
+        assert!(resolve_named_workspace(&state, "Corpus Two").is_none());
     }
 }

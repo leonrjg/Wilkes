@@ -47,8 +47,11 @@ export interface WorkspaceSummary {
 }
 
 export interface WorkspaceState {
+  /** The workspace this window shows. */
   active_workspace_id: string;
   workspaces: WorkspaceSummary[];
+  /** Workspaces other windows show: choosing one brings that window forward. */
+  open_elsewhere: string[];
 }
 
 export interface StartupAction {

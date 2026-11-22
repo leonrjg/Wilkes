@@ -38,6 +38,7 @@ vi.mock("./services", () => ({
     listWorkspaces: vi.fn(() => Promise.resolve({
       active_workspace_id: "workspace-1",
       workspaces: [{ id: "workspace-1", name: "Default", roots: [], active_root: "/test/dir" }],
+      open_elsewhere: [],
     })),
     onNativeOpen: vi.fn(() => Promise.resolve(() => {})),
     nativeOpenReady: vi.fn(() => Promise.resolve([])),
@@ -675,6 +676,7 @@ describe("App", () => {
           read_only: true,
         },
       ],
+      open_elsewhere: [],
     } as any);
 
     await act(async () => {
@@ -841,6 +843,7 @@ describe("App", () => {
       vi.mocked(api.listWorkspaces).mockResolvedValue({
         active_workspace_id: "workspace-1",
         workspaces: [DEFAULT_WORKSPACE, CORPUS],
+        open_elsewhere: [],
       } as never);
       vi.mocked(api.nativeOpenReady!).mockResolvedValue([request as never]);
       const switchTo = vi.fn().mockResolvedValue(undefined);

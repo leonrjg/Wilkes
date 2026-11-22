@@ -13,6 +13,10 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(),
 }));
 
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({ label: "main" }),
+}));
+
 describe("TauriSearchApi", () => {
   let api: TauriSearchApi;
 
@@ -121,7 +125,9 @@ describe("TauriSearchApi", () => {
     const handler = vi.fn();
     (listen as any).mockResolvedValue(() => {});
     await api.onNativeOpen(handler);
-    expect(listen).toHaveBeenCalledWith("native-open", expect.any(Function));
+    // Addressed to this window: another window's open request is not this
+    // one's to show.
+    expect(listen).toHaveBeenCalledWith("native-open", expect.any(Function), { target: "main" });
     const eventHandler = (listen as any).mock.calls.at(-1)[1];
     eventHandler({ payload: queued });
     expect(handler).toHaveBeenCalledWith(queued);
@@ -171,7 +177,7 @@ describe("TauriSearchApi", () => {
   });
 
   it("manages workspaces through dedicated commands", async () => {
-    (invoke as any).mockResolvedValue({ active_workspace_id: "a", workspaces: [] });
+    (invoke as any).mockResolvedValue({ active_workspace_id: "a", workspaces: [], open_elsewhere: [] });
     await api.listWorkspaces();
     expect(invoke).toHaveBeenLastCalledWith("list_workspaces");
 
@@ -309,8 +315,8 @@ describe("TauriSearchApi", () => {
     const searchId = await api.search(mockQuery, onResult, onComplete);
 
     expect(searchId).toBeDefined();
-    expect(listen).toHaveBeenCalledWith(`search-result-${searchId}`, expect.any(Function));
-    expect(listen).toHaveBeenCalledWith(`search-complete-${searchId}`, expect.any(Function));
+    expect(listen).toHaveBeenCalledWith(`search-result-${searchId}`, expect.any(Function), { target: "main" });
+    expect(listen).toHaveBeenCalledWith(`search-complete-${searchId}`, expect.any(Function), { target: "main" });
     expect(invoke).toHaveBeenCalledWith("search", { query: mockQuery, searchId });
   });
 
@@ -511,7 +517,7 @@ describe("TauriSearchApi", () => {
     (listen as any).mockResolvedValue(unlisten);
 
     const result = await api.onEmbedProgress(handler);
-    expect(listen).toHaveBeenCalledWith("embed-progress", expect.any(Function));
+    expect(listen).toHaveBeenCalledWith("embed-progress", expect.any(Function), { target: "main" });
     
     // Call the handler
     const eventHandler = (listen as any).mock.calls.find((call: any) => call[0] === "embed-progress")[1];
@@ -526,14 +532,14 @@ describe("TauriSearchApi", () => {
     const handler = vi.fn();
     (listen as any).mockResolvedValue(vi.fn());
     await api.onEmbedDone(handler);
-    expect(listen).toHaveBeenCalledWith("embed-done", expect.any(Function));
+    expect(listen).toHaveBeenCalledWith("embed-done", expect.any(Function), { target: "main" });
   });
 
   it("should subscribe to embed error", async () => {
     const handler = vi.fn();
     (listen as any).mockResolvedValue(vi.fn());
     await api.onEmbedError(handler);
-    expect(listen).toHaveBeenCalledWith("embed-error", expect.any(Function));
+    expect(listen).toHaveBeenCalledWith("embed-error", expect.any(Function), { target: "main" });
   });
 
   it("starts generation tasks and subscribes to their shared stream", async () => {
@@ -566,6 +572,7 @@ describe("TauriSearchApi", () => {
     expect(listen).toHaveBeenLastCalledWith(
       "generation-stream",
       expect.any(Function),
+      { target: "main" },
     );
     const listener = (listen as any).mock.calls.at(-1)[1];
     const event = {

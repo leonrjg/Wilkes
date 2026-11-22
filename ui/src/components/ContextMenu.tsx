@@ -59,7 +59,18 @@ export function useContextMenu<T>() {
     });
   }, []);
 
-  return { menu, openMenu, closeMenu };
+  /** Opens the menu at a point, for a menu opened by something other than a
+   *  pointer: a button's own corner, or a command chosen from the native menu. */
+  const openMenuAt = useCallback(
+    ({ position, target, items, size = "default" }: Omit<OpenContextMenuArgs<T>, "event"> & {
+      position: ContextMenuPosition;
+    }) => {
+      setMenu({ position, target, items, size });
+    },
+    [],
+  );
+
+  return { menu, openMenu, openMenuAt, closeMenu };
 }
 
 interface ContextMenuProps<T> {

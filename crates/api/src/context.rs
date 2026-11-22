@@ -110,6 +110,27 @@ pub trait EventEmitter: Send + Sync + 'static {
     fn emit(&self, name: &str, payload: serde_json::Value);
 }
 
+/// Who one workspace's event is for.
+pub struct EventAudience<'a> {
+    /// The views — desktop windows, or the web UI — showing the workspace.
+    pub views: &'a [String],
+    /// Whether it is the installation's default workspace: the one a request
+    /// naming none is answered from, whose events the shared HTTP event
+    /// stream carries.
+    pub default: bool,
+}
+
+/// A shell's event sink, as a [`crate::workspace::WorkspaceManager`] uses it.
+///
+/// Two entry points because there are two kinds of event. `emit` is the
+/// installation's own — a workspace list that changed, a setting every
+/// window shows — and reaches everything. `emit_to` is one workspace's, from
+/// the context serving it, and reaches only who is looking at that workspace:
+/// with a window per workspace, a build in one is not progress in the other.
+pub trait ViewEventSink: EventEmitter {
+    fn emit_to(&self, audience: EventAudience<'_>, name: &str, payload: serde_json::Value);
+}
+
 #[async_trait::async_trait]
 impl wilkes_agent::search::SearchService for AppContext {
     async fn read_library(

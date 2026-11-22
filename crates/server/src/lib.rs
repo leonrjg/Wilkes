@@ -467,8 +467,11 @@ async fn switch_workspace_handler(
         .workspaces
         .as_ref()
         .ok_or_else(|| server_err("Workspace manager is unavailable"))?;
+    // The web UI in front of `wilkes-server` is the primary view. In the
+    // desktop app this is the main window, as activating through the API
+    // always moved it.
     manager
-        .switch(&workspace_id)
+        .switch_view(wilkes_api::workspace::PRIMARY_VIEW, &workspace_id)
         .await
         .map(Json)
         .map_err(|error| server_err(error.to_string()))

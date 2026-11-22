@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::broadcast;
-use wilkes_api::context::EventEmitter;
+use wilkes_api::context::{EventAudience, EventEmitter, ViewEventSink};
 use wilkes_api::workspace::{ConsumerIndex, ConsumerScope};
 
 use super::errors::{consumer_err, err, server_err, ErrorBody};
@@ -87,6 +87,17 @@ pub struct BroadcastEmitter {
 impl EventEmitter for BroadcastEmitter {
     fn emit(&self, name: &str, payload: serde_json::Value) {
         let _ = self.tx.send((name.to_string(), payload));
+    }
+}
+
+/// The stream carries the default workspace's events: the one its requests
+/// are answered from when they name none, and — in `wilkes-server`, where the
+/// web UI is the only view — the one that UI shows.
+impl ViewEventSink for BroadcastEmitter {
+    fn emit_to(&self, audience: EventAudience<'_>, name: &str, payload: serde_json::Value) {
+        if audience.default {
+            self.emit(name, payload);
+        }
     }
 }
 

@@ -71,7 +71,7 @@ impl StartupStatus {
             message: in_use.to_string(),
             actions: vec![StartupAction {
                 label: "Close the other Wilkes".to_string(),
-                description: "Quit the other Wilkes, or stop the wilkes-server using this library, then start Wilkes again."
+                description: "Quit the other Wilkes, or stop the wilkes-server using this library, then start Wilkes again. To work in two workspaces at once, use File → New Window in the Wilkes that is open."
                     .to_string(),
                 command: None,
             }],

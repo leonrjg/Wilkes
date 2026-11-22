@@ -31,7 +31,7 @@ use wilkes_api::commands::chat::{
 use wilkes_api::context::AppContext;
 use wilkes_api::context::EventEmitter;
 
-use crate::{agent_browser, app_context, workspace_manager, TauriEmitter};
+use crate::{agent_browser, window_context, workspace_manager, TauriEmitter};
 
 /// One open session: the subprocess, the Wilkes behind it, and the transcript
 /// being written into it.
@@ -289,8 +289,9 @@ pub async fn chat_start(
     backend: AgentBackend,
     host: Option<HostContext>,
     app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<ChatStartResult, String> {
-    let ctx = app_context(&app);
+    let ctx = window_context(&window);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let (spawned, wilkes) =
         wilkes_api::commands::chat::start(
@@ -339,8 +340,9 @@ pub async fn chat_open_conversation(
     conversation_id: String,
     host: Option<HostContext>,
     app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<ChatStartResult, String> {
-    let ctx = app_context(&app);
+    let ctx = window_context(&window);
     let chats = manager(&app);
     let record = wilkes_api::commands::chat::get_conversation(&chats.store_dir, &conversation_id)
         .map_err(|e| format!("{e:#}"))?;
@@ -409,8 +411,9 @@ pub async fn chat_fork_conversation(
     include_message: bool,
     host: Option<HostContext>,
     app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<ChatStartResult, String> {
-    let ctx = app_context(&app);
+    let ctx = window_context(&window);
     let chats = manager(&app);
     let source = wilkes_api::commands::chat::get_conversation(&chats.store_dir, &conversation_id)
         .map_err(|e| format!("{e:#}"))?;
@@ -500,8 +503,9 @@ pub async fn chat_set_config_option(
     config_id: String,
     value: String,
     app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<Vec<ChatConfigOption>, String> {
-    let ctx = app_context(&app);
+    let ctx = window_context(&window);
     let managed = session_or_err(&app, &session_id)?;
     let options = managed
         .session
@@ -542,8 +546,9 @@ pub async fn chat_send(
     text: String,
     host: Option<HostContext>,
     app: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<ChatSendResult, String> {
-    let ctx = app_context(&app);
+    let ctx = window_context(&window);
     let managed = session_or_err(&app, &session_id)?;
     managed.host.apply(host.unwrap_or_default());
     // Read at send time so an edit in Settings reaches conversations that are
