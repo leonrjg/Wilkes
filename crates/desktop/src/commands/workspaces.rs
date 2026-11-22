@@ -136,13 +136,19 @@ pub(crate) async fn show_workspace_in_window(
         .open_view(&label, workspace_id)
         .await
         .map_err(|error| error.to_string())?;
+    // Built from the main window's configuration, so every workspace window
+    // has the same size, title bar and traffic-light placement as the first.
+    let mut config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == native_open::MAIN_WINDOW_LABEL)
+        .cloned()
+        .ok_or_else(|| "The main window is not configured".to_string())?;
+    config.label = label.clone();
     let built =
-        tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::App("index.html".into()))
-            .title("Wilkes")
-            .inner_size(1200.0, 800.0)
-            .min_inner_size(800.0, 200.0)
-            .title_bar_style(tauri::TitleBarStyle::Transparent)
-            .build();
+        tauri::WebviewWindowBuilder::from_config(app, &config).and_then(|builder| builder.build());
     if let Err(error) = built {
         manager
             .close_view(&label)

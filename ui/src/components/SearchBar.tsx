@@ -7,6 +7,7 @@ import type { SearchMode, SearchQuery } from "../lib/types";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { api } from "../services";
 import { useResearchStore } from "../stores/useResearchStore";
+import { useTrafficLightInset } from "../hooks/useTrafficLightInset";
 
 interface Props {
   sourceSlot: React.ReactNode;
@@ -65,6 +66,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const prevFilterKey = useRef(`${selectedCollectionId ?? ""}|${selectedTagId ?? ""}`);
   const replayQueryRef = useRef<SearchQuery | null>(null);
   const historyRef = useRef<HTMLDivElement | null>(null);
+  const trafficLightInset = useTrafficLightInset();
 
   // Searching everywhere is the default, so learn the global index state up
   // front, as turning the toggle on does.
@@ -267,9 +269,17 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   };
 
   return (
-    <div className="flex flex-col gap-1 p-2 border-b border-[var(--border-main)] bg-[var(--bg-app)]">
+    // The bar is the window's title bar too: its bare background moves the
+    // window, and its top row starts after the traffic lights.
+    <div
+      data-tauri-drag-region
+      className="flex flex-col gap-1 p-2 border-b border-[var(--border-main)] bg-[var(--bg-app)]"
+    >
       {/* Top row: toggles + pattern */}
-      <div className="flex min-w-0 items-center gap-2">
+      <div
+        data-tauri-drag-region
+        className={`flex min-w-0 items-center gap-2 ${trafficLightInset ? "pl-[72px]" : ""}`}
+      >
         <Toggle tooltip="Regular expression" active={isRegex} onToggle={handleToggleRegex}>
           <span className="font-mono text-[10px] w-4">.*</span>
         </Toggle>
@@ -411,7 +421,9 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
       </div>
 
       {/* Bottom row: source controls */}
-      <div className="flex items-center mt-1 gap-2 flex-wrap">{sourceSlot}</div>
+      <div data-tauri-drag-region className="flex items-center mt-1 gap-2 flex-wrap">
+        {sourceSlot}
+      </div>
     </div>
   );
 }
