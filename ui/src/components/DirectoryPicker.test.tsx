@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, within } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import DirectoryPicker, { describeCoverage, rootOrderAfterMove } from "./DirectoryPicker";
 import { capturePointer, pointerEvent } from "../test/pointerDrag";
@@ -143,12 +143,12 @@ describe("DirectoryPicker", () => {
     renderWithToasts();
 
     // "other" is already favorited
-    const otherFavoriteBtn = screen.getByRole("button", { name: "Remove favorite" });
+    const otherFavoriteBtn = screen.getByRole("button", { name: "Unpin" });
     fireEvent.click(otherFavoriteBtn);
     expect(defaultProps.onFavoriteRemove).toHaveBeenCalledWith("/home/user/other");
 
     // "recent" is not favorited
-    const favoriteBtns = screen.getAllByRole("button", { name: "Favorite this directory" });
+    const favoriteBtns = screen.getAllByRole("button", { name: "Pin to the front" });
     fireEvent.click(favoriteBtns[0]); // Click the first one
     expect(defaultProps.onFavoriteAdd).toHaveBeenCalledWith("/home/user/recent");
   });
@@ -394,8 +394,8 @@ describe("DirectoryPicker", () => {
     it("does not start a drag from a root's own buttons", () => {
       renderWithToasts(props);
       layOut();
-      const favorite = chip("r3").querySelectorAll("button");
-      pointerEvent(favorite[favorite.length - 1], "pointerdown", { clientX: 480 });
+      const pin = within(chip("r3")).getByRole("button", { name: "Pin to the front" });
+      pointerEvent(pin, "pointerdown", { clientX: 480 });
       pointerEvent(window, "pointermove", { clientX: 210 });
       pointerEvent(window, "pointerup", { clientX: 210, buttons: 0 });
       expect(props.onReorderRoots).not.toHaveBeenCalled();

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { confirmDialog } from "../lib/utils/dialog";
-import { ChevronLeft, ChevronRight, Folder, FolderPlus, Star, X } from "react-feather";
+import { ChevronLeft, ChevronRight, Folder, FolderPlus, X } from "react-feather";
 import { useToasts } from "./Toast";
 import { ContextMenu, useContextMenu } from "./ContextMenu";
 import { api, isTauri, source } from "../services";
@@ -54,6 +54,27 @@ export function describeCoverage(coverage: RootCoverage): string {
       : `Indexed — all ${coverage.indexable} documents are in the semantic index`;
   }
   return `Not fully indexed — ${coverage.covered} of ${coverage.indexable} documents are in the semantic index`;
+}
+
+/** A pushpin, which Feather does not draw, in Feather's stroke style. The
+ *  outline is Lucide's `pin` (ISC licence). Filled while the root is pinned. */
+function PinIcon({ size, filled }: { size: number; filled: boolean }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill={filled ? "currentColor" : "none"}
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <line x1="12" y1="17" x2="12" y2="22" />
+      <path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z" />
+    </svg>
+  );
 }
 
 const ROOT_SCROLL_EDGE_TOLERANCE = 2;
@@ -494,7 +515,7 @@ export default function DirectoryPicker({
         </Tooltip>
       </div>
 
-      {/* Folders list (Favorites + History) */}
+      {/* Roots: pinned (stored as favorites) first, then the rest */}
       {displayDirs.length > 0 && (
         <RootCarousel activeRoot={directory} contentKey={displayDirs.join("\0")}>
           {displayDirs.map((b) => {
@@ -567,17 +588,20 @@ export default function DirectoryPicker({
                     }`}
                   />
                 )}
-                {onForgetDirectory && !readOnly && (
-                  <Tooltip content="Remove from history">
+                {onFavoriteAdd && onFavoriteRemove && !readOnly && (
+                  <Tooltip content={favorite ? "Unpin" : "Pin to the front"}>
                     <button
-                      onClick={async (e) => {
+                      onClick={(e) => {
                         e.stopPropagation();
-                        const confirmed = await confirmDialog(`Remove "${shortPath(b)}" from your history?`);
-                        if (confirmed) onForgetDirectory(b);
+                        favorite ? onFavoriteRemove(b) : onFavoriteAdd(b);
                       }}
-                      className="h-full pl-1 pr-0.5 text-[10px] text-[var(--text-dim)] transition-colors hover:text-[var(--text-error)]"
+                      className={`h-full pl-1 pr-0.5 text-[10px] transition-colors ${
+                        favorite
+                          ? "text-[var(--accent-blue)]"
+                          : "text-[var(--text-dim)] hover:text-[var(--accent-blue)]"
+                      }`}
                     >
-                      <X size={10} />
+                      <PinIcon size={10} filled={favorite} />
                     </button>
                   </Tooltip>
                 )}
@@ -610,20 +634,17 @@ export default function DirectoryPicker({
                     {shortPath(b).split("/").pop() || shortPath(b)}
                   </button>
                 </Tooltip>
-                {onFavoriteAdd && onFavoriteRemove && !readOnly && (
-                  <Tooltip content={favorite ? "Remove favorite" : "Favorite this directory"}>
+                {onForgetDirectory && !readOnly && (
+                  <Tooltip content="Remove from history">
                     <button
-                      onClick={(e) => {
+                      onClick={async (e) => {
                         e.stopPropagation();
-                        favorite ? onFavoriteRemove(b) : onFavoriteAdd(b);
+                        const confirmed = await confirmDialog(`Remove "${shortPath(b)}" from your history?`);
+                        if (confirmed) onForgetDirectory(b);
                       }}
-                      className={`h-full px-1 text-[10px] transition-colors ${
-                        favorite
-                          ? "text-[var(--accent-blue)]"
-                          : "text-[var(--text-dim)] hover:text-[var(--accent-blue)]"
-                      }`}
+                      className="h-full px-1 text-[10px] text-[var(--text-dim)] transition-colors hover:text-[var(--text-error)]"
                     >
-                      <Star size={9} fill={favorite ? "currentColor" : "none"} />
+                      <X size={10} />
                     </button>
                   </Tooltip>
                 )}
