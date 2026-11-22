@@ -150,4 +150,19 @@ describe("Toast", () => {
     expect(screen.getByTestId("toast-shimmer-bar")).toBeInTheDocument();
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
   });
+
+  it("runs a toast's action and dismisses the toast", () => {
+    const onClick = vi.fn();
+    const options = { duration: 0, action: { label: "Index them", onClick } };
+    render(
+      <ToastProvider>
+        <TestComponent message="3 documents are not indexed" options={options} />
+      </ToastProvider>
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Index them" }));
+
+    expect(onClick).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("3 documents are not indexed")).not.toBeInTheDocument();
+  });
 });

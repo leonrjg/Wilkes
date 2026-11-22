@@ -11,6 +11,12 @@ export interface ToastProgress {
   total: number;
 }
 
+/** A button on the toast. Pressing it runs `onClick` and dismisses the toast. */
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
 interface Toast {
   id: string;
   message: string;
@@ -18,6 +24,7 @@ interface Toast {
   startTime?: number;
   shimmer?: boolean;
   progress?: ToastProgress;
+  action?: ToastAction;
 }
 
 const RECENT_TOASTS_WINDOW = 1000; // 1 second
@@ -27,6 +34,7 @@ interface ToastOptions {
   duration?: number;
   startTime?: number;
   shimmer?: boolean;
+  action?: ToastAction;
 }
 
 interface ToastContextType {
@@ -60,7 +68,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const addToast = useCallback((message: string, options: ToastOptions = {}) => {
-    const { type = "info", duration = 5000, startTime, shimmer } = options;
+    const { type = "info", duration = 5000, startTime, shimmer, action } = options;
     const now = Date.now();
     const key = `${type}:${message}`;
     
@@ -71,7 +79,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     }
 
     const id = randomId();
-    setToasts((prev) => [...prev, { id, message, type, startTime, shimmer }]);
+    setToasts((prev) => [...prev, { id, message, type, startTime, shimmer, action }]);
     recentMessages.current[key] = now;
     
     // Auto-remove if duration > 0
@@ -157,6 +165,18 @@ function ToastItem({ toast, onRemove }: { toast: Toast; onRemove: (id: string) =
               <span>Elapsed: {formatElapsed(elapsed)}</span>
               {percent !== null && <span data-testid="toast-progress-percent">· {percent}%</span>}
             </div>
+          )}
+          {toast.action && (
+            <button
+              type="button"
+              onClick={() => {
+                toast.action?.onClick();
+                onRemove(toast.id);
+              }}
+              className="self-start mt-1 px-2 py-1 rounded text-[11px] font-semibold bg-[var(--accent-blue)] text-white hover:opacity-90 transition-opacity"
+            >
+              {toast.action.label}
+            </button>
           )}
         </div>
         <button

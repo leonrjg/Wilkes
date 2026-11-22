@@ -34,6 +34,7 @@ import {
 } from "./stores/useWorkspaceStore";
 import { activeViewerTab, useViewerStore } from "./stores/useViewerStore";
 import { useGlobalEvents } from "./hooks/useGlobalEvents";
+import { useMissingDocumentsOffer } from "./hooks/useMissingDocumentsOffer";
 import { useNativeOpen } from "./hooks/useNativeOpen";
 import { useWindowTitle } from "./hooks/useWindowTitle";
 import { pathIsWithinRoot } from "./lib/configuredRoots";
@@ -61,6 +62,7 @@ interface DockedPane {
 
 export default function App() {
   useGlobalEvents();
+  useMissingDocumentsOffer();
   const { addToast } = useToasts();
 
   const loadSettings = useSettingsStore((s) => s.load);

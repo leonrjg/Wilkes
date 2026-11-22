@@ -9429,6 +9429,10 @@ impl AppContext {
             "Choose a directory before building an index.",
         )
         .await?;
+        if documents.is_some() {
+            self.ensure_subset_build_matches_index(&root_path, selected)
+                .await?;
+        }
 
         Ok(BuildIndexPlan {
             root_path,
@@ -9439,6 +9443,43 @@ impl AppContext {
             documents: documents.as_ref().map(|scope| scope.documents.clone()),
             continues: documents.and_then(|scope| scope.continues),
         })
+    }
+
+    /// A build over part of a root adds to the index it finds; it cannot add
+    /// to an index built with another model, and the build's answer to that
+    /// is to publish its few documents *in place of* the whole index. So a
+    /// partial build — continuing, retrying, or indexing what is missing — is
+    /// refused unless the existing index was built with `selected`. With no
+    /// index on disk there is nothing to replace, and nothing to refuse.
+    async fn ensure_subset_build_matches_index(
+        &self,
+        root: &Path,
+        selected: &SelectedEmbedder,
+    ) -> Result<(), String> {
+        if !self.data_dir.join("semantic_index.db").exists() {
+            return Ok(());
+        }
+        let status =
+            crate::commands::embed::get_index_status(&self.data_dir, Some(root.to_path_buf()))
+                .await
+                .map_err(|e| format!("{e:#}"))?;
+        if status.engine != selected.engine
+            || status.model_id != selected.model.model_id()
+            || status.dimension != selected.dimension
+        {
+            return Err(format!(
+                "The index was built with {} ({}, {} dimensions), not the selected {} ({}, {} \
+                 dimensions). Indexing only some documents with a different model would replace \
+                 the whole index; rebuild it with the selected model instead.",
+                status.model_id,
+                status.engine.as_str(),
+                status.dimension,
+                selected.model.model_id(),
+                selected.engine.as_str(),
+                selected.dimension,
+            ));
+        }
+        Ok(())
     }
 
     /// The workspace's index job journal, opened on first use.
@@ -13973,6 +14014,90 @@ title = "title[0]"
             .await
             .unwrap_err();
         assert!(err.contains("No documents failed"), "{err}");
+    }
+
+    /// Build `root` into the context's own index with the mock model
+    /// (Candle, "mock-model", 384 dimensions).
+    async fn index_root_with_mock_model(ctx: &Arc<AppContext>, root: &Path) {
+        let extensions = vec!["txt".to_string()];
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        crate::commands::embed::build_index_with_embedder(
+            root.to_path_buf(),
+            Arc::new(wilkes_core::embed::MockEmbedder::default()),
+            crate::commands::embed::BuildIndexOptions {
+                model_dir: ctx.data_dir.join("models"),
+                index_dir: ctx.data_dir.clone(),
+                reporter: BuildReporter::without_journal(tx),
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                documents: crate::commands::embed::collect_indexable_paths(root, &extensions),
+                scope: wilkes_core::embed::index::db::BuildScope::WholeRoot,
+                chunk_size: 600,
+                chunk_overlap: 128,
+                supported_extensions: extensions,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A partial build publishes into the index it finds, and an index built
+    /// with another model is not one it can publish into: it would replace
+    /// the whole index with its few documents. So it is refused up front.
+    #[tokio::test]
+    async fn a_partial_build_is_refused_when_the_index_has_another_model() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("corpus");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        std::fs::create_dir_all(ctx.data_dir.join("models")).unwrap();
+        index_root_with_mock_model(&ctx, &root).await;
+
+        let same = SelectedEmbedder {
+            engine: EmbeddingEngine::Candle,
+            model: EmbedderModel("mock-model".to_string()),
+            dimension: 384,
+        };
+        ctx.ensure_subset_build_matches_index(&root, &same)
+            .await
+            .expect("the model the index was built with may add to it");
+
+        let other = SelectedEmbedder {
+            model: EmbedderModel("other-model".to_string()),
+            ..same.clone()
+        };
+        let err = ctx
+            .ensure_subset_build_matches_index(&root, &other)
+            .await
+            .unwrap_err();
+        assert!(err.contains("would replace the whole index"), "{err}");
+        assert!(
+            err.contains("mock-model") && err.contains("other-model"),
+            "{err}"
+        );
+    }
+
+    /// Nothing missing is nothing to do, said as such rather than started.
+    #[tokio::test]
+    async fn indexing_missing_documents_refuses_when_none_are_missing() {
+        let (dir, ctx) = test_ctx();
+        let root = dir.path().join("corpus");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        std::fs::create_dir_all(ctx.data_dir.join("models")).unwrap();
+        index_root_with_mock_model(&ctx, &root).await;
+
+        let err = Arc::clone(&ctx)
+            .index_missing_documents(
+                root.to_string_lossy().into_owned(),
+                SelectedEmbedder {
+                    engine: EmbeddingEngine::Candle,
+                    model: EmbedderModel("mock-model".to_string()),
+                    dimension: 384,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("already in the semantic index"), "{err}");
     }
 
     /// A root nobody has indexed has no job to continue, and says so rather

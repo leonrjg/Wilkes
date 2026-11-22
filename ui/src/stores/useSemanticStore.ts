@@ -26,6 +26,12 @@ interface SemanticStore {
   refreshCurrentRootStatus: () => Promise<boolean>;
   refreshGlobalStatus: () => Promise<boolean>;
   refreshCoverage: (roots?: string[]) => Promise<void>;
+  /** How many documents under `root` its index lacks, read fresh and stored
+   *  as that root's coverage — or 0 when indexing them is not on offer: the
+   *  semantic search is off, the root has no index of its own (building one
+   *  is a separate, much larger decision), or the index was built with
+   *  another model than the selected one. */
+  missingDocumentsToOffer: (root: string) => Promise<number>;
   ensureCurrentRootIndexed: (freshAttempt?: boolean) => Promise<boolean>;
   handleIndexUpdated: () => Promise<void>;
   handleIndexTerminated: () => Promise<void>;
@@ -137,6 +143,22 @@ export const useSemanticStore = create<SemanticStore>((set, get) => ({
       console.error("indexCoverage failed:", e);
       set({ coverage: {} });
     }
+  },
+
+  missingDocumentsToOffer: async (root) => {
+    const { preferSemantic, semantic } = useSettingsStore.getState();
+    if (!preferSemantic || !semantic) return 0;
+    const status = await api.getIndexStatus(root);
+    if (!isUsableSemanticIndex(status, root)) return 0;
+    if (status.engine !== semantic.selected.engine || status.model_id !== semantic.selected.model) {
+      return 0;
+    }
+    const [row] = await api.indexCoverage([root]);
+    if (!row) {
+      throw new Error(`indexCoverage returned no row for ${root}`);
+    }
+    set((state) => ({ coverage: { ...state.coverage, [root]: row } }));
+    return row.complete ? 0 : row.indexable - row.covered;
   },
 
   ensureCurrentRootIndexed: async (freshAttempt = false) => {
