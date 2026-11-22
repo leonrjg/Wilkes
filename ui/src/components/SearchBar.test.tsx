@@ -401,9 +401,10 @@ describe("SearchBar", () => {
     expect(deferSemanticSearch).not.toHaveBeenCalled();
   });
 
-  it("centres its top row on the window's controls and starts it a gap after them", async () => {
-    const watch = vi.fn(async (handler: (controls: { center_y: number; right: number } | null) => void) => {
-      handler({ center_y: 25, right: 70 });
+  it("boxes the window's controls as a control of its top row", async () => {
+    type Controls = { left: number; top: number; right: number; bottom: number };
+    const watch = vi.fn(async (handler: (controls: Controls | null) => void) => {
+      handler({ left: 16, top: 18, right: 70, bottom: 32 });
       return () => {};
     });
     (api as any).watchWindowControls = watch;
@@ -411,17 +412,23 @@ describe("SearchBar", () => {
       vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
         const isTopRow = this.parentElement?.hasAttribute("data-tauri-drag-region") ?? false;
         return isTopRow
-          ? ({ top: 8, left: 8, height: 34 } as DOMRect)
+          ? ({ top: 8, left: 8, height: 30 } as DOMRect)
           : ({ top: 0, left: 0, height: 0 } as DOMRect);
       });
       const { container } = render(<SearchBar sourceSlot={<MockSourceSlot />} />);
       await act(async () => {});
 
       const [bar, topRow] = container.querySelectorAll<HTMLElement>("[data-tauri-drag-region]");
-      // The row's centre, 25 - 34 / 2 from the bar's top; and its first
-      // control 12px after the controls' right edge at 70.
-      expect(bar.style.paddingTop).toBe("8px");
-      expect(topRow.style.paddingLeft).toBe("74px");
+      const box = screen.getByTestId("window-controls-box");
+      // The buttons are 14px tall in a 30px row: 8px around them on every
+      // side, and the row centred on their centre at 25.
+      expect(box.style.left).toBe("8px");
+      expect(box.style.top).toBe("10px");
+      expect(box.style.width).toBe("70px");
+      expect(box.style.height).toBe("30px");
+      expect(bar.style.paddingTop).toBe("10px");
+      // The first control 8px after the box's right edge at 78.
+      expect(topRow.style.paddingLeft).toBe("78px");
     } finally {
       delete (api as any).watchWindowControls;
     }
@@ -438,6 +445,7 @@ describe("SearchBar", () => {
       const [bar, topRow] = container.querySelectorAll<HTMLElement>("[data-tauri-drag-region]");
       expect(bar.style.paddingTop).toBe("");
       expect(topRow.style.paddingLeft).toBe("");
+      expect(screen.queryByTestId("window-controls-box")).toBeNull();
     } finally {
       delete (api as any).watchWindowControls;
     }

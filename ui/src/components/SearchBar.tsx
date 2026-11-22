@@ -14,8 +14,17 @@ interface Props {
   settingsSlot?: React.ReactNode;
 }
 
-/** The space between the window's controls and the bar's first control. */
-const WINDOW_CONTROLS_GAP = 12;
+/** The space between the box around the window's controls and the bar's
+ *  first control: the space between the bar's controls (`gap-2`). */
+const WINDOW_CONTROLS_GAP = 8;
+
+/** Where the bar's top row goes when the window's controls are over the bar,
+ *  and the box drawn around them, in CSS pixels from the bar's top-left. */
+interface TitleBarLayout {
+  paddingTop: number;
+  rowPaddingLeft: number;
+  box: { left: number; top: number; width: number; height: number };
+}
 
 /** History rows name the mode a search actually ran in, in the words the
  *  controls use. "Semantic" only appears for rows recorded before the combined
@@ -72,7 +81,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const windowControls = useWindowControls();
   const barRef = useRef<HTMLDivElement | null>(null);
   const topRowRef = useRef<HTMLDivElement | null>(null);
-  const [titleBarInset, setTitleBarInset] = useState<{ top: number; left: number } | null>(null);
+  const [titleBar, setTitleBar] = useState<TitleBarLayout | null>(null);
 
   // Searching everywhere is the default, so learn the global index state up
   // front, as turning the toggle on does.
@@ -274,21 +283,33 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     setHistoryOpen(false);
   };
 
-  // Where the window's controls are drawn over the bar, its top row is
-  // centred on them and starts a gap after them. Measured from the row as laid
-  // out: the row's own padding moves neither its left edge nor its height, so
-  // the measure does not depend on the inset it decides.
+  // Where the window's controls are drawn over the bar, they are boxed as one
+  // more control of its top row: the box is as tall as the row, with the same
+  // space around the buttons on every side, and the row is centred on them
+  // and starts a gap after the box. Measured from the row as laid out: the
+  // row's own padding moves neither its left edge nor its height, so the
+  // measure does not depend on the layout it decides.
   useLayoutEffect(() => {
     const bar = barRef.current;
     const row = topRowRef.current;
     if (!windowControls || !bar || !row) {
-      setTitleBarInset(null);
+      setTitleBar(null);
       return;
     }
+    const barRect = bar.getBoundingClientRect();
     const rowRect = row.getBoundingClientRect();
-    setTitleBarInset({
-      top: windowControls.center_y - bar.getBoundingClientRect().top - rowRect.height / 2,
-      left: windowControls.right + WINDOW_CONTROLS_GAP - rowRect.left,
+    const { left, top, right, bottom } = windowControls;
+    const space = (rowRect.height - (bottom - top)) / 2;
+    const boxTop = (top + bottom) / 2 - rowRect.height / 2 - barRect.top;
+    setTitleBar({
+      paddingTop: boxTop,
+      rowPaddingLeft: right + space + WINDOW_CONTROLS_GAP - rowRect.left,
+      box: {
+        left: left - space - barRect.left,
+        top: boxTop,
+        width: right - left + 2 * space,
+        height: rowRect.height,
+      },
     });
   }, [windowControls]);
 
@@ -298,15 +319,24 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     <div
       ref={barRef}
       data-tauri-drag-region
-      className="flex flex-col gap-1 p-2 border-b border-[var(--border-main)] bg-[var(--bg-app)]"
-      style={titleBarInset ? { paddingTop: titleBarInset.top } : undefined}
+      className="relative flex flex-col gap-1 p-2 border-b border-[var(--border-main)] bg-[var(--bg-app)]"
+      style={titleBar ? { paddingTop: titleBar.paddingTop } : undefined}
     >
+      {titleBar && (
+        // Under the native buttons, which are drawn over the page.
+        <div
+          aria-hidden="true"
+          data-testid="window-controls-box"
+          className="pointer-events-none absolute rounded border border-[var(--border-main)] bg-[var(--bg-active)]"
+          style={titleBar.box}
+        />
+      )}
       {/* Top row: toggles + pattern */}
       <div
         ref={topRowRef}
         data-tauri-drag-region
         className="flex min-w-0 items-center gap-2"
-        style={titleBarInset ? { paddingLeft: titleBarInset.left } : undefined}
+        style={titleBar ? { paddingLeft: titleBar.rowPaddingLeft } : undefined}
       >
         <Toggle tooltip="Regular expression" active={isRegex} onToggle={handleToggleRegex}>
           <span className="font-mono text-[10px] w-4">.*</span>
@@ -356,7 +386,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
           <div className="relative min-w-0 max-w-full flex-shrink overflow-hidden">
             <span
               aria-hidden="true"
-              className="invisible block whitespace-pre py-1.5 pl-3 pr-1 text-sm"
+              className="invisible block whitespace-pre py-1 pl-3 pr-1 text-sm"
             >
               {pattern || "Search…"}
             </span>
@@ -366,7 +396,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
               value={pattern}
               onChange={(e) => setPattern(e.target.value)}
               placeholder="Search…"
-              className="absolute inset-0 min-w-0 w-full bg-transparent py-1.5 pl-3 text-sm text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
+              className="absolute inset-0 min-w-0 w-full bg-transparent py-1 pl-3 text-sm text-[var(--text-main)] outline-none placeholder:text-[var(--text-dim)]"
               spellCheck={false}
               autoFocus
             />
@@ -418,7 +448,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
                 setHistoryOpen(next);
                 if (next) loadHistory().catch(console.error);
               }}
-              className={`rounded border p-2 transition-colors ${historyOpen ? "border-[var(--accent-blue)] text-[var(--accent-blue)]" : "border-[var(--border-main)] text-[var(--text-muted)] hover:text-[var(--text-main)]"}`}
+              className={`rounded border p-1.5 transition-colors ${historyOpen ? "border-[var(--accent-blue)] text-[var(--accent-blue)]" : "border-[var(--border-main)] text-[var(--text-muted)] hover:text-[var(--text-main)]"}`}
             >
               <Clock size={14} />
             </button>
@@ -463,7 +493,7 @@ function Toggle({
   active,
   disabled,
   onToggle,
-  className = "min-w-[32px]",
+  className = "min-w-[28px]",
 }: {
   children: React.ReactNode;
   tooltip: string;
@@ -481,7 +511,7 @@ function Toggle({
         disabled={disabled}
         aria-label={ariaLabel}
         aria-pressed={active}
-        className={`h-[32px] px-2 py-1 rounded text-xs font-mono font-semibold transition-all border flex items-center justify-center ${className} ${
+        className={`h-[28px] px-2 py-1 rounded text-xs font-mono font-semibold transition-all border flex items-center justify-center ${className} ${
           disabled
             ? "bg-[var(--bg-active)] text-[var(--text-dim)] border-transparent cursor-not-allowed"
             : active

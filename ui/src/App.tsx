@@ -538,7 +538,7 @@ export default function App() {
               onClick={handleChatButtonClick}
               aria-label="Ask the documents"
               aria-busy={chatPaneOpening}
-              className={`w-[32px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] transition-all active:scale-95 ${
+              className={`w-[28px] h-[28px] flex items-center justify-center bg-[var(--bg-active)] transition-all active:scale-95 ${
                 chatPanesShown
                   ? "text-[var(--accent-blue)] shadow-inner"
                   : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
@@ -587,7 +587,7 @@ export default function App() {
                 });
               }}
               aria-label="Choose chat agent"
-              className="w-[14px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] text-[var(--text-dim)] hover:text-[var(--text-main)] transition-all border-l border-[var(--border-main)]"
+              className="w-[14px] h-[28px] flex items-center justify-center bg-[var(--bg-active)] text-[var(--text-dim)] hover:text-[var(--text-main)] transition-all border-l border-[var(--border-main)]"
             >
               <ChevronDown size={10} />
             </button>
@@ -604,7 +604,7 @@ export default function App() {
             }
           }}
           aria-label="Bookmarks"
-          className="w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all border border-[var(--border-main)] hover:border-[var(--border-strong)]"
+          className="w-[28px] h-[28px] flex items-center justify-center rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all border border-[var(--border-main)] hover:border-[var(--border-strong)]"
         >
           <Bookmark size={14} fill={bookmarksPaneOpen ? "currentColor" : "none"} />
         </button>
@@ -625,7 +625,7 @@ export default function App() {
           }}
           aria-label="Chunk topic cloud"
           aria-pressed={topicsPaneOpen}
-          className={`flex h-[32px] w-[32px] items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] transition-all disabled:opacity-40 ${
+          className={`flex h-[28px] w-[28px] items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] transition-all disabled:opacity-40 ${
             topicsPaneOpen
               ? "text-[var(--accent-blue)] shadow-inner"
               : "text-[var(--text-muted)] hover:border-[var(--border-strong)] hover:text-[var(--text-main)]"
@@ -644,7 +644,7 @@ export default function App() {
           }}
           aria-label="Library citations"
           aria-pressed={citationsPaneOpen}
-          className={`flex h-[32px] w-[32px] items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] transition-all disabled:opacity-40 ${
+          className={`flex h-[28px] w-[28px] items-center justify-center rounded border border-[var(--border-main)] bg-[var(--bg-active)] transition-all disabled:opacity-40 ${
             citationsPaneOpen
               ? "text-[var(--accent-blue)] shadow-inner"
               : "text-[var(--text-muted)] hover:border-[var(--border-strong)] hover:text-[var(--text-main)]"
@@ -663,7 +663,7 @@ export default function App() {
             }}
             aria-label="Catalogues and literature"
             aria-pressed={cataloguePanesShown}
-            className={`w-[32px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] transition-all ${
+            className={`w-[28px] h-[28px] flex items-center justify-center bg-[var(--bg-active)] transition-all ${
               cataloguePanesShown
                 ? "text-[var(--accent-blue)] shadow-inner"
                 : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
@@ -686,7 +686,7 @@ export default function App() {
               })
             }
             aria-label="Literature pane options"
-            className="w-[14px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] text-[var(--text-dim)] hover:text-[var(--text-main)] transition-all border-l border-[var(--border-main)]"
+            className="w-[14px] h-[28px] flex items-center justify-center bg-[var(--bg-active)] text-[var(--text-dim)] hover:text-[var(--text-main)] transition-all border-l border-[var(--border-main)]"
           >
             <ChevronDown size={10} />
           </button>
@@ -699,7 +699,7 @@ export default function App() {
               onClick={toggleBrowserPane}
               aria-label="Browser pane"
               aria-pressed={browserPaneOpen}
-              className={`relative w-[32px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] transition-all ${
+              className={`relative w-[28px] h-[28px] flex items-center justify-center bg-[var(--bg-active)] transition-all ${
                 browserPaneOpen || agentBrowserOpen
                   ? "text-[var(--accent-blue)] shadow-inner"
                   : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
@@ -741,7 +741,7 @@ export default function App() {
                   })
                 }
                 aria-label="Browser pane options"
-                className="w-[14px] h-[32px] flex items-center justify-center bg-[var(--bg-active)] text-[var(--text-dim)] hover:text-[var(--text-main)] transition-all border-l border-[var(--border-main)]"
+                className="w-[14px] h-[28px] flex items-center justify-center bg-[var(--bg-active)] text-[var(--text-dim)] hover:text-[var(--text-main)] transition-all border-l border-[var(--border-main)]"
               >
                 <ChevronDown size={10} />
               </button>
@@ -753,7 +753,7 @@ export default function App() {
         <button
           onClick={() => setSettingsOpen(true)}
           aria-label="Settings"
-          className="w-[32px] h-[32px] flex items-center justify-center rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all border border-[var(--border-main)] hover:border-[var(--border-strong)]"
+          className="w-[28px] h-[28px] flex items-center justify-center rounded bg-[var(--bg-active)] text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all border border-[var(--border-main)] hover:border-[var(--border-strong)]"
         >
           <SettingsIcon size={14} />
         </button>

@@ -10,13 +10,14 @@
 
 use serde::Serialize;
 
-/// The traffic lights' extent, in CSS pixels from the webview's top-left.
+/// The rectangle the traffic lights take, from the close button's left edge
+/// to the zoom button's right, in CSS pixels from the webview's top-left.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub(crate) struct WindowControls {
-    /// The buttons' vertical centre.
-    center_y: f64,
-    /// The right edge of the last button.
+    left: f64,
+    top: f64,
     right: f64,
+    bottom: f64,
 }
 
 /// The traffic lights over the calling webview, or none where none are drawn
@@ -79,7 +80,9 @@ unsafe fn measure(
     let close = in_view(&close);
     let zoom = in_view(&zoom);
     Some(WindowControls {
-        center_y: close.origin.y + close.size.height / 2.0,
+        left: close.origin.x,
+        top: close.origin.y,
         right: zoom.origin.x + zoom.size.width,
+        bottom: close.origin.y + close.size.height,
     })
 }
