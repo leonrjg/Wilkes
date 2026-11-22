@@ -17,6 +17,23 @@ vi.mock("@tauri-apps/api/webview", () => ({
   getCurrentWebview: () => ({ label: "main" }),
 }));
 
+const currentWindow = vi.hoisted(() => ({
+  fullscreen: false,
+  resized: null as (() => void) | null,
+}));
+
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({
+    isFullscreen: async () => currentWindow.fullscreen,
+    onResized: async (handler: () => void) => {
+      currentWindow.resized = handler;
+      return () => {
+        currentWindow.resized = null;
+      };
+    },
+  }),
+}));
+
 describe("TauriSearchApi", () => {
   let api: TauriSearchApi;
 
@@ -583,6 +600,55 @@ describe("TauriSearchApi", () => {
     };
     listener({ payload: event });
     expect(handler).toHaveBeenCalledWith(event);
+  });
+});
+
+describe("TauriSearchApi.watchWindowControls", () => {
+  let api: TauriSearchApi;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    currentWindow.fullscreen = false;
+    currentWindow.resized = null;
+    api = new TauriSearchApi();
+  });
+
+  const resize = async () => {
+    currentWindow.resized?.();
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(calls + 1));
+    calls += 1;
+  };
+  let handler: ReturnType<typeof vi.fn>;
+  let calls: number;
+
+  it("measures the controls once, and gives them up for full screen", async () => {
+    const controls = { center_y: 25, right: 70 };
+    (invoke as any).mockResolvedValue(controls);
+    handler = vi.fn();
+    calls = 1;
+    const unwatch = await api.watchWindowControls(handler);
+    expect(handler).toHaveBeenLastCalledWith(controls);
+
+    currentWindow.fullscreen = true;
+    await resize();
+    expect(handler).toHaveBeenLastCalledWith(null);
+
+    currentWindow.fullscreen = false;
+    await resize();
+    expect(handler).toHaveBeenLastCalledWith(controls);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("window_controls");
+
+    unwatch();
+    expect(currentWindow.resized).toBeNull();
+  });
+
+  it("stops watching where the controls are never over the page", async () => {
+    (invoke as any).mockResolvedValue(null);
+    handler = vi.fn();
+    await api.watchWindowControls(handler);
+    expect(handler).toHaveBeenCalledExactlyOnceWith(null);
+    expect(currentWindow.resized).toBeNull();
   });
 });
 

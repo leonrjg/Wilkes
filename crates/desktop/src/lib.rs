@@ -41,6 +41,7 @@ mod lan_share;
 mod platform;
 #[cfg(target_os = "macos")]
 mod shell_path;
+mod window_controls;
 
 use platform::{
     build_startup_plan, validate_open_target, validate_reveal_target, DesktopPlatform,
@@ -688,6 +689,7 @@ pub fn run() {
             delete_workspace,
             open_path,
             reveal_path,
+            window_controls::window_controls,
             browser_pane::browser_pane_show,
             browser_pane::browser_pane_set_bounds,
             browser_pane::browser_pane_set_visible,

@@ -106,6 +106,15 @@ export interface PaneBounds {
   height: number;
 }
 
+/** Where the window's own controls -- macOS's traffic lights -- are drawn
+ *  over the page, in CSS pixels from the webview's top-left. */
+export interface WindowControls {
+  /** The buttons' vertical centre. */
+  center_y: number;
+  /** The right edge of the last button. */
+  right: number;
+}
+
 /** An opaque colour as red, green and blue, each 0-255. */
 export type RgbColor = [number, number, number];
 
@@ -186,6 +195,11 @@ export interface SearchApi {
    *  follows (null follows the OS), and the colour it paints where the page
    *  does not reach -- its title bar -- as a `#rrggbb` hex. */
   setWindowAppearance?(theme: "light" | "dark" | null, background: string): Promise<void>;
+  /** Desktop-only: calls `handler` with where the window's controls are
+   *  drawn over the page now, and again whenever that changes -- null while
+   *  they are not: in full screen, and always on a platform that draws them
+   *  in a title bar of its own. */
+  watchWindowControls?(handler: (controls: WindowControls | null) => void): Promise<() => void>;
   /** Desktop-only docked browser: a native webview this window keeps over a
    *  page rectangle. Opens `url` in it, creating it at `bounds` if needed,
    *  in `background` until its first page is in. */

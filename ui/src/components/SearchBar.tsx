@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { Search, Database, Check, Clock, Globe, Trash2, X } from "react-feather";
 import { useSearchStore } from "../stores/useSearchStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
@@ -7,12 +7,15 @@ import type { SearchMode, SearchQuery } from "../lib/types";
 import { Tooltip } from "@leonrjg/wilkes-reader";
 import { api } from "../services";
 import { useResearchStore } from "../stores/useResearchStore";
-import { useTrafficLightInset } from "../hooks/useTrafficLightInset";
+import { useWindowControls } from "../hooks/useWindowControls";
 
 interface Props {
   sourceSlot: React.ReactNode;
   settingsSlot?: React.ReactNode;
 }
+
+/** The space between the window's controls and the bar's first control. */
+const WINDOW_CONTROLS_GAP = 12;
 
 /** History rows name the mode a search actually ran in, in the words the
  *  controls use. "Semantic" only appears for rows recorded before the combined
@@ -66,7 +69,10 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
   const prevFilterKey = useRef(`${selectedCollectionId ?? ""}|${selectedTagId ?? ""}`);
   const replayQueryRef = useRef<SearchQuery | null>(null);
   const historyRef = useRef<HTMLDivElement | null>(null);
-  const trafficLightInset = useTrafficLightInset();
+  const windowControls = useWindowControls();
+  const barRef = useRef<HTMLDivElement | null>(null);
+  const topRowRef = useRef<HTMLDivElement | null>(null);
+  const [titleBarInset, setTitleBarInset] = useState<{ top: number; left: number } | null>(null);
 
   // Searching everywhere is the default, so learn the global index state up
   // front, as turning the toggle on does.
@@ -268,17 +274,39 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
     setHistoryOpen(false);
   };
 
+  // Where the window's controls are drawn over the bar, its top row is
+  // centred on them and starts a gap after them. Measured from the row as laid
+  // out: the row's own padding moves neither its left edge nor its height, so
+  // the measure does not depend on the inset it decides.
+  useLayoutEffect(() => {
+    const bar = barRef.current;
+    const row = topRowRef.current;
+    if (!windowControls || !bar || !row) {
+      setTitleBarInset(null);
+      return;
+    }
+    const rowRect = row.getBoundingClientRect();
+    setTitleBarInset({
+      top: windowControls.center_y - bar.getBoundingClientRect().top - rowRect.height / 2,
+      left: windowControls.right + WINDOW_CONTROLS_GAP - rowRect.left,
+    });
+  }, [windowControls]);
+
   return (
     // The bar is the window's title bar too: its bare background moves the
-    // window, and its top row starts after the traffic lights.
+    // window.
     <div
+      ref={barRef}
       data-tauri-drag-region
       className="flex flex-col gap-1 p-2 border-b border-[var(--border-main)] bg-[var(--bg-app)]"
+      style={titleBarInset ? { paddingTop: titleBarInset.top } : undefined}
     >
       {/* Top row: toggles + pattern */}
       <div
+        ref={topRowRef}
         data-tauri-drag-region
-        className={`flex min-w-0 items-center gap-2 ${trafficLightInset ? "pl-[80px]" : ""}`}
+        className="flex min-w-0 items-center gap-2"
+        style={titleBarInset ? { paddingLeft: titleBarInset.left } : undefined}
       >
         <Toggle tooltip="Regular expression" active={isRegex} onToggle={handleToggleRegex}>
           <span className="font-mono text-[10px] w-4">.*</span>
