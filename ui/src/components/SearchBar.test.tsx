@@ -400,46 +400,4 @@ describe("SearchBar", () => {
     expect(ensureCurrentRootIndexed).not.toHaveBeenCalled();
     expect(deferSemanticSearch).not.toHaveBeenCalled();
   });
-
-  it("centres its top row on the window's controls and starts it a gap after them", async () => {
-    const watch = vi.fn(async (handler: (controls: { center_y: number; right: number } | null) => void) => {
-      handler({ center_y: 25, right: 70 });
-      return () => {};
-    });
-    (api as any).watchWindowControls = watch;
-    try {
-      vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
-        const isTopRow = this.parentElement?.hasAttribute("data-tauri-drag-region") ?? false;
-        return isTopRow
-          ? ({ top: 8, left: 8, height: 34 } as DOMRect)
-          : ({ top: 0, left: 0, height: 0 } as DOMRect);
-      });
-      const { container } = render(<SearchBar sourceSlot={<MockSourceSlot />} />);
-      await act(async () => {});
-
-      const [bar, topRow] = container.querySelectorAll<HTMLElement>("[data-tauri-drag-region]");
-      // The row's centre, 25 - 34 / 2 from the bar's top; and its first
-      // control 12px after the controls' right edge at 70.
-      expect(bar.style.paddingTop).toBe("8px");
-      expect(topRow.style.paddingLeft).toBe("74px");
-    } finally {
-      delete (api as any).watchWindowControls;
-    }
-  });
-
-  it("keeps its own padding where the window's controls are not over it", async () => {
-    (api as any).watchWindowControls = vi.fn(async (handler: (controls: null) => void) => {
-      handler(null);
-      return () => {};
-    });
-    try {
-      const { container } = render(<SearchBar sourceSlot={<MockSourceSlot />} />);
-      await act(async () => {});
-      const [bar, topRow] = container.querySelectorAll<HTMLElement>("[data-tauri-drag-region]");
-      expect(bar.style.paddingTop).toBe("");
-      expect(topRow.style.paddingLeft).toBe("");
-    } finally {
-      delete (api as any).watchWindowControls;
-    }
-  });
 });

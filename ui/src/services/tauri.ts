@@ -117,7 +117,6 @@ import type {
   PaneBounds,
   BrowserFound,
   RgbColor,
-  WindowControls,
   BrowserStep,
   BrowserPageEvent,
   BrowserPaneKind,
@@ -570,29 +569,6 @@ export class TauriSearchApi implements SearchApi {
     const window = getCurrentWindow();
     await window.setTheme(theme);
     await window.setBackgroundColor(background);
-  }
-
-  async watchWindowControls(handler: (controls: WindowControls | null) => void): Promise<() => void> {
-    const window = getCurrentWindow();
-    // Measured once: the controls keep their place from the window's top-left
-    // however it is sized, and a measure taken as it leaves full screen could
-    // catch them before they are put back.
-    let measured: WindowControls | null = null;
-    const update = async (): Promise<boolean> => {
-      if (await window.isFullscreen()) {
-        handler(null);
-        return true;
-      }
-      measured ??= await invoke<WindowControls | null>("window_controls");
-      handler(measured);
-      return measured !== null;
-    };
-    // Out of full screen and still none: this platform draws them in a title
-    // bar of its own, and always will.
-    if (!(await update())) return () => {};
-    return window.onResized(() => {
-      update().catch((error) => console.error("Could not measure the window's controls:", error));
-    });
   }
 
   async browserPaneShow(kind: BrowserPaneKind, url: string | null, bounds: PaneBounds, background: RgbColor): Promise<void> {
