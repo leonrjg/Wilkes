@@ -137,7 +137,7 @@ pub(crate) async fn show_workspace_in_window(
         .await
         .map_err(|error| error.to_string())?;
     // Built from the main window's configuration, so every workspace window
-    // has the same size and title bar as the first.
+    // has the same size, title bar and traffic-light placement as the first.
     let mut config = app
         .config()
         .app
@@ -149,15 +149,12 @@ pub(crate) async fn show_workspace_in_window(
     config.label = label.clone();
     let built =
         tauri::WebviewWindowBuilder::from_config(app, &config).and_then(|builder| builder.build());
-    match built {
-        Ok(window) => crate::window_controls::pin(&window),
-        Err(error) => {
-            manager
-                .close_view(&label)
-                .await
-                .map_err(|close| format!("{close:#}"))?;
-            return Err(format!("Could not open a window: {error}"));
-        }
+    if let Err(error) = built {
+        manager
+            .close_view(&label)
+            .await
+            .map_err(|close| format!("{close:#}"))?;
+        return Err(format!("Could not open a window: {error}"));
     }
     title_window_for_view(app, &label).await?;
     Ok(label)
