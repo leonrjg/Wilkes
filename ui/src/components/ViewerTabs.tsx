@@ -66,7 +66,7 @@ export default function ViewerTabs({ standalone = false, paneId }: ViewerTabsPro
       <div
         role="tablist"
         aria-label={split ? `Open documents, pane ${paneIndex + 1} of ${panes.length}` : "Open documents"}
-        className="flex min-h-9 flex-shrink-0 items-end overflow-x-auto border-b border-[var(--border-main)] bg-[var(--bg-sidebar)] custom-scrollbar"
+        className="flex min-h-7 flex-shrink-0 items-end overflow-x-auto border-b border-[var(--border-main)] bg-[var(--bg-sidebar)] custom-scrollbar"
       >
         {tabs.map((tab, index) => {
           const active = tab.id === activeTabId;
@@ -134,7 +134,7 @@ export default function ViewerTabs({ standalone = false, paneId }: ViewerTabsPro
                 );
               }}
               className={[
-                "group flex h-9 min-w-[8rem] max-w-[14rem] flex-shrink-0 items-center border-r border-t-2 border-[var(--border-main)]",
+                "group flex h-7 min-w-[6rem] max-w-[11rem] flex-shrink-0 items-center border-r border-t-2 border-[var(--border-main)]",
                 active
                   ? `${focused ? "border-t-[var(--accent-blue)]" : "border-t-[var(--border-strong)]"} bg-[var(--bg-app)] text-[var(--text-main)]`
                   : "border-t-transparent bg-[var(--bg-sidebar)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)]",
@@ -178,7 +178,7 @@ export default function ViewerTabs({ standalone = false, paneId }: ViewerTabsPro
                     closeAndFocusNeighbor(tab.id, index);
                   }
                 }}
-                className="flex h-full min-w-0 flex-1 select-none items-center truncate px-3 text-left text-xs"
+                className="flex h-full min-w-0 flex-1 select-none items-center truncate pl-2.5 pr-1.5 text-left text-xs"
               >
                 {name}
               </button>
@@ -189,7 +189,7 @@ export default function ViewerTabs({ standalone = false, paneId }: ViewerTabsPro
                 aria-label={`Close ${name}`}
                 onClick={() => closeAndFocusNeighbor(tab.id, index)}
                 className={[
-                  "mr-1 inline-flex rounded p-1 transition-colors",
+                  "mr-1 inline-flex rounded p-0.5 transition-colors",
                   active
                     ? "text-[var(--text-dim)] hover:bg-red-500/10 hover:text-red-500"
                     : "text-transparent group-hover:text-[var(--text-dim)] focus-visible:text-[var(--text-dim)] hover:!bg-red-500/10 hover:!text-red-500",
