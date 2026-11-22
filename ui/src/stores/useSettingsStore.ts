@@ -222,7 +222,7 @@ export const useSettingsStore = create<SettingsStore>()(
 
     setDirectory: (dir: string) => {
       const { recentDirs, directory } = get();
-      const next = recentDirs.includes(dir) ? recentDirs : [...recentDirs, dir].slice(-10);
+      const next = recentDirs.includes(dir) ? recentDirs : [...recentDirs, dir];
       api.updateSettings({ last_directory: dir, recent_dirs: next }).catch(() => {});
       if (dir === directory) {
         // Subscription only fires on value change; refresh explicitly when directory is unchanged.
@@ -245,7 +245,7 @@ export const useSettingsStore = create<SettingsStore>()(
       const next = [
         ...recentDirs,
         ...fresh.filter((dir) => !recentDirs.includes(dir)),
-      ].slice(-10);
+      ];
       const active = fresh[fresh.length - 1];
       api.updateSettings({ last_directory: active, recent_dirs: next }).catch(() => {});
       set({ directory: active, recentDirs: next });

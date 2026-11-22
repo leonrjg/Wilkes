@@ -237,6 +237,19 @@ describe("useSettingsStore", () => {
     expect(api.updateSettings).not.toHaveBeenCalled();
   });
 
+  it("keeps every root however many are added", () => {
+    (api.updateSettings as any).mockResolvedValue({});
+    (api.listFiles as any).mockResolvedValue({ files: [], omitted: [] });
+    const roots = Array.from({ length: 12 }, (_, i) => `/root/${i}`);
+    useSettingsStore.setState({ recentDirs: roots.slice(0, 10) });
+
+    useSettingsStore.getState().setDirectory(roots[10]);
+    useSettingsStore.getState().addRoots([roots[11]]);
+
+    expect(useSettingsStore.getState().recentDirs).toEqual(roots);
+    expect(api.updateSettings).toHaveBeenLastCalledWith({ last_directory: roots[11], recent_dirs: roots });
+  });
+
   it("refreshes the file list when a dropped root is already the active one", async () => {
     (api.updateSettings as any).mockResolvedValue({});
     (api.listFiles as any).mockResolvedValue({ files: [], omitted: [] });
