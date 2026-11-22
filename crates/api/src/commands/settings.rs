@@ -37,7 +37,38 @@ fn canonicalize_root_list(roots: &mut Vec<std::path::PathBuf>) {
     *roots = canonical;
 }
 
+/// Held across every read-modify-write of a settings file.
+///
+/// The global settings file is the installation's, and every open workspace's
+/// context writes it: each window, and each context the HTTP API or an MCP
+/// tool opens. A lock owned by one context serializes only that context's
+/// writes, so two contexts saving at once each read the file, each merged
+/// their own patch, and the second write dropped the first one's change.
+/// One process has an installation open at a time (see
+/// [`crate::installation`]), so a lock for the process is a lock for the
+/// installation.
+static SETTINGS_WRITE: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Replaces `path` whole, so a reader in another window never sees half a
+/// file. The temporary name is safe to reuse because [`SETTINGS_WRITE`] is
+/// held by every writer.
+async fn write_settings_file(path: &Path, contents: String) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    tokio::fs::write(&tmp, contents).await?;
+    tokio::fs::rename(&tmp, path).await?;
+    Ok(())
+}
+
 pub async fn update_settings(path: &Path, patch: serde_json::Value) -> anyhow::Result<Settings> {
+    let _write = SETTINGS_WRITE.lock().await;
+    update_settings_locked(path, patch).await
+}
+
+async fn update_settings_locked(path: &Path, patch: serde_json::Value) -> anyhow::Result<Settings> {
     let mut current = get_settings(path).await?;
 
     // Merge patch fields into current settings via round-trip through JSON.
@@ -50,10 +81,7 @@ pub async fn update_settings(path: &Path, patch: serde_json::Value) -> anyhow::R
     current = serde_json::from_value(current_json)?;
     validate_custom_integrations(&current)?;
 
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    tokio::fs::write(path, serde_json::to_string_pretty(&current)?).await?;
+    write_settings_file(path, serde_json::to_string_pretty(&current)?).await?;
 
     Ok(current)
 }
@@ -116,8 +144,9 @@ pub async fn update_scoped_settings(
     workspace_path: &Path,
     patch: serde_json::Value,
 ) -> anyhow::Result<Settings> {
+    let _write = SETTINGS_WRITE.lock().await;
     if global_path == workspace_path {
-        return update_settings(global_path, patch).await;
+        return update_settings_locked(global_path, patch).await;
     }
 
     let manifest = read_manifest(workspace_path)?;
@@ -186,7 +215,7 @@ pub async fn update_scoped_settings(
         .as_object()
         .is_some_and(|object| !object.is_empty())
     {
-        update_settings(global_path, global_patch).await?;
+        update_settings_locked(global_path, global_patch).await?;
     }
     if global_path.exists() {
         let mut global: serde_json::Value =
@@ -204,7 +233,7 @@ pub async fn update_scoped_settings(
             }
         }
         if changed {
-            tokio::fs::write(global_path, serde_json::to_string_pretty(&global)?).await?;
+            write_settings_file(global_path, serde_json::to_string_pretty(&global)?).await?;
         }
     }
 
@@ -235,6 +264,43 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use wilkes_core::types::{DarkModeReading, FileDisplayField, FileSortDirection, FileSortKey};
+
+    /// Two contexts (two windows, or a window and the HTTP API) saving at
+    /// once each change a different setting, and both changes survive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_saves_from_two_contexts_both_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for round in 0..20u64 {
+            let (a, b) = tokio::join!(
+                tokio::spawn({
+                    let path = path.clone();
+                    async move {
+                        super::update_settings(
+                            &path,
+                            serde_json::json!({ "max_file_size": 1_000 + round }),
+                        )
+                        .await
+                    }
+                }),
+                tokio::spawn({
+                    let path = path.clone();
+                    async move {
+                        super::update_settings(
+                            &path,
+                            serde_json::json!({ "context_lines": 10 + round }),
+                        )
+                        .await
+                    }
+                }),
+            );
+            a.unwrap().unwrap();
+            b.unwrap().unwrap();
+            let saved = super::get_settings(&path).await.unwrap();
+            assert_eq!(saved.max_file_size, 1_000 + round);
+            assert_eq!(saved.context_lines, 10 + round as usize);
+        }
+    }
 
     #[tokio::test]
     async fn download_limit_defaults_migrates_and_persists() {
