@@ -278,7 +278,7 @@ export default function SearchBar({ sourceSlot, settingsSlot }: Props) {
       {/* Top row: toggles + pattern */}
       <div
         data-tauri-drag-region
-        className={`flex min-w-0 items-center gap-2 ${trafficLightInset ? "pl-[80px]" : ""}`}
+        className={`flex min-w-0 items-center gap-2 ${trafficLightInset ? "pl-[72px]" : ""}`}
       >
         <Toggle tooltip="Regular expression" active={isRegex} onToggle={handleToggleRegex}>
           <span className="font-mono text-[10px] w-4">.*</span>
