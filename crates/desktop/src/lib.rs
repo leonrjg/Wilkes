@@ -1058,6 +1058,12 @@ async fn update_settings_with_listeners(
     }
 }
 
+/// What every window opened on a workspace after the main one is labelled
+/// with, followed by an id. `capabilities/default.json` grants its
+/// permissions to `workspace-*`: a window whose label it does not match gets
+/// none, and its interface cannot even listen for events.
+const WORKSPACE_WINDOW_LABEL_PREFIX: &str = "workspace-";
+
 /// The native menu's File → New Window.
 const NEW_WINDOW_MENU_ID: &str = "new-window";
 /// What File → New Window asks the window in front to do: let the user pick
@@ -1468,7 +1474,10 @@ pub(crate) async fn show_workspace_in_window(
         native_open::focus_window(app, &view)?;
         return Ok(view);
     }
-    let label = format!("workspace-{}", uuid::Uuid::new_v4().simple());
+    let label = format!(
+        "{WORKSPACE_WINDOW_LABEL_PREFIX}{}",
+        uuid::Uuid::new_v4().simple()
+    );
     // Bound before the window exists, so the first command its interface
     // sends already resolves to this workspace.
     manager
@@ -3881,6 +3890,24 @@ mod tests {
         cancel_search_for_ctx(Arc::clone(&active), "search-1");
 
         assert!(active.0.lock().unwrap().is_empty());
+    }
+
+    /// Every window the app opens is one the capability grants its
+    /// permissions to. A workspace window it missed came up unable to listen
+    /// for any event or set its own title.
+    #[test]
+    fn the_default_capability_covers_every_window_label() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let windows: Vec<&str> = capability["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|label| label.as_str().unwrap())
+            .collect();
+        assert!(windows.contains(&native_open::MAIN_WINDOW_LABEL));
+        assert!(windows.contains(&native_open::DOCUMENT_WINDOW_LABEL));
+        assert!(windows.contains(&format!("{WORKSPACE_WINDOW_LABEL_PREFIX}*").as_str()));
     }
 
     /// A window leaving its workspace stops its own searches, not another
