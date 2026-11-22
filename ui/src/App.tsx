@@ -81,6 +81,7 @@ export default function App() {
   const recentDirs = useSettingsStore((s) => s.recentDirs);
   const setDirectory = useSettingsStore((s) => s.setDirectory);
   const addRoots = useSettingsStore((s) => s.addRoots);
+  const reorderRoots = useSettingsStore((s) => s.reorderRoots);
   const addFavorite = useSettingsStore((s) => s.addFavorite);
   const removeFavorite = useSettingsStore((s) => s.removeFavorite);
   const forgetDirectory = useSettingsStore((s) => s.forgetDirectory);
@@ -500,6 +501,7 @@ export default function App() {
         onFavoriteRemove={removeFavorite}
         onForgetDirectory={forgetDirectory}
         onRenameDirectory={handleRenameDirectory}
+        onReorderRoots={reorderRoots}
       />
     ) : (
       <UploadZone

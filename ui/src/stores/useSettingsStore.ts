@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import { api } from "../services";
 import { darkPageFilter } from "../lib/darkPages";
+import { configuredLibraryRoots } from "../lib/configuredRoots";
 import { useResearchStore } from "./useResearchStore";
 import { useCatalogueStore } from "./useCatalogueStore";
 import type {
@@ -109,6 +110,7 @@ interface SettingsStore {
   load: () => Promise<void>;
   setDirectory: (dir: string) => void;
   addRoots: (dirs: string[]) => void;
+  reorderRoots: (order: string[]) => void;
   addFavorite: (dir: string) => void;
   removeFavorite: (dir: string) => void;
   forgetDirectory: (dir: string) => void;
@@ -250,6 +252,37 @@ export const useSettingsStore = create<SettingsStore>()(
       // Subscription only fires on value change; refresh explicitly when the
       // active root is one the workspace already had open.
       if (active === directory) get().refreshFileList();
+    },
+
+    /**
+     * Put the roots in the order the strip shows after a drag. `order` is the
+     * whole strip, every configured root once. The strip draws favorites
+     * first (see `configuredLibraryRoots`), so the order is kept by writing
+     * each list in it: favorites in their new order, and the other roots in
+     * theirs. A root that is only the active one is written into the recent
+     * roots, since that is the list that keeps a position for it.
+     *
+     * Throws when `order` is not exactly the configured roots: a strip that
+     * has since changed underneath the drag must not drop or invent a root.
+     */
+    reorderRoots: (order: string[]) => {
+      const { favorites, recentDirs, directory } = get();
+      const configured = configuredLibraryRoots({ directory, favorites, recentDirs });
+      const unique = new Set(order);
+      if (
+        unique.size !== order.length
+        || order.length !== configured.length
+        || configured.some((root) => !unique.has(root))
+      ) {
+        throw new Error(
+          `Root order does not match the configured roots: got [${order.join(", ")}], have [${configured.join(", ")}]`,
+        );
+      }
+      const nextFavorites = order.filter((root) => favorites.includes(root));
+      const nextRecent = order.filter((root) =>
+        recentDirs.includes(root) || (root === directory && !favorites.includes(root)));
+      api.updateSettings({ favorites: nextFavorites, recent_dirs: nextRecent }).catch(console.error);
+      set({ favorites: nextFavorites, recentDirs: nextRecent });
     },
 
     addFavorite: (dir: string) => {

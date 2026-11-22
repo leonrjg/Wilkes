@@ -26,6 +26,8 @@ interface Props {
   onFavoriteRemove?: (dir: string) => void;
   onForgetDirectory?: (dir: string) => void;
   onRenameDirectory?: (oldPath: string, newPath: string) => void;
+  /** Called with the whole strip in its new order once a root is moved. */
+  onReorderRoots?: (order: string[]) => void;
 }
 
 function shortPath(p: string): string {
@@ -55,6 +57,34 @@ export function describeCoverage(coverage: RootCoverage): string {
 }
 
 const ROOT_SCROLL_EDGE_TOLERANCE = 2;
+const ROOT_DRAG_THRESHOLD = 6;
+
+/**
+ * Where a root moved within its group would land, as the strip's whole new
+ * order, or null when the move leaves the order as it is.
+ *
+ * Favorites are always drawn before the other roots, so a root moves only
+ * among the roots of its own kind: `slot` counts positions within that group,
+ * 0 being before its first member and `members.length` after its last.
+ */
+export function rootOrderAfterMove(
+  order: string[],
+  favorites: string[],
+  path: string,
+  slot: number,
+): string[] | null {
+  const favorite = favorites.includes(path);
+  const members = order.filter((root) => favorites.includes(root) === favorite);
+  const others = order.filter((root) => favorites.includes(root) !== favorite);
+  const from = members.indexOf(path);
+  if (from === -1) throw new Error(`${path} is not a root of the strip`);
+  const clamped = Math.max(0, Math.min(slot, members.length));
+  const to = clamped > from ? clamped - 1 : clamped;
+  if (to === from) return null;
+  const moved = members.filter((root) => root !== path);
+  moved.splice(to, 0, path);
+  return favorite ? [...moved, ...others] : [...others, ...moved];
+}
 
 function RootCarousel({
   activeRoot,
@@ -162,6 +192,7 @@ export default function DirectoryPicker({
   onFavoriteRemove,
   onForgetDirectory,
   onRenameDirectory,
+  onReorderRoots,
 }: Props) {
   const { addToast } = useToasts();
   const { menu, openMenu, closeMenu } = useContextMenu<ContextMenuTarget>();
@@ -190,12 +221,167 @@ export default function DirectoryPicker({
     [directory, favorites, recentDirs],
   );
 
+  // Moving a root is a write to the workspace manifest, like every other
+  // change to the strip, so a workspace another application owns does not
+  // offer it.
+  const reorderable = !!onReorderRoots && !readOnly;
+  const chipRefs = useRef(new Map<string, HTMLDivElement>());
+  const cancelRootDragRef = useRef<(() => void) | null>(null);
+  const suppressRootClickRef = useRef(false);
+  const [rootDrag, setRootDrag] = useState<{ path: string; slot: number | null } | null>(null);
+
+  /** The members of `path`'s group, in strip order, with where each is drawn. */
+  const groupOf = (path: string) => {
+    const favorite = favorites.includes(path);
+    return displayDirs.filter((root) => favorites.includes(root) === favorite);
+  };
+
+  /** The slot within `path`'s group a pointer at `x` points at: how many of
+   *  the group's roots are drawn with their middle to the left of it. */
+  const slotAt = (path: string, x: number): number | null => {
+    if (!Number.isFinite(x)) return null;
+    let slot = 0;
+    for (const root of groupOf(path)) {
+      const element = chipRefs.current.get(root);
+      if (!element) return null;
+      const rect = element.getBoundingClientRect();
+      if (rect.left + rect.width / 2 < x) slot += 1;
+    }
+    return slot;
+  };
+
+  // A drag begun on a strip that has since changed — a root added, removed or
+  // renamed by another window — is measuring roots that are no longer the
+  // ones drawn, so it is abandoned rather than allowed to land.
+  const rootsKey = displayDirs.join("\0");
+  useEffect(() => {
+    cancelRootDragRef.current?.();
+  }, [rootsKey, reorderable]);
+  useEffect(() => () => cancelRootDragRef.current?.(), []);
+
+  const startRootDrag = (event: React.PointerEvent<HTMLDivElement>, path: string) => {
+    if (!reorderable || event.button !== 0 || !event.isPrimary || cancelRootDragRef.current) return;
+    suppressRootClickRef.current = false;
+    // Only the root's name starts a drag; its remove and favorite buttons
+    // keep their own clicks.
+    if (!(event.target instanceof Element) || !event.target.closest("[data-root-name]")) return;
+
+    const source = event.currentTarget;
+    const scroller = source.parentElement;
+    const pointerId = event.pointerId;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    let x = startX;
+    let active = false;
+    let slot: number | null = null;
+    let frame = 0;
+    let previousFrame = performance.now();
+
+    const show = () => {
+      const next = slotAt(path, x);
+      const order = next === null ? null : rootOrderAfterMove(displayDirs, favorites, path, next);
+      slot = order ? next : null;
+      setRootDrag({ path, slot });
+    };
+    // Scrolls the strip while the drag rests near one of its edges, and
+    // re-measures the slot under a pointer that has not moved while the roots
+    // slide beneath it.
+    const tick = (now: number) => {
+      const seconds = Math.min(now - previousFrame, 32) / 1000;
+      previousFrame = now;
+      if (scroller && scroller.scrollWidth > scroller.clientWidth) {
+        const rect = scroller.getBoundingClientRect();
+        const edge = Math.min(32, rect.width / 3);
+        const direction = x < rect.left + edge ? -1 : x > rect.right - edge ? 1 : 0;
+        scroller.scrollLeft += direction * 360 * seconds;
+      }
+      show();
+      frame = requestAnimationFrame(tick);
+    };
+
+    const finish = () => {
+      cancelRootDragRef.current = null;
+      cancelAnimationFrame(frame);
+      window.removeEventListener("pointermove", move, true);
+      window.removeEventListener("pointerup", release, true);
+      window.removeEventListener("pointercancel", cancelPointer, true);
+      window.removeEventListener("keydown", keydown, true);
+      window.removeEventListener("blur", finish);
+      source.removeEventListener("lostpointercapture", cancelPointer);
+      if (source.hasPointerCapture(pointerId)) source.releasePointerCapture(pointerId);
+      setRootDrag(null);
+    };
+    const cancelPointer = (e: PointerEvent) => {
+      if (e.pointerId === pointerId) finish();
+    };
+    const keydown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        finish();
+      }
+    };
+    const move = (e: PointerEvent) => {
+      if (e.pointerId !== pointerId) return;
+      if ((e.buttons & 1) === 0) { finish(); return; }
+      x = e.clientX;
+      if (!active && Math.hypot(x - startX, e.clientY - startY) < ROOT_DRAG_THRESHOLD) return;
+      e.preventDefault();
+      if (!active) {
+        active = true;
+        suppressRootClickRef.current = true;
+        previousFrame = performance.now();
+        frame = requestAnimationFrame(tick);
+      }
+      show();
+    };
+    const release = (e: PointerEvent) => {
+      if (e.pointerId !== pointerId) return;
+      // The release lands where it is, not where the last frame drew it: a
+      // layout that moved without being redrawn cancels rather than surprises.
+      const landed = active ? slotAt(path, e.clientX) : null;
+      const order = landed !== null && landed === slot
+        ? rootOrderAfterMove(displayDirs, favorites, path, landed)
+        : null;
+      finish();
+      if (order) onReorderRoots?.(order);
+    };
+
+    source.setPointerCapture(pointerId);
+    cancelRootDragRef.current = finish;
+    window.addEventListener("pointermove", move, true);
+    window.addEventListener("pointerup", release, true);
+    window.addEventListener("pointercancel", cancelPointer, true);
+    window.addEventListener("keydown", keydown, true);
+    window.addEventListener("blur", finish);
+    source.addEventListener("lostpointercapture", cancelPointer);
+  };
+
+  /** Alt+Left and Alt+Right move the focused root one place within its group. */
+  const moveRootByKey = (event: React.KeyboardEvent<HTMLButtonElement>, path: string) => {
+    if (!reorderable || !event.altKey || event.metaKey || event.ctrlKey || event.shiftKey) return;
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const members = groupOf(path);
+    const from = members.indexOf(path);
+    // The slot after the neighbour on the right is two places on.
+    const order = rootOrderAfterMove(
+      displayDirs,
+      favorites,
+      path,
+      event.key === "ArrowLeft" ? from - 1 : from + 2,
+    );
+    if (!order) return;
+    const button = event.currentTarget;
+    onReorderRoots?.(order);
+    // Moving a node in the document takes focus off it in some engines.
+    requestAnimationFrame(() => button.focus());
+  };
+
   // The strip is what knows which roots are on screen, so it is what asks how
   // much of each the index holds. Keyed on the set rather than the array, so
   // making an already-listed root active does not re-walk every directory.
   const coverage = useSemanticStore((state) => state.coverage);
   const refreshCoverage = useSemanticStore((state) => state.refreshCoverage);
-  const rootsKey = displayDirs.join("\0");
   useEffect(() => {
     refreshCoverage(rootsKey ? rootsKey.split("\0") : []).catch(console.error);
   }, [rootsKey, refreshCoverage]);
@@ -320,14 +506,36 @@ export default function DirectoryPicker({
             // says so rather than inviting the drop.
             const alreadyHere = dropTarget && !!draggedPath
               && pathsEqual(parentPath(draggedPath), b);
+            const group = rootDrag ? groupOf(rootDrag.path) : [];
+            const insertBefore = rootDrag?.slot != null && group[rootDrag.slot] === b;
+            const insertAfter = rootDrag?.slot != null
+              && rootDrag.slot === group.length
+              && group[group.length - 1] === b;
 
             return (
               <div
                 key={b}
+                ref={(element) => {
+                  if (element) chipRefs.current.set(b, element);
+                  else chipRefs.current.delete(b);
+                }}
                 data-root-active={active ? "true" : undefined}
+                data-root-dragging={rootDrag?.path === b ? "true" : undefined}
+                data-root-insert={insertBefore ? "before" : insertAfter ? "after" : undefined}
                 data-file-drop-root-path={b}
                 data-file-drop-target={dropTarget ? "true" : undefined}
-                className={`group flex h-6 items-center rounded bg-[var(--bg-active)] transition-colors ${
+                style={reorderable ? { touchAction: "none" } : undefined}
+                onDragStart={(event) => event.preventDefault()}
+                onPointerDown={(event) => startRootDrag(event, b)}
+                onClickCapture={(event) => {
+                  if (!suppressRootClickRef.current || event.detail === 0) return;
+                  suppressRootClickRef.current = false;
+                  event.preventDefault();
+                  event.stopPropagation();
+                }}
+                className={`group relative flex h-6 items-center rounded bg-[var(--bg-active)] transition-colors ${
+                  rootDrag?.path === b ? "opacity-45 " : ""
+                }${
                   dropTarget && !alreadyHere
                     ? "ring-2 ring-inset ring-[var(--accent-blue)]"
                     : dropTarget
@@ -351,6 +559,14 @@ export default function DirectoryPicker({
                     }),
                   })}
               >
+                {(insertBefore || insertAfter) && (
+                  <span
+                    aria-hidden="true"
+                    className={`pointer-events-none absolute inset-y-0.5 w-0.5 rounded-full bg-[var(--accent-blue)] ${
+                      insertBefore ? "left-0" : "right-0"
+                    }`}
+                  />
+                )}
                 {onForgetDirectory && !readOnly && (
                   <Tooltip content="Remove from history">
                     <button
@@ -381,7 +597,10 @@ export default function DirectoryPicker({
                 )}
                 <Tooltip content={b} className="font-mono break-all">
                   <button
+                    data-root-name
                     onClick={() => onChange(b)}
+                    onKeyDown={(event) => moveRootByKey(event, b)}
+                    aria-keyshortcuts={reorderable ? "Alt+ArrowLeft Alt+ArrowRight" : undefined}
                     className={`h-full max-w-[88px] flex-shrink-0 select-none truncate px-1.5 text-xs transition-colors ${
                       active
                         ? "text-[var(--text-main)] font-bold"

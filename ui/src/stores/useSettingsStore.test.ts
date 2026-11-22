@@ -205,6 +205,38 @@ describe("useSettingsStore", () => {
     });
   });
 
+  it("writes a new root order into each list the strip draws from", () => {
+    (api.updateSettings as any).mockResolvedValue({});
+    useSettingsStore.setState({
+      favorites: ["/fav/a", "/fav/b"],
+      recentDirs: ["/fav/a", "/r/one", "/r/two"],
+      directory: "/active/only",
+    });
+
+    useSettingsStore.getState().reorderRoots(["/fav/b", "/fav/a", "/active/only", "/r/two", "/r/one"]);
+
+    const state = useSettingsStore.getState();
+    expect(state.favorites).toEqual(["/fav/b", "/fav/a"]);
+    // The active-only root gets its place in the recent roots, and a favorite
+    // that is also recent keeps its entry there.
+    expect(state.recentDirs).toEqual(["/fav/a", "/active/only", "/r/two", "/r/one"]);
+    expect(api.updateSettings).toHaveBeenCalledExactlyOnceWith({
+      favorites: ["/fav/b", "/fav/a"],
+      recent_dirs: ["/fav/a", "/active/only", "/r/two", "/r/one"],
+    });
+  });
+
+  it.each([
+    ["a root missing", ["/a"]],
+    ["a root it does not have", ["/a", "/c"]],
+    ["a root twice", ["/a", "/a", "/b"]],
+  ])("refuses a root order with %s", (_case, order) => {
+    useSettingsStore.setState({ favorites: [], recentDirs: ["/a", "/b"], directory: "/a" });
+    expect(() => useSettingsStore.getState().reorderRoots(order)).toThrow(/does not match/);
+    expect(useSettingsStore.getState().recentDirs).toEqual(["/a", "/b"]);
+    expect(api.updateSettings).not.toHaveBeenCalled();
+  });
+
   it("refreshes the file list when a dropped root is already the active one", async () => {
     (api.updateSettings as any).mockResolvedValue({});
     (api.listFiles as any).mockResolvedValue({ files: [], omitted: [] });
