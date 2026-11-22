@@ -334,6 +334,7 @@ describe("DirectoryPicker", () => {
           top: 0, bottom: 24, height: 24, x: index * 100, y: 0, toJSON: () => ({}),
         });
         capturePointer(chip);
+        capturePointer(chip.querySelector<HTMLElement>("[data-root-name]")!);
       });
     };
     const chip = (name: string) => screen.getByText(name).closest<HTMLElement>("[data-file-drop-root-path]")!;
@@ -366,6 +367,28 @@ describe("DirectoryPicker", () => {
       expect(props.onReorderRoots).toHaveBeenCalledExactlyOnceWith([
         "/home/user/f2", "/home/user/f1", "/home/user/r1", "/home/user/r2", "/home/user/r3",
       ]);
+    });
+
+    /** A click goes to whatever holds the pointer when the button comes up.
+     *  jsdom does not retarget it, so where the pointer is held is asserted:
+     *  held by the root around the name, the click that opens a root never
+     *  reached the name's button. */
+    it("holds the pointer only for a drag, and only by the root's name", () => {
+      renderWithToasts(props);
+      layOut();
+      const name = screen.getByText("r3");
+      pointerEvent(name, "pointerdown", { clientX: 420 });
+      pointerEvent(window, "pointerup", { clientX: 420, buttons: 0 });
+      fireEvent.click(name, { detail: 1 });
+      expect(name.setPointerCapture).not.toHaveBeenCalled();
+      expect(chip("r3").setPointerCapture).not.toHaveBeenCalled();
+      expect(props.onChange).toHaveBeenCalledExactlyOnceWith("/home/user/r3");
+
+      drag("r3", 210);
+      expect(name.setPointerCapture).toHaveBeenCalledExactlyOnceWith(1);
+      expect(chip("r3").setPointerCapture).not.toHaveBeenCalled();
+      pointerEvent(window, "pointerup", { clientX: 210, buttons: 0 });
+      expect(name.hasPointerCapture(1)).toBe(false);
     });
 
     it("does not open the root a drag ended on", () => {

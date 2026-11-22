@@ -283,12 +283,14 @@ export default function DirectoryPicker({
   const startRootDrag = (event: React.PointerEvent<HTMLDivElement>, path: string) => {
     if (!reorderable || event.button !== 0 || !event.isPrimary || cancelRootDragRef.current) return;
     suppressRootClickRef.current = false;
-    // Only the root's name starts a drag; its remove and favorite buttons
-    // keep their own clicks.
-    if (!(event.target instanceof Element) || !event.target.closest("[data-root-name]")) return;
+    // Only the root's name starts a drag; its remove and pin buttons keep
+    // their own clicks.
+    const handle = event.target instanceof Element
+      ? event.target.closest<HTMLElement>("[data-root-name]")
+      : null;
+    if (!handle) return;
 
-    const source = event.currentTarget;
-    const scroller = source.parentElement;
+    const scroller = event.currentTarget.parentElement;
     const pointerId = event.pointerId;
     const startX = event.clientX;
     const startY = event.clientY;
@@ -328,8 +330,8 @@ export default function DirectoryPicker({
       window.removeEventListener("pointercancel", cancelPointer, true);
       window.removeEventListener("keydown", keydown, true);
       window.removeEventListener("blur", finish);
-      source.removeEventListener("lostpointercapture", cancelPointer);
-      if (source.hasPointerCapture(pointerId)) source.releasePointerCapture(pointerId);
+      handle.removeEventListener("lostpointercapture", cancelPointer);
+      if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
       setRootDrag(null);
     };
     const cancelPointer = (e: PointerEvent) => {
@@ -350,6 +352,13 @@ export default function DirectoryPicker({
       if (!active) {
         active = true;
         suppressRootClickRef.current = true;
+        // The pointer is held only once this is a drag, and by the name
+        // itself. A click is delivered to whatever holds the pointer when the
+        // button comes up, so holding it from the press, or on the root
+        // around the name, took the click that opens the root away from the
+        // name's button.
+        handle.setPointerCapture(pointerId);
+        handle.addEventListener("lostpointercapture", cancelPointer);
         previousFrame = performance.now();
         frame = requestAnimationFrame(tick);
       }
@@ -367,14 +376,12 @@ export default function DirectoryPicker({
       if (order) onReorderRoots?.(order);
     };
 
-    source.setPointerCapture(pointerId);
     cancelRootDragRef.current = finish;
     window.addEventListener("pointermove", move, true);
     window.addEventListener("pointerup", release, true);
     window.addEventListener("pointercancel", cancelPointer, true);
     window.addEventListener("keydown", keydown, true);
     window.addEventListener("blur", finish);
-    source.addEventListener("lostpointercapture", cancelPointer);
   };
 
   /** Alt+Left and Alt+Right move the focused root one place within its group. */
