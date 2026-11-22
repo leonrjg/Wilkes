@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Edit2, ExternalLink, Lock, Plus } from "react-feather";
+import { ChevronDown, Edit2, ExternalLink, Lock, Plus } from "react-feather";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 import { api } from "../services";
 import { TextInputDialog } from "./TextInputDialog";
@@ -25,7 +25,7 @@ export default function WorkspacePicker() {
   const openInWindow = useWorkspaceStore((state) => state.openInWindow);
   const refreshList = useWorkspaceStore((state) => state.refreshList);
   const { menu, openMenuAt, closeMenu } = useContextMenu<null>();
-  const windowButton = useRef<HTMLButtonElement | null>(null);
+  const trigger = useRef<HTMLButtonElement | null>(null);
   const active = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
   const canOpenWindows = Boolean(api.openWorkspaceWindow);
 
@@ -40,40 +40,52 @@ export default function WorkspacePicker() {
     return () => window.removeEventListener("focus", refresh);
   }, [canOpenWindows, refreshList]);
 
-  const openWindowMenu = useCallback(() => {
-    const anchor = windowButton.current?.getBoundingClientRect();
-    const items: ContextMenuItem[] = workspaces
-      .filter((workspace) => workspace.id !== activeWorkspaceId)
-      .map((workspace) => ({
+  /**
+   * The one list of workspaces. Choosing a row switches this window to it —
+   * or, for one another window shows, brings that window forward — and a
+   * row's own button opens it in a new window instead.
+   */
+  const openWorkspaceMenu = useCallback(() => {
+    const anchor = trigger.current?.getBoundingClientRect();
+    const report = (fallback: string) => (error: unknown) => {
+      addToast(error instanceof Error ? error.message : fallback, { type: "error" });
+    };
+    const items: ContextMenuItem[] = workspaces.map((workspace) => {
+      const shownElsewhere = openElsewhere.includes(workspace.id);
+      const isActive = workspace.id === activeWorkspaceId;
+      return {
         id: workspace.id,
-        label: openElsewhere.includes(workspace.id)
-          ? `${workspace.name} (already open)`
-          : workspace.name,
-        run: async () => {
-          try {
-            await openInWindow(workspace.id);
-          } catch (error) {
-            addToast(error instanceof Error ? error.message : "Could not open a window", { type: "error" });
+        label: `${workspace.name}${workspace.read_only ? " (read-only)" : ""}${
+          shownElsewhere ? " (open in another window)" : ""
+        }`,
+        checked: isActive,
+        run: () => switchTo(workspace.id).catch(report("Could not switch workspace")),
+        // A window of its own only for a workspace no window shows: this one
+        // already shows the active workspace, and choosing one shown
+        // elsewhere already goes to its window.
+        secondary: canOpenWindows && !isActive && !shownElsewhere
+          ? {
+            label: `Open ${workspace.name} in a new window`,
+            icon: ExternalLink,
+            run: () => openInWindow(workspace.id).catch(report("Could not open a window")),
           }
-        },
-      }));
-    if (items.length === 0) {
-      addToast("There is no other workspace to open. Create one first.", { type: "info" });
-      return;
-    }
+          : undefined,
+      };
+    });
     openMenuAt({
       position: { x: anchor?.left ?? 0, y: anchor?.bottom ?? 0 },
       target: null,
       items,
     });
-  }, [activeWorkspaceId, addToast, openElsewhere, openInWindow, openMenuAt, workspaces]);
+  }, [activeWorkspaceId, addToast, canOpenWindows, openElsewhere, openInWindow, openMenuAt, switchTo, workspaces]);
 
-  // File → New Window in the native menu asks the window in front to choose.
+  // File → New Window in the native menu opens the same list, for the user to
+  // pick the workspace the new window shows.
   useEffect(() => {
     if (!api.onNewWindowRequested) return;
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    api.onNewWindowRequested(openWindowMenu)
+    api.onNewWindowRequested(openWorkspaceMenu)
       .then((stop) => {
         if (disposed) stop();
         else unlisten = stop;
@@ -83,7 +95,7 @@ export default function WorkspacePicker() {
       disposed = true;
       unlisten?.();
     };
-  }, [openWindowMenu]);
+  }, [openWorkspaceMenu]);
   // A read-only workspace is listed and can be opened; only the controls that
   // would write to it are withheld.
   const activeIsReadOnly = active?.read_only ?? false;
@@ -112,23 +124,25 @@ export default function WorkspacePicker() {
   return (
     <>
       <div className="flex h-6 shrink-0 items-center overflow-hidden rounded bg-[var(--bg-active)]">
-        <select
-          aria-label="Workspace"
+        <button
+          ref={trigger}
+          type="button"
+          aria-label={`Workspace: ${active?.name ?? ""}`}
+          aria-haspopup="menu"
+          aria-expanded={menu !== null}
           disabled={switching || submitting}
-          value={activeWorkspaceId ?? ""}
-          onChange={(event) => void switchTo(event.target.value).catch((error) =>
-            addToast(error instanceof Error ? error.message : "Could not switch workspace", { type: "error" }),
-          )}
-          className="h-full max-w-36 bg-transparent px-2 text-xs font-medium text-[var(--text-main)] outline-none disabled:opacity-50"
+          onClick={openWorkspaceMenu}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+              event.preventDefault();
+              openWorkspaceMenu();
+            }
+          }}
+          className="flex h-full max-w-36 items-center gap-1 px-2 text-xs font-medium text-[var(--text-main)] outline-none disabled:opacity-50"
         >
-          {workspaces.map((workspace) => (
-            <option key={workspace.id} value={workspace.id}>
-              {`${workspace.name}${workspace.read_only ? " (read-only)" : ""}${
-                openElsewhere.includes(workspace.id) ? " (open in another window)" : ""
-              }`}
-            </option>
-          ))}
-        </select>
+          <span className="truncate">{active?.name ?? ""}</span>
+          <ChevronDown size={11} aria-hidden="true" className="flex-shrink-0 text-[var(--text-dim)]" />
+        </button>
         {activeIsReadOnly && (
           <Tooltip
             content={active?.managed_by
@@ -169,20 +183,6 @@ export default function WorkspacePicker() {
             <Plus size={11} />
           </button>
         </Tooltip>
-        {canOpenWindows && (
-          <Tooltip content="Open a workspace in a new window">
-            <button
-              ref={windowButton}
-              type="button"
-              aria-label="Open a workspace in a new window"
-              disabled={switching || submitting}
-              onClick={openWindowMenu}
-              className="flex h-full w-6 items-center justify-center border-l border-[var(--border-main)] text-[var(--text-dim)] hover:text-[var(--text-main)] disabled:opacity-40"
-            >
-              <ExternalLink size={10} />
-            </button>
-          </Tooltip>
-        )}
       </div>
       <ContextMenu menu={menu} onClose={closeMenu} />
       <TextInputDialog

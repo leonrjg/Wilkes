@@ -1,7 +1,7 @@
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { Icon } from "react-feather";
+import { Check, type Icon } from "react-feather";
 
 interface ContextMenuItemBase {
   id: string;
@@ -9,6 +9,26 @@ interface ContextMenuItemBase {
   icon?: Icon;
   disabled?: boolean;
   dividerBefore?: boolean;
+  /** The item stands for the current choice: shown with a check, and
+   *  announced as the checked one. */
+  checked?: boolean;
+  /** A second, narrower action on the same row, shown as an icon button at
+   *  its end: "do this to that one" beside "choose that one". */
+  secondary?: {
+    label: string;
+    icon: Icon;
+    run: () => Promise<void> | void;
+  };
+}
+
+/** The menu's focusable actions, in the order arrow keys move through. */
+function menuActions(menu: HTMLElement | null): HTMLElement[] {
+  if (!menu) return [];
+  return Array.from(
+    menu.querySelectorAll<HTMLElement>(
+      '[role="menuitem"]:not(:disabled), [role="menuitemradio"]:not(:disabled)',
+    ),
+  );
 }
 
 export type ContextMenuItem = ContextMenuItemBase & (
@@ -87,6 +107,16 @@ export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
 
   useEffect(() => {
     if (!menu) return;
+    // Where focus was when the menu opened, given back when it closes: a menu
+    // opened from a button returns the keyboard to that button.
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    return () => {
+      if (opener?.isConnected) opener.focus({ preventScroll: true });
+    };
+  }, [menu]);
+
+  useEffect(() => {
+    if (!menu) return;
 
     const handlePointerDown = (event: PointerEvent) => {
       if (!menuRef.current?.contains(event.target as Node)) {
@@ -97,7 +127,19 @@ export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         onClose();
+        return;
       }
+      if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+      const actions = menuActions(menuRef.current);
+      if (actions.length === 0) return;
+      event.preventDefault();
+      const current = actions.indexOf(document.activeElement as HTMLElement);
+      const next =
+        event.key === "Home" ? 0
+          : event.key === "End" ? actions.length - 1
+            : event.key === "ArrowDown" ? (current + 1) % actions.length
+              : (current <= 0 ? actions.length : current) - 1;
+      actions[next].focus({ preventScroll: true });
     };
 
     const handleScroll = () => onClose();
@@ -136,6 +178,44 @@ export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
     });
   }, [menu]);
 
+  // Once placed, the keyboard is in the menu: on the checked item when there
+  // is one, otherwise on the first.
+  const placed = position !== null;
+  useEffect(() => {
+    if (!menu || !placed) return;
+    const actions = menuActions(menuRef.current);
+    const checked = actions.find((action) => action.getAttribute("aria-checked") === "true");
+    (checked ?? actions[0])?.focus({ preventScroll: true });
+  }, [menu, placed]);
+
+  // One way to run an action, for a row's own and its secondary one alike.
+  const runAction = useCallback((id: string, run: () => Promise<void> | void) => {
+    if (pendingId !== null) return;
+    let result: Promise<void> | void;
+    try {
+      result = run();
+    } catch (error) {
+      console.error("context menu action failed", error);
+      onClose();
+      return;
+    }
+    if (!result || typeof result.then !== "function") {
+      onClose();
+      return;
+    }
+    // Keep the menu open with a spinner until the action settles,
+    // so the click has immediate visible feedback.
+    setPendingId(id);
+    void result
+      .catch((error) => {
+        console.error("context menu action failed", error);
+      })
+      .finally(() => {
+        setPendingId(null);
+        onClose();
+      });
+  }, [onClose, pendingId]);
+
   const content = useMemo(() => {
     if (!menu) return null;
 
@@ -153,7 +233,7 @@ export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
         }}
       >
         {menu.items.map((item) => {
-          const Icon = item.icon;
+          const Icon = item.icon ?? (item.checked ? Check : undefined);
           const isPending = pendingId === item.id;
           const showIconSlot = menu.size !== "content" || Icon || isPending;
           const inlineInput = item.inlineInput;
@@ -220,41 +300,25 @@ export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
               </div>
             );
           }
+          const run = item.run;
+          const secondary = item.secondary;
+          const SecondaryIcon = secondary?.icon;
+          const secondaryId = `${item.id}:secondary`;
           return (
             <div key={item.id}>
               {item.dividerBefore && (
                 <div role="separator" className="my-1 border-t border-[var(--border-main)]" />
               )}
+              <div className="flex items-center rounded-md hover:bg-[var(--bg-hover)]">
               <button
-                role="menuitem"
+                role={item.checked === undefined ? "menuitem" : "menuitemradio"}
+                aria-checked={item.checked === undefined ? undefined : item.checked}
                 disabled={item.disabled || pendingId !== null}
                 onClick={() => {
-                  if (item.disabled || pendingId !== null) return;
-                  let result: Promise<void> | void;
-                  try {
-                    result = item.run();
-                  } catch (error) {
-                    console.error("context menu action failed", error);
-                    onClose();
-                    return;
-                  }
-                  if (!result || typeof result.then !== "function") {
-                    onClose();
-                    return;
-                  }
-                  // Keep the menu open with a spinner until the action settles,
-                  // so the click has immediate visible feedback.
-                  setPendingId(item.id);
-                  void result
-                    .catch((error) => {
-                      console.error("context menu action failed", error);
-                    })
-                    .finally(() => {
-                      setPendingId(null);
-                      onClose();
-                    });
+                  if (item.disabled) return;
+                  runAction(item.id, run);
                 }}
-                className={`flex w-full items-center rounded-md px-3 py-1.5 text-left text-xs text-[var(--text-main)] hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50 ${
+                className={`flex min-w-0 flex-1 items-center rounded-md px-3 py-1.5 text-left text-xs text-[var(--text-main)] outline-none focus-visible:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50 ${
                   showIconSlot ? "gap-2" : ""
                 }`}
               >
@@ -272,12 +336,32 @@ export function ContextMenu<T>({ menu, onClose }: ContextMenuProps<T>) {
                 )}
                 <span className="truncate">{item.label}</span>
               </button>
+              {secondary && SecondaryIcon && (
+                <button
+                  role="menuitem"
+                  aria-label={secondary.label}
+                  title={secondary.label}
+                  disabled={pendingId !== null}
+                  onClick={() => runAction(secondaryId, secondary.run)}
+                  className="mr-1 flex h-6 w-6 flex-shrink-0 items-center justify-center rounded text-[var(--text-dim)] outline-none hover:bg-[var(--bg-active)] hover:text-[var(--text-main)] focus-visible:bg-[var(--bg-active)] disabled:opacity-50"
+                >
+                  {pendingId === secondaryId ? (
+                    <span
+                      data-testid="context-menu-spinner"
+                      className="h-3 w-3 rounded-full border-2 border-[var(--text-muted)] border-t-transparent animate-spin"
+                    />
+                  ) : (
+                    <SecondaryIcon size={12} aria-hidden="true" />
+                  )}
+                </button>
+              )}
+              </div>
             </div>
           );
         })}
       </div>
     );
-  }, [menu, onClose, position, pendingId]);
+  }, [menu, position, pendingId, runAction]);
 
   if (!menu || !content) return null;
   return createPortal(content, document.body);
