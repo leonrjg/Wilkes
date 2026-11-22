@@ -14466,9 +14466,13 @@ title = "title[0]"
         });
         ctx.emit_progress_event(&progress);
 
+        // A build's count goes out twice: on its own stream, and on the one
+        // every rewrite of the index reports on — the indexing toast's.
         let events = captured.lock().unwrap();
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].0, "embed-progress");
+        assert_eq!(events[1].0, "reindex-progress");
+        assert_eq!(events[1].1, serde_json::json!({ "done": 1, "total": 2 }));
     }
 
     #[tokio::test]
