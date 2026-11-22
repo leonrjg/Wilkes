@@ -106,14 +106,13 @@ export interface PaneBounds {
   height: number;
 }
 
-/** The rectangle the window's own controls -- macOS's traffic lights -- take
- *  over the page, from the first button's left edge to the last one's right,
- *  in CSS pixels from the webview's top-left. */
+/** Where the window's own controls -- macOS's traffic lights -- are drawn
+ *  over the page, in CSS pixels from the webview's top-left. */
 export interface WindowControls {
-  left: number;
-  top: number;
+  /** The buttons' vertical centre. */
+  center_y: number;
+  /** The right edge of the last button. */
   right: number;
-  bottom: number;
 }
 
 /** An opaque colour as red, green and blue, each 0-255. */

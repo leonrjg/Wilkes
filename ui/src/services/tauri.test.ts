@@ -622,7 +622,7 @@ describe("TauriSearchApi.watchWindowControls", () => {
   let calls: number;
 
   it("measures the controls once, and gives them up for full screen", async () => {
-    const controls = { left: 16, top: 18, right: 70, bottom: 32 };
+    const controls = { center_y: 25, right: 70 };
     (invoke as any).mockResolvedValue(controls);
     handler = vi.fn();
     calls = 1;
