@@ -428,6 +428,12 @@ pub fn run() {
         .manage(browser_pane::PageSaves::default())
         .manage(agent_browser::AgentState::default())
         .setup(|app| {
+            // Before anything titles the main window: a new title is one of
+            // the things AppKit lays its traffic lights out again for.
+            match app.get_webview_window(native_open::MAIN_WINDOW_LABEL) {
+                Some(window) => window_controls::pin(&window),
+                None => error!("window controls: no main window to place them in"),
+            }
             let startup = Arc::new(DesktopStartupState::default());
             app.manage(Arc::clone(&startup));
             let handle = app.handle().clone();
