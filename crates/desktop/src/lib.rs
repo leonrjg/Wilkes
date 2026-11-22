@@ -2783,7 +2783,14 @@ pub fn run() {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         error!("desktop startup initialization failed: {error:#}");
-                        startup.replace(StartupStatus::unexpected(error));
+                        startup.replace(
+                            match error
+                                .downcast_ref::<wilkes_api::installation::InstallationInUse>()
+                            {
+                                Some(in_use) => StartupStatus::installation_in_use(in_use),
+                                None => StartupStatus::unexpected(error),
+                            },
+                        );
                         return Ok(());
                     }
                 };

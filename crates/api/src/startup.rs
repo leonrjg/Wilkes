@@ -59,6 +59,24 @@ impl StartupStatus {
             }],
         }])
     }
+
+    /// Another process has this installation open. Not a failure of this
+    /// build: the other Wilkes is the one to close, and saying so is the
+    /// whole of the remedy.
+    pub fn installation_in_use(in_use: &crate::installation::InstallationInUse) -> Self {
+        Self::blocked(vec![StartupBlocker {
+            id: "application.installation-in-use".to_string(),
+            feature: "Application startup".to_string(),
+            title: "Wilkes is already open".to_string(),
+            message: in_use.to_string(),
+            actions: vec![StartupAction {
+                label: "Close the other Wilkes".to_string(),
+                description: "Quit the other Wilkes, or stop the wilkes-server using this library, then start Wilkes again."
+                    .to_string(),
+                command: None,
+            }],
+        }])
+    }
 }
 
 #[cfg(test)]

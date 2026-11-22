@@ -892,6 +892,10 @@ pub struct WorkspaceManager {
     /// Tells one build from the next under the same projection id, so a
     /// finished build removes its own entry and never its successor's.
     projection_build_serial: std::sync::atomic::AtomicU64,
+    /// This process's hold on the data directory. Last, so it is released
+    /// only after every other field — every context and its databases — has
+    /// been dropped.
+    _installation: crate::installation::InstallationLock,
 }
 
 /// One projection build, as a request waiting on it sees it.
@@ -994,6 +998,9 @@ impl WorkspaceManager {
         mpsc::Receiver<ManagerEvent>,
         impl std::future::Future<Output = ()> + Send,
     )> {
+        // Before anything reads or writes the directory: a second opener must
+        // be turned away before it can touch the registry it would share.
+        let installation = crate::installation::InstallationLock::acquire(&app_data_dir)?;
         let id = initialize_workspace_registry(&app_data_dir, &settings_path)?;
         let active_event_workspace_id = Arc::new(RwLock::new(id.clone()));
         let data_dir = workspace_root(&app_data_dir, &id);
@@ -1023,6 +1030,7 @@ impl WorkspaceManager {
                 switch_lock: Mutex::new(()),
                 projection_builds: PLMutex::new(std::collections::HashMap::new()),
                 projection_build_serial: std::sync::atomic::AtomicU64::new(0),
+                _installation: installation,
             }),
             event_rx,
             loop_fut,
