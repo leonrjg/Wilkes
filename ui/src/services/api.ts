@@ -487,6 +487,9 @@ export interface SearchApi {
   continueIndexJob(root: string, selected: SelectedEmbedder): Promise<void>;
   /** Re-attempt the documents the last job for `root` failed on. */
   retryFailedDocuments(root: string, selected: SelectedEmbedder): Promise<void>;
+  /** Index the documents under `root` the index does not hold — the ones
+   *  `indexCoverage` counts as missing — and nothing else. */
+  indexMissingDocuments(root: string, selected: SelectedEmbedder): Promise<void>;
   cancelEmbed(): Promise<void>;
   getIndexStatus(root?: string): Promise<IndexStatus>;
   /** How much of each root the index covers, so the interface can say which

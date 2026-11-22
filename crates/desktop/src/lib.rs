@@ -499,6 +499,18 @@ async fn continue_index_job_for_ctx(
     Arc::clone(&ctx).continue_index_job(root, selected).await
 }
 
+/// Index the documents under `root` the semantic index does not hold.
+async fn index_missing_documents_for_ctx(
+    ctx: Arc<AppContext>,
+    root: String,
+    selected: SelectedEmbedder,
+) -> Result<(), String> {
+    info!("desktop::index_missing_documents_for_ctx: root={root}");
+    Arc::clone(&ctx)
+        .index_missing_documents(root, selected)
+        .await
+}
+
 /// Re-attempt the documents the last job for `root` failed on. Never automatic:
 /// a document that broke the reader breaks it again, and a continuation that
 /// swept failures up with it would re-attempt the same one forever.
@@ -2185,6 +2197,15 @@ async fn continue_index_job(
 }
 
 #[tauri::command]
+async fn index_missing_documents(
+    root: String,
+    selected: SelectedEmbedder,
+    app: AppHandle,
+) -> Result<(), String> {
+    index_missing_documents_for_ctx(app_context(&app), root, selected).await
+}
+
+#[tauri::command]
 async fn retry_failed_documents(
     root: String,
     selected: SelectedEmbedder,
@@ -2934,6 +2955,7 @@ pub fn run() {
             index_coverage,
             continue_index_job,
             retry_failed_documents,
+            index_missing_documents,
             embedder_capabilities,
             get_model_size,
             search_custom_models,

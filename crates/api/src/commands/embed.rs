@@ -206,22 +206,7 @@ pub async fn root_coverage(
             .zip(settled_empty)
             .map(|(root, empty)| {
                 let paths = collect_indexable_paths(&root, &supported_extensions);
-                // A document the index holds is covered; so is one a job read
-                // and found no text in, which the index has no row for and
-                // never will. Counted as one set rather than two tallies, so
-                // that a path both could name is counted once.
-                let empty: std::collections::HashSet<PathBuf> = empty
-                    .into_iter()
-                    .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
-                    .collect();
-                let unheld: Vec<PathBuf> = index.unindexed_paths_for_root(&root, &paths)?;
-                let missing = unheld
-                    .into_iter()
-                    .filter(|path| {
-                        !empty
-                            .contains(&std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
-                    })
-                    .count();
+                let missing = missing_among(&index, &root, &paths, empty)?.len();
                 Ok(RootCoverage {
                     indexable: paths.len(),
                     covered: paths.len() - missing,
@@ -232,6 +217,52 @@ pub async fn root_coverage(
             .collect()
     })
     .await?
+}
+
+/// The indexable documents under `root` that coverage counts as missing:
+/// exactly the ones [`root_coverage`] reports as not covered, in walk order.
+///
+/// `settled_empty` is the journal's reading for this root, as for
+/// [`root_coverage`]. No model is loaded and no document is read.
+pub async fn missing_documents(
+    data_dir: &Path,
+    root: PathBuf,
+    supported_extensions: Vec<String>,
+    settled_empty: Vec<PathBuf>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let data_dir = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let index = SemanticIndex::open_for_maintenance(&data_dir)?;
+        let paths = collect_indexable_paths(&root, &supported_extensions);
+        missing_among(&index, &root, &paths, settled_empty)
+    })
+    .await?
+}
+
+/// Of `paths` under `root`, the ones the index holds no row for and no job
+/// found empty. One definition for both the count and the list, so the number
+/// a button offers is the number of documents it indexes.
+fn missing_among(
+    index: &SemanticIndex,
+    root: &Path,
+    paths: &[PathBuf],
+    settled_empty: Vec<PathBuf>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    // A document the index holds is covered; so is one a job read and found no
+    // text in, which the index has no row for and never will. Counted as one
+    // set rather than two tallies, so that a path both could name is counted
+    // once.
+    let empty: std::collections::HashSet<PathBuf> = settled_empty
+        .into_iter()
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        .collect();
+    let unheld: Vec<PathBuf> = index.unindexed_paths_for_root(root, paths)?;
+    Ok(unheld
+        .into_iter()
+        .filter(|path| {
+            !empty.contains(&std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+        })
+        .collect())
 }
 
 /// Delete the whole index database or, when `root` is supplied, only that root's coverage.
@@ -443,6 +474,96 @@ mod tests {
         .unwrap();
         assert_eq!(covered[0].covered, 2);
         assert!(covered[0].complete);
+    }
+
+    /// The catch-up for a root indexed except for files added since: its
+    /// scope is exactly what coverage counts as missing, and building over
+    /// that scope completes the root without dropping what it already held.
+    #[tokio::test]
+    async fn indexing_the_missing_documents_completes_the_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("files");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("read.txt"), "hello world").unwrap();
+
+        let index_dir = dir.path().join("workspace");
+        std::fs::create_dir(&index_dir).unwrap();
+        let model_dir = dir.path().join("models");
+        std::fs::create_dir(&model_dir).unwrap();
+        let supported_extensions = vec!["txt".to_string()];
+        let options = |documents: Vec<PathBuf>, scope: BuildScope| {
+            let (tx, _rx) = tokio::sync::mpsc::channel(10);
+            BuildIndexOptions {
+                model_dir: model_dir.clone(),
+                index_dir: index_dir.clone(),
+                reporter: BuildReporter::without_journal(tx),
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                documents,
+                scope,
+                chunk_size: 600,
+                chunk_overlap: 128,
+                supported_extensions: supported_extensions.clone(),
+            }
+        };
+
+        build_index_with_embedder(
+            root.clone(),
+            Arc::new(TestEmbedder),
+            options(
+                collect_indexable_paths(&root, &supported_extensions),
+                BuildScope::WholeRoot,
+            ),
+        )
+        .await
+        .unwrap();
+
+        std::fs::write(root.join("arrived-later.txt"), "new passage").unwrap();
+        std::fs::write(root.join("found-empty.txt"), "").unwrap();
+        let settled_empty = vec![root.join("found-empty.txt")];
+
+        let missing = missing_documents(
+            &index_dir,
+            root.clone(),
+            supported_extensions.clone(),
+            settled_empty.clone(),
+        )
+        .await
+        .unwrap();
+        let names: Vec<_> = missing
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["arrived-later.txt"],
+            "neither the indexed document nor the one read as empty is missing"
+        );
+
+        build_index_with_embedder(
+            root.clone(),
+            Arc::new(TestEmbedder),
+            options(missing, BuildScope::Subset),
+        )
+        .await
+        .unwrap();
+
+        let covered = root_coverage(
+            &index_dir,
+            vec![root.clone()],
+            supported_extensions.clone(),
+            vec![settled_empty.clone()],
+        )
+        .await
+        .unwrap();
+        assert_eq!((covered[0].indexable, covered[0].covered), (3, 3));
+        assert!(covered[0].complete);
+        assert!(
+            missing_documents(&index_dir, root, supported_extensions, settled_empty)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the document that was already indexed is still held"
+        );
     }
 
     /// A root nothing has ever indexed is answered, not refused: "never

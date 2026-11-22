@@ -251,6 +251,9 @@ function parseHuggingFaceRepoId(input: string): string | null {
 
 export default function SemanticPanel({ api, directory, refreshSemanticReady }: Props) {
   const handleCurrentRootIndexRemoved = useSemanticStore((s) => s.handleCurrentRootIndexRemoved);
+  // The folder strip keeps this current for every root it shows, the active
+  // one included, and re-asks after every build.
+  const rootCoverage = useSemanticStore((s) => s.coverage[directory]);
   const activeWorkspace = useWorkspaceStore((s) =>
     s.workspaces.find((workspace) => workspace.id === s.activeWorkspaceId) ?? null,
   );
@@ -289,6 +292,8 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
     capabilities === null || !currentEngine || supportedEngines.includes(currentEngine);
   const phase = derivePhase(state, effectiveSemantic, backendModels);
   const isActive = phase === "downloading" || phase === "building";
+  const missingDocuments =
+    rootCoverage && !rootCoverage.complete ? rootCoverage.indexable - rootCoverage.covered : 0;
 
   const invalidate = useCallback(() => setFetchEpoch((e) => e + 1), []);
 
@@ -592,6 +597,21 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       }).catch((e) => console.error("deleteIndex failed:", e));
     }
   }, [phase, settings, effectiveSelected, api, directory, handleCurrentRootIndexRemoved, refreshSemanticReady]);
+
+  // Index only what the index lacks, with the model it was built with. Shown
+  // only in the indexed phase, where that model is the selected one.
+  const handleIndexMissing = useCallback(() => {
+    if (!effectiveSelected) return;
+    dispatch({ type: "op_started", op: "building" });
+    api.indexMissingDocuments(directory, effectiveSelected).catch((e) => {
+      console.error("indexMissingDocuments failed:", e);
+      dispatch({
+        type: "op_error",
+        message: e?.toString?.() ?? "Failed to start indexing the missing documents",
+        operation: "Build",
+      });
+    });
+  }, [api, directory, effectiveSelected]);
 
   const customModelIds = new Set(
     (settings?.custom_models ?? []).filter((m) => m.engine === currentEngine).map((m) => m.model_id),
@@ -922,6 +942,17 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
               </div>
             )}
           </div>
+        )}
+
+        {phase === "indexed" && missingDocuments > 0 && (
+          <button
+            onClick={handleIndexMissing}
+            disabled={!isEngineAvailable}
+            type="button"
+            className="w-full py-2 rounded-lg text-xs font-semibold transition-all shadow-sm active:scale-[0.98] disabled:opacity-50 bg-[var(--accent-blue)] hover:bg-[var(--accent-blue)] text-white"
+          >
+            {`Index ${missingDocuments} missing document${missingDocuments === 1 ? "" : "s"}`}
+          </button>
         )}
 
         <button

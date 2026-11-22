@@ -9530,6 +9530,68 @@ impl AppContext {
             .await
     }
 
+    /// Index the documents under `root` that the semantic index does not hold.
+    ///
+    /// The catch-up for a root that is indexed except for some of its files —
+    /// typically ones added while Wilkes was not running, which the directory
+    /// watcher never saw. The scope is exactly what [`Self::index_coverage`]
+    /// counts as missing, so the number the interface offers is the number
+    /// this reads, and nothing the index already holds is touched. Documents
+    /// an earlier job failed on are unindexed and so in scope: asking for the
+    /// missing documents is asking for those too.
+    ///
+    /// It continues the root's latest job, when there is one, so that job's
+    /// verdicts on everything outside the scope carry over to this one.
+    pub async fn index_missing_documents(
+        self: Arc<Self>,
+        root: String,
+        selected: SelectedEmbedder,
+    ) -> Result<(), String> {
+        let root_path = PathBuf::from(&root);
+        let extensions = self.settings().await.supported_extensions.clone();
+        // Read up front and let the lock go: the walk below is filesystem
+        // work, as in `index_coverage`.
+        let (settled_empty, continues) = {
+            let journal = self.job_journal().map_err(|e| format!("{e:#}"))?;
+            let journal = journal.lock().map_err(|_| {
+                "The index job journal is unavailable after an earlier panic".to_string()
+            })?;
+            let empty = journal
+                .paths_with_outcome_for_root(&root_path, DocumentOutcome::Empty)
+                .map_err(|e| format!("{e:#}"))?;
+            let latest = journal
+                .latest_for_root(&root_path)
+                .map_err(|e| format!("{e:#}"))?;
+            (empty, latest.map(|job| job.id))
+        };
+        let documents = crate::commands::embed::missing_documents(
+            &self.data_dir,
+            root_path,
+            extensions,
+            settled_empty,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+        if documents.is_empty() {
+            return Err(
+                "Every document in this directory is already in the semantic index.".into(),
+            );
+        }
+        info!(
+            "AppContext::index_missing_documents: {} document(s) missing from {root}",
+            documents.len()
+        );
+        self.start_build_index_over(
+            root,
+            selected,
+            Some(JobScope {
+                documents,
+                continues,
+            }),
+        )
+        .await
+    }
+
     async fn prepare_download_model(
         &self,
         selected: &SelectedEmbedder,

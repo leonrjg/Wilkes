@@ -2971,6 +2971,21 @@ async fn retry_failed_documents_handler(
     Ok(StatusCode::ACCEPTED)
 }
 
+/// Index the documents under this root the semantic index does not hold.
+async fn index_missing_documents_handler(
+    State(state): State<Arc<AppState>>,
+    Json(mut body): Json<BuildBody>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    let (ctx, uploads_dir) = state.workspace_snapshot();
+    body.root = confine_to_uploads(&body.root, &uploads_dir)?
+        .to_string_lossy()
+        .into_owned();
+    ctx.index_missing_documents(body.root, body.selected)
+        .await
+        .map_err(server_err)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
 async fn build_index_handler(
     State(state): State<Arc<AppState>>,
     Json(mut body): Json<BuildBody>,
@@ -3393,6 +3408,10 @@ pub fn api_router(state: Arc<AppState>, token: ApiToken) -> Router {
         .route("/api/embed/activity", get(index_activity_handler))
         .route("/api/embed/coverage", post(index_coverage_handler))
         .route("/api/embed/continue", post(continue_index_job_handler))
+        .route(
+            "/api/embed/index-missing",
+            post(index_missing_documents_handler),
+        )
         .route(
             "/api/embed/retry-failed",
             post(retry_failed_documents_handler),

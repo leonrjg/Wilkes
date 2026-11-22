@@ -791,6 +791,16 @@ export class HttpSearchApi implements SearchApi {
       throw new Error(`retryFailedDocuments failed: ${res.status}`);
   }
 
+  async indexMissingDocuments(root: string, selected: SelectedEmbedder): Promise<void> {
+    const res = await fetch("/api/embed/index-missing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root, selected }),
+    });
+    if (!res.ok && res.status !== 202)
+      throw new Error(`indexMissingDocuments failed: ${res.status}`);
+  }
+
   async cancelEmbed(): Promise<void> {
     const res = await fetch("/api/embed/cancel", { method: "DELETE" });
     if (!res.ok && res.status !== 204) throw new Error(`cancelEmbed failed: ${res.status}`);

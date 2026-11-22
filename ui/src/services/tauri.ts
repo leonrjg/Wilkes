@@ -663,6 +663,10 @@ export class TauriSearchApi implements SearchApi {
     return invoke("retry_failed_documents", { root, selected });
   }
 
+  async indexMissingDocuments(root: string, selected: SelectedEmbedder): Promise<void> {
+    return invoke("index_missing_documents", { root, selected });
+  }
+
   async cancelEmbed(): Promise<void> {
     return invoke("cancel_embed");
   }

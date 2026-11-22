@@ -2,6 +2,7 @@ import { render, screen, fireEvent, act, waitFor } from "@testing-library/react"
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import SemanticPanel from "./SemanticPanel";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useSemanticStore } from "../stores/useSemanticStore";
 
 describe("SemanticPanel", () => {
   let progressHandler: any;
@@ -36,6 +37,7 @@ describe("SemanticPanel", () => {
     updateSettings: vi.fn(),
     downloadModel: vi.fn().mockResolvedValue(undefined),
     buildIndex: vi.fn().mockResolvedValue(undefined),
+    indexMissingDocuments: vi.fn().mockResolvedValue(undefined),
     deleteIndex: vi.fn().mockResolvedValue(undefined),
     cancelEmbed: vi.fn().mockResolvedValue(undefined),
     getModelSize: vi.fn(),
@@ -96,6 +98,7 @@ describe("SemanticPanel", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    useSemanticStore.setState({ coverage: {}, coverageRoots: [] });
     useSettingsStore.setState({
       favorites: [],
       recentDirs: [],
@@ -810,5 +813,70 @@ describe("SemanticPanel", () => {
     expect(screen.getByText("100")).toBeInTheDocument();
     expect(screen.getByText("500")).toBeInTheDocument();
     expect(screen.getByText(/Delete Index/i)).toBeInTheDocument();
+  });
+
+  describe("documents missing from an indexed root", () => {
+    const indexed = {
+      engine: "Candle",
+      model_id: "initial-id",
+      indexed_files: 97,
+      total_chunks: 500,
+      built_at: Math.floor(Date.now() / 1000),
+      build_duration_ms: 5000,
+    };
+
+    it("offers to index exactly the documents coverage counts as missing", async () => {
+      mockApi.getIndexStatus.mockResolvedValue(indexed);
+      useSemanticStore.setState({
+        coverage: { "/test": { root: "/test", indexable: 100, covered: 97, complete: false } },
+      });
+
+      await act(async () => {
+        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      });
+
+      const button = screen.getByRole("button", { name: "Index 3 missing documents" });
+      await act(async () => {
+        fireEvent.click(button);
+      });
+
+      expect(mockApi.indexMissingDocuments).toHaveBeenCalledWith("/test", defaultSettings.semantic.selected);
+      expect(mockApi.buildIndex).not.toHaveBeenCalled();
+      expect(mockApi.deleteIndex).not.toHaveBeenCalled();
+      // The build it starts is reported like any other, and can be cancelled.
+      expect(screen.getByText(/Cancel build/i)).toBeInTheDocument();
+    });
+
+    it("says why when the backend refuses", async () => {
+      mockApi.getIndexStatus.mockResolvedValue(indexed);
+      mockApi.indexMissingDocuments.mockRejectedValueOnce("An index build is already running.");
+      useSemanticStore.setState({
+        coverage: { "/test": { root: "/test", indexable: 98, covered: 97, complete: false } },
+      });
+
+      await act(async () => {
+        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Index 1 missing document" }));
+      });
+
+      expect(screen.getByText(/An index build is already running/)).toBeInTheDocument();
+      expect(screen.queryByText(/Cancel build/i)).not.toBeInTheDocument();
+    });
+
+    it("is not offered when the root is fully covered", async () => {
+      mockApi.getIndexStatus.mockResolvedValue(indexed);
+      useSemanticStore.setState({
+        coverage: { "/test": { root: "/test", indexable: 97, covered: 97, complete: true } },
+      });
+
+      await act(async () => {
+        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      });
+
+      expect(screen.queryByRole("button", { name: /missing document/ })).not.toBeInTheDocument();
+      expect(screen.getByText(/Delete Index/i)).toBeInTheDocument();
+    });
   });
 });
