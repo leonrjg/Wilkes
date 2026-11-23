@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect, type ReactNode } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { BookOpen, Bookmark, Cloud, Cpu, Share2, Globe, MessageSquare, Settings as SettingsIcon, ChevronDown, ChevronLeft, ChevronRight, Loader, Plus } from "react-feather";
+import { BookOpen, Bookmark, Cloud, Cpu, Share2, Globe, MessageSquare, Settings as SettingsIcon, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Loader, Plus } from "react-feather";
 import SearchBar from "./components/SearchBar";
 import ResultList from "./components/ResultList";
 import PreviewPane from "./components/PreviewPane";
@@ -139,6 +139,9 @@ export default function App() {
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(320);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // The search header (search, workspace, roots) folds away like the sidebar;
+  // it stays mounted so the pattern and toggles survive being hidden.
+  const [headerCollapsed, setHeaderCollapsed] = useState(false);
   // The widths the user dragged the docked panes to, by pane key. A pane not
   // named here opens at its minimum width, and resizing one does not resize
   // the others.
@@ -1055,7 +1058,21 @@ export default function App() {
           className="absolute inset-0 z-[100] cursor-wait"
         />
       )}
-      <SearchBar sourceSlot={sourceSlot} settingsSlot={settingsSlot} />
+      <div id="search-header" className={headerCollapsed ? "hidden" : "shrink-0"}>
+        <SearchBar sourceSlot={sourceSlot} settingsSlot={settingsSlot} />
+      </div>
+      <div className="relative h-0 shrink-0">
+        <button
+          type="button"
+          aria-label={headerCollapsed ? "Show search bar" : "Hide search bar"}
+          aria-expanded={!headerCollapsed}
+          aria-controls="search-header"
+          onClick={() => setHeaderCollapsed((collapsed) => !collapsed)}
+          className="absolute left-1/2 top-0 z-30 flex h-4 w-12 -translate-x-1/2 items-center justify-center rounded-b-md border border-t-0 border-[var(--border-strong)] bg-[var(--bg-sidebar)] text-[var(--text-muted)] shadow-sm transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-main)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent-blue)]"
+        >
+          {headerCollapsed ? <ChevronDown size={12} /> : <ChevronUp size={12} />}
+        </button>
+      </div>
       {paneDrag?.line && (
         <div
           aria-hidden="true"

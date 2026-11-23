@@ -523,6 +523,29 @@ describe("App", () => {
     }
   });
 
+  it("folds the search header away and back, keeping what was typed", async () => {
+    await act(async () => {
+      render(
+        <ToastProvider>
+          <App />
+        </ToastProvider>
+      );
+    });
+
+    const input = screen.getByPlaceholderText("Search…");
+    fireEvent.change(input, { target: { value: "entropy" } });
+    const header = document.getElementById("search-header");
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide search bar" }));
+    expect(header).toHaveClass("hidden");
+    const show = screen.getByRole("button", { name: "Show search bar" });
+    expect(show).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(show);
+    expect(header).not.toHaveClass("hidden");
+    expect(screen.getByPlaceholderText("Search…")).toHaveValue("entropy");
+  });
+
   it("shows DirectoryPicker for desktop source", async () => {
     await act(async () => {
       render(
