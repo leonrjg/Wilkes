@@ -45,6 +45,10 @@ interface PanelState {
    *  already merges the user's own entries. */
   capabilities: EmbedderCapability[] | null;
   indexStatus: IndexStatus | null;
+  /** Why the model list could not be read. Kept apart from `error`, which
+   *  every operation clears: the picker stays disabled for as long as this
+   *  is set, so it must stay on screen for as long. */
+  capabilitiesError: string | null;
   error: string | null;
   activeOp: ActiveOp;
   progress: ProgressState | null;
@@ -60,6 +64,7 @@ interface PanelState {
 const INITIAL_STATE: PanelState = {
   capabilities: null,
   indexStatus: null,
+  capabilitiesError: null,
   error: null,
   activeOp: null,
   progress: null,
@@ -99,10 +104,10 @@ function reducer(state: PanelState, action: Action): PanelState {
         ...state,
         supportedEngines: action.manifest.engines,
         capabilities: action.manifest.models,
-        error: null,
+        capabilitiesError: null,
       };
     case "capabilities_failed":
-      return { ...state, supportedEngines: [], capabilities: [], error: action.error };
+      return { ...state, supportedEngines: [], capabilities: [], capabilitiesError: action.error };
     case "index_loaded":
       return { ...state, indexStatus: action.indexStatus };
     case "error":
@@ -229,6 +234,10 @@ interface Props {
   api: SearchApi;
   directory: string;
   refreshSemanticReady: () => Promise<boolean>;
+  /** Bumped by the owner whenever the model list may have changed outside
+   *  this panel — each time Settings opens, since an embedding host that
+   *  could not be reached before may answer now. */
+  capabilitiesRevision: number;
 }
 
 interface CustomSearch {
@@ -249,7 +258,7 @@ function parseHuggingFaceRepoId(input: string): string | null {
   return match ? `${match[1]}/${match[2]}` : null;
 }
 
-export default function SemanticPanel({ api, directory, refreshSemanticReady }: Props) {
+export default function SemanticPanel({ api, directory, refreshSemanticReady, capabilitiesRevision }: Props) {
   const handleCurrentRootIndexRemoved = useSemanticStore((s) => s.handleCurrentRootIndexRemoved);
   // The folder strip keeps this current for every root it shows, the active
   // one included, and re-asks after every build.
@@ -321,8 +330,9 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
   // ---------------------------------------------------------------------------
   // Effect: what this build can embed with. Refetched after an operation that
   // changes it — a download lands artifacts, adding a custom model adds an
-  // entry — and not when the engine selection changes, since the manifest
-  // already covers every engine.
+  // entry — and whenever the owner says it may have changed (Settings opened
+  // again: a remote host may be reachable now), but not when the engine
+  // selection changes, since the manifest already covers every engine.
   // ---------------------------------------------------------------------------
 
   useEffect(() => {
@@ -333,7 +343,7 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
       if (!cancelled) dispatch({ type: "capabilities_failed", error: e.toString() });
     });
     return () => { cancelled = true; };
-  }, [api, fetchEpoch]);
+  }, [api, fetchEpoch, capabilitiesRevision]);
 
   // ---------------------------------------------------------------------------
   // Effect: fetch index status when engine/model changes (or after invalidate)
@@ -732,7 +742,16 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
           {ALL_ENGINES.map((e) => {
             const isSupported = supportedEngines.includes(e);
             return (
-            <Tooltip key={e} content={!isSupported ? "Feature disabled in this build" : undefined}>
+            <Tooltip
+              key={e}
+              content={
+                isSupported
+                  ? undefined
+                  : state.capabilitiesError
+                    ? "The model list could not be read"
+                    : "Feature disabled in this build"
+              }
+            >
               <button
                 type="button"
                 disabled={isActive || (!isEngineAvailable && currentEngine === e) || !isSupported}
@@ -756,6 +775,11 @@ export default function SemanticPanel({ api, directory, refreshSemanticReady }: 
             ? "Uses the GPU when available."
             : "Runs on CPU."}
         </p>
+        {state.capabilitiesError && (
+          <div role="alert" className="mt-1.5 p-2 bg-red-900/20 border border-red-900/50 rounded text-[10px] text-red-400 break-all">
+            {state.capabilitiesError}
+          </div>
+        )}
         {currentEngine === "SBERT" && (
           <div className="mt-1.5 px-2 py-1.5 rounded bg-[var(--bg-active)] flex items-start gap-1.5">
             <span className="text-[10px] text-[var(--text-dim)] shrink-0 mt-px uppercase font-bold tracking-tighter">python</span>

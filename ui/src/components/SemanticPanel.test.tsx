@@ -136,9 +136,31 @@ describe("SemanticPanel", () => {
 
   it("renders correctly and loads data", async () => {
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
     expect(screen.getByText("SBERT")).toBeInTheDocument();
+    expect(screen.getByText("Initial")).toBeInTheDocument();
+  });
+
+  it("keeps a failed model list on screen and reads it again when asked", async () => {
+    mockApi.getEmbedderCapabilities.mockRejectedValueOnce("embedding host unreachable");
+
+    let rerender!: ReturnType<typeof render>["rerender"];
+    await act(async () => {
+      ({ rerender } = render(
+        <SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />,
+      ));
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("embedding host unreachable");
+    expect(screen.getByText("SBERT").closest("button")).toBeDisabled();
+
+    await act(async () => {
+      rerender(
+        <SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={1} />,
+      );
+    });
+    expect(screen.queryByText("embedding host unreachable")).not.toBeInTheDocument();
+    expect(screen.getByText("SBERT").closest("button")).not.toBeDisabled();
     expect(screen.getByText("Initial")).toBeInTheDocument();
   });
 
@@ -156,7 +178,7 @@ describe("SemanticPanel", () => {
     });
 
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     act(() => {
@@ -178,7 +200,7 @@ describe("SemanticPanel", () => {
         semantic: { ...defaultSettings.semantic, selected: { ...defaultSettings.semantic.selected, engine: "SBERT" } }
     });
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
     const candleBtn = screen.getByText("Candle");
     await act(async () => {
@@ -199,7 +221,7 @@ describe("SemanticPanel", () => {
     );
 
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     await act(async () => {
@@ -228,7 +250,7 @@ describe("SemanticPanel", () => {
     );
 
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     // Clicking a model only sets the pending selection — no API call yet.
@@ -272,7 +294,7 @@ describe("SemanticPanel", () => {
       mockApi.getSettings.mockResolvedValue(sbertSettings(selected, custom));
       mockApi.getEmbedderCapabilities.mockResolvedValue(manifest(models));
       await act(async () => {
-        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
       });
     };
 
@@ -373,7 +395,7 @@ describe("SemanticPanel", () => {
     });
 
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     const downloadBtn = screen.getByText(/Download model and index files/i);
@@ -418,7 +440,7 @@ describe("SemanticPanel", () => {
     });
 
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     await act(async () => {
@@ -442,7 +464,7 @@ describe("SemanticPanel", () => {
     });
 
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     await act(async () => {
@@ -478,7 +500,7 @@ describe("SemanticPanel", () => {
     });
 
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     await act(async () => {
@@ -500,7 +522,7 @@ describe("SemanticPanel", () => {
 
   it("returns to idle after a plain download completion with no queued build", async () => {
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     await act(async () => {
@@ -519,7 +541,7 @@ describe("SemanticPanel", () => {
 
   it("shows indexing progress via events", async () => {
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     const buildButton = screen.getByText("Build semantic index");
@@ -536,7 +558,7 @@ describe("SemanticPanel", () => {
 
   it("shows build feedback immediately after starting an index build", async () => {
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     await act(async () => {
@@ -558,7 +580,7 @@ describe("SemanticPanel", () => {
     );
 
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     await act(async () => {
@@ -577,7 +599,7 @@ describe("SemanticPanel", () => {
 
   it("handles cancel embedding", async () => {
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     const buildButton = screen.getByText("Build semantic index");
@@ -599,7 +621,7 @@ describe("SemanticPanel", () => {
 
   it("displays error from event", async () => {
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     await act(async () => {
@@ -611,7 +633,7 @@ describe("SemanticPanel", () => {
 
   it("toggles advanced settings and handles device change", async () => {
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     const advancedBtn = screen.getByText(/Advanced/i);
@@ -631,7 +653,7 @@ describe("SemanticPanel", () => {
 
   it("handles adding a custom model", async () => {
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     const addCustomBtn = screen.getByText(/Add Custom/i);
@@ -655,7 +677,7 @@ describe("SemanticPanel", () => {
   describe("searching Hugging Face for a custom model", () => {
     const openForm = async () => {
       await act(async () => {
-        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
       });
       await act(async () => {
         fireEvent.click(screen.getByText(/Add Custom/i));
@@ -784,7 +806,7 @@ describe("SemanticPanel", () => {
     );
 
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     const searchInput = screen.getByPlaceholderText(/Search models…/i);
@@ -807,7 +829,7 @@ describe("SemanticPanel", () => {
     });
 
     await act(async () => {
-      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+      render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
     });
 
     expect(screen.getByText("100")).toBeInTheDocument();
@@ -832,7 +854,7 @@ describe("SemanticPanel", () => {
       });
 
       await act(async () => {
-        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
       });
 
       const button = screen.getByRole("button", { name: "Index 3 missing documents" });
@@ -855,7 +877,7 @@ describe("SemanticPanel", () => {
       });
 
       await act(async () => {
-        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
       });
       await act(async () => {
         fireEvent.click(screen.getByRole("button", { name: "Index 1 missing document" }));
@@ -872,7 +894,7 @@ describe("SemanticPanel", () => {
       });
 
       await act(async () => {
-        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} />);
+        render(<SemanticPanel api={mockApi} directory="/test" refreshSemanticReady={vi.fn()} capabilitiesRevision={0} />);
       });
 
       expect(screen.queryByRole("button", { name: /missing document/ })).not.toBeInTheDocument();

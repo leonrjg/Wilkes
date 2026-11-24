@@ -246,6 +246,9 @@ export default function SettingsModal({
   // Bumped whenever the place embeddings run changes, so the model list below
   // is read again from there.
   const [remoteEmbeddingRevision, setRemoteEmbeddingRevision] = useState(0);
+  // The modal stays mounted while hidden, so the semantic panel would keep
+  // whatever model list it read first; opening Settings asks again.
+  const [capabilitiesRevision, setCapabilitiesRevision] = useState(0);
   const customInstructionsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settingsSaveQueue = useRef<Promise<void> | null>(null);
   const darkPagesRevision = useRef(0);
@@ -254,6 +257,7 @@ export default function SettingsModal({
 
   useEffect(() => {
     if (isOpen) {
+      setCapabilitiesRevision((revision) => revision + 1);
       api.getSettings().then((nextSettings) => {
         setSettings(nextSettings);
         setMaxDownloadMbDraft(String(nextSettings.max_download_bytes / 1_000_000));
@@ -1409,6 +1413,7 @@ export default function SettingsModal({
                 api={api}
                 directory={directory}
                 refreshSemanticReady={refreshSemanticReady}
+                capabilitiesRevision={capabilitiesRevision}
               />
             </div>
 
