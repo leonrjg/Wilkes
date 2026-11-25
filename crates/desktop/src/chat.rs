@@ -289,7 +289,7 @@ pub async fn chat_start(
     backend: AgentBackend,
     host: Option<HostContext>,
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<ChatStartResult, String> {
     let ctx = window_context(&window);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
@@ -340,7 +340,7 @@ pub async fn chat_open_conversation(
     conversation_id: String,
     host: Option<HostContext>,
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<ChatStartResult, String> {
     let ctx = window_context(&window);
     let chats = manager(&app);
@@ -411,7 +411,7 @@ pub async fn chat_fork_conversation(
     include_message: bool,
     host: Option<HostContext>,
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<ChatStartResult, String> {
     let ctx = window_context(&window);
     let chats = manager(&app);
@@ -503,7 +503,7 @@ pub async fn chat_set_config_option(
     config_id: String,
     value: String,
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Vec<ChatConfigOption>, String> {
     let ctx = window_context(&window);
     let managed = session_or_err(&app, &session_id)?;
@@ -546,7 +546,7 @@ pub async fn chat_send(
     text: String,
     host: Option<HostContext>,
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<ChatSendResult, String> {
     let ctx = window_context(&window);
     let managed = session_or_err(&app, &session_id)?;

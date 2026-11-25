@@ -3,7 +3,7 @@ use crate::*;
 /// Every feed with its status, flags and inbox count.
 #[tauri::command]
 pub(crate) async fn feeds_list(
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Vec<wilkes_api::research::FeedRecord>, String> {
     window_context(&window)
         .feeds_list()
@@ -14,7 +14,7 @@ pub(crate) async fn feeds_list(
 #[tauri::command]
 pub(crate) async fn feed_discover(
     address: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Vec<wilkes_api::context::feeds::OfferedFeed>, String> {
     window_context(&window)
         .feed_discover(&address)
@@ -26,7 +26,7 @@ pub(crate) async fn feed_discover(
 #[tauri::command]
 pub(crate) async fn feed_add(
     feed: wilkes_api::context::feeds::NewFeed,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_api::research::FeedRecord, String> {
     window_context(&window)
         .feed_add(feed)
@@ -38,7 +38,7 @@ pub(crate) async fn feed_add(
 pub(crate) async fn feed_update(
     id: String,
     update: wilkes_api::context::feeds::FeedUpdate,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_api::research::FeedRecord, String> {
     window_context(&window)
         .feed_update(&id, update)
@@ -51,7 +51,7 @@ pub(crate) async fn feed_update(
 pub(crate) async fn feed_remove(
     id: String,
     delete_files: bool,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     window_context(&window)
         .feed_remove(&id, delete_files)
@@ -60,14 +60,14 @@ pub(crate) async fn feed_remove(
 }
 
 #[tauri::command]
-pub(crate) async fn feeds_refresh(window: tauri::WebviewWindow) -> Result<(), String> {
+pub(crate) async fn feeds_refresh(window: tauri::Window) -> Result<(), String> {
     window_context(&window)
         .feeds_refresh()
         .map_err(|error| format!("{error:#}"))
 }
 
 #[tauri::command]
-pub(crate) async fn feeds_refresh_cancel(window: tauri::WebviewWindow) -> Result<(), String> {
+pub(crate) async fn feeds_refresh_cancel(window: tauri::Window) -> Result<(), String> {
     window_context(&window).feeds_refresh_cancel();
     Ok(())
 }
@@ -76,7 +76,7 @@ pub(crate) async fn feeds_refresh_cancel(window: tauri::WebviewWindow) -> Result
 #[tauri::command]
 pub(crate) async fn feed_items(
     query: wilkes_api::context::feeds::FeedItemsQuery,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_api::context::feeds::FeedItemsPage, String> {
     window_context(&window)
         .feed_items(query)
@@ -88,7 +88,7 @@ pub(crate) async fn feed_items(
 pub(crate) async fn feed_item_set_status(
     id: String,
     action: wilkes_api::context::feeds::FeedItemAction,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_api::research::FeedItemRecord, String> {
     window_context(&window)
         .feed_item_set_status(&id, action)

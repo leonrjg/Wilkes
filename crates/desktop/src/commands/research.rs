@@ -48,14 +48,14 @@ pub(crate) fn cancel_chunk_topics_for_ctx(ctx: Arc<AppContext>, request_id: &str
 }
 
 #[tauri::command]
-pub(crate) async fn list_bookmarks(window: tauri::WebviewWindow) -> Result<Vec<Bookmark>, String> {
+pub(crate) async fn list_bookmarks(window: tauri::Window) -> Result<Vec<Bookmark>, String> {
     list_bookmarks_for_ctx(window_context(&window)).await
 }
 
 #[tauri::command]
 pub(crate) async fn add_bookmark(
     bookmark: NewBookmark,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Bookmark, String> {
     add_bookmark_for_ctx(window_context(&window), bookmark).await
 }
@@ -63,7 +63,7 @@ pub(crate) async fn add_bookmark(
 #[tauri::command]
 pub(crate) async fn remove_bookmark(
     id: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     remove_bookmark_for_ctx(window_context(&window), id).await
 }
@@ -72,7 +72,7 @@ pub(crate) async fn remove_bookmark(
 pub(crate) async fn update_bookmark_note(
     id: String,
     note: Option<String>,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Bookmark, String> {
     update_bookmark_note_for_ctx(window_context(&window), id, note).await
 }
@@ -80,7 +80,7 @@ pub(crate) async fn update_bookmark_note(
 #[tauri::command]
 pub(crate) async fn cluster_bookmarks(
     query: BookmarkClustersQuery,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<BookmarkClustersResult, String> {
     cluster_bookmarks_for_ctx(window_context(&window), query).await
 }
@@ -89,7 +89,7 @@ pub(crate) async fn cluster_bookmarks(
 pub(crate) async fn chunk_topics(
     request_id: String,
     query: ChunkTopicsQuery,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<ChunkTopicsResult, String> {
     chunk_topics_for_ctx(window_context(&window), request_id, query).await
 }
@@ -97,7 +97,7 @@ pub(crate) async fn chunk_topics(
 #[tauri::command]
 pub(crate) async fn cancel_chunk_topics(
     request_id: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     cancel_chunk_topics_for_ctx(window_context(&window), &request_id);
     Ok(())
@@ -105,7 +105,7 @@ pub(crate) async fn cancel_chunk_topics(
 
 #[tauri::command]
 pub(crate) async fn list_saved_works(
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Vec<SavedWork>, String> {
     window_context(&window)
         .list_saved_works()
@@ -116,7 +116,7 @@ pub(crate) async fn list_saved_works(
 #[tauri::command]
 pub(crate) async fn save_work(
     work: NewSavedWork,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<SavedWork, String> {
     window_context(&window)
         .save_work(work)
@@ -126,7 +126,7 @@ pub(crate) async fn save_work(
 #[tauri::command]
 pub(crate) async fn remove_saved_work(
     id: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     window_context(&window)
         .remove_saved_work(&id)
@@ -137,7 +137,7 @@ pub(crate) async fn remove_saved_work(
 pub(crate) async fn update_saved_work_note(
     id: String,
     note: Option<String>,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<SavedWork, String> {
     window_context(&window)
         .update_saved_work_note(&id, note)
@@ -149,7 +149,7 @@ pub(crate) async fn mark_saved_work_acquired(
     provider: String,
     work: LiteratureSearchResult,
     path: PathBuf,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Option<SavedWork>, String> {
     window_context(&window)
         .mark_saved_work_acquired(&provider, &work, path)
@@ -157,14 +157,14 @@ pub(crate) async fn mark_saved_work_acquired(
 }
 
 #[tauri::command]
-pub(crate) async fn list_tags(window: tauri::WebviewWindow) -> Result<Vec<Tag>, String> {
+pub(crate) async fn list_tags(window: tauri::Window) -> Result<Vec<Tag>, String> {
     window_context(&window)
         .list_tags()
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub(crate) async fn create_tag(tag: NewTag, window: tauri::WebviewWindow) -> Result<Tag, String> {
+pub(crate) async fn create_tag(tag: NewTag, window: tauri::Window) -> Result<Tag, String> {
     window_context(&window)
         .create_tag(tag)
         .map_err(|e| e.to_string())
@@ -174,7 +174,7 @@ pub(crate) async fn create_tag(tag: NewTag, window: tauri::WebviewWindow) -> Res
 pub(crate) async fn update_tag(
     id: String,
     tag: UpdateTag,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Tag, String> {
     window_context(&window)
         .update_tag(&id, tag)
@@ -182,7 +182,7 @@ pub(crate) async fn update_tag(
 }
 
 #[tauri::command]
-pub(crate) async fn delete_tag(id: String, window: tauri::WebviewWindow) -> Result<(), String> {
+pub(crate) async fn delete_tag(id: String, window: tauri::Window) -> Result<(), String> {
     window_context(&window)
         .delete_tag(&id)
         .map_err(|e| e.to_string())
@@ -191,7 +191,7 @@ pub(crate) async fn delete_tag(id: String, window: tauri::WebviewWindow) -> Resu
 #[tauri::command]
 pub(crate) async fn update_document_tags(
     update: DocumentTagUpdate,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     window_context(&window)
         .update_document_tags(update)
@@ -200,7 +200,7 @@ pub(crate) async fn update_document_tags(
 
 #[tauri::command]
 pub(crate) async fn list_smart_collections(
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Vec<SmartCollection>, String> {
     window_context(&window)
         .list_collections()
@@ -210,7 +210,7 @@ pub(crate) async fn list_smart_collections(
 #[tauri::command]
 pub(crate) async fn create_smart_collection(
     collection: NewSmartCollection,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<SmartCollection, String> {
     window_context(&window)
         .create_collection(collection)
@@ -221,7 +221,7 @@ pub(crate) async fn create_smart_collection(
 pub(crate) async fn update_smart_collection(
     id: String,
     collection: UpdateSmartCollection,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<SmartCollection, String> {
     window_context(&window)
         .update_collection(&id, collection)
@@ -231,7 +231,7 @@ pub(crate) async fn update_smart_collection(
 #[tauri::command]
 pub(crate) async fn delete_smart_collection(
     id: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     window_context(&window)
         .delete_collection(&id)
@@ -250,7 +250,7 @@ pub(crate) async fn validate_smart_collection(
 #[tauri::command]
 pub(crate) async fn list_search_log(
     limit: Option<usize>,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Vec<SearchLogEntry>, String> {
     window_context(&window)
         .list_search_log(limit.unwrap_or(100))
@@ -260,7 +260,7 @@ pub(crate) async fn list_search_log(
 #[tauri::command]
 pub(crate) async fn delete_search_log(
     id: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     window_context(&window)
         .delete_search_log(&id)
@@ -268,7 +268,7 @@ pub(crate) async fn delete_search_log(
 }
 
 #[tauri::command]
-pub(crate) async fn clear_search_log(window: tauri::WebviewWindow) -> Result<(), String> {
+pub(crate) async fn clear_search_log(window: tauri::Window) -> Result<(), String> {
     window_context(&window)
         .clear_search_log()
         .map_err(|e| e.to_string())

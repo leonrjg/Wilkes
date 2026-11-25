@@ -133,7 +133,7 @@ pub(crate) async fn reveal_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub(crate) async fn trash_file(path: String, window: tauri::WebviewWindow) -> Result<(), String> {
+pub(crate) async fn trash_file(path: String, window: tauri::Window) -> Result<(), String> {
     // Path-based rather than routed through the context, so the read-only gate
     // has to be asked for here: the workspace it would delete from is the
     // active one either way.
@@ -165,7 +165,7 @@ pub(crate) async fn list_files(
     collection_id: Option<String>,
     tag_ids: Option<Vec<String>>,
     collection_expression: Option<String>,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<FileListResponse, String> {
     list_files_for_ctx(
         window_context(&window),
@@ -180,7 +180,7 @@ pub(crate) async fn list_files(
 #[tauri::command]
 pub(crate) async fn open_file(
     path: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_core::types::PreviewData, String> {
     open_file_for_ctx(window_context(&window), path).await
 }
@@ -189,7 +189,7 @@ pub(crate) async fn open_file(
 pub(crate) async fn rename_file(
     path: String,
     new_name: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<String, String> {
     rename_file_for_path(window_context(&window), path, new_name).await
 }
@@ -205,7 +205,7 @@ pub(crate) async fn import_files(
     root: String,
     folder: Option<String>,
     mode: wilkes_api::commands::files::FileImportMode,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Vec<String>, String> {
     import_files_into_current_root_for_ctx(window_context(&window), paths, root, folder, mode).await
 }
@@ -234,7 +234,7 @@ pub(crate) async fn read_clipboard_files() -> Result<Vec<String>, String> {
 pub(crate) async fn move_file(
     path: String,
     target_root: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<String, String> {
     move_file_to_root_for_ctx(window_context(&window), path, target_root).await
 }
@@ -243,7 +243,7 @@ pub(crate) async fn move_file(
 pub(crate) async fn create_directory(
     parent: String,
     name: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<String, String> {
     window_context(&window)
         .ensure_writable()
@@ -306,7 +306,7 @@ pub(crate) async fn path_kinds(paths: Vec<String>) -> Result<Vec<PathKind>, Stri
 #[tauri::command]
 pub(crate) async fn get_file_metadata(
     path: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<DocumentMetadata, String> {
     get_file_metadata_for_path(window_context(&window), path).await
 }

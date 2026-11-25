@@ -26,7 +26,7 @@ pub(crate) async fn get_standalone_file_metadata(
 #[tauri::command]
 pub(crate) async fn preview(
     match_ref: wilkes_core::types::MatchRef,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_core::types::PreviewData, String> {
     window_context(&window)
         .preview(match_ref)
@@ -39,7 +39,7 @@ pub(crate) async fn preview(
 pub(crate) async fn comic_page(
     path: String,
     page: u32,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<tauri::ipc::Response, String> {
     let bytes = window_context(&window)
         .comic_page(std::path::PathBuf::from(path), page)
@@ -57,7 +57,7 @@ pub(crate) async fn comic_page(
 pub(crate) async fn file_cover(
     path: String,
     max_edge: u32,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<tauri::ipc::Response, String> {
     window_context(&window)
         .file_cover(std::path::PathBuf::from(path), max_edge)
@@ -75,7 +75,7 @@ pub(crate) async fn file_cover(
 #[tauri::command]
 pub(crate) async fn surrogate_bytes(
     path: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<tauri::ipc::Response, String> {
     window_context(&window)
         .surrogate_bytes(std::path::PathBuf::from(path))
@@ -87,7 +87,7 @@ pub(crate) async fn surrogate_bytes(
 #[tauri::command]
 pub(crate) async fn resolve_pdf_font(
     request: wilkes_core::pdf_edit::fonts::FontRequest,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<String, String> {
     window_context(&window)
         .resolve_pdf_font(request)
@@ -99,7 +99,7 @@ pub(crate) async fn resolve_pdf_font(
 #[tauri::command]
 pub(crate) async fn pdf_font_bytes(
     id: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<tauri::ipc::Response, String> {
     window_context(&window)
         .pdf_font_bytes(id)
@@ -113,7 +113,7 @@ pub(crate) async fn save_pdf_edits(
     source: String,
     destination: String,
     export: wilkes_core::pdf_edit::EditExport,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     window_context(&window)
         .save_pdf_edits(

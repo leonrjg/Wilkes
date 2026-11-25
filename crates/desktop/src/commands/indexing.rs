@@ -132,14 +132,14 @@ where
 }
 
 #[tauri::command]
-pub(crate) fn is_semantic_ready(window: tauri::WebviewWindow) -> bool {
+pub(crate) fn is_semantic_ready(window: tauri::Window) -> bool {
     is_semantic_ready_for_ctx(window_context(&window))
 }
 
 #[tauri::command]
 pub(crate) async fn download_model(
     selected: SelectedEmbedder,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     download_model_for_ctx(window_context(&window), selected).await
 }
@@ -148,7 +148,7 @@ pub(crate) async fn download_model(
 pub(crate) async fn build_index(
     root: String,
     selected: SelectedEmbedder,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     build_index_for_ctx(window_context(&window), root, selected).await
 }
@@ -156,7 +156,7 @@ pub(crate) async fn build_index(
 #[tauri::command]
 pub(crate) async fn index_activity(
     root: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<IndexActivity, String> {
     index_activity_for_ctx(window_context(&window), root).await
 }
@@ -164,7 +164,7 @@ pub(crate) async fn index_activity(
 #[tauri::command]
 pub(crate) async fn index_coverage(
     roots: Vec<String>,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Vec<RootCoverage>, String> {
     index_coverage_for_ctx(window_context(&window), roots).await
 }
@@ -173,7 +173,7 @@ pub(crate) async fn index_coverage(
 pub(crate) async fn continue_index_job(
     root: String,
     selected: SelectedEmbedder,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     continue_index_job_for_ctx(window_context(&window), root, selected).await
 }
@@ -182,7 +182,7 @@ pub(crate) async fn continue_index_job(
 pub(crate) async fn index_missing_documents(
     root: String,
     selected: SelectedEmbedder,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     index_missing_documents_for_ctx(window_context(&window), root, selected).await
 }
@@ -191,14 +191,14 @@ pub(crate) async fn index_missing_documents(
 pub(crate) async fn retry_failed_documents(
     root: String,
     selected: SelectedEmbedder,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     retry_failed_documents_for_ctx(window_context(&window), root, selected).await
 }
 
 #[tauri::command]
 pub(crate) async fn embedder_capabilities(
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<EmbedderCapabilityManifest, String> {
     embedder_capabilities_for_ctx(window_context(&window)).await
 }
@@ -225,14 +225,14 @@ pub(crate) async fn search_custom_models(
 }
 
 #[tauri::command]
-pub(crate) async fn cancel_embed(window: tauri::WebviewWindow) -> Result<(), String> {
+pub(crate) async fn cancel_embed(window: tauri::Window) -> Result<(), String> {
     cancel_embed_for_ctx(window_context(&window)).await
 }
 
 #[tauri::command]
 pub(crate) async fn get_index_status(
     root: Option<String>,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<IndexStatus, String> {
     get_index_status_for_ctx(window_context(&window), root).await
 }
@@ -240,7 +240,7 @@ pub(crate) async fn get_index_status(
 #[tauri::command]
 pub(crate) async fn delete_index(
     root: Option<String>,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     delete_index_for_ctx(window_context(&window), root).await
 }

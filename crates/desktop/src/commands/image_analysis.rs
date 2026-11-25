@@ -3,7 +3,7 @@ use crate::*;
 /// Every recognizer this build can read with, and the engines it compiled in.
 #[tauri::command]
 pub(crate) async fn image_recognizer_catalogue(
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> wilkes_core::extract::image::dispatch::RecognizerCatalogue {
     window_context(&window).image_recognizer_catalogue()
 }
@@ -15,7 +15,7 @@ pub(crate) async fn image_recognizer_catalogue(
 pub(crate) async fn image_recognizer_inventory(
     engine: wilkes_core::extract::image::dispatch::RecognitionEngine,
     model_id: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_core::types::RecognizerInventory, String> {
     window_context(&window)
         .image_recognizer_inventory(engine, &model_id)
@@ -30,7 +30,7 @@ pub(crate) async fn image_recognizer_inventory(
 pub(crate) async fn install_image_recognizer(
     engine: wilkes_core::extract::image::dispatch::RecognitionEngine,
     model_id: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     window_context(&window)
         .install_image_recognizer(engine, model_id)
@@ -43,7 +43,7 @@ pub(crate) async fn install_image_recognizer(
 /// image-analysis-error.
 #[cfg(feature = "recognize-onnx")]
 #[tauri::command]
-pub(crate) async fn install_layout_detector(window: tauri::WebviewWindow) -> Result<(), String> {
+pub(crate) async fn install_layout_detector(window: tauri::Window) -> Result<(), String> {
     window_context(&window)
         .install_layout_detector()
         .await

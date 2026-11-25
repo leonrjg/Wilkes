@@ -78,7 +78,7 @@ fn get_startup_status(app: AppHandle) -> StartupStatus {
 /// -- the standalone reader and the main window alike -- so the readiness
 /// handshake is one mechanism keyed by which window is asking.
 #[tauri::command]
-fn native_open_ready(window: tauri::WebviewWindow, app: AppHandle) -> Vec<NativeOpenRequest> {
+fn native_open_ready(window: tauri::Window, app: AppHandle) -> Vec<NativeOpenRequest> {
     app.state::<NativeOpenState>()
         .mark_ready_and_drain(window.label())
 }
@@ -145,7 +145,12 @@ pub(crate) fn view_context(app: &AppHandle, view: &str) -> Arc<AppContext> {
 }
 
 /// The context a command works in: the workspace of the window it came from.
-pub(crate) fn window_context(window: &tauri::WebviewWindow) -> Arc<AppContext> {
+///
+/// Commands take `tauri::Window`, not `tauri::WebviewWindow`: Tauri refuses
+/// to hand a command a `WebviewWindow` once its window holds a second webview,
+/// and the browser panes are child webviews of the window they dock in, so
+/// every command from that window would fail from then on.
+pub(crate) fn window_context(window: &tauri::Window) -> Arc<AppContext> {
     view_context(window.app_handle(), window.label())
 }
 

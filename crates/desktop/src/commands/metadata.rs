@@ -44,7 +44,7 @@ pub(crate) async fn zotero_generate_citation_for_ctx(
 
 #[tauri::command]
 pub(crate) async fn zotero_status(
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<IntegrationStatus, String> {
     zotero_status_for_ctx(window_context(&window)).await
 }
@@ -52,7 +52,7 @@ pub(crate) async fn zotero_status(
 #[tauri::command]
 pub(crate) async fn resolve_file_metadata(
     path: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<DocumentMetadata, String> {
     resolve_file_metadata_for_ctx(window_context(&window), path).await
 }
@@ -60,7 +60,7 @@ pub(crate) async fn resolve_file_metadata(
 #[tauri::command]
 pub(crate) async fn refresh_file_metadata(
     path: Option<String>,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     refresh_file_metadata_for_ctx(window_context(&window), path).await
 }
@@ -68,7 +68,7 @@ pub(crate) async fn refresh_file_metadata(
 #[tauri::command]
 pub(crate) async fn zotero_add_item(
     path: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<AddOutcome, String> {
     zotero_add_item_for_ctx(window_context(&window), path).await
 }
@@ -76,7 +76,7 @@ pub(crate) async fn zotero_add_item(
 #[tauri::command]
 pub(crate) async fn zotero_generate_citation(
     path: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<CitationResult, String> {
     zotero_generate_citation_for_ctx(window_context(&window), path).await
 }

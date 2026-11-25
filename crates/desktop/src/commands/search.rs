@@ -91,7 +91,7 @@ pub(crate) async fn search(
     query: wilkes_core::types::SearchQuery,
     search_id: Option<String>,
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<String, String> {
     let ctx = window_context(&window);
     let active_searches = active_searches_state(&app);
@@ -115,7 +115,7 @@ pub(crate) async fn cancel_search(search_id: String, app: AppHandle) -> Result<(
 #[tauri::command]
 pub(crate) async fn related_documents(
     query: wilkes_core::types::RelatedDocumentsQuery,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Vec<wilkes_core::types::RelatedDocument>, String> {
     window_context(&window).related_documents(query).await
 }
@@ -123,7 +123,7 @@ pub(crate) async fn related_documents(
 #[tauri::command]
 pub(crate) async fn tidy_folder(
     folder: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_core::types::TidyPlan, String> {
     window_context(&window).tidy_folder(folder.into()).await
 }
@@ -131,7 +131,7 @@ pub(crate) async fn tidy_folder(
 #[tauri::command]
 pub(crate) async fn reading_order(
     query: wilkes_core::types::ReadingOrderQuery,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_core::types::ReadingOrder, String> {
     window_context(&window).reading_order(query).await
 }
@@ -139,7 +139,7 @@ pub(crate) async fn reading_order(
 #[tauri::command]
 pub(crate) async fn citation_links(
     query: wilkes_core::types::CitationLinksQuery,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_core::types::CitationLinks, String> {
     window_context(&window).citation_links(query).await
 }
@@ -147,7 +147,7 @@ pub(crate) async fn citation_links(
 #[tauri::command]
 pub(crate) async fn citation_graph(
     query: wilkes_core::types::CitationGraphQuery,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_core::types::CitationGraph, String> {
     window_context(&window).citation_graph(query).await
 }
@@ -155,7 +155,7 @@ pub(crate) async fn citation_graph(
 #[tauri::command]
 pub(crate) async fn fetch_missing_citations(
     query: wilkes_core::types::CitationGraphQuery,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<usize, String> {
     window_context(&window).fetch_missing_citations(query).await
 }

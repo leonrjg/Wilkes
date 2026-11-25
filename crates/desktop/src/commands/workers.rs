@@ -26,7 +26,7 @@ pub(crate) async fn set_worker_timeout_for_ctx(
 
 #[tauri::command]
 pub(crate) async fn get_python_envs(
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_core::worker::PythonEnvInventory, String> {
     window_context(&window)
         .python_environments()
@@ -37,7 +37,7 @@ pub(crate) async fn get_python_envs(
 #[tauri::command]
 pub(crate) async fn remove_python_envs(
     ids: Vec<String>,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     window_context(&window)
         .remove_python_environments(ids)
@@ -48,7 +48,7 @@ pub(crate) async fn remove_python_envs(
 pub(crate) async fn remove_custom_model(
     engine: wilkes_core::types::EmbeddingEngine,
     model_id: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     window_context(&window)
         .remove_custom_model(engine, model_id)
@@ -56,24 +56,24 @@ pub(crate) async fn remove_custom_model(
 }
 
 #[tauri::command]
-pub(crate) fn get_worker_status(window: tauri::WebviewWindow) -> WorkerStatus {
+pub(crate) fn get_worker_status(window: tauri::Window) -> WorkerStatus {
     get_worker_status_for_ctx(window_context(&window))
 }
 
 #[tauri::command]
-pub(crate) fn get_worker_statuses(window: tauri::WebviewWindow) -> Vec<WorkerStatus> {
+pub(crate) fn get_worker_statuses(window: tauri::Window) -> Vec<WorkerStatus> {
     get_worker_statuses_for_ctx(window_context(&window))
 }
 
 #[tauri::command]
-pub(crate) async fn kill_worker(window: tauri::WebviewWindow) -> Result<(), String> {
+pub(crate) async fn kill_worker(window: tauri::Window) -> Result<(), String> {
     kill_worker_for_ctx(window_context(&window)).await
 }
 
 #[tauri::command]
 pub(crate) async fn set_worker_timeout(
     secs: u64,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     set_worker_timeout_for_ctx(window_context(&window), secs).await
 }

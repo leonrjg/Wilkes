@@ -412,7 +412,7 @@ pub(crate) async fn configure_external_mcp(
     bind_address: String,
     port: u16,
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<ExternalMcpStatus, String> {
     let bind_address = bind_address.parse::<std::net::IpAddr>().map_err(|_| {
         "External MCP bind address must be a valid IPv4 or IPv6 address".to_string()
@@ -446,7 +446,7 @@ pub(crate) async fn configure_http_api(
     bind_address: String,
     port: u16,
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<HttpApiStatus, String> {
     let bind_address = bind_address
         .parse::<std::net::IpAddr>()
@@ -474,7 +474,7 @@ pub(crate) async fn configure_http_api(
 #[tauri::command]
 pub(crate) async fn get_http_api_status(
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<HttpApiStatus, String> {
     let settings = window_context(&window).get_settings().await;
     Ok(http_api_manager_state(&app)
@@ -485,7 +485,7 @@ pub(crate) async fn get_http_api_status(
 #[tauri::command]
 pub(crate) async fn rotate_http_api_token(
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<HttpApiStatus, String> {
     let settings = window_context(&window).get_settings().await;
     let manager = http_api_manager_state(&app);
@@ -555,7 +555,7 @@ pub(crate) async fn configure_remote_embedding(
 
 #[tauri::command]
 pub(crate) async fn get_remote_embedding_status(
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<RemoteEmbeddingStatus, String> {
     Ok(remote_embedding_status(&window_context(&window)).await)
 }
@@ -565,7 +565,7 @@ pub(crate) async fn get_remote_embedding_status(
 pub(crate) async fn configure_lan_sharing(
     enabled: bool,
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<lan_share::LanSharingStatus, String> {
     let manager = lan_share_manager_state(&app);
     let settings = update_settings_with_listeners(
@@ -583,7 +583,7 @@ pub(crate) async fn configure_lan_sharing(
 #[tauri::command]
 pub(crate) async fn get_lan_sharing_status(
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<lan_share::LanSharingStatus, String> {
     let settings = window_context(&window).get_settings().await;
     Ok(lan_share_manager_state(&app)
@@ -610,7 +610,7 @@ pub(crate) async fn send_files_to_lan_peer(
 #[tauri::command]
 pub(crate) async fn get_external_mcp_status(
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<ExternalMcpStatus, String> {
     let settings = window_context(&window).get_settings().await;
     Ok(external_mcp_manager_state(&app)
@@ -626,7 +626,7 @@ pub(crate) fn set_active_document(path: Option<String>, page: Option<u32>, app: 
 #[tauri::command]
 pub(crate) async fn rotate_external_mcp_token(
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<ExternalMcpStatus, String> {
     let ctx = window_context(&window);
     let settings = ctx.get_settings().await;

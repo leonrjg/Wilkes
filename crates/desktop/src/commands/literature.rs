@@ -40,13 +40,13 @@ pub(crate) async fn custom_integration_probe_for_ctx(
 #[tauri::command]
 pub(crate) async fn custom_integration_summary(
     manifest: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> ManifestSummary {
     custom_integration_summary_for_ctx(window_context(&window), manifest).await
 }
 
 #[tauri::command]
-pub(crate) fn custom_integration_authoring_prompt(window: tauri::WebviewWindow) -> String {
+pub(crate) fn custom_integration_authoring_prompt(window: tauri::Window) -> String {
     window_context(&window).custom_integration_authoring_prompt()
 }
 
@@ -55,7 +55,7 @@ pub(crate) async fn custom_integration_probe(
     manifest: String,
     secrets: HashMap<String, String>,
     query: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<ProbeReport, String> {
     custom_integration_probe_for_ctx(window_context(&window), manifest, secrets, query).await
 }
@@ -69,7 +69,7 @@ pub(crate) fn catalogue_failed(error: wilkes_api::commands::catalogue::Catalogue
 #[tauri::command]
 pub(crate) async fn catalogue_remove(
     provider: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_api::commands::catalogue::CatalogueRemoveResponse, String> {
     wilkes_api::commands::catalogue::remove(&window_context(&window).catalogue_dir, provider)
         .map_err(catalogue_failed)
@@ -78,7 +78,7 @@ pub(crate) async fn catalogue_remove(
 /// Every literature provider this installation knows, switched on or not.
 #[tauri::command]
 pub(crate) async fn literature_providers(
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Vec<wilkes_api::commands::integrations::literature::LiteratureProviderInfo> {
     window_context(&window).literature_providers().await
 }
@@ -92,7 +92,7 @@ pub(crate) async fn literature_search(
     limit: Option<usize>,
     providers: Option<Vec<String>>,
     page: Option<usize>,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_api::commands::integrations::literature::LiteratureSearchResponse, String> {
     window_context(&window)
         .literature_search(query, limit, providers, page)
@@ -108,7 +108,7 @@ pub(crate) async fn literature_search(
 pub(crate) async fn literature_acquire(
     provider: String,
     result: wilkes_core::types::LiteratureSearchResult,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_core::acquire::AcquiredFiles, String> {
     window_context(&window)
         .literature_acquire(provider, result)
@@ -122,7 +122,7 @@ pub(crate) async fn literature_acquire(
 pub(crate) async fn literature_browse(
     provider: String,
     request: wilkes_core::types::BrowseRequest,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_api::commands::integrations::literature::LiteratureProviderAnswer, String> {
     window_context(&window)
         .literature_browse(provider, request)
@@ -136,7 +136,7 @@ pub(crate) async fn literature_filter_suggest(
     provider: String,
     filter: String,
     text: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Vec<wilkes_core::types::FilterSuggestion>, String> {
     window_context(&window)
         .literature_filter_suggest(provider, filter, text)
@@ -151,7 +151,7 @@ pub(crate) async fn literature_compose(
     request_id: String,
     text: String,
     providers: Vec<String>,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_api::commands::integrations::literature::LiteratureComposition, String> {
     window_context(&window)
         .literature_compose(request_id, text, providers)
@@ -164,7 +164,7 @@ pub(crate) async fn literature_compose(
 #[tauri::command]
 pub(crate) async fn literature_compose_cancel(
     request_id: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<(), String> {
     window_context(&window).literature_compose_cancel(&request_id);
     Ok(())
@@ -175,7 +175,7 @@ pub(crate) async fn literature_compose_cancel(
 #[tauri::command]
 pub(crate) async fn literature_provider_status(
     provider: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<IntegrationStatus, String> {
     literature_provider_status_for_ctx(window_context(&window), provider).await
 }
@@ -184,7 +184,7 @@ pub(crate) async fn literature_provider_status(
 pub(crate) async fn literature_provider_lookup(
     provider: String,
     doi: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_core::types::ProviderWork, String> {
     literature_provider_lookup_for_ctx(window_context(&window), provider, doi).await
 }
@@ -195,7 +195,7 @@ pub(crate) async fn literature_provider_lookup(
 #[tauri::command]
 pub(crate) async fn catalogue_sync(
     providers: Option<Vec<String>>,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_api::commands::catalogue::CatalogueSyncResponse, String> {
     window_context(&window)
         .catalogue_sync(providers)
@@ -212,7 +212,7 @@ pub(crate) async fn catalogue_sync(
 #[tauri::command]
 pub(crate) async fn catalogue_acquire_course(
     course_url: String,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<wilkes_api::commands::catalogue::CatalogueCourseResponse, String> {
     window_context(&window)
         .catalogue_acquire_course(course_url)

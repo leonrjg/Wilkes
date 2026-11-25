@@ -8,7 +8,7 @@ pub(crate) fn data_paths_from(app_data: String, workspace: String) -> DataPaths 
 }
 
 #[tauri::command]
-pub(crate) async fn get_data_paths(window: tauri::WebviewWindow) -> Result<DataPaths, String> {
+pub(crate) async fn get_data_paths(window: tauri::Window) -> Result<DataPaths, String> {
     let ctx = window_context(&window);
     Ok(data_paths_from(
         ctx.shared_data_dir.display().to_string(),
@@ -20,7 +20,7 @@ pub(crate) async fn get_data_paths(window: tauri::WebviewWindow) -> Result<DataP
 /// active one, and the workspaces other windows show.
 #[tauri::command]
 pub(crate) async fn list_workspaces(
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<WorkspaceState, String> {
     workspace_manager(window.app_handle())
         .state_for_view(window.label())
@@ -58,7 +58,7 @@ pub(crate) async fn rename_workspace(
 
 #[tauri::command]
 pub(crate) async fn delete_workspace(
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
     workspace_id: String,
 ) -> Result<WorkspaceState, String> {
     // No search cancellation and no chat teardown, unlike `switch_workspace`:
@@ -157,7 +157,7 @@ pub(crate) async fn show_workspace_in_window(
 #[tauri::command]
 pub(crate) async fn switch_workspace(
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
     workspace_id: String,
 ) -> Result<WorkspaceState, String> {
     let manager = workspace_manager(&app);

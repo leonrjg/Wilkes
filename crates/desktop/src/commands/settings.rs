@@ -88,7 +88,7 @@ pub(crate) async fn update_settings_with_listeners(
 }
 
 #[tauri::command]
-pub(crate) async fn get_settings(window: tauri::WebviewWindow) -> Result<Settings, String> {
+pub(crate) async fn get_settings(window: tauri::Window) -> Result<Settings, String> {
     get_settings_for_ctx(window_context(&window)).await
 }
 
@@ -96,7 +96,7 @@ pub(crate) async fn get_settings(window: tauri::WebviewWindow) -> Result<Setting
 pub(crate) async fn update_settings(
     patch: serde_json::Value,
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: tauri::Window,
 ) -> Result<Settings, String> {
     update_settings_with_listeners(
         window_context(&window),
